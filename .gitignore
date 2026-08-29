@@ -1,0 +1,134 @@
+```gitignore
+# =========================
+# Rust / Cargo
+# =========================
+
+# Cargo build output
+target/
+
+# Cargo lock file
+# 应用程序建议提交 Cargo.lock
+# 库项目通常可以不提交 Cargo.lock
+# Cargo.lock
+
+
+# =========================
+# Build / Output
+# =========================
+
+build/
+dist/
+out/
+bin/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
+
+
+# =========================
+# IDE
+# =========================
+
+# JetBrains / RustRover / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# VS Code
+.vscode/
+
+
+# =========================
+# OS
+# =========================
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Linux / Unix
+*~
+
+
+# =========================
+# Environment / Secrets
+# =========================
+
+.env
+.env.*
+!.env.example
+
+*.local
+
+# Certificates / Keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+
+# =========================
+# Runtime / Data
+# =========================
+
+logs/
+runtime/
+data/
+
+*.pid
+
+
+# =========================
+# Profiling / Debug
+# =========================
+
+*.prof
+*.pprof
+
+# Flamegraph / profiling outputs
+flamegraph.svg
+perf.data
+perf.data.old
+
+
+# =========================
+# Coverage
+# =========================
+
+coverage/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+
+# =========================
+# Rust tooling
+# =========================
+
+# rust-analyzer / local tooling cache
+.rust-analyzer/
+
+# Local benchmark / test results
+criterion/
+
+# cargo-expand / generated temporary files
+expanded.rs
+
+
+# =========================
+# Backup files
+# =========================
+
+*.bak
+*.swp
+*.swo
+```
