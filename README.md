@@ -6,7 +6,7 @@
 
 当前阶段为 **P0 / T00：Workspace、CI 与工程规则**。
 
-当前已建立包含六个无依赖 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。各库目前只有职责文档注释，没有业务实现或业务测试；根目录不再保留 Hello World binary，CI 尚未接入。
+当前已建立包含六个无依赖 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。各库目前只有职责文档注释，没有业务实现或业务测试；根目录不再保留 Hello World binary。CI workflow 已编写并通过本地 Review，尚未取得远端执行证据。
 
 本说明中的撮合、持久化和多分片能力均为规划目标，不代表当前已经实现或经过生产验证。已完成事项与实际验证结果以 [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md) 中的证据为准。
 
@@ -50,7 +50,9 @@ cargo test --workspace
 
 其中 fmt、clippy、test 是每个 Task 的最低 gate。任务书要求更强检查时，还必须执行对应检查。
 
-当前尚无 CI workflow，上述命令是本地运行方式。2026-09-22 workspace 骨架验收中，metadata 确认恰好六个 library 成员，以上四条命令在 Rust 1.98.0 下均通过。六个库的单元测试和文档测试实际运行数均为 **0**；这只证明骨架可构建，不能据此宣称撮合正确或 T00 已完成。本地通过与远端 CI 通过需要分别记录证据。
+已编写 [Rust CI workflow](.github/workflows/ci.yml)：push 到 main、目标为 main 的 PR 和手动触发时，在 Ubuntu 24.04 中读取项目工具链，分别执行 fmt、clippy 和 test；后两条命令还使用 `--locked`。2026-09-22 本地 Review 中 actionlint 1.7.12 和三条 CI 命令均通过，远端运行尚待验证。
+
+workspace 骨架验收已确认恰好六个 library 成员，且 `cargo check --workspace` 通过。六个库的单元测试和文档测试实际运行数均为 **0**；这只证明骨架可构建，不能据此宣称撮合正确或 T00 已完成。本地通过与远端 CI 通过需要分别记录证据。
 
 核心金融计算禁止浮点数，算术必须 checked；业务时间使用 LogicalClock；OrderBook 保持单写者；队列必须有界；P14 gate 前禁止 unsafe。这些约束需要结合 lint、代码审查和相应测试验证，不能假设默认 Clippy 自动覆盖全部业务语义。
 
