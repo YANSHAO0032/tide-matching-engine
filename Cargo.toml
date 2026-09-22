@@ -1,6 +1,22 @@
-[package]
-name = "tide-matching-engine"
+[workspace]
+members = [
+    "crates/matching-domain",
+    "crates/matching-orderbook",
+    "crates/matching-runtime",
+    "crates/matching-persistence",
+    "crates/matching-risk",
+    "crates/matching-protocol",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+float_arithmetic = "deny"
+disallowed_methods = "deny"

@@ -5,7 +5,8 @@
 
 # Cargo build output
 target/
-
+#存放任务执行手册
+assignment/
 # Cargo lock file
 # 应用程序建议提交 Cargo.lock
 # 库项目通常可以不提交 Cargo.lock

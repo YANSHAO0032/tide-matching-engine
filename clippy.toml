@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::sync::mpsc::channel", reason = "Unbounded channels violate the bounded-queue requirement; use a bounded channel with an explicit backpressure policy." },
+]

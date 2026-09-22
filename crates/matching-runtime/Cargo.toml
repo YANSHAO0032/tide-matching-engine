@@ -1,0 +1,7 @@
+[package]
+name = "matching-runtime"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
