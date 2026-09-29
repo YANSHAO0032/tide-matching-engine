@@ -1,13 +1,17 @@
-/// 撮合域逻辑时间
+/// 撮合域逻辑时间。
+///
+/// 该计数值不读取或表示 wall clock；推进仅能由持久化的时间命令完成。
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct LogicalTime(u64);
 
 impl LogicalTime {
+    /// 从已确定的逻辑计数构造值对象，不推进任何时钟。
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// 读取底层逻辑计数。
     pub fn get(self) -> u64 {
         self.0
     }
@@ -15,6 +19,7 @@ impl LogicalTime {
 
 #[cfg(test)]
 mod tests {
+    //! 验证逻辑时间的透明值语义，不测试时间推进协议。
     use super::*;
     use std::collections::BTreeMap;
 

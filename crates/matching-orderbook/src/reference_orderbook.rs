@@ -3,7 +3,9 @@ use matching_domain::{
     LimitGtcOrder, OrderId, Price, Qty, QueuePriority, RejectReason, Side, TradeEvent, TradeId,
 };
 
-/// 为优先级计数器保留不可分配的高位保护空间。
+/// 为 priority 计数器保留不可分配的高位保护空间。
+///
+/// 到达该边界前必须拒绝新 resting order，避免计数器 wrap 后破坏 FIFO 语义。
 const PRIORITY_GUARD: u128 = 1_024;
 
 /// 单市场参考订单簿
@@ -11,12 +13,14 @@ const PRIORITY_GUARD: u128 = 1_024;
 /// orders 的原始顺序表示已知挂单先后。
 #[derive(Debug, Default)]
 pub struct ReferenceOrderBook {
+    /// 挂单的权威存储顺序；同价 FIFO 的参考基线由该顺序加稳定排序得出。
     orders: Vec<ReferenceOrder>,
+    /// 下一张成功 rest 的订单将取得的 market-local priority 值。
     next_priority: u128,
 }
 
 impl ReferenceOrderBook {
-    //创建空订单簿
+    /// 创建不含挂单且 priority 从零开始的单市场参考订单簿。
     pub fn new() -> Self {
         Self::default()
     }
@@ -89,13 +93,17 @@ impl ReferenceOrderBook {
         self.orders(side).into_iter().next()
     }
 
-    /// 返回最优且可成交的 resting maker。
+    /// 返回对 `incoming` 价格可成交的最优 resting maker。
+    ///
+    /// 选择遵循对手方价格优先和同价 FIFO，并忽略已经耗尽的运行态订单。
     pub fn best_crossing_maker(&self, incoming: &LimitGtcOrder) -> Option<&ReferenceOrder> {
         self.best_crossing_maker_index(incoming)
             .map(|index| &self.orders[index])
     }
 
-    /// 查找最佳可成交 maker 在源 Vec 中的索引
+    /// 查找最佳可成交 maker 在源 `Vec` 中的索引。
+    ///
+    /// 该索引只在当前不可变借用期间有效，供后续规划和一次性执行定位同一 maker。
     pub(crate) fn best_crossing_maker_index(&self, incoming: &LimitGtcOrder) -> Option<usize> {
         let opposite_side = match incoming.side {
             Side::Buy => Side::Sell,
@@ -138,6 +146,10 @@ impl ReferenceOrderBook {
         Ok(Some((maker_index, fill_qty)))
     }
 
+    /// 返回下一笔成交的 maker 与数量，但不修改双方运行态。
+    ///
+    /// 与 [`Self::plan_next_fill`] 相同的价格/FIFO 选择逻辑被用于只读预览；
+    /// 返回的引用在订单簿发生可变操作前有效。
     pub fn next_fill_plan(
         &self,
         incoming: &IncomingOrder,
@@ -245,9 +257,11 @@ impl ReferenceOrderBook {
 
 #[cfg(test)]
 mod tests {
+    //! 覆盖 T02 参考模型的排序、成交、取消和 priority 边界。
     use super::*;
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, UserId};
 
+    /// 构造带指定业务字段的 resting order fixture。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> ReferenceOrder {
         ReferenceOrder::new(
             LimitGtcOrder {
@@ -261,7 +275,7 @@ mod tests {
         )
     }
 
-    // 仅测试模块可以构造非空订单簿。
+    /// 直接构造非空参考簿，仅用于表达需要特定源顺序的测试前置条件。
     fn book(orders: Vec<ReferenceOrder>) -> ReferenceOrderBook {
         ReferenceOrderBook {
             orders,
@@ -269,6 +283,7 @@ mod tests {
         }
     }
 
+    /// 提取只读视图中的 order ID，便于断言显示顺序。
     fn ids(orders: &[&ReferenceOrder]) -> Vec<OrderId> {
         orders
             .iter()
@@ -426,6 +441,7 @@ mod tests {
         assert_eq!(book.orders[0].original_order().qty.get(), 10);
     }
 
+    /// 构造经公开 `rest` 路径写入参考簿的合法订单 fixture。
     fn candidate(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -436,6 +452,7 @@ mod tests {
         }
     }
 
+    /// 保存完整可观察 resting 状态，用于失败原子性断言。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -768,9 +785,11 @@ mod tests {
 
 #[cfg(test)]
 mod maker_query_tests {
+    //! 验证 maker 查询的价格交叉、FIFO 与只读性质。
     use super::*;
     use matching_domain::{OrderId, Price, Qty, UserId};
 
+    /// 构造指定方向、价格和数量的订单 fixture。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -781,12 +800,12 @@ mod maker_query_tests {
         }
     }
 
+    /// 将 maker 查询结果投影为订单身份，便于断言选择结果。
     fn maker_id(maker: Option<&ReferenceOrder>) -> Option<OrderId> {
         maker.map(|maker| maker.original_order().order_id)
     }
 
-    // 最高 bid=95，最低 ask=105。
-    // 后挂入的订单具有更优价格。
+    /// 构造不交叉的双侧盘口，其中后挂入订单拥有更优价格。
     fn two_sided_book() -> ReferenceOrderBook {
         let mut book = ReferenceOrderBook::new();
 
@@ -1031,10 +1050,12 @@ mod maker_query_tests {
 
 #[cfg(test)]
 mod next_fill_planner_tests {
+    //! 验证只读 next-fill 规划的 maker、数量和状态保持性质。
     use super::ReferenceOrderBook;
     use crate::IncomingOrder;
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
 
+    /// 构造指定方向、价格和数量的订单 fixture。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -1045,11 +1066,12 @@ mod next_fill_planner_tests {
         }
     }
 
+    /// 将指定订单包装为尚未成交的 incoming 运行态。
     fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
         IncomingOrder::new(order(id, side, price, qty))
     }
 
-    // 最高 bid=95，最低 ask=105，盘口不交叉。
+    /// 构造最高 bid 为 95、最低 ask 为 105 的不交叉盘口。
     fn two_sided_book() -> ReferenceOrderBook {
         let mut book = ReferenceOrderBook::new();
 
@@ -1098,7 +1120,7 @@ mod next_fill_planner_tests {
         }
     }
 
-    // 保存完整订单、运行态剩余量和 FIFO priority。
+    /// 保存完整订单、运行态剩余量和 FIFO priority。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -1507,9 +1529,11 @@ mod next_fill_planner_tests {
 
 #[cfg(test)]
 mod next_fill_execution_tests {
+    //! 验证 next-fill 执行、连续成交、TradeEvent 与固定命令带确定性。
     use super::*;
     use matching_domain::{OrderId, Price, Qty, UserId};
 
+    /// 构造指定方向、价格和数量的订单 fixture。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -1520,11 +1544,12 @@ mod next_fill_execution_tests {
         }
     }
 
+    /// 将指定订单包装为尚未成交的 incoming 运行态。
     fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
         IncomingOrder::new(order(id, side, price, qty))
     }
 
-    // 包含源 Vec 顺序、原始订单、remaining 和 priority。
+    /// 保存源 `Vec` 顺序、原始订单、remaining 和 priority。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -1985,6 +2010,7 @@ mod next_fill_execution_tests {
         assert_eq!(taker.original_order(), &original_before);
         assert_eq!(taker.remaining(), remaining_before);
     }
+    /// 在独立空簿上执行固定命令带，供确定性回归比较。
     fn run_fixed_command_tape() -> (
         Vec<TradeEvent>,
         Vec<(LimitGtcOrder, u64, QueuePriority)>,
@@ -2083,10 +2109,12 @@ mod next_fill_execution_tests {
 
 #[cfg(test)]
 mod property_tests {
+    //! 用生成式输入覆盖 FIFO、数量守恒、取消和失败原子性。
     use super::*;
     use matching_domain::UserId;
     use proptest::prelude::*;
 
+    /// 构造生成式测试使用的合法订单 fixture。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -2097,7 +2125,7 @@ mod property_tests {
         }
     }
 
-    // 包含源 Vec 顺序、原始订单、remaining 和 priority。
+    /// 保存源 `Vec` 顺序、原始订单、remaining 和 priority。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -2111,6 +2139,7 @@ mod property_tests {
             .collect()
     }
 
+    /// 将指定订单包装为尚未成交的 incoming 运行态。
     fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
         IncomingOrder::new(order(id, side, price, qty))
     }

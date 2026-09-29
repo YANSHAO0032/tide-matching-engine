@@ -1,16 +1,18 @@
-/// 单市场内的 FIFO 队列优先级
+/// 单市场内的 FIFO 队列优先级。
 ///
-/// 数值越小，表示同价位下越早获得队列优先级
-/// 不代表全局身份、时间戳或订单 ID
+/// 数值越小，表示同价位下越早获得队列优先级。它不代表全局身份、时间戳或订单 ID；
+/// 生产簿中实际的同价顺序仍以 PriceLevel 链表为权威。
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct QueuePriority(u128);
 
 impl QueuePriority {
+    /// 从市场本地已分配的优先级数值构造值对象。
     pub const fn new(value: u128) -> Self {
         Self(value)
     }
 
+    /// 读取市场本地优先级数值。
     pub const fn get(self) -> u128 {
         self.0
     }
@@ -18,6 +20,7 @@ impl QueuePriority {
 
 #[cfg(test)]
 mod tests {
+    //! 验证 priority 的整数边界、排序和哈希值语义。
     use super::QueuePriority;
     use std::collections::HashSet;
 

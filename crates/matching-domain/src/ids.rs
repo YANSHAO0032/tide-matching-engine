@@ -1,14 +1,14 @@
-/// 集群身份
+/// 集群身份，用于区分独立的部署或复制域。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClusterId(pub u16);
 
-/// 市场身份
+/// 市场身份；其有效范围和路由语义由上层市场目录定义。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MarketId(pub u32);
 
-///用户身份
+/// 用户身份；它不是资金账户、订单或命令的替代标识。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UserId(pub u64);
@@ -31,17 +31,21 @@ pub struct UserId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OrderId(pub u128);
 
-/// 命令身份
+/// 客户端命令身份，用于幂等请求及其审计关联。
+///
+/// 它不是订单、成交或 durable sequence，不能据数值顺序推导处理次序。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(pub u128);
 
-/// 成交身份
+/// 成交身份，用于唯一标识一笔已经发生的交易。
+///
+/// 它不是订单优先级或可排序的业务时间。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TradeId(pub u128);
 
-/// 资金预留身份
+/// 资金预留身份，用于关联风控层保存的预留记录。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReservationId(pub u128);
@@ -51,10 +55,12 @@ pub struct ReservationId(pub u128);
 macro_rules! impl_id {
     ($name:ident, $inner:ty) => {
         impl $name {
+            /// 从调用方已持有的原始数值构造 ID，不分配或验证其唯一性。
             pub const fn new(value: $inner) -> Self {
                 Self(value)
             }
 
+            /// 读取底层数值；该数值不携带额外的顺序语义。
             pub const fn get(self) -> $inner {
                 self.0
             }
@@ -72,6 +78,7 @@ impl_id!(ReservationId, u128);
 
 #[cfg(test)]
 mod tests {
+    //! 验证透明 ID 包装的值语义与整数边界保真。
     use super::*;
     use std::collections::HashSet;
 

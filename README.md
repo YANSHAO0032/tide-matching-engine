@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-当前阶段为 **P0 / T00：Workspace、CI 与工程规则**。
+当前已验收 **P0 / T00、P1 / T01 和 T02：ReferenceOrderBook + FIFO 测试**；2026-09-26 经用户明确授权启动 **P2 / T03：Arena / PriceLevel / intrusive FIFO**。导师模式保持，T03 整体尚未完成；小步进度与最新验证以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
 
-当前已建立包含六个无依赖 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。各库目前只有职责文档注释，没有业务实现或业务测试；根目录不再保留 Hello World binary。CI workflow 已编写并通过本地 Review，尚未取得远端执行证据。
+当前已建立包含六个 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。matching-domain 已有领域类型、QueuePriority 与基础错误模型；matching-orderbook 已有 ReferenceOrder、IncomingOrder、ReferenceOrderBook 的挂单、双向成交、Cancel 和 TradeEvent，T02 提交为 `161abf7`；其余四库仍为职责注释骨架。orderbook 的运行依赖只有本地 domain，测试依赖为 proptest 1.11.0。CI 的 T00 提交已有远端成功证据，本轮只核验本地 gate，未查询新的远端 CI。
 
 本说明中的撮合、持久化和多分片能力均为规划目标，不代表当前已经实现或经过生产验证。已完成事项与实际验证结果以 [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md) 中的证据为准。
 
@@ -16,11 +16,11 @@
 
 账户中心、充值提现、KYC、财务总账、清结算数据库和 Web 前端不属于撮合核心。核心与外围资金、订单、行情和清算系统的集成协议，以及参考风控/资金实现，按规格对应阶段推进。
 
-T00 只建立工程基础，不实现 OrderBook 算法，不引入 Tokio 到撮合核心，不提前增加 Gateway、HA 或 MarketData 组件。
+T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。当前 API 不自动 rest incoming 余量，尚无完整生命周期事件/命令协议。T03 仅推进 OrderIndex、OrderArena slot/free-list、PriceLevel 双向 FIFO 与 QueuePriority/high-water 不变量；完整生产簿行为和 100k differential 分别在 T04/T05。P3 订单规则、runtime、Gateway、HA 和 MarketData 均不属于当前范围。
 
-## T00 crate 边界
+## Crate 边界
 
-以下六个 crate 的最小骨架已创建在 `crates/` 下。本表列出规划职责，业务功能尚未实现；当前没有第三方或 crate 间依赖，后续按实际需求添加。
+以下六个 crate 已创建在 `crates/` 下。本表列出规划职责，matching-domain 已完成当前所需领域子集，matching-orderbook 已完成 T02 参考模型；生产簿底层结构及其余四库业务尚未实现。依赖按实际小步需求添加。
 
 | Crate | 职责 |
 |---|---|
@@ -31,7 +31,7 @@ T00 只建立工程基础，不实现 OrderBook 算法，不引入 Tokio 到撮�
 | `matching-risk` | 交易前校验、价格保护、reservation 与参考资金规则 |
 | `matching-protocol` | 外部协议帧、编解码、版本和稳定的 reason code 契约 |
 
-T00 只需要这些 crate 的最小可编译骨架，其业务实现属于后续任务。规格中的完整目录是长期目标，不是当前创建清单。
+这些最小可编译骨架已在 T00 验收，领域类型和参考模型已在 T01/T02 验收；当前主要推进 matching-orderbook 的 T03 范围，复用既有 domain 契约。规格中的完整目录是长期目标，不是当前创建清单。
 
 根 [Cargo.toml](Cargo.toml) 显式列出六个成员，使用 resolver 3，并通过 `workspace.package` 统一版本 0.1.0 和 edition 2024；各成员显式继承。workspace 共用根目录的 Cargo.lock 和默认 target 目录。
 
@@ -50,9 +50,9 @@ cargo test --workspace
 
 其中 fmt、clippy、test 是每个 Task 的最低 gate。任务书要求更强检查时，还必须执行对应检查。
 
-已编写 [Rust CI workflow](.github/workflows/ci.yml)：push 到 main、目标为 main 的 PR 和手动触发时，在 Ubuntu 24.04 中读取项目工具链，分别执行 fmt、clippy 和 test；后两条命令还使用 `--locked`。2026-09-22 本地 Review 中 actionlint 1.7.12 和三条 CI 命令均通过，远端运行尚待验证。
+已编写 [Rust CI workflow](.github/workflows/ci.yml)：push 到 main、目标为 main 的 PR 和手动触发时，在 Ubuntu 24.04 中读取项目工具链，分别执行 fmt、clippy 和 test；后两条命令还使用 `--locked`。2026-09-22 对提交 `12a89a39ea7b08c610159a4adbf03733dfd60819` 的本地复核中，actionlint 1.7.12、cargo check 和三条 CI 命令均通过。[首次远端运行 Rust CI #1](https://github.com/YANSHAO0032/tide-matching-engine/actions/runs/35734785743) 与该提交对应，run 和 ci job 均显示成功；当时通过公开页面核验结果，未读取需登录的逐步日志。
 
-workspace 骨架验收已确认恰好六个 library 成员，且 `cargo check --workspace` 通过。六个库的单元测试和文档测试实际运行数均为 **0**；这只证明骨架可构建，不能据此宣称撮合正确或 T00 已完成。本地通过与远端 CI 通过需要分别记录证据。
+2026-09-26 在 T03 启动基线 `161abf7` 上执行 `cargo test -p matching-orderbook --locked`（74 unit）、`cargo fmt --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked --quiet`，全部 exit 0。workspace 合计 **144 个单元测试 + 2 个 compile-fail doctest**（domain 70 unit，orderbook 74 unit，其余四库 0）。这些证明 T02 前置基线保持全绿，不构成 T03 结构验收；T03 完成前仍须定向测试、结构不变量/复杂度证据和完整 workspace gate。
 
 核心金融计算禁止浮点数，算术必须 checked；业务时间使用 LogicalClock；OrderBook 保持单写者；队列必须有界；P14 gate 前禁止 unsafe。这些约束需要结合 lint、代码审查和相应测试验证，不能假设默认 Clippy 自动覆盖全部业务语义。
 
@@ -66,6 +66,6 @@ workspace 骨架验收已确认恰好六个 library 成员，且 `cargo check --
 - [当前交接记录](assignment/SESSION_HANDOFF.md)
 - [Rust 撮合系统 v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md)
 - [任务索引](assignment/README.md)
-- [当前 T00 任务书](assignment/tasks/T00_P0_workspace_ci_rules.md)
+- [当前 T03 任务书](assignment/tasks/T03_P2_arena_pricelevel.md)
 
-当前 `.gitignore` 忽略整个 `assignment/`，上述资料存在于本机但没有受 Git 跟踪；新 clone 不会自动带上这些文件。版本管理策略待 T00 后续工程检查确认，交接文件继续使用此唯一位置。
+当前 `.gitignore` 忽略整个 `assignment/`，上述资料存在于本机但没有受 Git 跟踪；新 clone 不会自动带上这些文件。版本管理策略仍待用户决定，交接文件继续使用此唯一位置。

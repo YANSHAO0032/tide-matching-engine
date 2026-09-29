@@ -1,17 +1,25 @@
 use crate::{OrderId, Price, Qty, Side, UserId};
 
 /// 最小 GTC 限价订单值对象。
+///
+/// 它不含市场、有效期、标志、状态或资金预留；这些契约由后续命令模型承载。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitGtcOrder {
+    /// 在订单簿内唯一定位该订单的业务身份。
     pub order_id: OrderId,
+    /// 提交订单的用户身份。
     pub user_id: UserId,
+    /// 买入或卖出方向。
     pub side: Side,
+    /// 限价价格，必须为严格正 ticks。
     pub price: Price,
+    /// 原始下单数量，必须为严格正 lots。
     pub qty: Qty,
 }
 
 #[cfg(test)]
 mod tests {
+    //! 验证最小 GTC 订单的字段级值语义。
     use super::*;
     use crate::{OrderId, Price, Qty, Side, UserId};
 
@@ -36,6 +44,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// 构造可复用的合法订单 fixture。
     fn sample_order() -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(1),

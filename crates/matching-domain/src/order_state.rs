@@ -1,22 +1,25 @@
-///订单状态
+/// 订单生命周期状态标签。
+///
+/// 该值对象不定义允许的状态迁移，迁移验证属于命令和撮合流程。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderState {
-    // 已接受
+    /// 已通过接收阶段。
     Accepted,
-    // 部分成交
+    /// 已成交一部分，仍有剩余数量。
     PartiallyFilled,
-    // 完全成交
+    /// 已无剩余数量，因全部成交结束。
     Filled,
-    // 已撤销
+    /// 因撤单结束。
     Canceled,
-    // 已过期
+    /// 因有效期规则结束。
     Expired,
-    // 已拒绝
+    /// 在进入生命周期前被拒绝。
     Rejected,
 }
 
 #[cfg(test)]
 mod tests {
+    //! 验证订单状态标签的基础值语义。
     use super::OrderState;
 
     #[test]

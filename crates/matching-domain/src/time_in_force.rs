@@ -1,21 +1,24 @@
 use crate::logical_time::LogicalTime;
-/// 订单有效期策略
+/// 订单有效期策略声明。
+///
+/// 该枚举保存策略参数；过期、FOK 预检和 IOC 剩余量处理由后续命令流程执行。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeInForce {
-    // Good-Til-Canceled
+    /// 除非被取消或按其他规则终止，否则持续有效。
     Gtc,
-    // Immediate-Or-Cancel
+    /// 立即尝试成交，未成交的剩余量应被取消。
     Ioc,
-    // Fill-Or-Kill
+    /// 只有可完整成交时才允许执行。
     Fok,
-    // 在指定 session 内有效
+    /// 仅在给定交易 session 内有效。
     Day { session_id: u64 },
-    // 在指定逻辑时间到期
+    /// 在给定逻辑时间到达后到期。
     Gtd { expire_at: LogicalTime },
 }
 
 #[cfg(test)]
 mod tests {
+    //! 验证有效期策略的值语义，不覆盖执行期行为。
     use super::*;
 
     #[test]

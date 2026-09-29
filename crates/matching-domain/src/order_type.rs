@@ -1,20 +1,23 @@
-/// 核心订单类型。
+/// 订单类型标签。
+///
+/// 该枚举只承载声明的类型；各类型的下单、触发和撮合行为在对应阶段实现。
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrderType {
-    //限价单
+    /// 带价格约束的限价订单。
     Limit,
-    //市价单
+    /// 以当时可得流动性为目标的市价订单。
     Market,
-    //止损市价单
+    /// 触发后形成市价 child 的止损订单。
     StopMarket,
-    //止损限价单
+    /// 触发后形成限价 child 的止损订单。
     StopLimit,
-    //冰山订单
+    /// 具有可见量与隐藏量语义的冰山订单。
     Iceberg,
 }
 
 #[cfg(test)]
 mod tests {
+    //! 验证订单类型标签的值语义，不覆盖未来订单行为。
     use super::OrderType;
 
     #[test]

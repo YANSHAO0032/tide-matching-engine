@@ -1,12 +1,17 @@
-/// 订单标志
+/// 订单附加约束标志。
+///
+/// 该结构只保存声明值；合法性和执行效果由命令与风险阶段验证。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderFlags {
+    /// 要求订单不得作为 taker 立即成交的约束。
     pub post_only: bool,
+    /// 要求订单仅降低现有风险敞口的约束。
     pub reduce_only: bool,
 }
 
 #[cfg(test)]
 mod tests {
+    //! 验证标志字段的独立值语义。
     use super::OrderFlags;
 
     #[test]

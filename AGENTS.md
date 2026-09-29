@@ -4,7 +4,7 @@
 
 本项目采用长期导师和 Code Reviewer 模式。用户负责实现，Codex 负责读取事实、解释设计、拆分小步、审查、运行验证和维护交接。
 
-- 不创建、修改或覆盖 Rust 实现 `.rs` 文件，不提供可直接复制的完整 struct/enum/trait/function/module 实现，不输出整项任务的完整实现 patch。
+- 不创建、修改或覆盖 Rust **行为实现** `.rs` 文件，不提供可直接复制的完整 struct/enum/trait/function/module 实现，不输出整项任务的完整实现 patch。用户于 2026-09-29 额外持续授权 Codex 直接新增、修订或删除 `.rs` 中的 Rustdoc 与普通注释，并在运行检查时主动补全与当前变更直接相关的注释；该授权仅限注释 token，不得改变行为、接口、derive、测试、依赖、格式以外的非注释文本，亦不得借此实现未来任务。纯 Rustfmt 例外仍有效：当 `cargo fmt --check` 已报告差异时，Codex 可直接运行 `cargo fmt`，仅接受格式化器生成的排版变更；不得借此改变行为、补写逻辑或绕过后续 review/gate。
 - 可以给文件位置、类型职责、函数签名、非编译级伪代码、测试场景，以及针对真实 diff 的修改建议。
 - 可以运行 cargo check/test/clippy/fmt --check、benchmark 和 Git 只读检查；不得为通过检查而弱化约束。
 - 可以直接维护 `assignment/SESSION_HANDOFF.md`。用户已分别授权 Codex 完成 T00.1 文档、T00.2 工具链配置及验证、T00.3 workspace 配置与仅含职责注释的空库骨架（包括移除 Hello World 入口）、T00.4 lint 配置/说明及临时独立探针验证。这些单步授权不取消业务 Rust 实现的导师模式，也不代表授权实现后续小步。
@@ -13,19 +13,21 @@
 
 ## 当前范围与文档入口
 
-当前只允许推进 **T00_P0_workspace_ci_rules**。T00 验收通过前不得进入 T01。
+当前只允许推进 **T03_P2_arena_pricelevel**。T00、T01 已验收，T02 已于 2026-09-26 验收并提交为 `161abf7`；用户于同日明确授权从 T02 切换到 T03，并要求同步范围文档。导师模式继续有效，这次切换不授权 Codex 代写 Rust 实现。T03 验收通过前不得进入 T04。
 
 每轮开始先读取：
 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
-3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的当前任务相关章节；T00 为 §4、§5、§61、§77、Appendix E。
-4. [T00 任务书](assignment/tasks/T00_P0_workspace_ci_rules.md)。
+3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的当前任务相关章节；T03 为 §10、§54 invariants 1–8/26/28、§63；同时遵守 §77 和 Appendix E。priority 高水位补读 §9.5、§46 与 invariant 29；复用领域类型时参考 §6–§9，数值与错误边界参考 §3 原则 D、§45、§58。Stop 相关 invariant 6、28 的 Stop 分支在当前范围不适用；读取未来契约不扩大实现范围。
+4. [T03 任务书](assignment/tasks/T03_P2_arena_pricelevel.md)。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
 
-T00 只建立 matching-domain、matching-orderbook、matching-runtime、matching-persistence、matching-risk、matching-protocol 六个 crate 的最小骨架、固定工具链、CI 和工程规则。不得提前实现 Domain 类型、撮合算法、runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件。
+T00 已建立六个 crate 的最小骨架、固定工具链、CI 和工程规则。T01 已建立领域类型，T02 已在 matching-orderbook 中建立 `Vec + sort` ReferenceOrderBook：rest、双向 Limit GTC 成交、Cancel、TradeEvent、价格优先/FIFO、重复 command tape 及数量守恒/取消性质测试。Incoming 余量不会自动 rest，完整生命周期事件/命令协议尚未实现。保留参考模型作为后续 differential 基线，不重写已验收类型。
+
+T03 仅建立 ProductionOrderBook 的底层结构：OrderIndex、OrderArena slot/free-list 生命周期、PriceLevel head/tail/count/total_visible_qty、基于索引的 intrusive 双向 FIFO，以及 market-local QueuePriority 分配边界与 high-water guard。链表顺序是 FIFO 权威；槽位复用必须保证现存索引/链表引用一致。§63 覆盖整个 P2：完整 ProductionOrderBook 行为在 T04，100k command Reference/Production differential 与完整集成 invariant gate 在 T05；T03 自身的结构 unit/edge/property、不变量与 O(1) 尾插证据不能延期。不得提前实现 Stop/Iceberg/FOK/HA、完整后续命令协议或 runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
@@ -100,7 +102,7 @@ Clippy 规则在运行 Clippy 时检查，不能用 `cargo check` 代替。即�
 3. 是否引入核心路径网络/数据库/异步运行时、wall clock、随机性、无界队列或其他确定性风险；依赖内部 unsafe 的情况不能由本项目 lint 推断。
 4. 队列 API 的容量、满队列行为与背压策略；引入新队列库时同步审查并扩充 disallowed-methods，而不是把未列入名单当作允许无界队列。
 
-保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T00 当前六个 crate 均无依赖，不能为了配置禁用列表而先引入 Tokio/Crossbeam。禁用的标准库无界 API 不代表现在要实现 channel/runtime。
+保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T03 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T03 首步不新增依赖，arena 容器与 checked 转换使用标准库。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
 
 lint 配置或继承发生变化时，用独立临时副本/探针验证预期诊断与合法对照，不在业务源码保留违规探针，不把空库检查通过当作规则拦截证据。
 
@@ -108,7 +110,9 @@ lint 配置或继承发生变化时，用独立临时副本/探针验证预期�
 
 每次 Review 检查：状态不变量、checked arithmetic、wall clock、非确定性迭代、FIFO/QueuePriority/StopPriority、replay、错误处理、I/O crash boundary、所需测试和是否越界到下一 Task。不涉及的项说明不适用，不伪造验证。
 
-- 订单规则需 unit、edge 以及 differential/property 测试。
+- 测试按风险保留证据，而非按每个方法机械增加。状态变更、分支选择、拒绝/失败原子性、checked 算术边界、价格/FIFO/确定性顺序、稳定 wire 编号与事件 payload 必须有针对性的 unit/edge 测试；Task/规格要求的 property、differential、command tape、replay、crash 测试同样不能用人工 review 替代。
+- 纯值对象 derive、透明包装、crate re-export、无分支委托、构造/只读 getter，或与已有测试断言完全相同的 fixture，可以不新增单元测试，或与代表性测试合并。用户完成实现后，Codex 必须直接审查真实 diff、调用链和类型约束，并运行适用的定向测试、fmt、Clippy 与 workspace gate；Review/Handoff 必须写明未单测项为何属于简单逻辑，以及哪项保留证据覆盖其行为。
+- 清理既有测试时先列出“删除/合并项 → 仍保留的核心证据”映射；不得因减量移除 T02 规定的 buy/sell、exact/partial、multi-maker、cross-price、empty book、duplicate ID、cancel、同价 FIFO、确定性和适用性质验证。
 - 持久化变更需 crash/truncation 测试；快照变更需 replay digest 测试。
 - publisher epoch/cursor、迁移 source/feed 连续性、PreOpen 重校验等不变量在对应阶段加入 debug/test assertions。
 - fmt 和默认 Clippy 不能替代全部业务语义审查，特别是 float、unsafe、无界队列和确定性约束。
@@ -122,6 +126,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-任务书更强的 gate 同样必须满足；T00 还需可编译 workspace、README scope、工程规则、CI 和无越界依赖的证据。任一 gate 未过，记录 blocker，不宣称 Task 完成，不进入下一 Task。
+任务书更强的 gate 同样必须满足；T03 先运行 matching-orderbook 定向测试，若变更 domain 契约也运行 domain 定向测试。T03 必须覆盖空/单/多节点、头/中/尾删除、free slot 复用与重复释放边界、双向链接/count/visible qty 一致、priority 单调与 high-water 失败不变，以及 O(1) 尾插证据（操作次数/访问路径，不能只凭运行时间或插入成功）。保留 T02 的双向成交、FIFO、Cancel、command tape 与 property 回归。无浮点金融类型、checked arithmetic 显式失败和方向独立数值排序仍须审查。引入的 reason 枚举按 §58 保持显式稳定编号并补 golden wire tests，不提前实现全量协议。任一 gate 未过，记录 blocker，不宣称 Task 完成，不进入下一 Task。
 
 “完成”必须有文件、diff、命令退出码/测试结果、benchmark 结果或 commit hash 等证据。区分计划与实现、本地检查与远端 CI、零测试通过与业务正确性；历史结果必须标明验证时点。

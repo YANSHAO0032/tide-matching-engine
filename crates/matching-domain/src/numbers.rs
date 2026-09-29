@@ -49,6 +49,7 @@ impl Price {
 pub struct Qty(u64);
 
 impl Qty {
+    /// 仅接受严格大于零的 lots；零返回 [`RejectReason::InvalidQty`]。
     pub const fn try_new(value: u64) -> Result<Self, RejectReason> {
         if value > 0 {
             Ok(Self(value))
@@ -56,6 +57,8 @@ impl Qty {
             Err(RejectReason::InvalidQty)
         }
     }
+
+    /// 读取原始 lots。
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -69,20 +72,23 @@ impl Qty {
 pub struct QuoteAmount(u128);
 
 impl QuoteAmount {
+    /// 从非负的原始报价金额构造值对象。
     pub const fn new(value: u128) -> Self {
         Self(value)
     }
+
+    /// 读取原始报价金额。
     pub const fn get(self) -> u128 {
         self.0
     }
-    ///加法溢出时返回ArithmeticOverflow
+    /// 相加溢出时返回 [`RejectReason::ArithmeticOverflow`]，且不产生截断值。
     pub const fn checked_add(self, rhs: Self) -> Result<Self, RejectReason> {
         match self.0.checked_add(rhs.0) {
             Some(value) => Ok(Self(value)),
             None => Err(RejectReason::ArithmeticOverflow),
         }
     }
-    ///减法下溢时返回ArithmeticOverflow
+    /// 相减下溢时返回 [`RejectReason::ArithmeticOverflow`]，且不产生截断值。
     pub const fn checked_sub(self, rhs: Self) -> Result<Self, RejectReason> {
         match self.0.checked_sub(rhs.0) {
             Some(value) => Ok(Self(value)),
@@ -98,9 +104,12 @@ impl QuoteAmount {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SignedAmount(i128);
 impl SignedAmount {
+    /// 从有符号原始金额构造值对象；允许负数、零和正数。
     pub const fn new(value: i128) -> Self {
         Self(value)
     }
+
+    /// 读取原始有符号金额。
     pub const fn get(self) -> i128 {
         self.0
     }
@@ -122,6 +131,7 @@ impl SignedAmount {
 
 #[cfg(test)]
 mod tests {
+    //! 验证整数值对象的边界、值语义与 checked 算术失败语义。
     use super::*;
     use std::collections::HashSet;
 

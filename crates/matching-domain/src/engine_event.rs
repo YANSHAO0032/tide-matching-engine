@@ -1,24 +1,27 @@
 use crate::{OrderId, Qty, RejectReason, TradeEvent};
 
-/// 撮合引擎核心生命周期事件
+/// 当前参考模型产生的最小订单生命周期事件。
+///
+/// 它不是完整 durable event envelope：不携带 market event sequence、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
-    // 命令被拒绝
+    /// 命令在状态变更前被拒绝，并携带稳定的原因码。
     CommandRejected { reason: RejectReason },
-    // 订单已接受
+    /// 订单已通过接收阶段。
     OrderAccepted { order_id: OrderId },
-    // 订单已进入订单簿
+    /// 订单已进入订单簿并成为 resting 流动性。
     OrderOpened { order_id: OrderId },
-    // 订单部分成交
+    /// 订单成交后仍有严格正的剩余数量。
     OrderPartiallyFilled { order_id: OrderId, remaining: Qty },
-    // 订单完全成交
+    /// 订单因成交完毕而结束。
     OrderFilled { order_id: OrderId },
-    // 成交事件
+    /// 一笔已提交的成交及其 maker/taker 载荷。
     Trade(TradeEvent),
 }
 
 #[cfg(test)]
 mod tests {
+    //! 验证生命周期事件及其载荷的值语义。
     use super::*;
 
     #[test]
@@ -114,6 +117,7 @@ mod tests {
         );
     }
 
+    /// 构造可复用的成交事件 fixture。
     fn sample_trade() -> TradeEvent {
         TradeEvent {
             trade_id: crate::TradeId::new(100),

@@ -1,12 +1,18 @@
 use matching_domain::{LimitGtcOrder, Qty, RejectReason};
 
+/// 正在作为 taker 处理的最小运行态订单。
+///
+/// 原始订单不可变；`remaining` 只记录本次进入撮合流程后尚未成交的数量，且不会自动 rest。
 #[derive(Debug)]
 pub struct IncomingOrder {
+    /// 调用方提交的不可变订单载荷。
     original: LimitGtcOrder,
+    /// 当前尚未成交的 lots，可以在完全成交后为零。
     remaining: u64,
 }
 
 impl IncomingOrder {
+    /// 从原始订单初始化全部剩余量的 incoming 运行态。
     pub fn new(original: LimitGtcOrder) -> Self {
         let remaining = original.qty.get();
         Self {
@@ -15,10 +21,12 @@ impl IncomingOrder {
         }
     }
 
+    /// 借用不可变的原始订单载荷。
     pub fn original_order(&self) -> &LimitGtcOrder {
         &self.original
     }
 
+    /// 返回当前尚未成交的 lots；零表示此 incoming 已耗尽。
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
@@ -39,9 +47,11 @@ impl IncomingOrder {
 
 #[cfg(test)]
 mod tests {
+    //! 验证 incoming 初始化保留原始订单和初始数量。
     use super::*;
     use matching_domain::{OrderId, Price, Qty, Side, UserId};
 
+    /// 构造合法的买入订单 fixture。
     fn make_order(qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(1),
@@ -74,13 +84,16 @@ mod tests {
 
 #[cfg(test)]
 mod fill_tests {
+    //! 验证成交扣减的原子性与原始订单不可变性。
     use super::*;
     use matching_domain::{OrderId, Price, Side, UserId};
 
+    /// 构造严格正的测试数量。
     fn qty(value: u64) -> Qty {
         Qty::try_new(value).expect("test quantity must be positive")
     }
 
+    /// 构造可直接覆盖 remaining 边界的卖出 incoming fixture。
     fn make_incoming(qty: u64) -> IncomingOrder {
         IncomingOrder {
             original: LimitGtcOrder {
