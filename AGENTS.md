@@ -13,14 +13,14 @@
 
 ## 当前范围与文档入口
 
-**T04_P2_production_orderbook 已于 2026-09-30 本地验收通过**。T00–T03 已验收，T02 提交为 `161abf7`，T03 提交为 `f96e81b`。用户于 2026-09-29 明确授权从 T03 切换到 T04，并要求同步范围文档；导师模式始终有效，未授权 Codex 代写 Rust 实现。下一项 T05 需要用户明确切换授权后才可开始。
+**当前范围为 T05_P2_differential_invariants**。T00–T04 已验收；T02 提交为 `161abf7`，T03 提交为 `f96e81b`，T04 提交为 `c860543` 并已于 2026-09-30 推送至 `origin/main`。用户于 2026-09-30 明确授权完成 T04 提交/推送并准备开启 T05；导师模式始终有效，未授权 Codex 代写 Rust 实现。
 
 每轮开始先读取：
 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
-3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的当前任务相关章节；下一任务 T05 时按其任务书重新确定章节与适用 invariants，同时始终遵守 §77 和 Appendix E。
-4. 当前任务书；在用户明确授权 T05 前，T04 任务书与本 handoff 是已验收范围的依据，不得自行启动 T05。
+3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §54、§55.2–§55.4、§63，并核对当前适用不变量 1–11/16/26/28–30/49；同时始终遵守 §77 和 Appendix E。读取未来契约不扩大实现范围。
+4. [T05 任务书](assignment/tasks/T05_P2_differential_invariants.md)；只建立 Reference/Production differential 与当前适用的完整集成 invariant gate，不提前实现 P3+ 订单规则、持久化或 runtime。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
@@ -29,7 +29,7 @@ T00 已建立六个 crate 的最小骨架、固定工具链、CI 和工程规则
 
 T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/count/total_visible_qty、intrusive 双向 FIFO 和 market-local QueuePriority allocator/high-water guard，并通过结构 unit/edge/property 与 O(1) 尾插访问计数验证。T04 复用这些结构，组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，实现 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。链表顺序是 FIFO 权威；槽位释放/复用必须与全部 ID/链表引用同步。每次 book mutation 完成后检查 active index、聚合和 uncrossed 等适用不变量，不将 T04 自身的行为/失败原子性/不变量测试延期。
 
-T04 已组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，完成 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。§63 覆盖整个 P2：100k command Reference/Production differential 与完整集成 invariant gate 仍属于 T05；T02 参考 API 不自动 rest incoming 余量，T04 的 GTC API 是明确的流程适配。不得在未获新授权时提前实现 Market/IOC/FOK/PostOnly/Stop/Iceberg/Amend/CancelReplace/HA、完整后续命令协议或 runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T04 已组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，完成 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。T05 以明确流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，构造可复现 100k command tape 并检查适用不变量。不得提前实现 Market/IOC/FOK/PostOnly/Stop/Iceberg/Amend/CancelReplace/HA、完整后续命令协议或 runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
