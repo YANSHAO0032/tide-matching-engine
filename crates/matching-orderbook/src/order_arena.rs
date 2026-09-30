@@ -130,6 +130,39 @@ impl OrderArena {
     pub(crate) fn slot_accesses(&self) -> usize {
         self.slot_accesses.get()
     }
+
+    /// 只读验证下一次 insert 是否可执行。
+    ///
+    /// 不弹出 free-list，不扩展 slots，不修改任何 Arena 状态。
+    pub(crate) fn preflight_insert(&self) -> Result<(), RejectReason> {
+        if let Some(index) = self.free.last().copied() {
+            let position = usize::try_from(index.get())
+                .expect("OrderIndex must fit usize on supported targets");
+
+            let slot = self.slots.get(position).unwrap_or_else(|| {
+                panic!(
+                    "OrderArena invariant violation: \
+                 free-list tail references missing slot: \
+                 index={index:?}"
+                )
+            });
+
+            assert!(
+                slot.is_none(),
+                "OrderArena invariant violation: \
+             free-list tail references occupied slot: \
+             index={index:?}"
+            );
+
+            return Ok(());
+        }
+
+        // 没有 free slot 时，下一次 insert 必须 append。
+        // 这里只验证 index 可表示性，不真正扩容。
+        OrderIndex::try_from_usize(self.slots.len())?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +185,7 @@ mod tests {
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// 构造具有固定有效价格的最小测试订单。
     fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
@@ -1150,5 +1184,99 @@ mod tests {
 
         assert_eq!(second.get(), 1);
         assert_eq!(arena.slot_accesses(), 1);
+    }
+    #[test]
+    fn preflight_insert_accepts_append_without_mutation() {
+        let arena = OrderArena::new();
+
+        let before = arena.test_snapshot();
+
+        assert_eq!(arena.preflight_insert(), Ok(()));
+
+        assert_eq!(arena.test_snapshot(), before);
+    }
+    #[test]
+    fn preflight_insert_accepts_nonempty_append_without_mutation() {
+        let mut arena = OrderArena::new();
+
+        arena
+            .insert(OrderNode::new(
+                order(1, Side::Buy, 100),
+                QueuePriority::new(10),
+            ))
+            .unwrap();
+
+        let before = arena.test_snapshot();
+
+        assert_eq!(arena.preflight_insert(), Ok(()));
+
+        assert_eq!(arena.test_snapshot(), before);
+    }
+    #[test]
+    fn preflight_insert_accepts_lifo_reuse_without_consuming_free_slot() {
+        let mut arena = OrderArena::new();
+
+        let first = arena
+            .insert(OrderNode::new(
+                order(1, Side::Buy, 100),
+                QueuePriority::new(10),
+            ))
+            .unwrap();
+
+        let second = arena
+            .insert(OrderNode::new(
+                order(2, Side::Buy, 100),
+                QueuePriority::new(11),
+            ))
+            .unwrap();
+
+        arena.remove(first).unwrap();
+        arena.remove(second).unwrap();
+
+        let before = arena.test_snapshot();
+
+        assert_eq!(arena.preflight_insert(), Ok(()));
+        assert_eq!(arena.test_snapshot(), before);
+
+        // 真正 insert 仍然复用最后进入 free-list 的 second。
+        let reused = arena
+            .insert(OrderNode::new(
+                order(3, Side::Buy, 100),
+                QueuePriority::new(12),
+            ))
+            .unwrap();
+
+        assert_eq!(reused, second);
+    }
+
+    #[test]
+    fn preflight_insert_panics_on_corrupted_free_tail_without_mutation() {
+        for occupied in [false, true] {
+            let mut arena = OrderArena::new();
+
+            let live = arena
+                .insert(OrderNode::new(
+                    order(1, Side::Buy, 100),
+                    QueuePriority::new(10),
+                ))
+                .unwrap();
+
+            if occupied {
+                // 故意把仍 occupied 的 slot 塞进 free tail。
+                arena.free.push(live);
+            } else {
+                arena.free.push(OrderIndex::try_from_usize(99).unwrap());
+            }
+
+            let before = arena.test_snapshot();
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = arena.preflight_insert();
+            }));
+
+            assert!(result.is_err());
+
+            assert_eq!(arena.test_snapshot(), before);
+        }
     }
 }

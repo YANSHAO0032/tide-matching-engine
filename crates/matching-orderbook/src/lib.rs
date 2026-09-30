@@ -5,6 +5,8 @@
 //! `order_arena`、`price_level` 与 `queue_priority_allocator` 只提供
 //! ProductionOrderBook 所需的槽位、intrusive FIFO 和 priority 基础结构；
 //! 它们不构成完整订单命令、撮合、持久化或 market 管理实现。
+//! T04 的 `production_orderbook` 已组合这些结构，提供只读查询、rest、
+//! Cancel，以及完整 Limit GTC 的连续成交与成交后余量挂单。
 
 /// T02：进入撮合流程但尚未 rest 的最小运行态订单。
 pub mod incoming_order;
@@ -16,6 +18,8 @@ pub mod order_index;
 pub mod order_node;
 /// T03：单价格档位的 FIFO 端点、聚合值与局部链表维护。
 pub mod price_level;
+/// T04：单市场生产簿容器组合、查询与完整 Limit GTC。
+pub mod production_orderbook;
 /// T03：market-local QueuePriority 的分配与 high-water 边界。
 pub mod queue_priority_allocator;
 /// T02：参考模型中持有剩余量与 priority 的 resting 订单。
@@ -41,3 +45,6 @@ pub use queue_priority_allocator::{
 pub use reference_order::ReferenceOrder;
 /// T02 `Vec + sort` 参考订单簿。
 pub use reference_orderbook::ReferenceOrderBook;
+
+/// T04 生产簿组合，已接入挂单、撤单和完整 Limit GTC。
+pub use production_orderbook::ProductionOrderBook;

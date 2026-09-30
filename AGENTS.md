@@ -13,26 +13,28 @@
 
 ## 当前范围与文档入口
 
-当前只允许推进 **T03_P2_arena_pricelevel**。T00、T01 已验收，T02 已于 2026-09-26 验收并提交为 `161abf7`；用户于同日明确授权从 T02 切换到 T03，并要求同步范围文档。导师模式继续有效，这次切换不授权 Codex 代写 Rust 实现。T03 验收通过前不得进入 T04。
+**T04_P2_production_orderbook 已于 2026-09-30 本地验收通过**。T00–T03 已验收，T02 提交为 `161abf7`，T03 提交为 `f96e81b`。用户于 2026-09-29 明确授权从 T03 切换到 T04，并要求同步范围文档；导师模式始终有效，未授权 Codex 代写 Rust 实现。下一项 T05 需要用户明确切换授权后才可开始。
 
 每轮开始先读取：
 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
-3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的当前任务相关章节；T03 为 §10、§54 invariants 1–8/26/28、§63；同时遵守 §77 和 Appendix E。priority 高水位补读 §9.5、§46 与 invariant 29；复用领域类型时参考 §6–§9，数值与错误边界参考 §3 原则 D、§45、§58。Stop 相关 invariant 6、28 的 Stop 分支在当前范围不适用；读取未来契约不扩大实现范围。
-4. [T03 任务书](assignment/tasks/T03_P2_arena_pricelevel.md)。
+3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的当前任务相关章节；下一任务 T05 时按其任务书重新确定章节与适用 invariants，同时始终遵守 §77 和 Appendix E。
+4. 当前任务书；在用户明确授权 T05 前，T04 任务书与本 handoff 是已验收范围的依据，不得自行启动 T05。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
 
 T00 已建立六个 crate 的最小骨架、固定工具链、CI 和工程规则。T01 已建立领域类型，T02 已在 matching-orderbook 中建立 `Vec + sort` ReferenceOrderBook：rest、双向 Limit GTC 成交、Cancel、TradeEvent、价格优先/FIFO、重复 command tape 及数量守恒/取消性质测试。Incoming 余量不会自动 rest，完整生命周期事件/命令协议尚未实现。保留参考模型作为后续 differential 基线，不重写已验收类型。
 
-T03 仅建立 ProductionOrderBook 的底层结构：OrderIndex、OrderArena slot/free-list 生命周期、PriceLevel head/tail/count/total_visible_qty、基于索引的 intrusive 双向 FIFO，以及 market-local QueuePriority 分配边界与 high-water guard。链表顺序是 FIFO 权威；槽位复用必须保证现存索引/链表引用一致。§63 覆盖整个 P2：完整 ProductionOrderBook 行为在 T04，100k command Reference/Production differential 与完整集成 invariant gate 在 T05；T03 自身的结构 unit/edge/property、不变量与 O(1) 尾插证据不能延期。不得提前实现 Stop/Iceberg/FOK/HA、完整后续命令协议或 runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/count/total_visible_qty、intrusive 双向 FIFO 和 market-local QueuePriority allocator/high-water guard，并通过结构 unit/edge/property 与 O(1) 尾插访问计数验证。T04 复用这些结构，组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，实现 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。链表顺序是 FIFO 权威；槽位释放/复用必须与全部 ID/链表引用同步。每次 book mutation 完成后检查 active index、聚合和 uncrossed 等适用不变量，不将 T04 自身的行为/失败原子性/不变量测试延期。
+
+T04 已组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，完成 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。§63 覆盖整个 P2：100k command Reference/Production differential 与完整集成 invariant gate 仍属于 T05；T02 参考 API 不自动 rest incoming 余量，T04 的 GTC API 是明确的流程适配。不得在未获新授权时提前实现 Market/IOC/FOK/PostOnly/Stop/Iceberg/Amend/CancelReplace/HA、完整后续命令协议或 runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
 1. 分析仓库实际状态，明确已完成证据、缺失项及本轮唯一小目标。
-2. 给用户一个约 15–60 分钟的小任务，说明改哪里、为什么、约束、错误语义、测试场景和验证命令。
+2. 给用户一个约 15–60 分钟的小任务，必须给出具体实施步骤：修改位置与职责、只读预检顺序、状态提交顺序、约束与错误语义、测试场景和验证命令。不得只用一句话概述下一步或以任务标题代替实施指导。
 3. 用户实现并报告完成后，检查实际文件、diff、编译和测试结果，不凭描述认定完成。
 4. 发现问题就继续指导修订当前小步；区分阻塞问题与非阻塞建议。
 5. 当前小步有充分证据验收后，再进入下一小步。小步完成不等于整个 Task 完成。
@@ -102,7 +104,7 @@ Clippy 规则在运行 Clippy 时检查，不能用 `cargo check` 代替。即�
 3. 是否引入核心路径网络/数据库/异步运行时、wall clock、随机性、无界队列或其他确定性风险；依赖内部 unsafe 的情况不能由本项目 lint 推断。
 4. 队列 API 的容量、满队列行为与背压策略；引入新队列库时同步审查并扩充 disallowed-methods，而不是把未列入名单当作允许无界队列。
 
-保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T03 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T03 首步不新增依赖，arena 容器与 checked 转换使用标准库。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
+保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T04 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T04 首步不新增依赖，BTreeMap/HashMap 使用标准库，复用已验收 Arena/PriceLevel/allocator。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
 
 lint 配置或继承发生变化时，用独立临时副本/探针验证预期诊断与合法对照，不在业务源码保留违规探针，不把空库检查通过当作规则拦截证据。
 
@@ -126,6 +128,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-任务书更强的 gate 同样必须满足；T03 先运行 matching-orderbook 定向测试，若变更 domain 契约也运行 domain 定向测试。T03 必须覆盖空/单/多节点、头/中/尾删除、free slot 复用与重复释放边界、双向链接/count/visible qty 一致、priority 单调与 high-water 失败不变，以及 O(1) 尾插证据（操作次数/访问路径，不能只凭运行时间或插入成功）。保留 T02 的双向成交、FIFO、Cancel、command tape 与 property 回归。无浮点金融类型、checked arithmetic 显式失败和方向独立数值排序仍须审查。引入的 reason 枚举按 §58 保持显式稳定编号并补 golden wire tests，不提前实现全量协议。任一 gate 未过，记录 blocker，不宣称 Task 完成，不进入下一 Task。
+任务书更强的 gate 同样必须满足；T04 先运行 matching-orderbook 定向测试，若变更 domain 契约也运行 domain 定向测试。T04 必须覆盖双侧 best price、空簿/单侧、按 ID 查询及 Cancel、头/中/尾取消与最后一单清档、slot 复用后索引一致、双向 exact/partial/multi-maker/cross-price/FIFO 成交和 GTC 余量挂单、重复 ID/checked 失败/priority high-water 边界，以及 mutation 结束后 active index/链表/聚合/uncrossed 一致性。order lookup 平均 O(1) 需有 HashMap 访问路径证据，不能把价档 O(log P) 删除描述成整个 Cancel 严格 O(1)。保留 T02 command tape/property 与 T03 结构/property/O(1) 尾插访问计数回归。无浮点金融类型、checked arithmetic 显式失败和方向独立数值排序仍须审查。引入的 reason 枚举按 §58 保持显式稳定编号并补 golden wire tests，不提前实现全量协议。任一 gate 未过，记录 blocker，不宣称 Task 完成，不进入下一 Task。
 
 “完成”必须有文件、diff、命令退出码/测试结果、benchmark 结果或 commit hash 等证据。区分计划与实现、本地检查与远端 CI、零测试通过与业务正确性；历史结果必须标明验证时点。

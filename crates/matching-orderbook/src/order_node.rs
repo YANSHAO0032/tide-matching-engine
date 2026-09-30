@@ -45,6 +45,25 @@ impl OrderNode {
         self.remaining
     }
 
+    /// 提交已经完成全部外部预检的严格部分成交剩余量。
+    ///
+    /// 该方法只负责最终写入，不负责计算 fill。
+    /// 新 remaining 必须保持正数且严格小于旧 remaining；
+    /// 完整成交必须由 PriceLevel 的删除路径处理。
+    pub(crate) fn commit_partial_remaining(&mut self, new_remaining: u64) {
+        assert!(
+            new_remaining > 0,
+            "OrderNode invariant violation: partial fill exhausted order"
+        );
+
+        assert!(
+            new_remaining < self.remaining,
+            "OrderNode invariant violation: partial fill must reduce remaining"
+        );
+
+        self.remaining = new_remaining;
+    }
+
     /// 返回 market-local 排队优先级；它不替代链表定义的 FIFO 顺序。
     pub fn priority(&self) -> QueuePriority {
         self.priority
@@ -109,5 +128,26 @@ mod tests {
             assert_eq!(node.prev(), None);
             assert_eq!(node.next(), None);
         }
+    }
+    #[test]
+    fn commit_partial_remaining_changes_only_remaining() {
+        let original = LimitGtcOrder {
+            order_id: OrderId::new(1),
+            user_id: UserId::new(1),
+            side: Side::Buy,
+            price: Price::try_new(100).unwrap(),
+            qty: Qty::try_new(10).unwrap(),
+        };
+
+        let priority = QueuePriority::new(7);
+        let mut node = OrderNode::new(original.clone(), priority);
+
+        node.commit_partial_remaining(6);
+
+        assert_eq!(node.original_order(), &original);
+        assert_eq!(node.remaining(), 6);
+        assert_eq!(node.priority(), priority);
+        assert_eq!(node.prev(), None);
+        assert_eq!(node.next(), None);
     }
 }

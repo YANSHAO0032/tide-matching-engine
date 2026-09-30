@@ -1,5 +1,5 @@
 use crate::{OrderArena, OrderIndex, OrderNode};
-use matching_domain::RejectReason;
+use matching_domain::{Qty, RejectReason};
 
 /// 单个价格档位的运行态。
 ///
@@ -147,6 +147,194 @@ impl PriceLevel {
         self.total_visible_qty = new_total;
 
         Ok(new_index)
+    }
+
+    /// 对当前 FIFO head 应用严格部分成交。
+    ///
+    /// 只允许 `0 < fill < head.remaining()`。
+    /// 完整成交必须由后续路径使用 `pop_front`，
+    /// 不允许把 remaining=0 的节点留在价格档中。
+    ///
+    /// 成功时仅修改：
+    /// - head.remaining
+    /// - total_visible_qty
+    ///
+    /// 不修改 count、head/tail、prev/next、priority 或 Arena 生命周期。
+    pub(crate) fn apply_head_partial_fill(&mut self, arena: &mut OrderArena, fill: Qty) {
+        // 1. PriceLevel 基本状态只读预检。
+        assert!(
+            self.count > 0,
+            "PriceLevel invariant violation: partial fill on empty level"
+        );
+        let head_index = self
+            .head
+            .expect("PriceLevel invariant violation: missing head");
+
+        let tail_index = self
+            .tail
+            .expect("PriceLevel invariant violation: missing tail");
+
+        assert!(
+            self.total_visible_qty > 0,
+            "PriceLevel invariant violation: zero aggregate"
+        );
+        // 2. 只读取得 head 状态。
+        let (head_remaining, successor_index, head_side, head_price, head_priority) = {
+            let head = arena
+                .get(head_index)
+                .expect("PriceLevel invariant violation: missing head node");
+
+            assert!(
+                head.prev().is_none(),
+                "PriceLevel invariant violation: head has prev"
+            );
+
+            assert!(
+                head.remaining() > 0,
+                "PriceLevel invariant violation: exhausted head"
+            );
+
+            (
+                head.remaining(),
+                head.next(),
+                head.original_order().side,
+                head.original_order().price,
+                head.priority(),
+            )
+        };
+
+        let fill_lots = fill.get();
+
+        // Qty 已保证 fill > 0。
+        // equality 属于完整成交，不属于本原语。
+        assert!(
+            fill_lots < head_remaining,
+            "PriceLevel invariant violation: \
+         partial fill must be strictly smaller than head remaining"
+        );
+
+        // 3. 所有新数量必须在任何写入前预计算。
+        let new_remaining = head_remaining
+            .checked_sub(fill_lots)
+            .expect("PriceLevel invariant violation: head quantity underflow");
+
+        let new_total = self
+            .total_visible_qty
+            .checked_sub(fill_lots)
+            .expect("PriceLevel invariant violation: aggregate quantity underflow");
+
+        assert!(
+            new_remaining > 0,
+            "PriceLevel invariant violation: partial fill exhausted head"
+        );
+
+        // 4. 检查当前 head 所在档位的局部结构。
+        if self.count == 1 {
+            assert_eq!(
+                head_index, tail_index,
+                "PriceLevel invariant violation: invalid single-node tail"
+            );
+
+            assert!(
+                successor_index.is_none(),
+                "PriceLevel invariant violation: single node has successor"
+            );
+
+            // 单节点可以精确证明 aggregate 正确。
+            assert_eq!(
+                self.total_visible_qty, head_remaining,
+                "PriceLevel invariant violation: single-node aggregate mismatch"
+            );
+
+            assert_eq!(
+                new_total, new_remaining,
+                "PriceLevel invariant violation: partial aggregate mismatch"
+            );
+        } else {
+            assert_ne!(
+                head_index, tail_index,
+                "PriceLevel invariant violation: invalid multi-node endpoints"
+            );
+
+            let successor_index =
+                successor_index.expect("PriceLevel invariant violation: missing successor");
+
+            assert_ne!(
+                successor_index, head_index,
+                "PriceLevel invariant violation: head self-cycle"
+            );
+
+            let successor = arena
+                .get(successor_index)
+                .expect("PriceLevel invariant violation: missing successor node");
+
+            assert_eq!(
+                successor.prev(),
+                Some(head_index),
+                "PriceLevel invariant violation: broken successor prev"
+            );
+
+            assert_eq!(
+                successor.original_order().side,
+                head_side,
+                "PriceLevel invariant violation: successor side mismatch"
+            );
+
+            assert_eq!(
+                successor.original_order().price,
+                head_price,
+                "PriceLevel invariant violation: successor price mismatch"
+            );
+
+            assert!(
+                successor.remaining() > 0,
+                "PriceLevel invariant violation: exhausted successor"
+            );
+
+            assert!(
+                successor.priority() > head_priority,
+                "PriceLevel invariant violation: \
+             successor priority not strictly increasing"
+            );
+
+            if self.count == 2 {
+                assert_eq!(
+                    successor_index, tail_index,
+                    "PriceLevel invariant violation: invalid two-node tail"
+                );
+            } else {
+                assert_ne!(
+                    successor_index, tail_index,
+                    "PriceLevel invariant violation: premature tail"
+                );
+            }
+
+            let tail = arena
+                .get(tail_index)
+                .expect("PriceLevel invariant violation: missing tail node");
+
+            assert!(
+                tail.next().is_none(),
+                "PriceLevel invariant violation: tail has next"
+            );
+
+            // 多节点至少还有其它正 remaining。
+            assert!(
+                new_total > new_remaining,
+                "PriceLevel invariant violation: invalid multi-node aggregate"
+            );
+        }
+
+        // ---------- 到这里之前绝不能发生任何写入 ----------
+
+        // 5. 提交节点 remaining。
+        arena
+            .get_mut(head_index)
+            .expect("prechecked head must exist")
+            .commit_partial_remaining(new_remaining);
+
+        // 6. 提交档位 aggregate。
+        self.total_visible_qty = new_total;
     }
 
     /// 移除并返回当前档位的 FIFO 头节点。
@@ -635,6 +823,32 @@ mod tests {
             node.prev(),
             node.next(),
         )
+    }
+    fn assert_partial_fill_panics_without_mutation(
+        level: &mut PriceLevel,
+        arena: &mut OrderArena,
+        fill: Qty,
+    ) {
+        let level_before = level_state(level);
+        let arena_before = arena.test_snapshot();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            level.apply_head_partial_fill(arena, fill);
+        }));
+
+        assert!(result.is_err(), "invalid partial fill must fail closed");
+
+        assert_eq!(
+            level_state(level),
+            level_before,
+            "failed partial fill mutated level"
+        );
+
+        assert_eq!(
+            arena.test_snapshot(),
+            arena_before,
+            "failed partial fill mutated Arena slots/free-list"
+        );
     }
     /// 独立 Vec FIFO 模型生成的单步结构操作。
     #[derive(Debug, Clone)]
@@ -1521,6 +1735,185 @@ mod tests {
 
         // 校验器只检查当前档位的可达链。
         assert_eq!(validate_level(&level, &arena), Ok(()));
+    }
+    #[test]
+    fn head_partial_fill_updates_only_remaining_and_total_on_both_sides() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut arena = OrderArena::new();
+            let mut level = PriceLevel::new();
+
+            let first = level
+                .push_back(
+                    &mut arena,
+                    OrderNode::new(order(1, side, 100, 10), QueuePriority::new(10)),
+                )
+                .unwrap();
+
+            let second = level
+                .push_back(
+                    &mut arena,
+                    OrderNode::new(order(2, side, 100, 7), QueuePriority::new(11)),
+                )
+                .unwrap();
+
+            let head_before = level.head();
+            let tail_before = level.tail();
+            let count_before = level.count();
+
+            let first_priority = arena.get(first).unwrap().priority();
+            let first_prev = arena.get(first).unwrap().prev();
+            let first_next = arena.get(first).unwrap().next();
+
+            let second_before = node_state(arena.get(second).unwrap());
+
+            let (_, free_before) = arena.test_snapshot();
+
+            level.apply_head_partial_fill(&mut arena, Qty::try_new(3).unwrap());
+
+            assert_eq!(arena.get(first).unwrap().remaining(), 7);
+
+            assert_eq!(level.total_visible_qty(), 14);
+
+            // Level 结构不变。
+            assert_eq!(level.head(), head_before);
+            assert_eq!(level.tail(), tail_before);
+            assert_eq!(level.count(), count_before);
+
+            // Head 除 remaining 外全部不变。
+            let first_after = arena.get(first).unwrap();
+
+            assert_eq!(first_after.priority(), first_priority);
+            assert_eq!(first_after.prev(), first_prev);
+            assert_eq!(first_after.next(), first_next);
+
+            // 非 maker 节点完全不变。
+            assert_eq!(node_state(arena.get(second).unwrap()), second_before);
+
+            // partial fill 不操作 Arena 生命周期。
+            let (_, free_after) = arena.test_snapshot();
+            assert_eq!(free_after, free_before);
+
+            assert_eq!(validate_level(&level, &arena), Ok(()));
+        }
+    }
+    #[test]
+    fn head_partial_fill_rejects_full_and_overfill_without_mutation() {
+        for side in [Side::Buy, Side::Sell] {
+            for fill in [5u64, 6] {
+                let mut arena = OrderArena::new();
+                let mut level = PriceLevel::new();
+
+                level
+                    .push_back(
+                        &mut arena,
+                        OrderNode::new(order(1, side, 100, 5), QueuePriority::new(10)),
+                    )
+                    .unwrap();
+
+                assert_partial_fill_panics_without_mutation(
+                    &mut level,
+                    &mut arena,
+                    Qty::try_new(fill).unwrap(),
+                );
+            }
+        }
+    }
+    #[test]
+    fn head_partial_fill_corruption_panics_without_mutation() {
+        for case in 0..7 {
+            let mut arena = OrderArena::new();
+            let mut level = PriceLevel::new();
+
+            if case == 0 {
+                // 合法空档。
+                assert_partial_fill_panics_without_mutation(
+                    &mut level,
+                    &mut arena,
+                    Qty::try_new(1).unwrap(),
+                );
+                continue;
+            }
+
+            let head = level
+                .push_back(
+                    &mut arena,
+                    OrderNode::new(order(1, Side::Buy, 100, 5), QueuePriority::new(10)),
+                )
+                .unwrap();
+
+            match case {
+                // 非空档缺 head。
+                1 => {
+                    level.head = None;
+                }
+
+                // 非空档缺 tail。
+                2 => {
+                    level.tail = None;
+                }
+
+                // Level 仍引用 head，但 Arena slot 已释放。
+                3 => {
+                    arena.remove(head).unwrap();
+                }
+
+                // aggregate 为零。
+                4 => {
+                    level.total_visible_qty = 0;
+                }
+
+                // aggregate 小于 fill，checked_sub 必须 fail-closed。
+                5 => {
+                    level.total_visible_qty = 1;
+                }
+
+                // remaining=5，但 aggregate 错误为 6。
+                // checked_sub 自身仍然成功，因此必须由单节点
+                // aggregate invariant 捕获。
+                6 => {
+                    level.total_visible_qty = 6;
+                }
+
+                _ => unreachable!(),
+            }
+
+            assert_partial_fill_panics_without_mutation(
+                &mut level,
+                &mut arena,
+                Qty::try_new(2).unwrap(),
+            );
+        }
+    }
+    #[test]
+    fn head_partial_fill_broken_successor_panics_without_mutation() {
+        let mut arena = OrderArena::new();
+        let mut level = PriceLevel::new();
+
+        let first = level
+            .push_back(
+                &mut arena,
+                OrderNode::new(order(1, Side::Buy, 100, 10), QueuePriority::new(10)),
+            )
+            .unwrap();
+
+        let second = level
+            .push_back(
+                &mut arena,
+                OrderNode::new(order(2, Side::Buy, 100, 7), QueuePriority::new(11)),
+            )
+            .unwrap();
+
+        // head.next 仍指向 second，
+        // 但 successor.prev 被破坏。
+        arena.get_mut(second).unwrap().set_prev(None);
+
+        assert_eq!(arena.get(first).unwrap().next(), Some(second));
+
+        assert_partial_fill_panics_without_mutation(
+            &mut level,
+            &mut arena,
+            Qty::try_new(3).unwrap(),
+        );
     }
     #[test]
     fn pop_front_preserves_fifo_on_both_sides() {
