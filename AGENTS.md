@@ -13,7 +13,7 @@
 
 ## 当前范围与文档入口
 
-**当前范围为 T05_P2_differential_invariants**。T00–T04 已验收；T02 提交为 `161abf7`，T03 提交为 `f96e81b`，T04 提交为 `c860543` 并已于 2026-09-30 推送至 `origin/main`。用户于 2026-09-30 明确授权完成 T04 提交/推送并准备开启 T05；导师模式始终有效，未授权 Codex 代写 Rust 实现。
+**T05_P2_differential_invariants 已于 2026-10-10 完成本地验收**。T00–T04 已验收；T02 提交为 `161abf7`，T03 提交为 `f96e81b`，T04 提交为 `c860543` 并已于 2026-09-30 推送至 `origin/main`；T05 启动文档基线为 `d5090d2`。下一实现范围尚未切换；进入 T06 或其他任务仍须用户明确授权。导师模式始终有效，未授权 Codex 代写 Rust 实现。
 
 每轮开始先读取：
 
@@ -104,7 +104,7 @@ Clippy 规则在运行 Clippy 时检查，不能用 `cargo check` 代替。即�
 3. 是否引入核心路径网络/数据库/异步运行时、wall clock、随机性、无界队列或其他确定性风险；依赖内部 unsafe 的情况不能由本项目 lint 推断。
 4. 队列 API 的容量、满队列行为与背压策略；引入新队列库时同步审查并扩充 disallowed-methods，而不是把未列入名单当作允许无界队列。
 
-保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T04 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T04 首步不新增依赖，BTreeMap/HashMap 使用标准库，复用已验收 Arena/PriceLevel/allocator。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
+保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T05 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T05 首步不新增依赖，保留 Reference 的独立 Vec 模型及 Production 的 BTreeMap/HashMap/Arena/PriceLevel，不复用生产撮合逻辑来生成参考答案。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
 
 lint 配置或继承发生变化时，用独立临时副本/探针验证预期诊断与合法对照，不在业务源码保留违规探针，不把空库检查通过当作规则拦截证据。
 
@@ -131,3 +131,7 @@ cargo test --workspace
 任务书更强的 gate 同样必须满足；T04 先运行 matching-orderbook 定向测试，若变更 domain 契约也运行 domain 定向测试。T04 必须覆盖双侧 best price、空簿/单侧、按 ID 查询及 Cancel、头/中/尾取消与最后一单清档、slot 复用后索引一致、双向 exact/partial/multi-maker/cross-price/FIFO 成交和 GTC 余量挂单、重复 ID/checked 失败/priority high-water 边界，以及 mutation 结束后 active index/链表/聚合/uncrossed 一致性。order lookup 平均 O(1) 需有 HashMap 访问路径证据，不能把价档 O(log P) 删除描述成整个 Cancel 严格 O(1)。保留 T02 command tape/property 与 T03 结构/property/O(1) 尾插访问计数回归。无浮点金融类型、checked arithmetic 显式失败和方向独立数值排序仍须审查。引入的 reason 枚举按 §58 保持显式稳定编号并补 golden wire tests，不提前实现全量协议。任一 gate 未过，记录 blocker，不宣称 Task 完成，不进入下一 Task。
 
 “完成”必须有文件、diff、命令退出码/测试结果、benchmark 结果或 commit hash 等证据。区分计划与实现、本地检查与远端 CI、零测试通过与业务正确性；历史结果必须标明验证时点。
+
+T05 先运行 differential 定向及完整 matching-orderbook 回归，再运行上述 workspace gate。验收必须包含至少 100k 随机命令、可复现 seed/tape、逐命令的结果/有序 TradeEvent/open orders/depth 比较和当前适用 invariant assertions；不能仅比较终态或将事件排序后比较。适用范围为 §54 的 1–5、7–11、26、49，以及 16/28/29 的当前单市场部分；6 的 Stop/expiry、28–30 的 Stop 分支和 16 的跨 shard 全局唯一性不伪造验证，普通 GTC 只在实际 rest 时分配 priority 的规则仍须验证。未来 Stops/Expiry/digest 比较点记录为待扩展契约，不用恒空数据冒充已验证。
+
+T05 最终本地验收证据为：21 项 differential（固定 seed 单条 100k、两组固定 seed 双次 10k、逐命令原序事件/状态/不变量）、229 项 matching-orderbook 单测、workspace 299 项单测和 2 项 doctest，以及 fmt、严格 Clippy、普通/cached diff check 全部 exit 0。此证据不覆盖 Stop/expiry、跨 shard TradeId、WAL/digest/crash 或远端 CI；它们只能在对应范围任务中实现和验证。

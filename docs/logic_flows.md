@@ -1,6 +1,6 @@
 # 匹配引擎关键逻辑流程图
 
-本文件是项目关键逻辑流程图的长期入口。当前收录已验收的工程基础与订单簿流程；后续经过验收的重要流程也应补入此文件。现有图不表示尚未实现的差分测试、扩展订单规则、持久化或运行时能力。
+本文件是项目关键逻辑流程图的长期入口。当前收录已验收的工程基础、订单簿和 T05 差分验证流程；后续经过验收的重要流程也应补入此文件。现有图不表示尚未实现的扩展订单规则、持久化或运行时能力。
 
 ## 工程基础与本地质量门
 
@@ -145,3 +145,44 @@ return TradeEvents in actual matching order
 ```
 
 生产订单簿使用 BTreeMap 决定双侧价格优先，使用 `PriceLevel` 决定同价 FIFO，HashMap 只做单个 OrderId 定位。所有可预期的 `RejectReason` 在第一笔成交前结束；预检与提交发生分歧属于内部不变量损坏，按 fail-closed 处理。
+
+## Reference / Production 差分验证
+
+```text
+fixed seed + explicit ChaCha + bounded command domain
+                         |
+                         v
+              generate complete command tape
+                         |
+                         v
+          validate whole tape before book creation
+                         |
+                         v
+fresh ReferenceBook + fresh ProductionBook + TradeIdSource
+                         |
+                         v
+for each command, in original tape order
+  |
+  +--> observe both books; require equal semantic projection
+  |
+  +--> snapshot Production failure-sensitive state
+  |
+  +--> Reference adapter: duplicate -> fills -> actual residual rest
+  |
+  +--> Production: place_limit_gtc / cancel
+  |
+  +--> compare outcome and TradeEvents in emitted order
+  |
+  +--> on controlled rejection, require complete state unchanged
+  |
+  +--> validate Production internals and compare open orders/depth/FIFO
+  |
+  +--> assert current regular-book invariants and next priority
+  |
+  +--> stream or retain the already-validated StepRecord
+                         |
+                         v
+100k path: stream records only; no final-state-only shortcut
+```
+
+Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本、ChaCha 算法和完整 seed 会输出到测试日志；失败可据此重建同一输入。当前图覆盖 regular Limit GTC/Cancel、单市场 priority 和当前适用不变量，不覆盖 Stop/expiry、跨 shard TradeId、WAL/digest/crash 或 P3 订单规则。

@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-当前已验收 **T00–T04**，包括 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO 与 ProductionOrderBook 的 Limit GTC / Cancel 行为；T03 提交为 `f96e81b`。T04 于 2026-09-30 完成本地验收：production 定向 73、Arena 定向 17、workspace 278 个单元测试与 2 个 doctest，以及 fmt、严格 Clippy 均通过；未查询新的远端 CI。导师模式保持；下一任务 T05 仍需用户明确授权，小步进度与最新验证以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
+当前已验收 **T00–T05**，包括 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel 行为，以及 Reference/Production differential/invariant gate；T03 提交为 `f96e81b`，T04 提交为 `c860543`。T05 启动文档基线为 `d5090d2`，本地最终证据为 21 项 differential（含固定 seed 单条 100k 与两组固定 seed 双次 10k 流式回放）、229 项 orderbook 单测、workspace 299 项单测与 2 项 doctest，以及 fmt、严格 Clippy、两类 diff 检查全部通过；未查询新的远端 CI。导师模式保持；进入下一任务仍需用户明确授权，小步进度以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
 
 当前已建立包含六个 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。matching-domain 已有领域类型、QueuePriority 与基础错误模型；matching-orderbook 已有 ReferenceOrder、IncomingOrder、ReferenceOrderBook 的挂单、双向成交、Cancel 和 TradeEvent，T02 提交为 `161abf7`；其余四库仍为职责注释骨架。orderbook 的运行依赖只有本地 domain，测试依赖为 proptest 1.11.0。CI 的 T00 提交已有远端成功证据，本轮只核验本地 gate，未查询新的远端 CI。
 
@@ -16,7 +16,7 @@
 
 账户中心、充值提现、KYC、财务总账、清结算数据库和 Web 前端不属于撮合核心。核心与外围资金、订单、行情和清算系统的集成协议，以及参考风控/资金实现，按规格对应阶段推进。
 
-T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。该 API 不自动 rest incoming 余量，尚无完整生命周期事件/命令协议。T03 已完成 OrderIndex、OrderArena slot/free-list、PriceLevel 双向 FIFO 与 QueuePriority/high-water 不变量。T04 已组合生产簿的双侧价格索引和订单 ID 索引，完成 Limit GTC/Cancel、余量挂单及 mutation 后不变量；100k differential 和完整集成 gate 属于 T05。Market/IOC/FOK 等 P3 订单规则、runtime、Gateway、HA 和 MarketData 均不属于当前范围。
+T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。该 API 不自动 rest incoming 余量，尚无完整生命周期事件/命令协议。T03 已完成 OrderIndex、OrderArena slot/free-list、PriceLevel 双向 FIFO 与 QueuePriority/high-water 不变量。T04 已组合生产簿的双侧价格索引和订单 ID 索引，完成 Limit GTC/Cancel、余量挂单及 mutation 后不变量；T05 已用独立 Reference 适配、逐命令差分和固定 seed 100k 流式回放验收这一行为等价门。Market/IOC/FOK 等 P3 订单规则、runtime、Gateway、HA 和 MarketData 均不属于当前范围。
 
 ## Crate 边界
 
@@ -68,6 +68,6 @@ cargo test --workspace
 - [当前交接记录](assignment/SESSION_HANDOFF.md)
 - [Rust 撮合系统 v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md)
 - [任务索引](assignment/README.md)
-- [当前 T04 任务书](assignment/tasks/T04_P2_production_orderbook.md)
+- [最近验收的 T05 任务书](assignment/tasks/T05_P2_differential_invariants.md)
 
 当前 `.gitignore` 忽略整个 `assignment/`，上述资料存在于本机但没有受 Git 跟踪；新 clone 不会自动带上这些文件。版本管理策略仍待用户决定，交接文件继续使用此唯一位置。

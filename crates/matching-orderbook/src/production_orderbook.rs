@@ -1591,6 +1591,8 @@ mod tests {
     use std::collections::{BTreeSet, HashSet};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    mod differential;
+
     /// 使用与参考模型一致的真实 guard 创建有效测试策略。
     fn policy() -> QueuePriorityPolicy {
         QueuePriorityPolicy::try_new(1024).unwrap()
@@ -2266,7 +2268,7 @@ mod tests {
         //
         // test_snapshot:
         // (
-        //   Vec<Option<(LimitGtcOrder, u64, QueuePriority, prev, next)>>,
+        //   Vec<Option<OrderNode>>,
         //   Vec<OrderIndex>,
         // )
         // ------------------------------------------------------------
