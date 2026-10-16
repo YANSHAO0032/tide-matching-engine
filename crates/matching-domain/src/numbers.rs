@@ -97,6 +97,29 @@ impl QuoteAmount {
     }
 }
 
+/// 初始下单时严格正的最大成交名义额预算，不包含手续费。
+///
+/// 该值不是资金预留凭证；运行中的剩余预算和最终未用金额可以为零，
+/// 应以 [`QuoteAmount`] 表达，未用金额不计作成交。
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuoteBudget(u128);
+
+impl QuoteBudget {
+    /// 校验原始整数预算，只有非零值才能构造有效预算。
+    pub const fn try_new(value: u128) -> Result<Self, RejectReason> {
+        if value == 0 {
+            return Err(RejectReason::InvalidQty);
+        }
+        Ok(Self(value))
+    }
+
+    /// 无损读取原始 quote 整数预算。
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
 /// 有符号金额，底层为 i128。
 ///
 /// 允许负数、零和正数。自然排序仅表示整数大小。
@@ -201,6 +224,41 @@ mod tests {
         assert_eq!(QuoteAmount::new(0).get(), 0);
         assert_eq!(QuoteAmount::new(1).get(), 1);
         assert_eq!(QuoteAmount::new(u128::MAX).get(), u128::MAX);
+    }
+    #[test]
+    fn quote_budget_rejects_zero_with_invalid_qty() {
+        assert_eq!(QuoteBudget::try_new(0), Err(RejectReason::InvalidQty));
+    }
+
+    #[test]
+    fn quote_budget_preserves_positive_boundaries() {
+        assert_eq!(QuoteBudget::try_new(1).unwrap().get(), 1);
+        assert_eq!(QuoteBudget::try_new(u128::MAX).unwrap().get(), u128::MAX);
+    }
+
+    #[test]
+    fn quote_budget_value_semantics() {
+        let one = QuoteBudget::try_new(1).unwrap();
+        let same = QuoteBudget::try_new(1).unwrap();
+        let max = QuoteBudget::try_new(u128::MAX).unwrap();
+
+        assert_eq!(one, same);
+        assert_ne!(one, max);
+        assert!(one < max);
+
+        let copied = one;
+        assert_eq!(copied, one);
+        assert_eq!(format!("{one:?}"), "QuoteBudget(1)");
+
+        let mut values = [max, one];
+        values.sort();
+        assert_eq!(values, [one, max]);
+
+        let mut set = HashSet::new();
+        assert!(set.insert(one));
+        assert!(!set.insert(same));
+        assert!(set.insert(max));
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

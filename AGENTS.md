@@ -13,14 +13,14 @@
 
 ## 当前范围与文档入口
 
-**T05_P2_differential_invariants 已于 2026-10-10 完成本地验收**。T00–T04 已验收；T02 提交为 `161abf7`，T03 提交为 `f96e81b`，T04 提交为 `c860543` 并已于 2026-09-30 推送至 `origin/main`；T05 启动文档基线为 `d5090d2`。下一实现范围尚未切换；进入 T06 或其他任务仍须用户明确授权。导师模式始终有效，未授权 Codex 代写 Rust 实现。
+**当前授权范围为 T06_P3_market_orders**（2026-10-10 用户明确从 T05 切换）。T00–T05 已验收；T02 提交为 `161abf7`，T03 为 `f96e81b`，T04 为 `c860543`，T05 为 `e752fdb`，后者也是 T06 启动基线。T06 只推进 MarketByBase / MarketByQuote、checked MarketMath、quote dust 与命令开始时固定的保护参考边界；§18/§27 reservation 仅预留接口边界。导师模式始终有效，未授权 Codex 代写 Rust 实现；T07 及其他后续任务未授权。
 
 每轮开始先读取：
 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
-3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §54、§55.2–§55.4、§63，并核对当前适用不变量 1–11/16/26/28–30/49；同时始终遵守 §77 和 Appendix E。读取未来契约不扩大实现范围。
-4. [T05 任务书](assignment/tasks/T05_P2_differential_invariants.md)；只建立 Reference/Production differential 与当前适用的完整集成 invariant gate，不提前实现 P3+ 订单规则、持久化或 runtime。
+3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §6.5.1–§6.5.2、§13、§18/§27（reservation 仅按接口边界）、§64，按当前小步核对 §8、§26.3–§26.5、§45–§46.1、§58；保留 §54、§55.2–§55.4、§63 的回归要求，核对当前适用不变量 1–11/16/17/26/28–30/49–52，53 仅作后续资金契约；始终遵守 §77 和 Appendix E。读取未来契约不扩大实现范围。
+4. [T06 任务书](assignment/tasks/T06_P3_market_orders.md)（实际文件名是复数 `orders`）；保留已验收的 [T05](assignment/tasks/T05_P2_differential_invariants.md) differential/invariant gate。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
@@ -29,7 +29,7 @@ T00 已建立六个 crate 的最小骨架、固定工具链、CI 和工程规则
 
 T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/count/total_visible_qty、intrusive 双向 FIFO 和 market-local QueuePriority allocator/high-water guard，并通过结构 unit/edge/property 与 O(1) 尾插访问计数验证。T04 复用这些结构，组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，实现 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。链表顺序是 FIFO 权威；槽位释放/复用必须与全部 ID/链表引用同步。每次 book mutation 完成后检查 active index、聚合和 uncrossed 等适用不变量，不将 T04 自身的行为/失败原子性/不变量测试延期。
 
-T04 已组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，完成 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。T05 以明确流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，构造可复现 100k command tape 并检查适用不变量。不得提前实现 Market/IOC/FOK/PostOnly/Stop/Iceberg/Amend/CancelReplace/HA、完整后续命令协议或 runtime/persistence/risk/protocol 业务，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T05 已以独立流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，验收可复现 100k command tape 与当前适用不变量。T06 的 Market 不 rest、不分配 QueuePriority；quote budget 严格正且不含手续费，spent<=budget，unused_quote 不是成交。所有 notional/quote→qty 换算走统一 checked MarketMath；向下取整到合法 lot，本档不能成交一个 lot 时立即终止，不构造 Qty(0) 或零量 Trade。保护参考在命令开始捕获并固定；bps 只允许 0..=9_999，Buy 对 reference×(10_000+bps)/10_000 双重向下取整，Sell 对 reference×(10_000-bps)/10_000 双重向上取整，最终边界按方向与显式 worst price/market band 取更严格者。边界比较包含等号；首个越界 maker 不成交并终结命令。reservation/fee release 只保留后续接口契约，不伪造已实现的资金闭环。Market 仅推进当前立即成交并终结余量的语义；独立 Limit IOC、FOK、PostOnly、Stop、Iceberg、Amend、CancelReplace、HA、完整后续命令协议及 runtime/persistence/risk/protocol 业务仍在后续任务。禁止 MarketByQuote + FOK，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
@@ -44,11 +44,17 @@ T04 已组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Are
 
 v6 §77 的全部工程规则是审查依据。以下为常用约束摘要，不替代当前任务相关章节中的完整协议和边界条件，也不授权提前实现那些功能。
 
+### 文档与流程图
+
+- 流程图的标题、说明和图内节点只描述实际职责、输入、状态转换和验证边界；不得使用 `T00`、`T05` 等任务/阶段编号作为流程图标识。任务编号仍可用于任务书、交接、提交记录和范围管理文档。
+- 涉及计算公式时，必须维护 [docs/numerical_formulas.md](docs/numerical_formulas.md)：公式单独记录，使用 TeX，按通用业务职责组织；该文档不得出现任务或阶段编号。Codex 负责维护此文档，并在公式契约改变时同步规格、实现说明和测试边界。
+
 ### 数值、时间与确定性
 
 - Correctness / determinism 优先于性能。
 - price、qty、fee、balance、notional、settlement 禁止 f32/f64；价格、参考价、tick、qty、lot、quote budget 等 canonical 值按规格验证严格正值。
 - 所有算术使用 checked math；失败必须显式处理，不 silent wrap、截断或隐式降级。notional 使用统一 MarketMath checked helper。
+- 数值协议遵守 v6 §6.5.1–§6.5.2/§46.1：price/qty/quote 各有独立 scale；先消公共幂，配置须保证最小 tick×lot 本金精确且可表示。本金不取整，fee policy 单独处理；数值溢出仍显式失败。T06 逐步覆盖不变量 50–52，53 的资产映射/Settlement 守恒只作后续资金契约，不能宣称当前已验证。
 - 撮合业务不依赖 wall clock；只有 durable AdvanceTime 驱动 LogicalClock。客户端时间和接收时间仅用于审计/指标。
 - 状态变化必须可确定性重放；HashMap 迭代顺序、随机性不得影响业务结果、事件顺序或 digest。
 
@@ -104,7 +110,7 @@ Clippy 规则在运行 Clippy 时检查，不能用 `cargo check` 代替。即�
 3. 是否引入核心路径网络/数据库/异步运行时、wall clock、随机性、无界队列或其他确定性风险；依赖内部 unsafe 的情况不能由本项目 lint 推断。
 4. 队列 API 的容量、满队列行为与背压策略；引入新队列库时同步审查并扩充 disallowed-methods，而不是把未列入名单当作允许无界队列。
 
-保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T05 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T05 首步不新增依赖，保留 Reference 的独立 Vec 模型及 Production 的 BTreeMap/HashMap/Arena/PriceLevel，不复用生产撮合逻辑来生成参考答案。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
+保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T06 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T06 首步不新增依赖，保留 Reference 的独立 Vec 模型及 Production 的 BTreeMap/HashMap/Arena/PriceLevel，不复用生产撮合逻辑来生成参考答案。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
 
 lint 配置或继承发生变化时，用独立临时副本/探针验证预期诊断与合法对照，不在业务源码保留违规探针，不把空库检查通过当作规则拦截证据。
 
@@ -113,14 +119,15 @@ lint 配置或继承发生变化时，用独立临时副本/探针验证预期�
 每次 Review 检查：状态不变量、checked arithmetic、wall clock、非确定性迭代、FIFO/QueuePriority/StopPriority、replay、错误处理、I/O crash boundary、所需测试和是否越界到下一 Task。不涉及的项说明不适用，不伪造验证。
 
 - 测试按风险保留证据，而非按每个方法机械增加。状态变更、分支选择、拒绝/失败原子性、checked 算术边界、价格/FIFO/确定性顺序、稳定 wire 编号与事件 payload 必须有针对性的 unit/edge 测试；Task/规格要求的 property、differential、command tape、replay、crash 测试同样不能用人工 review 替代。
-- 纯值对象 derive、透明包装、crate re-export、无分支委托、构造/只读 getter，或与已有测试断言完全相同的 fixture，可以不新增单元测试，或与代表性测试合并。用户完成实现后，Codex 必须直接审查真实 diff、调用链和类型约束，并运行适用的定向测试、fmt、Clippy 与 workspace gate；Review/Handoff 必须写明未单测项为何属于简单逻辑，以及哪项保留证据覆盖其行为。
+- 纯值对象 derive、透明包装、crate re-export、无分支委托、构造/只读 getter，或与已有测试断言完全相同的 fixture，可以不新增单元测试，或与代表性测试合并。用户完成实现后，Codex 必须直接审查真实 diff、调用链和类型约束，并运行适用的定向测试、fmt 与受影响 crate 的 Clippy/test；workspace gate 仅在 Task 最终验收、构建配置/共享依赖变更，或 diff 已触及跨 crate 调用链时重跑。Review/Handoff 必须写明未单测项为何属于简单逻辑，以及哪项保留证据覆盖其行为。
+- 已有历史 suite 只有在其测试文件、被测实现、依赖配置和调用链都未被当前 diff 触及，且 handoff 已记录可复核的通过证据时，才可不在当前小步重跑。不得把“测试文件未修改”当作跳过实际被修改行为路径的理由；一旦触及 Reference/Production、共享 domain API、状态不变量、依赖或构建配置，按影响面补跑相应 regression、differential/property 或 workspace gate。
 - 清理既有测试时先列出“删除/合并项 → 仍保留的核心证据”映射；不得因减量移除 T02 规定的 buy/sell、exact/partial、multi-maker、cross-price、empty book、duplicate ID、cancel、同价 FIFO、确定性和适用性质验证。
 - 持久化变更需 crash/truncation 测试；快照变更需 replay digest 测试。
 - publisher epoch/cursor、迁移 source/feed 连续性、PreOpen 重校验等不变量在对应阶段加入 debug/test assertions。
 - fmt 和默认 Clippy 不能替代全部业务语义审查，特别是 float、unsafe、无界队列和确定性约束。
 - 纯文档小步检查内容、路径、diff 和范围，不为此新增 Rust 测试；实现或构建配置变化运行相关检查。
 
-每个 Task 完成前至少实际运行：
+每个 Task 最终完成前至少实际运行：
 
 ```sh
 cargo fmt --check
@@ -135,3 +142,5 @@ cargo test --workspace
 T05 先运行 differential 定向及完整 matching-orderbook 回归，再运行上述 workspace gate。验收必须包含至少 100k 随机命令、可复现 seed/tape、逐命令的结果/有序 TradeEvent/open orders/depth 比较和当前适用 invariant assertions；不能仅比较终态或将事件排序后比较。适用范围为 §54 的 1–5、7–11、26、49，以及 16/28/29 的当前单市场部分；6 的 Stop/expiry、28–30 的 Stop 分支和 16 的跨 shard 全局唯一性不伪造验证，普通 GTC 只在实际 rest 时分配 priority 的规则仍须验证。未来 Stops/Expiry/digest 比较点记录为待扩展契约，不用恒空数据冒充已验证。
 
 T05 最终本地验收证据为：21 项 differential（固定 seed 单条 100k、两组固定 seed 双次 10k、逐命令原序事件/状态/不变量）、229 项 matching-orderbook 单测、workspace 299 项单测和 2 项 doctest，以及 fmt、严格 Clippy、普通/cached diff check 全部 exit 0。此证据不覆盖 Stop/expiry、跨 shard TradeId、WAL/digest/crash 或远端 CI；它们只能在对应范围任务中实现和验证。
+
+T06 每个小步先运行当前定向测试；domain 契约变化须运行 matching-domain 全量，Reference/Production 或其公共调用链变化才重跑相应 differential、完整 matching-orderbook 和必要 property。未受当前 diff 影响的历史 suite 可引用 handoff 的最近通过证据，不机械重跑；Task 最终验收仍必须完整运行 differential、matching-orderbook 与 workspace gate。Task 验收必须有 MarketByBase/MarketByQuote 的 empty/multi-level/partial/invalid、双向价格/FIFO、无 rest/无 priority 消耗、原序 TradeEvent、dust 终止/无零量成交、spent<=budget property、checked 错误与失败边界、保护参考不随本单成交漂移等证据。§64 的 IOC/FOK/PostOnly/Iceberg 属于其他任务，不能把阶段清单视为本次授权；当前所有 T05 数量证据只证明 Limit GTC/Cancel 基线，不代表 Market 已实现。

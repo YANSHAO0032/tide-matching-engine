@@ -1,4 +1,4 @@
-use crate::{OrderId, Qty, RejectReason, TradeEvent};
+use crate::{OrderId, Price, ProtectionSource, Qty, RejectReason, TradeEvent};
 
 /// 当前参考模型产生的最小订单生命周期事件。
 ///
@@ -17,6 +17,13 @@ pub enum EngineEvent {
     OrderFilled { order_id: OrderId },
     /// 一笔已提交的成交及其 maker/taker 载荷。
     Trade(TradeEvent),
+    /// 下一候选 maker 越过有效保护边界，市价订单据此终结。
+    MarketProtectionTriggered {
+        order_id: OrderId,
+        next_price: Price,
+        effective_worst_price: Price,
+        source: ProtectionSource,
+    },
 }
 
 #[cfg(test)]
@@ -194,5 +201,138 @@ mod tests {
         let debug = format!("{original:?}");
         assert!(debug.contains("Trade"));
         assert!(debug.contains("TradeId(100)"));
+    }
+    #[test]
+    fn market_protection_triggered_preserves_four_field_payload() {
+        for (source, next, worst) in [
+            (ProtectionSource::User, 110, 100),
+            (ProtectionSource::MarketBand, 90, 100),
+            (ProtectionSource::Both, 120, 110),
+        ] {
+            let order_id = OrderId::new(100);
+            let next_price = Price::try_new(next).unwrap();
+            let effective_worst_price = Price::try_new(worst).unwrap();
+
+            let event = EngineEvent::MarketProtectionTriggered {
+                order_id,
+                next_price,
+                effective_worst_price,
+                source,
+            };
+
+            // 保持 EngineEvent 既有的值语义。
+            assert_eq!(event.clone(), event);
+
+            let debug = format!("{event:?}");
+            assert!(debug.contains("MarketProtectionTriggered"));
+
+            // 直接验证四个字段原样保留。
+            let EngineEvent::MarketProtectionTriggered {
+                order_id: actual_order_id,
+                next_price: actual_next_price,
+                effective_worst_price: actual_worst_price,
+                source: actual_source,
+            } = event
+            else {
+                panic!("expected MarketProtectionTriggered");
+            };
+
+            assert_eq!(actual_order_id, order_id);
+            assert_eq!(actual_next_price, next_price);
+            assert_eq!(actual_worst_price, effective_worst_price);
+            assert_eq!(actual_source, source);
+        }
+    }
+    #[test]
+    fn market_protection_triggered_has_stable_value_semantics() {
+        use crate::{ProtectionSource, Qty, Side, TradeEvent, TradeId};
+
+        // 固定原始事件，作为所有比较的基准。
+        let original = EngineEvent::MarketProtectionTriggered {
+            order_id: OrderId::new(100),
+            next_price: Price::try_new(110).unwrap(),
+            effective_worst_price: Price::try_new(100).unwrap(),
+            source: ProtectionSource::User,
+        };
+
+        // 1. 独立构造相同四字段，必须相等。
+        let same = EngineEvent::MarketProtectionTriggered {
+            order_id: OrderId::new(100),
+            next_price: Price::try_new(110).unwrap(),
+            effective_worst_price: Price::try_new(100).unwrap(),
+            source: ProtectionSource::User,
+        };
+
+        assert_eq!(original, same);
+
+        // 2. Clone 保留完整值语义。
+        assert_eq!(original.clone(), original);
+
+        // 3. Debug 可用，包含变体与字段信息。
+        let debug = format!("{original:?}");
+        assert!(debug.contains("MarketProtectionTriggered"));
+        assert!(debug.contains("order_id"));
+        assert!(debug.contains("next_price"));
+        assert!(debug.contains("effective_worst_price"));
+        assert!(debug.contains("User"));
+
+        // 4. 仅改变 order_id。
+        let changed_order_id = EngineEvent::MarketProtectionTriggered {
+            order_id: OrderId::new(101),
+            next_price: Price::try_new(110).unwrap(),
+            effective_worst_price: Price::try_new(100).unwrap(),
+            source: ProtectionSource::User,
+        };
+        assert_ne!(original, changed_order_id);
+
+        // 5. 仅改变 next_price。
+        let changed_next_price = EngineEvent::MarketProtectionTriggered {
+            order_id: OrderId::new(100),
+            next_price: Price::try_new(120).unwrap(),
+            effective_worst_price: Price::try_new(100).unwrap(),
+            source: ProtectionSource::User,
+        };
+        assert_ne!(original, changed_next_price);
+
+        // 6. 仅改变 effective_worst_price。
+        let changed_effective_worst_price = EngineEvent::MarketProtectionTriggered {
+            order_id: OrderId::new(100),
+            next_price: Price::try_new(110).unwrap(),
+            effective_worst_price: Price::try_new(105).unwrap(),
+            source: ProtectionSource::User,
+        };
+        assert_ne!(original, changed_effective_worst_price);
+
+        // 7. 仅改变 source。
+        let changed_source = EngineEvent::MarketProtectionTriggered {
+            order_id: OrderId::new(100),
+            next_price: Price::try_new(110).unwrap(),
+            effective_worst_price: Price::try_new(100).unwrap(),
+            source: ProtectionSource::MarketBand,
+        };
+        assert_ne!(original, changed_source);
+
+        // 8. 与 CommandRejected 必须不相等。
+        let rejected = EngineEvent::CommandRejected {
+            reason: RejectReason::InvalidPrice,
+        };
+        assert_ne!(original, rejected);
+
+        // 9. 与 Trade 必须不相等。
+        let trade = EngineEvent::Trade(TradeEvent {
+            trade_id: TradeId::new(1),
+            maker_order_id: OrderId::new(200),
+            taker_order_id: OrderId::new(100),
+            price: Price::try_new(110).unwrap(),
+            qty: Qty::try_new(1).unwrap(),
+            maker_side: Side::Sell,
+        });
+        assert_ne!(original, trade);
+
+        // 10. 与既有生命周期事件必须不相等。
+        let accepted = EngineEvent::OrderAccepted {
+            order_id: OrderId::new(100),
+        };
+        assert_ne!(original, accepted);
     }
 }

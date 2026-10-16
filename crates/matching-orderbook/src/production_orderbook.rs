@@ -1,10 +1,23 @@
 use crate::{
     IncomingOrder, OrderArena, OrderIndex, OrderNode, PriceLevel, QueuePriorityAllocator,
     QueuePriorityPolicy,
+    market_plan::{
+        MarketByQuotePlan, ProtectedMarketByQuotePlan, ProtectionBoundaryStop, QuoteFillPlan,
+    },
+};
+
+use matching_domain::market_order::{
+    CommandStartProtectionContext, ProtectedMarketByQuoteExecution,
+    effective_protection_at_command_start_with_source, maker_price_within_protection,
 };
 use matching_domain::{
-    LimitGtcOrder, OrderId, Price, Qty, QueuePriority, RejectReason, Side, TradeEvent, TradeId,
+    EngineEvent, LimitGtcOrder, MarketByBase, MarketByQuote, MarketByQuoteExecution, MarketMath,
+    MathError, OrderId, Price, Qty, QueuePriority, QuoteAmount, RejectReason, Side, TradeEvent,
+    TradeId,
 };
+
+#[cfg(test)]
+use matching_domain::ProtectionSource;
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +63,30 @@ struct RestPlan {
 struct FillPlan {
     trade_count: usize,
     remaining: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProtectedBaseFill {
+    maker_order_id: OrderId,
+    maker_price: Price,
+    qty: Qty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtectedMarketByBasePlan {
+    fills: Vec<ProtectedBaseFill>,
+    stop: Option<ProtectionBoundaryStop>,
+    remaining: u64,
+}
+
+/// MarketByQuote 只读预检过程中的临时累计状态。
+///
+/// 仅修改本对象，不修改 OrderBook / Arena / PriceLevel。
+#[derive(Debug)]
+struct QuotePreflightState {
+    remaining_quote: QuoteAmount,
+    spent_quote: QuoteAmount,
+    fills: Vec<QuoteFillPlan>,
 }
 
 /// 单市场生产簿的容器组合与只读查询入口。
@@ -765,6 +802,607 @@ impl ProductionOrderBook {
         Ok(trades)
     }
 
+    /// 以基础币数量立即成交市价订单。
+    ///
+    /// 入口先完成只读预检并确认 TradeId 数量，再按对手侧价格优先和
+    /// 同价 FIFO 提交成交。未成交余量不挂簿，也不分配 QueuePriority。
+    pub fn execute_market_by_base(
+        &mut self,
+        incoming: MarketByBase,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<TradeEvent>, RejectReason> {
+        let plan = self.preflight_market_by_base(&incoming)?;
+
+        assert!(
+            trade_ids.len() >= plan.trade_count,
+            "ProductionOrderBook invariant violation: \
+         insufficient TradeIds for MarketByBase: required={}, provided={}",
+            plan.trade_count,
+            trade_ids.len(),
+        );
+
+        let mut remaining = incoming.qty.get();
+        let mut trades = Vec::with_capacity(plan.trade_count);
+
+        for trade_id in trade_ids.iter().copied().take(plan.trade_count) {
+            trades.push(self.commit_market_by_base_fill(
+                incoming.order_id,
+                incoming.side,
+                &mut remaining,
+                trade_id,
+            ));
+        }
+
+        assert_eq!(remaining, plan.remaining);
+        assert_eq!(trades.len(), plan.trade_count);
+
+        Ok(trades)
+    }
+
+    /// 按命令开始时固定的保护边界执行 MarketByBase。
+    ///
+    /// 完整预检成功后才允许首次 maker mutation。
+    /// 保护触发最多产生一个事件，不消耗 TradeId；
+    /// 未成交市价余量不挂簿、不分配 QueuePriority。
+    pub fn execute_market_by_base_with_protection(
+        &mut self,
+        incoming: MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        // 1. 全量只读预检。
+        let plan = self.preflight_protected_market_by_base_plan(&incoming, context, math)?;
+
+        // 2. 在首次 mutation 前校验 TradeId。
+        // 延续当前 Production 的 fail-closed panic 契约。
+        assert!(
+            trade_ids.len() >= plan.fills.len(),
+            "insufficient TradeIds for protected MarketByBase: \
+         required={}, provided={}",
+            plan.fills.len(),
+            trade_ids.len(),
+        );
+
+        // 3. 预先为 Trade + 可选保护事件分配全部容量。
+        let event_count = plan
+            .fills
+            .len()
+            .checked_add(usize::from(plan.stop.is_some()))
+            .expect("protected MarketByBase event count overflow");
+
+        let mut events = Vec::with_capacity(event_count);
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let mut remaining = incoming.qty.get();
+
+        // 4. 严格按照预检计划提交。
+        for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
+            // 当前全市场最优 maker 价格必须等于计划价格。
+            let best_price = self
+                .best_price(maker_side)
+                .expect("preflighted protected maker side became empty");
+
+            assert_eq!(best_price, fill.maker_price);
+
+            // 必须选择最优价档的 FIFO head。
+            let levels = match maker_side {
+                Side::Buy => &self.bids,
+                Side::Sell => &self.asks,
+            };
+
+            let level = levels
+                .get(&best_price)
+                .expect("preflighted protected level missing");
+
+            let head_slot = level
+                .head()
+                .expect("preflighted protected FIFO head missing");
+
+            let maker = self
+                .arena
+                .get(head_slot)
+                .expect("preflighted protected Arena node missing");
+
+            assert_eq!(maker.original_order().order_id, fill.maker_order_id);
+            assert_eq!(maker.original_order().side, maker_side);
+            assert_eq!(maker.original_order().price, fill.maker_price);
+
+            assert_eq!(self.orders.get(&fill.maker_order_id), Some(&head_slot));
+
+            // 计划数量必须与当前可执行数量完全一致。
+            assert!(remaining > 0);
+            assert!(maker.remaining() > 0);
+            assert_eq!(fill.qty.get(), remaining.min(maker.remaining()));
+
+            // 5. 复用已验收的 Production 单笔提交。
+            //    本次调用内部完成：
+            //    - maker partial / full
+            //    - PriceLevel 聚合与 FIFO 更新
+            //    - Arena slot 释放
+            //    - OrderId index / 空价档清理
+            //    - taker remaining 扣减
+            let trade = self.commit_market_by_base_fill(
+                incoming.order_id,
+                incoming.side,
+                &mut remaining,
+                trade_id,
+            );
+
+            assert_eq!(trade.maker_order_id, fill.maker_order_id);
+            assert_eq!(trade.price, fill.maker_price);
+            assert_eq!(trade.qty, fill.qty);
+
+            events.push(EngineEvent::Trade(trade));
+        }
+
+        assert_eq!(remaining, plan.remaining);
+
+        // 6. 所有 Trade 之后最多追加一个保护事件。
+        if let Some(stop) = plan.stop {
+            events.push(EngineEvent::MarketProtectionTriggered {
+                order_id: incoming.order_id,
+                next_price: stop.next_price,
+                effective_worst_price: stop.effective_worst_price,
+                source: stop.source,
+            });
+        }
+
+        assert_eq!(events.len(), event_count);
+
+        Ok(events)
+    }
+
+    /// 市价按 quote 预算立即成交。
+    ///
+    /// 全部可预期错误发生在首笔 mutation 前。
+    /// 不挂入 taker，不分配 QueuePriority。
+    pub fn execute_market_by_quote(
+        &mut self,
+        incoming: MarketByQuote,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<MarketByQuoteExecution, RejectReason> {
+        let plan = self.preflight_market_by_quote(&incoming, math)?;
+
+        assert!(
+            trade_ids.len() >= plan.required_trade_ids,
+            "ProductionOrderBook invariant violation: \
+         insufficient TradeIds for MarketByQuote: required={}, provided={}",
+            plan.required_trade_ids,
+            trade_ids.len(),
+        );
+
+        assert_eq!(plan.fills.len(), plan.required_trade_ids);
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let priority_before = self.next_queue_priority();
+        let mut trades = Vec::with_capacity(plan.required_trade_ids);
+
+        for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
+            let index = *self
+                .orders
+                .get(&fill.maker_order_id)
+                .expect("preflighted MarketByQuote maker ID disappeared");
+
+            let level = match maker_side {
+                Side::Buy => self.bids.get(&fill.maker_price),
+                Side::Sell => self.asks.get(&fill.maker_price),
+            }
+            .expect("preflighted MarketByQuote level disappeared");
+
+            // 必须仍然是当前最优对手价的 FIFO head。
+            assert_eq!(level.head(), Some(index));
+
+            let actual_best = self
+                .best_price(maker_side)
+                .expect("preflighted MarketByQuote best price missing");
+
+            assert_eq!(
+                actual_best, fill.maker_price,
+                "MarketByQuote maker price diverged from plan"
+            );
+
+            let maker = self
+                .arena
+                .get(index)
+                .expect("preflighted MarketByQuote maker node disappeared");
+
+            assert_eq!(maker.original_order().order_id, fill.maker_order_id);
+            assert_eq!(maker.original_order().side, maker_side);
+            assert_eq!(maker.original_order().price, fill.maker_price);
+
+            let maker_remaining = maker.remaining();
+            let fill_lots = fill.qty.get();
+
+            assert!(fill_lots > 0 && fill_lots <= maker_remaining);
+
+            let maker_after = maker_remaining
+                .checked_sub(fill_lots)
+                .expect("preflighted MarketByQuote maker underflow");
+
+            // 原序事件使用计划中的价、量。
+            // 不调用 MarketMath，也不重算 notional。
+            let trade = TradeEvent {
+                trade_id,
+                maker_order_id: fill.maker_order_id,
+                taker_order_id: incoming.order_id,
+                price: fill.maker_price,
+                qty: fill.qty,
+                maker_side,
+            };
+
+            if maker_after > 0 {
+                let level = match maker_side {
+                    Side::Buy => self.bids.get_mut(&fill.maker_price),
+                    Side::Sell => self.asks.get_mut(&fill.maker_price),
+                }
+                .expect("preflighted MarketByQuote partial level missing");
+
+                level.apply_head_partial_fill(&mut self.arena, fill.qty);
+            } else {
+                let level_became_empty = {
+                    let level = match maker_side {
+                        Side::Buy => self.bids.get_mut(&fill.maker_price),
+                        Side::Sell => self.asks.get_mut(&fill.maker_price),
+                    }
+                    .expect("preflighted MarketByQuote full level missing");
+
+                    let removed = level
+                        .pop_front(&mut self.arena)
+                        .expect("preflighted MarketByQuote head missing");
+
+                    assert_eq!(removed.original_order().order_id, fill.maker_order_id);
+
+                    level.is_empty()
+                };
+
+                // pop_front 已释放 Arena slot，不能再 remove 一次。
+                assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index));
+
+                if level_became_empty {
+                    let removed_level = match maker_side {
+                        Side::Buy => self.bids.remove(&fill.maker_price),
+                        Side::Sell => self.asks.remove(&fill.maker_price),
+                    }
+                    .expect("preflighted MarketByQuote empty level missing");
+
+                    assert!(removed_level.is_empty());
+                }
+            }
+
+            trades.push(trade);
+        }
+
+        assert_eq!(trades.len(), plan.required_trade_ids);
+        assert_eq!(self.next_queue_priority(), priority_before);
+        assert!(!self.orders.contains_key(&incoming.order_id));
+
+        Ok(MarketByQuoteExecution::new(
+            trades,
+            plan.spent_quote,
+            plan.remaining_quote,
+        ))
+    }
+
+    /// 按命令开始时固定的保护边界执行 MarketByQuote。
+    ///
+    /// 预检、TradeId 足量检查和金额计划校验均先于首笔 mutation。
+    /// 提交只使用 QuoteFillPlan，不重新计算保护边界、本金或预算。
+    /// 保护事件不消耗 TradeId，市价 taker 不挂簿。
+    pub fn execute_market_by_quote_with_protection(
+        &mut self,
+        incoming: MarketByQuote,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        // 1. 完整只读预检。
+        let plan = self.preflight_market_by_quote_with_protection(&incoming, context, math)?;
+
+        // 2. 所有 TradeId 检查必须先于首次 mutation。
+        assert!(
+            trade_ids.len() >= plan.fills.len(),
+            "insufficient TradeIds for protected MarketByQuote: required={}, provided={}",
+            plan.fills.len(),
+            trade_ids.len(),
+        );
+
+        // 3. 只核对已规划的 notional，不重新调用 MarketMath。
+        let mut planned_spent = QuoteAmount::new(0);
+
+        for fill in &plan.fills {
+            assert!(fill.notional.get() > 0);
+
+            planned_spent = planned_spent
+                .checked_add(fill.notional)
+                .expect("preflighted protected Quote notional overflow");
+        }
+
+        assert_eq!(planned_spent, plan.spent_quote);
+
+        let accounted = plan
+            .spent_quote
+            .checked_add(plan.unused_quote)
+            .expect("preflighted protected Quote budget overflow");
+
+        assert_eq!(accounted.get(), incoming.quote_budget.get());
+
+        let trade_count = plan.fills.len();
+        let event_count = trade_count
+            .checked_add(usize::from(plan.stop.is_some()))
+            .expect("protected MarketByQuote event count overflow");
+
+        // 首笔 maker mutation 前完成事件容量预分配。
+        let mut events = Vec::with_capacity(event_count);
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let priority_before = self.next_queue_priority();
+
+        // 4. 严格依照预检 fill 顺序提交。
+        for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
+            // 必须仍然是当前最优对手价。
+            let best_price = self
+                .best_price(maker_side)
+                .expect("preflighted protected Quote best price missing");
+
+            assert_eq!(best_price, fill.maker_price);
+
+            let index = *self
+                .orders
+                .get(&fill.maker_order_id)
+                .expect("preflighted protected Quote maker ID missing");
+
+            // maker 必须位于预检价格档的 FIFO head。
+            let level = match maker_side {
+                Side::Buy => self.bids.get(&fill.maker_price),
+                Side::Sell => self.asks.get(&fill.maker_price),
+            }
+            .expect("preflighted protected Quote level missing");
+
+            assert_eq!(level.head(), Some(index));
+
+            let maker = self
+                .arena
+                .get(index)
+                .expect("preflighted protected Quote maker node missing");
+
+            assert_eq!(maker.original_order().order_id, fill.maker_order_id);
+            assert_eq!(maker.original_order().side, maker_side);
+            assert_eq!(maker.original_order().price, fill.maker_price);
+
+            let maker_remaining = maker.remaining();
+            let maker_priority = maker.priority();
+            let fill_lots = fill.qty.get();
+
+            assert!(fill_lots > 0 && fill_lots <= maker_remaining);
+
+            let maker_after = maker_remaining
+                .checked_sub(fill_lots)
+                .expect("preflighted protected Quote maker underflow");
+
+            // 事件只读取计划中的 maker、价格和数量。
+            let trade = TradeEvent {
+                trade_id,
+                maker_order_id: fill.maker_order_id,
+                taker_order_id: incoming.order_id,
+                price: fill.maker_price,
+                qty: fill.qty,
+                maker_side,
+            };
+
+            // 5. 首次 maker mutation。
+            if maker_after > 0 {
+                // 部分成交：保留 FIFO slot 和 QueuePriority。
+                let level = match maker_side {
+                    Side::Buy => self.bids.get_mut(&fill.maker_price),
+                    Side::Sell => self.asks.get_mut(&fill.maker_price),
+                }
+                .expect("preflighted protected Quote partial level missing");
+
+                level.apply_head_partial_fill(&mut self.arena, fill.qty);
+
+                let updated = self
+                    .arena
+                    .get(index)
+                    .expect("partial maker must retain Arena slot");
+
+                assert_eq!(updated.remaining(), maker_after);
+                assert_eq!(updated.priority(), maker_priority);
+                assert_eq!(self.orders.get(&fill.maker_order_id), Some(&index));
+            } else {
+                // 完全成交：FIFO pop_front 释放 Arena slot。
+                let level_became_empty = {
+                    let level = match maker_side {
+                        Side::Buy => self.bids.get_mut(&fill.maker_price),
+                        Side::Sell => self.asks.get_mut(&fill.maker_price),
+                    }
+                    .expect("preflighted protected Quote full level missing");
+
+                    let removed = level
+                        .pop_front(&mut self.arena)
+                        .expect("preflighted protected Quote FIFO head missing");
+
+                    assert_eq!(removed.original_order().order_id, fill.maker_order_id,);
+                    assert_eq!(removed.remaining(), maker_remaining);
+
+                    level.is_empty()
+                };
+
+                // pop_front 已释放 slot，不得二次 arena.remove。
+                assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index),);
+
+                if level_became_empty {
+                    let removed_level = match maker_side {
+                        Side::Buy => self.bids.remove(&fill.maker_price),
+                        Side::Sell => self.asks.remove(&fill.maker_price),
+                    }
+                    .expect("preflighted protected Quote empty level missing");
+
+                    assert!(removed_level.is_empty());
+                }
+            }
+
+            events.push(EngineEvent::Trade(trade));
+        }
+
+        assert_eq!(events.len(), trade_count);
+
+        // 6. 所有 Trade 之后最多追加一个保护终结事件。
+        // 不使用 TradeId，也不读取下一张 maker。
+        if let Some(stop) = plan.stop {
+            events.push(EngineEvent::MarketProtectionTriggered {
+                order_id: incoming.order_id,
+                next_price: stop.next_price,
+                effective_worst_price: stop.effective_worst_price,
+                source: stop.source,
+            });
+        }
+
+        assert_eq!(events.len(), event_count);
+
+        // MarketByQuote 不消耗 QueuePriority、不挂入 taker。
+        assert_eq!(self.next_queue_priority(), priority_before);
+        assert!(!self.orders.contains_key(&incoming.order_id));
+
+        Ok(ProtectedMarketByQuoteExecution::new(
+            events,
+            plan.spent_quote,
+            plan.unused_quote,
+        ))
+    }
+
+    fn commit_market_by_base_fill(
+        &mut self,
+        taker_order_id: OrderId,
+        taker_side: Side,
+        remaining: &mut u64,
+        trade_id: TradeId,
+    ) -> TradeEvent {
+        assert!(*remaining > 0, "preflighted taker exhausted");
+
+        let maker_side = match taker_side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let maker_price = match maker_side {
+            Side::Buy => {
+                *self
+                    .bids
+                    .last_key_value()
+                    .expect("preflighted bid missing")
+                    .0
+            }
+            Side::Sell => {
+                *self
+                    .asks
+                    .first_key_value()
+                    .expect("preflighted ask missing")
+                    .0
+            }
+        };
+
+        let (head_index, maker_order_id, maker_remaining) = {
+            let level = match maker_side {
+                Side::Buy => self.bids.get(&maker_price),
+                Side::Sell => self.asks.get(&maker_price),
+            }
+            .expect("preflighted level missing");
+
+            let index = level.head().expect("preflighted head missing");
+            let maker = self
+                .arena
+                .get(index)
+                .expect("preflighted Arena node missing");
+
+            assert_eq!(maker.original_order().side, maker_side);
+            assert_eq!(maker.original_order().price, maker_price);
+            assert!(maker.remaining() > 0);
+
+            (index, maker.original_order().order_id, maker.remaining())
+        };
+
+        assert_eq!(self.orders.get(&maker_order_id), Some(&head_index));
+
+        // 本笔全部数量计算先于写入。
+        let fill_lots = (*remaining).min(maker_remaining);
+        let fill_qty = Qty::try_new(fill_lots).expect("preflighted fill must be positive");
+
+        let maker_after = maker_remaining
+            .checked_sub(fill_lots)
+            .expect("preflighted maker underflow");
+
+        let taker_after = (*remaining)
+            .checked_sub(fill_lots)
+            .expect("preflighted taker underflow");
+
+        let trade = TradeEvent {
+            trade_id,
+            maker_order_id,
+            taker_order_id,
+            price: maker_price,
+            qty: fill_qty,
+            maker_side,
+        };
+
+        if maker_after > 0 {
+            let level = match maker_side {
+                Side::Buy => self.bids.get_mut(&maker_price),
+                Side::Sell => self.asks.get_mut(&maker_price),
+            }
+            .expect("preflighted partial level missing");
+
+            level.apply_head_partial_fill(&mut self.arena, fill_qty);
+        } else {
+            let level_became_empty = {
+                let level = match maker_side {
+                    Side::Buy => self.bids.get_mut(&maker_price),
+                    Side::Sell => self.asks.get_mut(&maker_price),
+                }
+                .expect("preflighted full level missing");
+
+                // pop_front 同时更新链表/聚合并释放 Arena 槽位。
+                let removed = level
+                    .pop_front(&mut self.arena)
+                    .expect("preflighted head missing");
+
+                assert_eq!(removed.original_order().order_id, maker_order_id);
+                level.is_empty()
+            };
+
+            // 不要重复调用 arena.remove。
+            assert_eq!(self.orders.remove(&maker_order_id), Some(head_index),);
+
+            if level_became_empty {
+                let removed = match maker_side {
+                    Side::Buy => self.bids.remove(&maker_price),
+                    Side::Sell => self.asks.remove(&maker_price),
+                }
+                .expect("preflighted empty level missing");
+
+                assert!(removed.is_empty());
+            }
+        }
+
+        // 最后才更新本次市价 taker 的局部剩余量。
+        *remaining = taker_after;
+
+        trade
+    }
+
     /// 在一个价格档内模拟 FIFO 成交，并验证单步提交依赖的局部结构。
     ///
     /// 该扫描只读地推进 `incoming_remaining`，返回实际需要的 TradeId 数量。
@@ -1172,6 +1810,635 @@ impl ProductionOrderBook {
             trade_count,
             remaining,
         }
+    }
+
+    fn preflight_market_by_base(&self, incoming: &MarketByBase) -> Result<FillPlan, RejectReason> {
+        if self.orders.contains_key(&incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        let mut remaining = incoming.qty.get();
+        let mut trade_count = 0usize;
+
+        match incoming.side {
+            Side::Buy => {
+                for (price, level) in &self.asks {
+                    if remaining == 0 {
+                        break;
+                    }
+
+                    let count =
+                        self.preflight_level_fill_count(level, Side::Sell, *price, &mut remaining);
+
+                    trade_count = trade_count
+                        .checked_add(count)
+                        .expect("MarketByBase trade count overflow");
+                }
+            }
+            Side::Sell => {
+                for (price, level) in self.bids.iter().rev() {
+                    if remaining == 0 {
+                        break;
+                    }
+
+                    let count =
+                        self.preflight_level_fill_count(level, Side::Buy, *price, &mut remaining);
+
+                    trade_count = trade_count
+                        .checked_add(count)
+                        .expect("MarketByBase trade count overflow");
+                }
+            }
+        }
+
+        Ok(FillPlan {
+            trade_count,
+            remaining,
+        })
+    }
+
+    /// T06.31：Production 独立只读规划；不触碰 Arena、价档、ID 索引或 allocator。
+    /// 业务拒绝优先级：duplicate -> command-start protection -> 扫描。
+    /// 返回成交前缀及首个越界价，终结保护本身不消耗 TradeId。
+    fn preflight_protected_market_by_base_plan(
+        &self,
+        incoming: &MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+    ) -> Result<ProtectedMarketByBasePlan, RejectReason> {
+        if self.orders.contains_key(&incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        let effective = effective_protection_at_command_start_with_source(
+            incoming.market_protection.as_ref(),
+            context,
+            incoming.side,
+            math,
+        )?;
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let mut remaining = incoming.qty.get();
+        let mut fills = Vec::new();
+        let mut stop = None;
+
+        // true：当前价档已处理完，可以继续下一档；false：立即终止整个扫描。
+        let mut scan_level = |price: Price, level: &PriceLevel| -> Result<bool, RejectReason> {
+            if remaining == 0 {
+                return Ok(false);
+            }
+
+            if !maker_price_within_protection(
+                incoming.side,
+                price,
+                effective.map(|(worst, _)| worst),
+            ) {
+                let (effective_worst_price, source) =
+                    effective.expect("out-of-bound maker requires a protection boundary");
+                stop = Some(ProtectionBoundaryStop {
+                    next_price: price,
+                    effective_worst_price,
+                    source,
+                });
+                return Ok(false);
+            }
+
+            assert!(
+                level.count() > 0,
+                "protected MarketByBase: empty matching level"
+            );
+            assert!(
+                level.total_visible_qty() > 0,
+                "protected MarketByBase: zero matching aggregate"
+            );
+            let head = level
+                .head()
+                .expect("protected MarketByBase: missing level head");
+            let tail = level
+                .tail()
+                .expect("protected MarketByBase: missing level tail");
+            let tail_node = self
+                .arena
+                .get(tail)
+                .expect("protected MarketByBase: missing tail");
+            assert_eq!(tail_node.original_order().side, maker_side);
+            assert_eq!(tail_node.original_order().price, price);
+            assert!(tail_node.remaining() > 0);
+            assert!(tail_node.next().is_none());
+            if level.count() == 1 {
+                assert_eq!(head, tail);
+                assert!(tail_node.prev().is_none());
+            } else {
+                assert_ne!(head, tail);
+                let prev = tail_node
+                    .prev()
+                    .expect("protected MarketByBase: missing tail prev");
+                let predecessor = self
+                    .arena
+                    .get(prev)
+                    .expect("protected MarketByBase: missing tail predecessor");
+                assert_eq!(predecessor.next(), Some(tail));
+                assert_eq!(predecessor.original_order().side, maker_side);
+                assert_eq!(predecessor.original_order().price, price);
+                assert!(predecessor.remaining() > 0);
+                assert!(predecessor.priority() < tail_node.priority());
+            }
+
+            let mut current = Some(head);
+            let mut expected_prev = None;
+            let mut previous_priority = None;
+            let mut visited = 0u32;
+            let mut consumed_in_level = 0u64;
+
+            while remaining > 0 {
+                let Some(slot) = current else { break };
+                visited = visited
+                    .checked_add(1)
+                    .expect("protected MarketByBase: count overflow");
+                assert!(
+                    visited <= level.count(),
+                    "protected MarketByBase: FIFO cycle"
+                );
+
+                let node = self
+                    .arena
+                    .get(slot)
+                    .expect("protected MarketByBase: missing FIFO node");
+                assert_eq!(node.prev(), expected_prev);
+                assert_eq!(node.original_order().side, maker_side);
+                assert_eq!(node.original_order().price, price);
+                assert!(node.remaining() > 0);
+                if let Some(previous) = previous_priority {
+                    assert!(
+                        previous < node.priority(),
+                        "protected MarketByBase: priority regression"
+                    );
+                }
+                let maker_order_id = node.original_order().order_id;
+                assert_eq!(self.orders.get(&maker_order_id), Some(&slot));
+
+                let next = node.next();
+                if visited == level.count() {
+                    assert_eq!(slot, tail);
+                    assert!(next.is_none());
+                } else {
+                    let successor = next.expect("protected MarketByBase: truncated FIFO chain");
+                    let next_node = self
+                        .arena
+                        .get(successor)
+                        .expect("protected MarketByBase: missing successor");
+                    assert_eq!(next_node.prev(), Some(slot));
+                    assert!(node.priority() < next_node.priority());
+                }
+
+                let fill_lots = remaining.min(node.remaining());
+                let qty = Qty::try_new(fill_lots)?;
+                remaining = remaining
+                    .checked_sub(fill_lots)
+                    .ok_or(RejectReason::ArithmeticOverflow)?;
+                consumed_in_level = consumed_in_level
+                    .checked_add(fill_lots)
+                    .ok_or(RejectReason::ArithmeticOverflow)?;
+                fills.push(ProtectedBaseFill {
+                    maker_order_id,
+                    maker_price: price,
+                    qty,
+                });
+
+                expected_prev = Some(slot);
+                previous_priority = Some(node.priority());
+                current = next;
+            }
+
+            assert!(
+                consumed_in_level <= level.total_visible_qty(),
+                "protected MarketByBase: planned quantity exceeds level aggregate"
+            );
+            if remaining > 0 {
+                assert_eq!(visited, level.count());
+                assert!(current.is_none());
+                assert_eq!(consumed_in_level, level.total_visible_qty());
+            }
+            Ok(remaining > 0)
+        };
+
+        // 价格树决定档位顺序；每档 intrusive next 链决定 FIFO。
+        match incoming.side {
+            Side::Buy => {
+                for (price, level) in &self.asks {
+                    if !scan_level(*price, level)? {
+                        break;
+                    }
+                }
+            }
+            Side::Sell => {
+                for (price, level) in self.bids.iter().rev() {
+                    if !scan_level(*price, level)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(ProtectedMarketByBasePlan {
+            fills,
+            stop,
+            remaining,
+        })
+    }
+
+    #[cfg(test)]
+    fn preflight_market_by_base_with_protection(
+        &self,
+        incoming: &MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+    ) -> Result<Vec<(OrderId, Qty)>, RejectReason> {
+        let plan = self.preflight_protected_market_by_base_plan(incoming, context, math)?;
+
+        Ok(plan
+            .fills
+            .into_iter()
+            .map(|fill| (fill.maker_order_id, fill.qty))
+            .collect())
+    }
+
+    fn reject_quote_math_error(error: MathError) -> RejectReason {
+        error.to_reject_reason().unwrap_or_else(|| {
+            panic!(
+                "ProductionOrderBook invariant violation: \
+             non-rejectable MarketByQuote math error: {error:?}"
+            )
+        })
+    }
+
+    fn preflight_quote_level(
+        &self,
+        level: &PriceLevel,
+        maker_side: Side,
+        price: Price,
+        math: &MarketMath,
+        state: &mut QuotePreflightState,
+    ) -> Result<bool, RejectReason> {
+        assert!(level.count() > 0, "matching level is empty");
+
+        let mut current = level.head();
+        let mut previous = None;
+        let mut previous_priority = None;
+        let mut observed_count = 0u32;
+        let mut observed_total = 0u64;
+        let mut stop = false;
+
+        // 即使本单在档位中途耗尽，也扫描剩余链表完成
+        // 本档结构检查，确保提交依赖的 FIFO 链正确。
+        while let Some(index) = current {
+            let node = self
+                .arena
+                .get(index)
+                .expect("MarketByQuote preflight missing Arena node");
+
+            assert_eq!(node.prev(), previous);
+            assert_eq!(node.original_order().side, maker_side);
+            assert_eq!(node.original_order().price, price);
+            assert!(node.remaining() > 0);
+
+            if let Some(priority) = previous_priority {
+                assert!(priority < node.priority());
+            }
+
+            assert_eq!(
+                self.orders.get(&node.original_order().order_id),
+                Some(&index),
+            );
+
+            observed_count = observed_count
+                .checked_add(1)
+                .expect("MarketByQuote level count overflow");
+
+            observed_total = observed_total
+                .checked_add(node.remaining())
+                .expect("MarketByQuote level quantity overflow");
+
+            if !stop && state.remaining_quote.get() > 0 {
+                let affordable = math
+                    .max_qty_for_quote(state.remaining_quote, price)
+                    .map_err(Self::reject_quote_math_error)?;
+
+                match affordable {
+                    None => {
+                        stop = true;
+                    }
+                    Some(max_qty) => {
+                        let lots = max_qty.get().min(node.remaining());
+
+                        let qty = Qty::try_new(lots).expect("MarketByQuote planned zero fill");
+
+                        let notional = math
+                            .trade_notional(price, qty)
+                            .map_err(Self::reject_quote_math_error)?;
+
+                        assert!(notional.get() > 0, "MarketByQuote planned zero notional");
+
+                        state.remaining_quote = state.remaining_quote.checked_sub(notional)?;
+                        state.spent_quote = state.spent_quote.checked_add(notional)?;
+
+                        state.fills.push(QuoteFillPlan {
+                            maker_order_id: node.original_order().order_id,
+                            maker_price: price,
+                            qty,
+                            notional,
+                        });
+
+                        if state.remaining_quote.get() == 0 {
+                            stop = true;
+                        }
+                    }
+                }
+            }
+
+            previous_priority = Some(node.priority());
+            previous = Some(index);
+            current = node.next();
+
+            // 防止损坏链表形成环导致无限循环。
+            assert!(
+                observed_count <= level.count(),
+                "MarketByQuote FIFO cycle or incorrect count"
+            );
+        }
+
+        assert_eq!(observed_count, level.count());
+        assert_eq!(observed_total, level.total_visible_qty());
+        assert_eq!(previous, level.tail());
+
+        Ok(stop)
+    }
+
+    fn preflight_market_by_quote(
+        &self,
+        incoming: &MarketByQuote,
+        math: &MarketMath,
+    ) -> Result<MarketByQuotePlan, RejectReason> {
+        // Duplicate 必须先于盘口和 MarketMath 检查。
+        if self.orders.contains_key(&incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let budget = incoming.quote_budget.get();
+
+        let mut state = QuotePreflightState {
+            remaining_quote: QuoteAmount::new(budget),
+            spent_quote: QuoteAmount::new(0),
+            fills: Vec::new(),
+        };
+
+        match maker_side {
+            Side::Sell => {
+                // Buy taker：asks 从低到高。
+                for (price, level) in &self.asks {
+                    if state.remaining_quote.get() == 0 {
+                        break;
+                    }
+
+                    if self.preflight_quote_level(level, maker_side, *price, math, &mut state)? {
+                        break;
+                    }
+                }
+            }
+            Side::Buy => {
+                // Sell taker：bids 从高到低。
+                for (price, level) in self.bids.iter().rev() {
+                    if state.remaining_quote.get() == 0 {
+                        break;
+                    }
+
+                    if self.preflight_quote_level(level, maker_side, *price, math, &mut state)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let accounted = state.spent_quote.checked_add(state.remaining_quote)?;
+
+        assert_eq!(
+            accounted.get(),
+            budget,
+            "MarketByQuote budget conservation mismatch"
+        );
+
+        Ok(MarketByQuotePlan {
+            required_trade_ids: state.fills.len(),
+            fills: state.fills,
+            spent_quote: state.spent_quote,
+            remaining_quote: state.remaining_quote,
+        })
+    }
+
+    fn preflight_market_by_quote_with_protection(
+        &self,
+        incoming: &MarketByQuote,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+    ) -> Result<ProtectedMarketByQuotePlan, RejectReason> {
+        // 1. Duplicate 必须优先于保护及数学错误。
+        if self.orders.contains_key(&incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        // 2. 命令开始时固定有效保护价格和来源，只调用一次。
+        let effective = effective_protection_at_command_start_with_source(
+            incoming.market_protection.as_ref(),
+            context,
+            incoming.side,
+            math,
+        )?;
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let budget = incoming.quote_budget.get();
+
+        let mut state = QuotePreflightState {
+            remaining_quote: QuoteAmount::new(budget),
+            spent_quote: QuoteAmount::new(0),
+            fills: Vec::new(),
+        };
+
+        let mut stop = None;
+
+        // true：继续下一价档；false：终止本次预检。
+        let mut scan_level = |price: Price, level: &PriceLevel| -> Result<bool, RejectReason> {
+            if state.remaining_quote.get() == 0 {
+                return Ok(false);
+            }
+
+            // 3. 保护先于 dust/MarketMath。
+            // 整档同价，因此在访问 FIFO 节点前检查一次即可。
+            if !maker_price_within_protection(
+                incoming.side,
+                price,
+                effective.map(|(worst, _)| worst),
+            ) {
+                let (effective_worst_price, source) =
+                    effective.expect("out-of-bound price requires protection");
+
+                stop = Some(ProtectionBoundaryStop {
+                    next_price: price,
+                    effective_worst_price,
+                    source,
+                });
+
+                // 首个越界价立即终止，不扫描更远价格。
+                return Ok(false);
+            }
+
+            assert!(level.count() > 0);
+            assert!(level.head().is_some());
+            assert!(level.tail().is_some());
+
+            let mut current = level.head();
+            let mut previous = None;
+            let mut previous_priority = None;
+            let mut observed_count = 0u32;
+            let mut observed_total = 0u64;
+            let mut halted = false;
+
+            // 4. 同价 FIFO：head -> next -> tail。
+            while let Some(index) = current {
+                let node = self
+                    .arena
+                    .get(index)
+                    .expect("protected Quote preflight missing Arena node");
+
+                assert_eq!(node.prev(), previous);
+                assert_eq!(node.original_order().side, maker_side);
+                assert_eq!(node.original_order().price, price);
+                assert!(node.remaining() > 0);
+
+                assert_eq!(
+                    self.orders.get(&node.original_order().order_id),
+                    Some(&index)
+                );
+
+                if let Some(priority) = previous_priority {
+                    assert!(
+                        priority < node.priority(),
+                        "protected Quote FIFO priority regression"
+                    );
+                }
+
+                observed_count = observed_count
+                    .checked_add(1)
+                    .expect("protected Quote level count overflow");
+
+                assert!(
+                    observed_count <= level.count(),
+                    "protected Quote FIFO cycle or count mismatch"
+                );
+
+                observed_total = observed_total
+                    .checked_add(node.remaining())
+                    .expect("protected Quote aggregate overflow");
+
+                // halted 后仅完成本档的结构检查，
+                // 不再做预算计算或规划新 fill。
+                if !halted && state.remaining_quote.get() > 0 {
+                    let affordable = math
+                        .max_qty_for_quote(state.remaining_quote, price)
+                        .map_err(Self::reject_quote_math_error)?;
+
+                    match affordable {
+                        None => {
+                            // 在保护边界内发生 dust。
+                            halted = true;
+                        }
+                        Some(max_qty) => {
+                            let lots = max_qty.get().min(node.remaining());
+
+                            let qty =
+                                Qty::try_new(lots).expect("protected Quote planned zero fill");
+
+                            let notional = math
+                                .trade_notional(price, qty)
+                                .map_err(Self::reject_quote_math_error)?;
+
+                            assert!(notional.get() > 0, "protected Quote planned zero notional");
+
+                            state.remaining_quote = state.remaining_quote.checked_sub(notional)?;
+
+                            state.spent_quote = state.spent_quote.checked_add(notional)?;
+
+                            state.fills.push(QuoteFillPlan {
+                                maker_order_id: node.original_order().order_id,
+                                maker_price: price,
+                                qty,
+                                notional,
+                            });
+
+                            if state.remaining_quote.get() == 0 {
+                                halted = true;
+                            }
+                        }
+                    }
+                }
+
+                previous_priority = Some(node.priority());
+                previous = Some(index);
+                current = node.next();
+            }
+
+            // 5. 验证整个已访问档位的聚合与链表。
+            assert_eq!(observed_count, level.count());
+            assert_eq!(observed_total, level.total_visible_qty());
+            assert_eq!(previous, level.tail());
+
+            Ok(!halted)
+        };
+
+        // 6. 直接使用 Production BTreeMap 的业务价格顺序。
+        match incoming.side {
+            Side::Buy => {
+                for (price, level) in &self.asks {
+                    if !scan_level(*price, level)? {
+                        break;
+                    }
+                }
+            }
+            Side::Sell => {
+                for (price, level) in self.bids.iter().rev() {
+                    if !scan_level(*price, level)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 7. 本地金额守恒验证，不修改任何订单簿状态。
+        let accounted = state.spent_quote.checked_add(state.remaining_quote)?;
+
+        assert_eq!(
+            accounted.get(),
+            budget,
+            "protected MarketByQuote budget conservation mismatch"
+        );
+
+        Ok(ProtectedMarketByQuotePlan {
+            fills: state.fills,
+            spent_quote: state.spent_quote,
+            unused_quote: state.remaining_quote,
+            stop,
+        })
     }
 
     /// 预检任何将要 rest 的 Limit GTC 载荷，而不检查对手侧价格。
@@ -4643,5 +5910,2406 @@ mod tests {
         );
 
         assert_eq!(validate_book(&book), Ok(()));
+    }
+
+    mod market_by_base_tests {
+        use super::*;
+        use matching_domain::{EngineEvent, MarketByBase, MarketProtection, UserId};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        fn market(id: u128, side: Side, qty: u64) -> MarketByBase {
+            MarketByBase {
+                order_id: OrderId::new(id),
+                user_id: UserId::new(id as u64),
+                side,
+                qty: Qty::try_new(qty).unwrap(),
+                market_protection: None,
+            }
+        }
+
+        fn book() -> ProductionOrderBook {
+            ProductionOrderBook::new(policy())
+        }
+
+        /// 比较完整 Production 状态。
+        ///
+        /// 包括：
+        /// - 双侧 BTreeMap 档位
+        /// - OrderId index
+        /// - Arena slots/free-list
+        /// - QueuePriority allocator
+        ///
+        /// 只用于失败路径的原子性验证。
+        fn assert_failure_atomic<F>(book: &mut ProductionOrderBook, action: F)
+        where
+            F: FnOnce(&mut ProductionOrderBook),
+        {
+            assert_eq!(validate_book(book), Ok(()));
+
+            let bids_before = level_snapshot(&book.bids);
+            let asks_before = level_snapshot(&book.asks);
+            let orders_before = book.orders.clone();
+            let arena_before = book.arena.test_snapshot();
+            let next_before = book.next_queue_priority();
+            let policy_before = *book.queue_priority_allocator.policy();
+
+            action(book);
+
+            assert_eq!(level_snapshot(&book.bids), bids_before);
+            assert_eq!(level_snapshot(&book.asks), asks_before);
+            assert_eq!(book.orders, orders_before);
+            assert_eq!(book.arena.test_snapshot(), arena_before);
+            assert_eq!(book.next_queue_priority(), next_before);
+            assert_eq!(book.queue_priority_allocator.policy(), &policy_before);
+
+            assert_eq!(validate_book(book), Ok(()));
+        }
+
+        #[test]
+        fn market_by_base_empty_both_sides() {
+            for side in [Side::Buy, Side::Sell] {
+                let mut book = book();
+
+                assert_failure_atomic(&mut book, |book| {
+                    let trades = book
+                        .execute_market_by_base(market(100, side, 10), &[])
+                        .unwrap();
+
+                    assert!(trades.is_empty());
+                });
+
+                assert_eq!(book.order(OrderId::new(100)), None);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_base_partial_both_sides() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+                book.rest(order(2, maker_side, 100, 5)).unwrap();
+
+                let maker_id = OrderId::new(1);
+                let slot_before = *book.orders.get(&maker_id).unwrap();
+                let priority_before = book.order(maker_id).unwrap().priority();
+                let next_before = book.next_queue_priority();
+
+                let levels_before = match maker_side {
+                    Side::Buy => level_snapshot(&book.bids),
+                    Side::Sell => level_snapshot(&book.asks),
+                };
+
+                let trades = book
+                    .execute_market_by_base(market(100, taker_side, 3), &[TradeId::new(500)])
+                    .unwrap();
+
+                assert_eq!(trades.len(), 1);
+
+                assert_eq!(trades[0].trade_id, TradeId::new(500));
+                assert_eq!(trades[0].maker_order_id, maker_id);
+                assert_eq!(trades[0].taker_order_id, OrderId::new(100));
+                assert_eq!(trades[0].maker_side, maker_side);
+                assert_eq!(trades[0].price, Price::try_new(100).unwrap());
+                assert_eq!(trades[0].qty, Qty::try_new(3).unwrap());
+
+                let maker = book.order(maker_id).unwrap();
+
+                assert_eq!(maker.remaining(), 7);
+                assert_eq!(maker.priority(), priority_before);
+                assert_eq!(maker.prev(), None);
+                assert_eq!(maker.next(), book.orders.get(&OrderId::new(2)).copied());
+
+                assert_eq!(book.orders.get(&maker_id), Some(&slot_before));
+
+                // 原价档仍有两张订单，只有聚合数量从 15 变成 12。
+                let levels_after = match maker_side {
+                    Side::Buy => level_snapshot(&book.bids),
+                    Side::Sell => level_snapshot(&book.asks),
+                };
+
+                assert_eq!(levels_after.len(), levels_before.len());
+                assert_eq!(levels_after[0].head, levels_before[0].head);
+                assert_eq!(levels_after[0].tail, levels_before[0].tail);
+                assert_eq!(levels_after[0].count, 2);
+                assert_eq!(levels_after[0].total_visible_qty, 12);
+
+                assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 5);
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(book.next_queue_priority(), next_before);
+
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_base_multi_level_fifo_both_sides() {
+            for (taker_side, maker_side, worse, better) in [
+                (Side::Buy, Side::Sell, 110, 105),
+                (Side::Sell, Side::Buy, 90, 95),
+            ] {
+                let mut book = book();
+
+                // 故意让 OrderId 数值顺序与 FIFO 顺序不同。
+                book.rest(order(20, maker_side, worse, 4)).unwrap();
+                book.rest(order(30, maker_side, better, 3)).unwrap();
+                book.rest(order(10, maker_side, better, 5)).unwrap();
+
+                let next_before = book.next_queue_priority();
+
+                let trades = book
+                    .execute_market_by_base(
+                        market(100, taker_side, 10),
+                        &[TradeId::new(501), TradeId::new(502), TradeId::new(503)],
+                    )
+                    .unwrap();
+
+                assert_eq!(trades.len(), 3);
+
+                assert_eq!(
+                    trades.iter().map(|t| t.maker_order_id).collect::<Vec<_>>(),
+                    vec![OrderId::new(30), OrderId::new(10), OrderId::new(20),]
+                );
+
+                assert_eq!(
+                    trades.iter().map(|t| t.price.get()).collect::<Vec<_>>(),
+                    vec![better, better, worse]
+                );
+
+                assert_eq!(
+                    trades.iter().map(|t| t.qty.get()).collect::<Vec<_>>(),
+                    vec![3, 5, 2]
+                );
+
+                assert_eq!(
+                    trades.iter().map(|t| t.trade_id).collect::<Vec<_>>(),
+                    vec![TradeId::new(501), TradeId::new(502), TradeId::new(503),]
+                );
+
+                for trade in &trades {
+                    assert_eq!(trade.maker_side, maker_side);
+                    assert_eq!(trade.taker_order_id, OrderId::new(100));
+                    assert!(trade.qty.get() > 0);
+                }
+
+                // 前两张 maker 完全成交。
+                assert!(book.order(OrderId::new(30)).is_none());
+                assert!(book.order(OrderId::new(10)).is_none());
+
+                // 最后一张 maker 部分成交。
+                let remaining = book.order(OrderId::new(20)).unwrap();
+                assert_eq!(remaining.remaining(), 2);
+                assert_eq!(remaining.original_order().qty.get(), 4);
+
+                // 更优价格档已被完全删除。
+                let maker_levels = match maker_side {
+                    Side::Buy => &book.bids,
+                    Side::Sell => &book.asks,
+                };
+
+                assert!(!maker_levels.contains_key(&Price::try_new(better).unwrap()));
+                assert_eq!(maker_levels.len(), 1);
+
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(book.next_queue_priority(), next_before);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_base_discards_remainder() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+
+                book.rest(order(1, maker_side, 100, 3)).unwrap();
+
+                let next_before = book.next_queue_priority();
+
+                // 需要 10，但盘口仅有 3。
+                let trades = book
+                    .execute_market_by_base(market(100, taker_side, 10), &[TradeId::new(600)])
+                    .unwrap();
+
+                assert_eq!(trades.len(), 1);
+                assert_eq!(trades[0].qty.get(), 3);
+
+                // Maker 完全成交，市价余量 7 不允许挂簿。
+                assert!(book.orders.is_empty());
+                assert!(book.bids.is_empty());
+                assert!(book.asks.is_empty());
+
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(book.next_queue_priority(), next_before);
+
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_base_duplicate_is_atomic() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    // 重复 ID 与 TradeId 不足同时成立。
+                    // DuplicateOrderId 必须优先返回。
+                    let result = book.execute_market_by_base(market(1, taker_side, 5), &[]);
+
+                    assert_eq!(result, Err(RejectReason::DuplicateOrderId));
+                });
+            }
+        }
+
+        #[test]
+        fn market_by_base_insufficient_trade_ids_is_atomic() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+
+                book.rest(order(30, maker_side, 105, 3)).unwrap();
+                book.rest(order(10, maker_side, 110, 7)).unwrap();
+
+                // 需要两笔成交，但只提供一个 TradeId。
+                assert_failure_atomic(&mut book, |book| {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = book.execute_market_by_base(
+                            market(100, taker_side, 10),
+                            &[TradeId::new(700)],
+                        );
+                    }));
+
+                    assert!(result.is_err());
+                });
+            }
+        }
+
+        #[test]
+        fn market_by_base_ignores_extra_trade_ids() {
+            let mut book = book();
+
+            book.rest(order(1, Side::Sell, 105, 10)).unwrap();
+
+            let next_before = book.next_queue_priority();
+
+            let trades = book
+                .execute_market_by_base(
+                    market(100, Side::Buy, 3),
+                    &[TradeId::new(800), TradeId::new(801), TradeId::new(802)],
+                )
+                .unwrap();
+
+            assert_eq!(trades.len(), 1);
+            assert_eq!(trades[0].trade_id, TradeId::new(800));
+            assert_eq!(trades[0].qty.get(), 3);
+
+            assert_eq!(book.order(OrderId::new(1)).unwrap().remaining(), 7);
+            assert_eq!(book.next_queue_priority(), next_before);
+            assert_eq!(validate_book(&book), Ok(()));
+        }
+
+        #[test]
+        fn market_by_base_works_with_exhausted_priority_allocator() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
+
+                // 消耗唯一一次允许的 QueuePriority 分配。
+                book.rest(order(1, maker_side, 100, 5)).unwrap();
+
+                assert!(book.queue_priority_allocator.is_exhausted());
+                assert_eq!(book.next_queue_priority(), 1);
+
+                let trades = book
+                    .execute_market_by_base(market(100, taker_side, 5), &[TradeId::new(900)])
+                    .unwrap();
+
+                assert_eq!(trades.len(), 1);
+                assert_eq!(trades[0].qty.get(), 5);
+                assert_eq!(trades[0].maker_order_id, OrderId::new(1));
+
+                assert!(book.orders.is_empty());
+                assert!(book.bids.is_empty());
+                assert!(book.asks.is_empty());
+
+                assert!(book.queue_priority_allocator.is_exhausted());
+                assert_eq!(book.next_queue_priority(), 1);
+
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn protected_market_by_base_preflight_price_fifo_and_boundary() {
+            let p = |value| Price::try_new(value).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            for (taker_side, maker_side, better, outside, farther) in [
+                (Side::Buy, Side::Sell, 90, 110, 120),
+                (Side::Sell, Side::Buy, 110, 90, 80),
+            ] {
+                let mut book = book();
+
+                // 插入顺序刻意不同于价格和 ID 顺序。
+                // 边界价 100：ID=40 必须先于 ID=10。
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+
+                let context = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_003),
+                    market_band_worst: Some(p(100)),
+                };
+
+                // 完整扫描：允许 better 和两个等于边界的 maker。
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(
+                            &market(100, taker_side, 20),
+                            &context,
+                            &math,
+                        ),
+                        Ok(vec![
+                            (OrderId::new(30), Qty::try_new(2).unwrap()),
+                            (OrderId::new(40), Qty::try_new(4).unwrap()),
+                            (OrderId::new(10), Qty::try_new(3).unwrap()),
+                        ])
+                    );
+                });
+
+                // 数量不足以耗尽第二张 maker：仍必须遵循同价 FIFO。
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(
+                            &market(101, taker_side, 5),
+                            &context,
+                            &math,
+                        ),
+                        Ok(vec![
+                            (OrderId::new(30), Qty::try_new(2).unwrap()),
+                            (OrderId::new(40), Qty::try_new(3).unwrap()),
+                        ])
+                    );
+                });
+            }
+        }
+        #[test]
+        fn protected_market_by_base_preflight_empty_outside_and_unbounded() {
+            let p = |value| Price::try_new(value).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            for (side, maker_side, better, outside, farther) in [
+                (Side::Buy, Side::Sell, 90, 110, 120),
+                (Side::Sell, Side::Buy, 110, 90, 80),
+            ] {
+                let mut book = book();
+
+                let bounded = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_003),
+                    market_band_worst: Some(p(100)),
+                };
+
+                // 空簿：零计划。
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(
+                            &market(100, side, 20),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(vec![])
+                    );
+                });
+
+                // 首档直接越界：不能跳过它寻找其他 maker。
+                book.rest(order(50, maker_side, outside, 1)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(
+                            &market(100, side, 20),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(vec![])
+                    );
+                });
+
+                // 再添加多档，其中有同价 FIFO。
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+
+                let unbounded = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_003),
+                    market_band_worst: None,
+                };
+
+                // 无 user/band：必须扫描全部五个 maker。
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(
+                            &market(100, side, 20),
+                            &unbounded,
+                            &math,
+                        ),
+                        Ok(vec![
+                            (OrderId::new(30), Qty::try_new(2).unwrap()),
+                            (OrderId::new(40), Qty::try_new(4).unwrap()),
+                            (OrderId::new(10), Qty::try_new(3).unwrap()),
+                            (OrderId::new(50), Qty::try_new(1).unwrap()),
+                            (OrderId::new(90), Qty::try_new(2).unwrap()),
+                        ])
+                    );
+                });
+            }
+        }
+        #[test]
+        fn protected_market_by_base_preflight_errors_are_atomic() {
+            let p = |value| Price::try_new(value).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+
+                book.rest(order(1, maker_side, 100_000, 5)).unwrap();
+
+                let context = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_003),
+                    market_band_worst: Some(p(100_000)),
+                };
+
+                // Duplicate 优先于非法 bps。
+                assert_failure_atomic(&mut book, |book| {
+                    let mut incoming = market(1, side, 5);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: Some(u32::MAX),
+                        worst_price: None,
+                    });
+
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(&incoming, &context, &math,),
+                        Err(RejectReason::DuplicateOrderId)
+                    );
+                });
+
+                // 非法 bps：固定 wire code 3007。
+                assert_failure_atomic(&mut book, |book| {
+                    let mut incoming = market(100, side, 5);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: Some(u32::MAX),
+                        worst_price: None,
+                    });
+
+                    assert!(matches!(
+                        book.preflight_market_by_base_with_protection(
+                            &incoming, &context, &math,
+                        ),
+                        Err(reason) if reason as u16 == 3007
+                    ));
+                });
+
+                // 显式 worst_price 未对齐 tick=10。
+                assert_failure_atomic(&mut book, |book| {
+                    let mut incoming = market(100, side, 5);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: None,
+                        worst_price: Some(p(100_003)),
+                    });
+
+                    assert_eq!(
+                        book.preflight_market_by_base_with_protection(&incoming, &context, &math,),
+                        Err(RejectReason::InvalidTick)
+                    );
+                });
+            }
+
+            // Buy 向上扩张滑点边界，超过 i64::MAX。
+            // 即使 market band 有效，也必须先传播算术错误。
+            let mut book = book();
+            book.rest(order(1, Side::Sell, 100_000, 5)).unwrap();
+
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: p(i64::MAX),
+                market_band_worst: Some(p(100_000)),
+            };
+
+            let mut incoming = market(100, Side::Buy, 5);
+            incoming.market_protection = Some(MarketProtection {
+                max_slippage_bps: Some(100),
+                worst_price: None,
+            });
+
+            assert_failure_atomic(&mut book, |book| {
+                assert_eq!(
+                    book.preflight_market_by_base_with_protection(&incoming, &context, &math,),
+                    Err(RejectReason::ArithmeticOverflow)
+                );
+            });
+        }
+        #[test]
+        fn protected_market_by_base_execution_orders_trades_then_trigger() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            let cases = [
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    100,
+                    110,
+                    ProtectionSource::User,
+                ),
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    110,
+                    100,
+                    ProtectionSource::MarketBand,
+                ),
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    100,
+                    100,
+                    ProtectionSource::Both,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    100,
+                    90,
+                    ProtectionSource::User,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    90,
+                    100,
+                    ProtectionSource::MarketBand,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    100,
+                    100,
+                    ProtectionSource::Both,
+                ),
+            ];
+
+            for (side, maker_side, better, outside, farther, user, band, source) in cases {
+                let mut book = book();
+
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+
+                let mut incoming = market(100, side, 20);
+                incoming.market_protection = Some(MarketProtection {
+                    max_slippage_bps: None,
+                    worst_price: Some(p(user)),
+                });
+
+                let context = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_000),
+                    market_band_worst: Some(p(band)),
+                };
+
+                let priority_before = book.next_queue_priority();
+
+                let events = book
+                    .execute_market_by_base_with_protection(
+                        incoming,
+                        &context,
+                        &math,
+                        &[TradeId::new(701), TradeId::new(702), TradeId::new(703)],
+                    )
+                    .unwrap();
+
+                let trade = |tid, maker_id, price, qty| {
+                    EngineEvent::Trade(TradeEvent {
+                        trade_id: TradeId::new(tid),
+                        maker_order_id: OrderId::new(maker_id),
+                        taker_order_id: OrderId::new(100),
+                        price: p(price),
+                        qty: Qty::try_new(qty).unwrap(),
+                        maker_side,
+                    })
+                };
+
+                assert_eq!(
+                    events,
+                    vec![
+                        trade(701, 30, better, 2),
+                        trade(702, 40, 100, 4),
+                        trade(703, 10, 100, 3),
+                        EngineEvent::MarketProtectionTriggered {
+                            order_id: OrderId::new(100),
+                            next_price: p(outside),
+                            effective_worst_price: p(100),
+                            source,
+                        },
+                    ]
+                );
+
+                // 已成交三张 maker 被移除，越界及更远 maker 保留。
+                for id in [30, 40, 10] {
+                    assert!(book.order(OrderId::new(id)).is_none());
+                }
+
+                assert_eq!(book.order(OrderId::new(50)).unwrap().remaining(), 1);
+                assert_eq!(book.order(OrderId::new(90)).unwrap().remaining(), 2);
+
+                assert_eq!(book.best_price(maker_side), Some(p(outside)));
+                assert_eq!(book.next_queue_priority(), priority_before);
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn protected_market_by_base_execution_equal_boundary_and_partial_maker() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            for (side, maker_side, outside) in
+                [(Side::Buy, Side::Sell, 110), (Side::Sell, Side::Buy, 90)]
+            {
+                for (taker_qty, triggered) in [(2, false), (3, true)] {
+                    let mut book = book();
+                    book.rest(order(1, maker_side, 100, 2)).unwrap();
+                    book.rest(order(2, maker_side, outside, 4)).unwrap();
+
+                    let mut incoming = market(100, side, taker_qty);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: None,
+                        worst_price: Some(p(100)),
+                    });
+                    let context = CommandStartProtectionContext {
+                        reference_price_at_command_start: p(100_000),
+                        market_band_worst: Some(p(100)),
+                    };
+                    let before_priority = book.next_queue_priority();
+                    let mut expected = vec![EngineEvent::Trade(TradeEvent {
+                        trade_id: TradeId::new(700),
+                        maker_order_id: OrderId::new(1),
+                        taker_order_id: OrderId::new(100),
+                        price: p(100),
+                        qty: Qty::try_new(2).unwrap(),
+                        maker_side,
+                    })];
+                    if triggered {
+                        expected.push(EngineEvent::MarketProtectionTriggered {
+                            order_id: OrderId::new(100),
+                            next_price: p(outside),
+                            effective_worst_price: p(100),
+                            source: ProtectionSource::Both,
+                        });
+                    }
+                    let actual = book
+                        .execute_market_by_base_with_protection(
+                            incoming,
+                            &context,
+                            &math,
+                            &[TradeId::new(700)],
+                        )
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                    assert!(book.order(OrderId::new(1)).is_none());
+                    assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 4);
+                    assert_eq!(book.next_queue_priority(), before_priority);
+                    assert!(!book.orders.contains_key(&OrderId::new(100)));
+                    assert_eq!(validate_book(&book), Ok(()));
+                }
+
+                // maker 严格部分成交：保留 slot、priority 和 FIFO 后继。
+                let mut book = book();
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+                book.rest(order(2, maker_side, outside, 4)).unwrap();
+                let slot = *book.orders.get(&OrderId::new(1)).unwrap();
+                let priority = book.order(OrderId::new(1)).unwrap().priority();
+                let next = book.next_queue_priority();
+                let context = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_000),
+                    market_band_worst: Some(p(100)),
+                };
+                let events = book
+                    .execute_market_by_base_with_protection(
+                        market(100, side, 3),
+                        &context,
+                        &math,
+                        &[TradeId::new(701)],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    events,
+                    vec![EngineEvent::Trade(TradeEvent {
+                        trade_id: TradeId::new(701),
+                        maker_order_id: OrderId::new(1),
+                        taker_order_id: OrderId::new(100),
+                        price: p(100),
+                        qty: Qty::try_new(3).unwrap(),
+                        maker_side,
+                    })]
+                );
+                let maker = book.order(OrderId::new(1)).unwrap();
+                assert_eq!(maker.remaining(), 7);
+                assert_eq!(maker.priority(), priority);
+                assert_eq!(book.orders.get(&OrderId::new(1)), Some(&slot));
+                assert_eq!(book.next_queue_priority(), next);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn protected_market_by_base_execution_empty_immediate_stop_and_unbounded() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            for (side, maker_side, better, outside, farther) in [
+                (Side::Buy, Side::Sell, 90, 110, 120),
+                (Side::Sell, Side::Buy, 110, 90, 80),
+            ] {
+                let mut book = book();
+                let bounded = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_000),
+                    market_band_worst: Some(p(100)),
+                };
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.execute_market_by_base_with_protection(
+                            market(100, side, 20),
+                            &bounded,
+                            &math,
+                            &[],
+                        ),
+                        Ok(vec![])
+                    );
+                });
+
+                // 首个 maker 越界时，仅产生保护事件、不消耗 TradeId。
+                book.rest(order(50, maker_side, outside, 1)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.execute_market_by_base_with_protection(
+                            market(100, side, 20),
+                            &bounded,
+                            &math,
+                            &[],
+                        ),
+                        Ok(vec![EngineEvent::MarketProtectionTriggered {
+                            order_id: OrderId::new(100),
+                            next_price: p(outside),
+                            effective_worst_price: p(100),
+                            source: ProtectionSource::MarketBand,
+                        }])
+                    );
+                });
+
+                // 没有任一保护候选时，扫完价格/FIFO 的完整前缀。
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+                let no_boundary = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_000),
+                    market_band_worst: None,
+                };
+                let before_priority = book.next_queue_priority();
+                let trade_ids = [
+                    TradeId::new(701),
+                    TradeId::new(702),
+                    TradeId::new(703),
+                    TradeId::new(704),
+                    TradeId::new(705),
+                    TradeId::new(706),
+                ];
+                let events = book
+                    .execute_market_by_base_with_protection(
+                        market(100, side, 20),
+                        &no_boundary,
+                        &math,
+                        &trade_ids,
+                    )
+                    .unwrap();
+                let expected_makers = [
+                    (30, better, 2),
+                    (40, 100, 4),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                    (90, farther, 2),
+                ];
+                let expected: Vec<_> = expected_makers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(maker_id, price, qty))| {
+                        EngineEvent::Trade(TradeEvent {
+                            trade_id: trade_ids[i],
+                            maker_order_id: OrderId::new(maker_id),
+                            taker_order_id: OrderId::new(100),
+                            price: p(price),
+                            qty: Qty::try_new(qty).unwrap(),
+                            maker_side,
+                        })
+                    })
+                    .collect();
+                assert_eq!(events, expected);
+                assert!(book.orders.is_empty());
+                assert!(book.bids.is_empty() && book.asks.is_empty());
+                assert_eq!(book.next_queue_priority(), before_priority);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn protected_market_by_base_execution_failures_are_atomic() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+                book.rest(order(1, maker_side, 100_000, 5)).unwrap();
+                let context = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_003),
+                    market_band_worst: Some(p(100_000)),
+                };
+
+                // Duplicate 的优先级高于非法 bps。
+                assert_failure_atomic(&mut book, |book| {
+                    let mut incoming = market(1, side, 5);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: Some(u32::MAX),
+                        worst_price: None,
+                    });
+                    assert_eq!(book.execute_market_by_base_with_protection(
+                        incoming, &context, &math, &[],
+                    ), Err(RejectReason::DuplicateOrderId));
+                });
+
+                assert_failure_atomic(&mut book, |book| {
+                    let mut incoming = market(100, side, 5);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: Some(u32::MAX),
+                        worst_price: None,
+                    });
+                    assert!(matches!(book.execute_market_by_base_with_protection(
+                        incoming, &context, &math, &[],
+                    ), Err(reason) if reason as u16 == 3007));
+                });
+
+                assert_failure_atomic(&mut book, |book| {
+                    let mut incoming = market(100, side, 5);
+                    incoming.market_protection = Some(MarketProtection {
+                        max_slippage_bps: None,
+                        worst_price: Some(p(100_003)),
+                    });
+                    assert_eq!(book.execute_market_by_base_with_protection(
+                        incoming, &context, &math, &[],
+                    ), Err(RejectReason::InvalidTick));
+                });
+
+                // 无保护：两张 maker 两笔成交，单个 TradeId 必须在修改前 panic。
+                book.rest(order(2, maker_side, 100_000, 5)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = book.execute_market_by_base_with_protection(
+                            market(100, side, 8),
+                            &context,
+                            &math,
+                            &[TradeId::new(700)],
+                        );
+                    }));
+                    assert!(result.is_err());
+                });
+            }
+
+            let mut book = book();
+            book.rest(order(1, Side::Sell, 100_000, 5)).unwrap();
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: p(i64::MAX),
+                market_band_worst: Some(p(100_000)),
+            };
+            let mut incoming = market(100, Side::Buy, 5);
+            incoming.market_protection = Some(MarketProtection {
+                max_slippage_bps: Some(100),
+                worst_price: None,
+            });
+            assert_failure_atomic(&mut book, |book| {
+                assert_eq!(
+                    book.execute_market_by_base_with_protection(incoming, &context, &math, &[],),
+                    Err(RejectReason::ArithmeticOverflow)
+                );
+            });
+        }
+
+        #[test]
+        fn protected_market_by_base_execution_ignores_priority_exhaustion() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
+                book.rest(order(1, maker_side, 100, 5)).unwrap();
+                assert!(book.queue_priority_allocator.is_exhausted());
+                let next = book.next_queue_priority();
+                let context = CommandStartProtectionContext {
+                    reference_price_at_command_start: p(100_000),
+                    market_band_worst: Some(p(100)),
+                };
+                let events = book
+                    .execute_market_by_base_with_protection(
+                        market(100, side, 5),
+                        &context,
+                        &math,
+                        &[TradeId::new(701)],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    events,
+                    vec![EngineEvent::Trade(TradeEvent {
+                        trade_id: TradeId::new(701),
+                        maker_order_id: OrderId::new(1),
+                        taker_order_id: OrderId::new(100),
+                        price: p(100),
+                        qty: Qty::try_new(5).unwrap(),
+                        maker_side,
+                    })]
+                );
+                assert_eq!(book.next_queue_priority(), next);
+                assert!(book.queue_priority_allocator.is_exhausted());
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+    }
+
+    mod market_by_quote_tests {
+        use super::*;
+        use matching_domain::{MarketByQuote, MarketProtection, QuoteBudget, UserId};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        fn market(id: u128, side: Side, budget: u128) -> MarketByQuote {
+            MarketByQuote {
+                order_id: OrderId::new(id),
+                user_id: UserId::new(id as u64),
+                side,
+                quote_budget: QuoteBudget::try_new(budget).unwrap(),
+                market_protection: None,
+            }
+        }
+
+        fn math() -> MarketMath {
+            MarketMath::try_new(0, 0, 0, 1, 1).unwrap()
+        }
+
+        fn book() -> ProductionOrderBook {
+            ProductionOrderBook::new(policy())
+        }
+
+        fn protected_math() -> MarketMath {
+            MarketMath::try_new(0, 0, 0, 10, 1).unwrap()
+        }
+
+        fn protection_context(band: Option<i64>) -> CommandStartProtectionContext {
+            CommandStartProtectionContext {
+                reference_price_at_command_start: Price::try_new(100_003).unwrap(),
+                market_band_worst: band.map(|v| Price::try_new(v).unwrap()),
+            }
+        }
+
+        fn expected_protected_quote_plan(
+            fills: &[(u128, i64, u64, u128)],
+            spent: u128,
+            unused: u128,
+            stop: Option<(i64, i64, ProtectionSource)>,
+        ) -> ProtectedMarketByQuotePlan {
+            let p = |v| Price::try_new(v).unwrap();
+
+            ProtectedMarketByQuotePlan {
+                fills: fills
+                    .iter()
+                    .map(|&(id, price, qty, notional)| QuoteFillPlan {
+                        maker_order_id: OrderId::new(id),
+                        maker_price: p(price),
+                        qty: Qty::try_new(qty).unwrap(),
+                        notional: QuoteAmount::new(notional),
+                    })
+                    .collect(),
+                spent_quote: QuoteAmount::new(spent),
+                unused_quote: QuoteAmount::new(unused),
+                stop: stop.map(|(next, worst, source)| ProtectionBoundaryStop {
+                    next_price: p(next),
+                    effective_worst_price: p(worst),
+                    source,
+                }),
+            }
+        }
+
+        // 对比全部 Production 内部状态，而不仅是 open orders。
+        fn assert_failure_atomic<F>(book: &mut ProductionOrderBook, action: F)
+        where
+            F: FnOnce(&mut ProductionOrderBook),
+        {
+            assert_eq!(validate_book(book), Ok(()));
+
+            let bids = level_snapshot(&book.bids);
+            let asks = level_snapshot(&book.asks);
+            let orders = book.orders.clone();
+            let arena = book.arena.test_snapshot();
+            let priority = book.next_queue_priority();
+            let policy = *book.queue_priority_allocator.policy();
+
+            action(book);
+
+            assert_eq!(level_snapshot(&book.bids), bids);
+            assert_eq!(level_snapshot(&book.asks), asks);
+            assert_eq!(book.orders, orders);
+            assert_eq!(book.arena.test_snapshot(), arena);
+            assert_eq!(book.next_queue_priority(), priority);
+            assert_eq!(book.queue_priority_allocator.policy(), &policy);
+
+            assert_eq!(validate_book(book), Ok(()));
+        }
+
+        #[test]
+        fn market_by_quote_empty_both_sides() {
+            for side in [Side::Buy, Side::Sell] {
+                let mut book = book();
+
+                assert_failure_atomic(&mut book, |book| {
+                    let result = book
+                        .execute_market_by_quote(market(100, side, 1000), &math(), &[])
+                        .unwrap();
+
+                    assert!(result.trades().is_empty());
+                    assert_eq!(result.spent_quote().get(), 0);
+                    assert_eq!(result.unused_quote().get(), 1000);
+                });
+            }
+        }
+
+        #[test]
+        fn market_by_quote_partial_both_sides() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+                book.rest(order(2, maker_side, 100, 5)).unwrap();
+
+                let index = *book.orders.get(&OrderId::new(1)).unwrap();
+                let priority = book.order(OrderId::new(1)).unwrap().priority();
+                let next = book.next_queue_priority();
+
+                let result = book
+                    .execute_market_by_quote(
+                        market(100, taker_side, 350),
+                        &math(),
+                        &[TradeId::new(500)],
+                    )
+                    .unwrap();
+
+                assert_eq!(result.trades().len(), 1);
+
+                let trade = &result.trades()[0];
+                assert_eq!(trade.trade_id, TradeId::new(500));
+                assert_eq!(trade.maker_order_id, OrderId::new(1));
+                assert_eq!(trade.taker_order_id, OrderId::new(100));
+                assert_eq!(trade.maker_side, maker_side);
+                assert_eq!(trade.price.get(), 100);
+                assert_eq!(trade.qty.get(), 3);
+
+                assert_eq!(result.spent_quote().get(), 300);
+                assert_eq!(result.unused_quote().get(), 50);
+
+                let maker = book.order(OrderId::new(1)).unwrap();
+                assert_eq!(maker.remaining(), 7);
+                assert_eq!(maker.priority(), priority);
+                assert_eq!(book.orders.get(&OrderId::new(1)), Some(&index));
+
+                assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 5);
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(book.next_queue_priority(), next);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_quote_multi_level_fifo_both_sides() {
+            for (taker_side, maker_side, worse, better) in [
+                (Side::Buy, Side::Sell, 110, 105),
+                (Side::Sell, Side::Buy, 90, 95),
+            ] {
+                let mut book = book();
+
+                book.rest(order(20, maker_side, worse, 4)).unwrap();
+                book.rest(order(30, maker_side, better, 3)).unwrap();
+                book.rest(order(10, maker_side, better, 5)).unwrap();
+
+                let next = book.next_queue_priority();
+
+                let result = book
+                    .execute_market_by_quote(
+                        market(100, taker_side, 2000),
+                        &math(),
+                        &[TradeId::new(501), TradeId::new(502), TradeId::new(503)],
+                    )
+                    .unwrap();
+
+                let trades = result.trades();
+
+                assert_eq!(
+                    trades.iter().map(|t| t.maker_order_id).collect::<Vec<_>>(),
+                    vec![OrderId::new(30), OrderId::new(10), OrderId::new(20)]
+                );
+
+                assert_eq!(
+                    trades.iter().map(|t| t.price.get()).collect::<Vec<_>>(),
+                    vec![better, better, worse]
+                );
+
+                assert_eq!(
+                    trades.iter().map(|t| t.qty.get()).collect::<Vec<_>>(),
+                    vec![3, 5, 4]
+                );
+
+                assert_eq!(
+                    trades.iter().map(|t| t.trade_id).collect::<Vec<_>>(),
+                    vec![TradeId::new(501), TradeId::new(502), TradeId::new(503),]
+                );
+
+                for trade in trades {
+                    assert_eq!(trade.maker_side, maker_side);
+                    assert_eq!(trade.taker_order_id, OrderId::new(100));
+                }
+
+                let spent = 8 * better as u128 + 4 * worse as u128;
+                assert_eq!(result.spent_quote().get(), spent);
+                assert_eq!(result.unused_quote().get(), 2000 - spent);
+
+                assert!(book.orders.is_empty());
+                assert!(book.bids.is_empty());
+                assert!(book.asks.is_empty());
+
+                assert_eq!(book.next_queue_priority(), next);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_quote_dust_both_sides() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    let result = book
+                        .execute_market_by_quote(market(100, taker_side, 99), &math(), &[])
+                        .unwrap();
+
+                    assert!(result.trades().is_empty());
+                    assert_eq!(result.spent_quote().get(), 0);
+                    assert_eq!(result.unused_quote().get(), 99);
+                });
+
+                let next = book.next_queue_priority();
+
+                // 先成交 3 lots，再因剩余 50 不足 1 lot 停止。
+                let result = book
+                    .execute_market_by_quote(
+                        market(101, taker_side, 350),
+                        &math(),
+                        &[TradeId::new(600)],
+                    )
+                    .unwrap();
+
+                assert_eq!(result.trades().len(), 1);
+                assert_eq!(result.trades()[0].qty.get(), 3);
+                assert_eq!(result.spent_quote().get(), 300);
+                assert_eq!(result.unused_quote().get(), 50);
+                assert_eq!(book.order(OrderId::new(1)).unwrap().remaining(), 7);
+
+                assert!(book.order(OrderId::new(101)).is_none());
+                assert_eq!(book.next_queue_priority(), next);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn market_by_quote_duplicate_and_math_error_are_atomic() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+                book.rest(order(1, maker_side, 6, 10)).unwrap();
+
+                let invalid_tick_math = MarketMath::try_new(0, 0, 0, 5, 1).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    assert!(matches!(
+                        book.execute_market_by_quote(
+                            market(1, taker_side, 1000),
+                            &invalid_tick_math,
+                            &[],
+                        ),
+                        Err(RejectReason::DuplicateOrderId)
+                    ));
+                });
+
+                assert_failure_atomic(&mut book, |book| {
+                    assert!(matches!(
+                        book.execute_market_by_quote(
+                            market(100, taker_side, 1000),
+                            &invalid_tick_math,
+                            &[TradeId::new(700)],
+                        ),
+                        Err(RejectReason::InvalidTick)
+                    ));
+                });
+            }
+        }
+
+        #[test]
+        fn market_by_quote_insufficient_trade_ids_is_atomic() {
+            for (taker_side, maker_side, better, worse) in [
+                (Side::Buy, Side::Sell, 105, 110),
+                (Side::Sell, Side::Buy, 95, 90),
+            ] {
+                let mut book = book();
+
+                book.rest(order(30, maker_side, better, 3)).unwrap();
+                book.rest(order(10, maker_side, worse, 5)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = book.execute_market_by_quote(
+                            market(100, taker_side, 2000),
+                            &math(),
+                            &[TradeId::new(800)],
+                        );
+                    }));
+
+                    assert!(result.is_err());
+                });
+            }
+        }
+
+        #[test]
+        fn market_by_quote_priority_exhaustion_does_not_block_execution() {
+            for (taker_side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
+
+                book.rest(order(1, maker_side, 100, 5)).unwrap();
+
+                assert!(book.queue_priority_allocator.is_exhausted());
+                let next = book.next_queue_priority();
+
+                let result = book
+                    .execute_market_by_quote(
+                        market(100, taker_side, 500),
+                        &math(),
+                        &[TradeId::new(900)],
+                    )
+                    .unwrap();
+
+                assert_eq!(result.trades().len(), 1);
+                assert_eq!(result.trades()[0].qty.get(), 5);
+                assert_eq!(result.spent_quote().get(), 500);
+                assert_eq!(result.unused_quote().get(), 0);
+
+                assert!(book.orders.is_empty());
+                assert!(book.bids.is_empty());
+                assert!(book.asks.is_empty());
+
+                assert_eq!(book.next_queue_priority(), next);
+                assert!(book.queue_priority_allocator.is_exhausted());
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+        fn assert_protected_quote_rejected(
+            book: &mut ProductionOrderBook,
+            incoming: MarketByQuote,
+            context: CommandStartProtectionContext,
+            math: &MarketMath,
+            expected: RejectReason,
+        ) {
+            assert_failure_atomic(book, |book| {
+                assert_eq!(
+                    book.preflight_market_by_quote_with_protection(&incoming, &context, math,),
+                    Err(expected)
+                );
+            });
+        }
+        #[test]
+        fn protected_quote_preflight_rejections_are_atomic() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = protected_math();
+
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100_000, 5)).unwrap();
+
+                let invalid_bps = MarketProtection {
+                    max_slippage_bps: Some(u32::MAX),
+                    worst_price: None,
+                };
+
+                // Duplicate 必须优先于非法 bps。
+                let mut incoming = market(1, side, 1000);
+                incoming.market_protection = Some(invalid_bps.clone());
+
+                assert_protected_quote_rejected(
+                    &mut book,
+                    incoming,
+                    protection_context(Some(100_000)),
+                    &math,
+                    RejectReason::DuplicateOrderId,
+                );
+
+                // ID 不重复，应返回 3007。
+                let mut incoming = market(100, side, 1000);
+                incoming.market_protection = Some(invalid_bps);
+
+                assert_protected_quote_rejected(
+                    &mut book,
+                    incoming,
+                    protection_context(Some(100_000)),
+                    &math,
+                    RejectReason::InvalidSlippageBps,
+                );
+
+                // 显式保护价格未对齐 tick=10。
+                let mut incoming = market(100, side, 1000);
+                incoming.market_protection = Some(MarketProtection {
+                    max_slippage_bps: None,
+                    worst_price: Some(p(100_003)),
+                });
+
+                assert_protected_quote_rejected(
+                    &mut book,
+                    incoming,
+                    protection_context(Some(100_000)),
+                    &math,
+                    RejectReason::InvalidTick,
+                );
+            }
+
+            // 保护边界计算溢出。
+            let mut book = ProductionOrderBook::new(policy());
+            book.rest(order(1, Side::Sell, 100_000, 5)).unwrap();
+
+            let mut incoming = market(100, Side::Buy, 1000);
+            incoming.market_protection = Some(MarketProtection {
+                max_slippage_bps: Some(100),
+                worst_price: None,
+            });
+
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: p(i64::MAX),
+                market_band_worst: Some(p(100_000)),
+            };
+
+            assert_protected_quote_rejected(
+                &mut book,
+                incoming,
+                context,
+                &math,
+                RejectReason::ArithmeticOverflow,
+            );
+
+            // 前序 fill 已规划成功，后续 maker 的 tick 错误
+            // 不得导致部分 mutation。
+            for (side, maker_side, better) in
+                [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
+            {
+                let mut book = ProductionOrderBook::new(policy());
+
+                book.rest(order(1, maker_side, better, 1)).unwrap();
+                book.rest(order(2, maker_side, 101, 5)).unwrap();
+
+                assert_protected_quote_rejected(
+                    &mut book,
+                    market(100, side, 2000),
+                    protection_context(None),
+                    &math,
+                    RejectReason::InvalidTick,
+                );
+            }
+        }
+        #[test]
+        fn protected_quote_preflight_multilevel_fifo_and_sources() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = protected_math();
+
+            let cases = [
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    100,
+                    110,
+                    ProtectionSource::User,
+                ),
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    110,
+                    100,
+                    ProtectionSource::MarketBand,
+                ),
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    100,
+                    100,
+                    ProtectionSource::Both,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    100,
+                    90,
+                    ProtectionSource::User,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    90,
+                    100,
+                    ProtectionSource::MarketBand,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    100,
+                    100,
+                    ProtectionSource::Both,
+                ),
+            ];
+
+            for (side, maker_side, better, outside, farther, user, band, source) in cases {
+                let mut book = ProductionOrderBook::new(policy());
+
+                // ID 数值顺序故意不同于 FIFO。
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+
+                let mut incoming = market(100, side, 2000);
+                incoming.market_protection = Some(MarketProtection {
+                    max_slippage_bps: None,
+                    worst_price: Some(p(user)),
+                });
+
+                let spent = if side == Side::Buy { 880 } else { 920 };
+
+                let expected = expected_protected_quote_plan(
+                    &[
+                        (30, better, 2, (2 * better) as u128),
+                        (40, 100, 4, 400),
+                        (10, 100, 3, 300),
+                    ],
+                    spent,
+                    2000 - spent,
+                    Some((outside, 100, source)),
+                );
+
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &incoming,
+                            &protection_context(Some(band)),
+                            &math,
+                        ),
+                        Ok(expected)
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn protected_quote_preflight_boundary_dust_and_unbounded() {
+            let math = protected_math();
+
+            for (side, maker_side, better, outside, farther, full_spent) in [
+                (Side::Buy, Side::Sell, 90, 110, 120, 1230u128),
+                (Side::Sell, Side::Buy, 110, 90, 80, 1170u128),
+            ] {
+                let bounded = protection_context(Some(100));
+
+                // 空簿，不生成 stop，预算全部 unused。
+                let mut book = book();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 1000),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(&[], 0, 1000, None)),
+                    );
+                });
+
+                // 首档越界：即使预算不足一个 lot，仍优先触发保护。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, outside, 5)).unwrap();
+                book.rest(order(2, maker_side, farther, 5)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 1),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[],
+                            0,
+                            1,
+                            Some((outside, 100, ProtectionSource::MarketBand)),
+                        )),
+                    );
+                });
+
+                // 边界相等可成交；预算恰好耗尽后不能再探测越界档。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 2)).unwrap();
+                book.rest(order(2, maker_side, outside, 5)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 200),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[(1, 100, 2, 200)],
+                            200,
+                            0,
+                            None,
+                        )),
+                    );
+                });
+
+                // 首档在保护范围内，余额不足 1 lot，正常 dust，无 trigger。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 5)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 99),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(&[], 0, 99, None)),
+                    );
+                });
+
+                // Maker 部分成交：只规划 3 lots，余 50 quote，原簿只读不变。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 350),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[(1, 100, 3, 300)],
+                            300,
+                            50,
+                            None,
+                        )),
+                    );
+                });
+
+                // 前序成交之后的 dust：下一 maker 在保护范围内，无 stop。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, better, 1)).unwrap();
+                book.rest(order(2, maker_side, 100, 5)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, better as u128 + 5),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[(1, better, 1, better as u128)],
+                            better as u128,
+                            5,
+                            None,
+                        )),
+                    );
+                });
+
+                // 前序成交后仅余 5 quote：越界优先于 dust。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, better, 1)).unwrap();
+                book.rest(order(2, maker_side, outside, 5)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, better as u128 + 5),
+                            &bounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[(1, better, 1, better as u128)],
+                            better as u128,
+                            5,
+                            Some((outside, 100, ProtectionSource::MarketBand)),
+                        )),
+                    );
+                });
+
+                // 无用户保护、无 band，按 BTreeMap + FIFO 扫完五个 maker。
+                let mut book = ProductionOrderBook::new(policy());
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+                let unbounded = protection_context(None);
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 2000),
+                            &unbounded,
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[
+                                (30, better, 2, (2 * better) as u128),
+                                (40, 100, 4, 400),
+                                (10, 100, 3, 300),
+                                (50, outside, 1, outside as u128),
+                                (90, farther, 2, (2 * farther) as u128),
+                            ],
+                            full_spent,
+                            2000 - full_spent,
+                            None,
+                        )),
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn protected_quote_preflight_outside_price_skips_invalid_tick() {
+            let math = protected_math();
+            for (side, maker_side, outside) in
+                [(Side::Buy, Side::Sell, 111), (Side::Sell, Side::Buy, 99)]
+            {
+                let mut book = book();
+                // 价格不满足 tick=10，但已越界，必须先 stop 而非报数学错误。
+                book.rest(order(1, maker_side, outside, 2)).unwrap();
+                assert_failure_atomic(&mut book, |book| {
+                    assert_eq!(
+                        book.preflight_market_by_quote_with_protection(
+                            &market(100, side, 1),
+                            &protection_context(Some(100)),
+                            &math,
+                        ),
+                        Ok(expected_protected_quote_plan(
+                            &[],
+                            0,
+                            1,
+                            Some((outside, 100, ProtectionSource::MarketBand)),
+                        )),
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn protected_quote_preflight_invalid_lot_is_atomic() {
+            let math = MarketMath::try_new(0, 0, 0, 1, 10).unwrap();
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = book();
+                book.rest(order(1, maker_side, 100, 11)).unwrap();
+                assert_protected_quote_rejected(
+                    &mut book,
+                    market(100, side, 2000),
+                    protection_context(None),
+                    &math,
+                    RejectReason::InvalidLot,
+                );
+            }
+        }
+
+        fn protected_quote_trade(
+            tid: u128,
+            maker_id: u128,
+            price: i64,
+            qty: u64,
+            maker_side: Side,
+        ) -> EngineEvent {
+            EngineEvent::Trade(TradeEvent {
+                trade_id: TradeId::new(tid),
+                maker_order_id: OrderId::new(maker_id),
+                taker_order_id: OrderId::new(100),
+                price: Price::try_new(price).unwrap(),
+                qty: Qty::try_new(qty).unwrap(),
+                maker_side,
+            })
+        }
+        #[test]
+        fn protected_quote_execution_multilevel_sources() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = protected_math();
+
+            let cases = [
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    100,
+                    110,
+                    ProtectionSource::User,
+                ),
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    110,
+                    100,
+                    ProtectionSource::MarketBand,
+                ),
+                (
+                    Side::Buy,
+                    Side::Sell,
+                    90,
+                    110,
+                    120,
+                    100,
+                    100,
+                    ProtectionSource::Both,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    100,
+                    90,
+                    ProtectionSource::User,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    90,
+                    100,
+                    ProtectionSource::MarketBand,
+                ),
+                (
+                    Side::Sell,
+                    Side::Buy,
+                    110,
+                    90,
+                    80,
+                    100,
+                    100,
+                    ProtectionSource::Both,
+                ),
+            ];
+
+            for (side, maker_side, better, outside, farther, user, band, source) in cases {
+                let mut book = ProductionOrderBook::new(policy());
+
+                // 挂单源顺序故意与价格优先和 FIFO 顺序不同。
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+
+                let mut incoming = market(100, side, 2000);
+                incoming.market_protection = Some(MarketProtection {
+                    max_slippage_bps: None,
+                    worst_price: Some(p(user)),
+                });
+
+                let priority_before = book.next_queue_priority();
+
+                let actual = book
+                    .execute_market_by_quote_with_protection(
+                        incoming,
+                        &protection_context(Some(band)),
+                        &math,
+                        &[TradeId::new(701), TradeId::new(702), TradeId::new(703)],
+                    )
+                    .unwrap();
+
+                let spent = if side == Side::Buy { 880 } else { 920 };
+
+                let expected = ProtectedMarketByQuoteExecution::new(
+                    vec![
+                        protected_quote_trade(701, 30, better, 2, maker_side),
+                        protected_quote_trade(702, 40, 100, 4, maker_side),
+                        protected_quote_trade(703, 10, 100, 3, maker_side),
+                        EngineEvent::MarketProtectionTriggered {
+                            order_id: OrderId::new(100),
+                            next_price: p(outside),
+                            effective_worst_price: p(100),
+                            source,
+                        },
+                    ],
+                    QuoteAmount::new(spent),
+                    QuoteAmount::new(2000 - spent),
+                );
+
+                // 完整事件原序和金额比较。
+                assert_eq!(actual, expected);
+
+                // 已成交 maker 删除。
+                for id in [30, 40, 10] {
+                    assert!(book.order(OrderId::new(id)).is_none());
+                }
+
+                // 越界 maker 和更远 maker 均未改变。
+                assert_eq!(book.order(OrderId::new(50)).unwrap().remaining(), 1);
+                assert_eq!(book.order(OrderId::new(90)).unwrap().remaining(), 2);
+
+                assert_eq!(book.best_price(maker_side), Some(p(outside)));
+                assert_eq!(book.next_queue_priority(), priority_before);
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+        #[test]
+        fn protected_quote_execution_boundary_and_dust() {
+            let p = |v| Price::try_new(v).unwrap();
+            let math = protected_math();
+
+            for (side, maker_side, outside) in
+                [(Side::Buy, Side::Sell, 110), (Side::Sell, Side::Buy, 90)]
+            {
+                let context = protection_context(Some(100));
+
+                // 空簿：预算全部 unused。
+                let mut book = ProductionOrderBook::new(policy());
+
+                assert_failure_atomic(&mut book, |book| {
+                    let actual = book
+                        .execute_market_by_quote_with_protection(
+                            market(100, side, 1000),
+                            &context,
+                            &math,
+                            &[],
+                        )
+                        .unwrap();
+
+                    assert_eq!(
+                        actual,
+                        ProtectedMarketByQuoteExecution::new(
+                            vec![],
+                            QuoteAmount::new(0),
+                            QuoteAmount::new(1000),
+                        )
+                    );
+                });
+
+                // 首档越界，即使预算不足一 lot，仍先触发保护。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, outside, 5)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    let actual = book
+                        .execute_market_by_quote_with_protection(
+                            market(100, side, 1),
+                            &context,
+                            &math,
+                            &[],
+                        )
+                        .unwrap();
+
+                    assert_eq!(
+                        actual,
+                        ProtectedMarketByQuoteExecution::new(
+                            vec![EngineEvent::MarketProtectionTriggered {
+                                order_id: OrderId::new(100),
+                                next_price: p(outside),
+                                effective_worst_price: p(100),
+                                source: ProtectionSource::MarketBand,
+                            }],
+                            QuoteAmount::new(0),
+                            QuoteAmount::new(1),
+                        )
+                    );
+                });
+
+                // 边界相等可成交；预算恰好耗尽，不产生 trigger。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 2)).unwrap();
+                book.rest(order(2, maker_side, outside, 4)).unwrap();
+
+                let actual = book
+                    .execute_market_by_quote_with_protection(
+                        market(100, side, 200),
+                        &context,
+                        &math,
+                        &[TradeId::new(700)],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    actual,
+                    ProtectedMarketByQuoteExecution::new(
+                        vec![protected_quote_trade(700, 1, 100, 2, maker_side)],
+                        QuoteAmount::new(200),
+                        QuoteAmount::new(0),
+                    )
+                );
+                assert!(book.order(OrderId::new(1)).is_none());
+                assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 4);
+                assert_eq!(validate_book(&book), Ok(()));
+
+                // 部分 maker 成交，保留原 Arena slot 和 priority。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 10)).unwrap();
+
+                let slot_before = *book.orders.get(&OrderId::new(1)).unwrap();
+                let priority_before = book.order(OrderId::new(1)).unwrap().priority();
+                let next_before = book.next_queue_priority();
+
+                let actual = book
+                    .execute_market_by_quote_with_protection(
+                        market(100, side, 350),
+                        &context,
+                        &math,
+                        &[TradeId::new(701)],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    actual,
+                    ProtectedMarketByQuoteExecution::new(
+                        vec![protected_quote_trade(701, 1, 100, 3, maker_side)],
+                        QuoteAmount::new(300),
+                        QuoteAmount::new(50),
+                    )
+                );
+                assert_eq!(book.orders.get(&OrderId::new(1)), Some(&slot_before));
+                assert_eq!(book.order(OrderId::new(1)).unwrap().remaining(), 7);
+                assert_eq!(
+                    book.order(OrderId::new(1)).unwrap().priority(),
+                    priority_before,
+                );
+                assert_eq!(book.next_queue_priority(), next_before);
+                assert_eq!(validate_book(&book), Ok(()));
+
+                // 首档在保护内，但预算不足一 lot：dust，无事件。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 5)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    let actual = book
+                        .execute_market_by_quote_with_protection(
+                            market(100, side, 99),
+                            &context,
+                            &math,
+                            &[],
+                        )
+                        .unwrap();
+
+                    assert_eq!(
+                        actual,
+                        ProtectedMarketByQuoteExecution::new(
+                            vec![],
+                            QuoteAmount::new(0),
+                            QuoteAmount::new(99),
+                        )
+                    );
+                });
+
+                // 成交后剩 5 quote，下一档越界：
+                // 保护必须先于 dust，且 trigger 不需要第二个 TradeId。
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 2)).unwrap();
+                book.rest(order(2, maker_side, outside, 4)).unwrap();
+
+                let actual = book
+                    .execute_market_by_quote_with_protection(
+                        market(100, side, 205),
+                        &context,
+                        &math,
+                        &[TradeId::new(702)],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    actual,
+                    ProtectedMarketByQuoteExecution::new(
+                        vec![
+                            protected_quote_trade(702, 1, 100, 2, maker_side),
+                            EngineEvent::MarketProtectionTriggered {
+                                order_id: OrderId::new(100),
+                                next_price: p(outside),
+                                effective_worst_price: p(100),
+                                source: ProtectionSource::MarketBand,
+                            },
+                        ],
+                        QuoteAmount::new(200),
+                        QuoteAmount::new(5),
+                    )
+                );
+                assert!(book.order(OrderId::new(1)).is_none());
+                assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 4);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+        #[test]
+        fn protected_quote_execution_without_boundary_scans_all() {
+            let math = protected_math();
+
+            for (side, maker_side, better, outside, farther, spent) in [
+                (Side::Buy, Side::Sell, 90, 110, 120, 1230),
+                (Side::Sell, Side::Buy, 110, 90, 80, 1170),
+            ] {
+                let mut book = ProductionOrderBook::new(policy());
+
+                for (id, price, qty) in [
+                    (90, farther, 2),
+                    (40, 100, 4),
+                    (30, better, 2),
+                    (10, 100, 3),
+                    (50, outside, 1),
+                ] {
+                    book.rest(order(id, maker_side, price, qty)).unwrap();
+                }
+
+                let priority_before = book.next_queue_priority();
+
+                let ids = [
+                    TradeId::new(701),
+                    TradeId::new(702),
+                    TradeId::new(703),
+                    TradeId::new(704),
+                    TradeId::new(705),
+                ];
+
+                let actual = book
+                    .execute_market_by_quote_with_protection(
+                        market(100, side, 2000),
+                        &protection_context(None),
+                        &math,
+                        &ids,
+                    )
+                    .unwrap();
+
+                let expected = ProtectedMarketByQuoteExecution::new(
+                    vec![
+                        protected_quote_trade(701, 30, better, 2, maker_side),
+                        protected_quote_trade(702, 40, 100, 4, maker_side),
+                        protected_quote_trade(703, 10, 100, 3, maker_side),
+                        protected_quote_trade(704, 50, outside, 1, maker_side),
+                        protected_quote_trade(705, 90, farther, 2, maker_side),
+                    ],
+                    QuoteAmount::new(spent),
+                    QuoteAmount::new(2000 - spent),
+                );
+
+                assert_eq!(actual, expected);
+                assert!(book.orders.is_empty());
+                assert!(book.bids.is_empty());
+                assert!(book.asks.is_empty());
+                assert_eq!(book.next_queue_priority(), priority_before);
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+        #[test]
+        fn protected_quote_execution_insufficient_ids_is_atomic() {
+            let math = protected_math();
+
+            for (side, maker_side, better) in
+                [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
+            {
+                let mut book = ProductionOrderBook::new(policy());
+
+                book.rest(order(1, maker_side, better, 2)).unwrap();
+                book.rest(order(2, maker_side, 100, 3)).unwrap();
+
+                assert_failure_atomic(&mut book, |book| {
+                    // 预检得到 2 笔 Trade，但只提供一个 TradeId。
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = book.execute_market_by_quote_with_protection(
+                            market(100, side, 2000),
+                            &protection_context(Some(100)),
+                            &math,
+                            &[TradeId::new(700)],
+                        );
+                    }));
+
+                    assert!(result.is_err());
+                });
+            }
+        }
+
+        // 公共执行入口的业务拒绝必须在任何 BTreeMap/Arena/ID/priority 改动之前发生。
+        fn assert_protected_quote_execution_rejected(
+            book: &mut ProductionOrderBook,
+            incoming: MarketByQuote,
+            context: &CommandStartProtectionContext,
+            math: &MarketMath,
+            expected: RejectReason,
+        ) {
+            assert_failure_atomic(book, |book| {
+                assert_eq!(
+                    book.execute_market_by_quote_with_protection(incoming, context, math, &[],),
+                    Err(expected),
+                );
+            });
+        }
+
+        #[test]
+        fn protected_quote_execution_rejections_are_atomic() {
+            let p = |value| Price::try_new(value).unwrap();
+            let math = protected_math();
+
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100_000, 5)).unwrap();
+                let context = protection_context(Some(100_000));
+                let invalid_bps = MarketProtection {
+                    max_slippage_bps: Some(u32::MAX),
+                    worst_price: None,
+                };
+
+                // Duplicate 优先于非法 bps；taker ID 必须确实等于 maker ID。
+                let mut incoming = market(1, side, 1000);
+                incoming.market_protection = Some(invalid_bps.clone());
+                assert_protected_quote_execution_rejected(
+                    &mut book,
+                    incoming,
+                    &context,
+                    &math,
+                    RejectReason::DuplicateOrderId,
+                );
+
+                // 不重复的 ID=100：返回稳定 3007，而非 Duplicate。
+                let mut incoming = market(100, side, 1000);
+                incoming.market_protection = Some(invalid_bps);
+                assert_protected_quote_execution_rejected(
+                    &mut book,
+                    incoming,
+                    &context,
+                    &math,
+                    RejectReason::InvalidSlippageBps,
+                );
+                assert_eq!(RejectReason::InvalidSlippageBps as u16, 3007);
+
+                // 显式用户 worst_price 不满足 tick=10。
+                let mut incoming = market(100, side, 1000);
+                incoming.market_protection = Some(MarketProtection {
+                    max_slippage_bps: None,
+                    worst_price: Some(p(100_003)),
+                });
+                assert_protected_quote_execution_rejected(
+                    &mut book,
+                    incoming,
+                    &context,
+                    &math,
+                    RejectReason::InvalidTick,
+                );
+            }
+
+            // Buy 的滑点价格向上扩张溢出，即使 band 有效也不能提交。
+            let mut book = ProductionOrderBook::new(policy());
+            book.rest(order(1, Side::Sell, 100_000, 5)).unwrap();
+            let mut incoming = market(100, Side::Buy, 1000);
+            incoming.market_protection = Some(MarketProtection {
+                max_slippage_bps: Some(100),
+                worst_price: None,
+            });
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: p(i64::MAX),
+                market_band_worst: Some(p(100_000)),
+            };
+            assert_protected_quote_execution_rejected(
+                &mut book,
+                incoming,
+                &context,
+                &math,
+                RejectReason::ArithmeticOverflow,
+            );
+
+            // 进入 MarketMath 后的 lot 错误仍保持完整状态不变。
+            let lot_math = MarketMath::try_new(0, 0, 0, 1, 10).unwrap();
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, 100, 11)).unwrap();
+                assert_protected_quote_execution_rejected(
+                    &mut book,
+                    market(100, side, 2000),
+                    &protection_context(None),
+                    &lot_math,
+                    RejectReason::InvalidLot,
+                );
+            }
+
+            // 第一个 maker 已被纳入只读计划，第二个 maker 的 tick 错误：
+            // 整个执行入口必须拒绝且不可提前提交第一笔成交。
+            for (side, maker_side, better) in
+                [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
+            {
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, better, 1)).unwrap();
+                book.rest(order(2, maker_side, 101, 5)).unwrap();
+                assert_protected_quote_execution_rejected(
+                    &mut book,
+                    market(100, side, 2000),
+                    &protection_context(None),
+                    &math,
+                    RejectReason::InvalidTick,
+                );
+            }
+        }
+
+        #[test]
+        fn protected_quote_execution_dust_after_trade_does_not_trigger() {
+            let math = protected_math();
+
+            for (side, maker_side, better) in
+                [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
+            {
+                let mut book = ProductionOrderBook::new(policy());
+                book.rest(order(1, maker_side, better, 1)).unwrap();
+                book.rest(order(2, maker_side, 100, 5)).unwrap();
+                let priority_before = book.next_queue_priority();
+                let second_slot = *book.orders.get(&OrderId::new(2)).unwrap();
+
+                let result = book
+                    .execute_market_by_quote_with_protection(
+                        market(100, side, better as u128 + 5),
+                        &protection_context(Some(100)),
+                        &math,
+                        &[TradeId::new(700)],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    result,
+                    ProtectedMarketByQuoteExecution::new(
+                        vec![protected_quote_trade(700, 1, better, 1, maker_side)],
+                        QuoteAmount::new(better as u128),
+                        QuoteAmount::new(5),
+                    ),
+                );
+                assert!(book.order(OrderId::new(1)).is_none());
+                assert_eq!(book.orders.get(&OrderId::new(2)), Some(&second_slot));
+                assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 5);
+                assert_eq!(book.next_queue_priority(), priority_before);
+                assert!(book.order(OrderId::new(100)).is_none());
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
+
+        #[test]
+        fn protected_quote_execution_ignores_priority_exhaustion() {
+            let math = protected_math();
+
+            for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
+                let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
+                book.rest(order(1, maker_side, 100, 5)).unwrap();
+                assert!(book.queue_priority_allocator.is_exhausted());
+                let next_before = book.next_queue_priority();
+
+                let result = book
+                    .execute_market_by_quote_with_protection(
+                        market(100, side, 500),
+                        &protection_context(None),
+                        &math,
+                        &[TradeId::new(701)],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    result,
+                    ProtectedMarketByQuoteExecution::new(
+                        vec![protected_quote_trade(701, 1, 100, 5, maker_side)],
+                        QuoteAmount::new(500),
+                        QuoteAmount::new(0),
+                    ),
+                );
+                assert!(book.orders.is_empty());
+                assert_eq!(book.next_queue_priority(), next_before);
+                assert!(book.queue_priority_allocator.is_exhausted());
+                assert_eq!(validate_book(&book), Ok(()));
+            }
+        }
     }
 }

@@ -4,11 +4,13 @@
 
 ## 当前状态
 
-当前已验收 **T00–T05**，包括 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel 行为，以及 Reference/Production differential/invariant gate；T03 提交为 `f96e81b`，T04 提交为 `c860543`。T05 启动文档基线为 `d5090d2`，本地最终证据为 21 项 differential（含固定 seed 单条 100k 与两组固定 seed 双次 10k 流式回放）、229 项 orderbook 单测、workspace 299 项单测与 2 项 doctest，以及 fmt、严格 Clippy、两类 diff 检查全部通过；未查询新的远端 CI。导师模式保持；进入下一任务仍需用户明确授权，小步进度以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
+当前已验收 **T00–T06**，并继续采用导师模式。已完成 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel 行为，以及 Reference/Production differential/invariant gate；T03 提交为 `f96e81b`，T04 为 `c860543`，T05 提交及 T06 启动基线为 `e752fdb`。T05 本地最终证据为 21 项 differential（含固定 seed 单条 100k 与两组固定 seed 双次 10k 流式回放）、229 项 orderbook 单测、workspace 299 项单测与 2 项 doctest，以及 fmt、严格 Clippy、两类 diff 检查全部通过；未查询新的远端 CI。T06 已本地验收严格正 QuoteBudget、MarketMath 的配置/精确本金/预算反推边界、两种无价格市价输入、Reference/Production 的 MarketByBase 与 MarketByQuote 立即成交、预算守恒/dust、固定差分与属性测试，以及命令开始固定保护 reference、bps/显式价格/market-band 边界、保护事件和跨模型差分。最终 T06 本地证据为固定 seed 100k 流式差分、workspace 139 个 domain 测试、316 个 orderbook 测试、2 个 doctest 与 fmt、严格 Clippy、两类 diff 检查全部通过。reservation/fee/settlement 资金闭环仍未实现。数值规格已明确独立 quote_scale、配置验证与本金精确不取整，详见 v6 §6.5/§13/§46.1；小步进度以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
 
 当前已建立包含六个 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。matching-domain 已有领域类型、QueuePriority 与基础错误模型；matching-orderbook 已有 ReferenceOrder、IncomingOrder、ReferenceOrderBook 的挂单、双向成交、Cancel 和 TradeEvent，T02 提交为 `161abf7`；其余四库仍为职责注释骨架。orderbook 的运行依赖只有本地 domain，测试依赖为 proptest 1.11.0。CI 的 T00 提交已有远端成功证据，本轮只核验本地 gate，未查询新的远端 CI。
 
 本说明中的撮合、持久化和多分片能力均为规划目标，不代表当前已经实现或经过生产验证。已完成事项与实际验证结果以 [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md) 中的证据为准。
+
+价格、数量、名义额与预算反推的冻结公式见 [数值计算公式](docs/numerical_formulas.md)。
 
 ## 项目范围
 
@@ -16,7 +18,7 @@
 
 账户中心、充值提现、KYC、财务总账、清结算数据库和 Web 前端不属于撮合核心。核心与外围资金、订单、行情和清算系统的集成协议，以及参考风控/资金实现，按规格对应阶段推进。
 
-T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。该 API 不自动 rest incoming 余量，尚无完整生命周期事件/命令协议。T03 已完成 OrderIndex、OrderArena slot/free-list、PriceLevel 双向 FIFO 与 QueuePriority/high-water 不变量。T04 已组合生产簿的双侧价格索引和订单 ID 索引，完成 Limit GTC/Cancel、余量挂单及 mutation 后不变量；T05 已用独立 Reference 适配、逐命令差分和固定 seed 100k 流式回放验收这一行为等价门。Market/IOC/FOK 等 P3 订单规则、runtime、Gateway、HA 和 MarketData 均不属于当前范围。
+T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。该 API 不自动 rest incoming 余量，尚无完整生命周期事件/命令协议。T03 已完成 OrderIndex、OrderArena slot/free-list、PriceLevel 双向 FIFO 与 QueuePriority/high-water 不变量。T04 已组合生产簿的双侧价格索引和订单 ID 索引，完成 Limit GTC/Cancel、余量挂单及 mutation 后不变量；T05 已用独立 Reference 适配、逐命令差分和固定 seed 100k 流式回放验收这一行为等价门。T06 已完成 MarketByBase/MarketByQuote 的不挂单语义、checked 金额换算、quote dust 终止、固定保护 reference 与保护终结事件；预算不含手续费，reservation 只预留接口边界。独立 Limit IOC/FOK/PostOnly/Iceberg/Stop、runtime、Gateway、HA 和 MarketData 仍属于后续范围。
 
 ## Crate 边界
 
@@ -68,6 +70,7 @@ cargo test --workspace
 - [当前交接记录](assignment/SESSION_HANDOFF.md)
 - [Rust 撮合系统 v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md)
 - [任务索引](assignment/README.md)
-- [最近验收的 T05 任务书](assignment/tasks/T05_P2_differential_invariants.md)
+- [当前 T06 任务书](assignment/tasks/T06_P3_market_orders.md)
+- [已验收的 T05 任务书](assignment/tasks/T05_P2_differential_invariants.md)
 
 当前 `.gitignore` 忽略整个 `assignment/`，上述资料存在于本机但没有受 Git 跟踪；新 clone 不会自动带上这些文件。版本管理策略仍待用户决定，交接文件继续使用此唯一位置。

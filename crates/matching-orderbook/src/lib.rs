@@ -10,6 +10,8 @@
 
 /// T02：进入撮合流程但尚未 rest 的最小运行态订单。
 pub mod incoming_order;
+/// Reference 与 Production 共享的只读市价计划数据；不含撮合算法。
+mod market_plan;
 /// T03：保存稳定槽位与 LIFO free-list 的 Arena 容器。
 pub mod order_arena;
 /// T03：稳定但可复用的 Arena 槽位位置。

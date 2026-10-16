@@ -1,6 +1,6 @@
 # 匹配引擎关键逻辑流程图
 
-本文件是项目关键逻辑流程图的长期入口。当前收录已验收的工程基础、订单簿和 T05 差分验证流程；后续经过验收的重要流程也应补入此文件。现有图不表示尚未实现的扩展订单规则、持久化或运行时能力。
+本文件是项目关键逻辑流程图的长期入口。当前收录已验收的工程基础、订单簿和行为差分验证流程；后续经过验收的重要流程也应补入此文件。现有图不表示尚未实现的扩展订单规则、持久化或运行时能力。
 
 ## 工程基础与本地质量门
 
@@ -146,6 +146,55 @@ return TradeEvents in actual matching order
 
 生产订单簿使用 BTreeMap 决定双侧价格优先，使用 `PriceLevel` 决定同价 FIFO，HashMap 只做单个 OrderId 定位。所有可预期的 `RejectReason` 在第一笔成交前结束；预检与提交发生分歧属于内部不变量损坏，按 fail-closed 处理。
 
+## 市价订单的预检、保护与提交
+
+```text
+MarketByBase / MarketByQuote + caller-supplied TradeIds
+                         |
+                         v
+1. reject duplicate active OrderId before reading liquidity
+                         |
+                         v
+2. protected entry only: freeze command-start reference,
+   derive the effective boundary and its source
+                         |
+                         v
+3. read-only maker plan in price priority and FIFO order
+   Buy: asks low -> high; Sell: bids high -> low
+                         |
+       +-----------------+-------------------+
+       |                                     |
+       v                                     v
+  MarketByBase                         MarketByQuote
+  consume positive qty                 checked max_qty_for_quote
+                                       -> floor to whole lot
+                                       -> dust stops the command
+       |                                     |
+       +-----------------+-------------------+
+                         |
+                         v
+4. protected plan stops before the first out-of-bound maker;
+   retain that maker and record one terminal trigger
+                         |
+                         v
+5. verify TradeId supply and checked quote conservation
+   before the first maker mutation
+                         |
+                         v
+6. commit only the plan in price/FIFO order
+   partial maker: reduce remaining and aggregate
+   full maker: remove head, ID index and empty level
+                         |
+                         v
+emit Trades in plan order, then optional protection trigger
+                         |
+                         v
+end remaining market quantity or quote budget; never rest taker
+and never allocate QueuePriority
+```
+
+普通市价入口不解释用户保护参数；带保护入口使用命令开始时的不可变 context。两类入口都在首笔 mutation 前完成可预期拒绝、TradeId 检查和金额计划校验。Quote 本金只经 MarketMath 计算：不足一个合法 lot 的 budget 是正常终止，不产生零数量 Trade 或保护触发。保护触发只表示首个越界 maker 终结命令，不消耗 TradeId，也不把未用预算当作成交。
+
 ## Reference / Production 差分验证
 
 ```text
@@ -185,4 +234,4 @@ for each command, in original tape order
 100k path: stream records only; no final-state-only shortcut
 ```
 
-Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本、ChaCha 算法和完整 seed 会输出到测试日志；失败可据此重建同一输入。当前图覆盖 regular Limit GTC/Cancel、单市场 priority 和当前适用不变量，不覆盖 Stop/expiry、跨 shard TradeId、WAL/digest/crash 或 P3 订单规则。
+Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本、ChaCha 算法和完整 seed 会输出到测试日志；失败可据此重建同一输入。当前图覆盖 regular Limit GTC/Cancel、市价订单、单市场 priority 和当前适用不变量，不覆盖 Stop/expiry、跨 shard TradeId、WAL/digest/crash 或未实现的扩展订单规则。

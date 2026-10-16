@@ -8,6 +8,9 @@ pub mod ids;
 pub mod limit_gtc_order;
 /// 不依赖 wall clock 的逻辑时间值。
 pub mod logical_time;
+/// 市场整数金额换算的已验证配置与内部错误分类。
+pub mod market_math;
+pub mod market_order;
 /// 价格、数量和金额的整数值对象及 checked 算术。
 pub mod numbers;
 /// 附加订单约束标志。
@@ -37,7 +40,7 @@ pub use limit_gtc_order::LimitGtcOrder;
 /// 确定性逻辑时间值。
 pub use logical_time::LogicalTime;
 /// 整数价格、数量和金额值对象。
-pub use numbers::{Price, Qty, QuoteAmount, SignedAmount};
+pub use numbers::{Price, Qty, QuoteAmount, QuoteBudget, SignedAmount};
 /// 订单附加约束标志。
 pub use order_flags::OrderFlags;
 /// 订单生命周期状态标签。
@@ -54,3 +57,10 @@ pub use side::Side;
 pub use time_in_force::TimeInForce;
 /// 一笔实际成交的载荷。
 pub use trade_event::TradeEvent;
+
+/// 市场整数金额换算的已验证配置与构造错误分类。
+pub use market_math::{MarketMath, MathConfigError, MathError};
+
+pub use market_order::{
+    MarketByBase, MarketByQuote, MarketByQuoteExecution, MarketProtection, ProtectionSource,
+};
