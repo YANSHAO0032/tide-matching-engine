@@ -12,7 +12,7 @@ Q = \frac{q}{10^{s_q}}, \qquad
 A = \frac{a}{10^{s_a}}.
 ```
 
-其中 $`p>0`$、$`q>0`$，而 $`a`$ 可以为零。价格以 quote/base 表示，数量以 base 表示，金额以 quote 表示。
+其中 $`p\gt 0`$、$`q\gt 0`$，而 $`a`$ 可以为零。价格以 quote/base 表示，数量以 base 表示，金额以 quote 表示。
 
 ## 精确成交本金
 
@@ -28,11 +28,11 @@ a = \frac{p \cdot q \cdot 10^{s_a}}{10^{s_p+s_q}}.
 \Delta = s_a-s_p-s_q.
 ```
 
-当 $`\Delta<0`$ 时，先验证 $`p\cdot q`$ 能被 $`10^{-\Delta}`$ 整除，再精确相除；当 $`\Delta\geq0`$ 时，使用 checked 整数乘法乘以 $`10^{\Delta}`$。本金不允许 floor、ceil 或任何四舍五入。
+当 $`\Delta\lt 0`$ 时，先验证 $`p\cdot q`$ 能被 $`10^{-\Delta}`$ 整除，再精确相除；当 $`\Delta\geq0`$ 时，使用 checked 整数乘法乘以 $`10^{\Delta}`$。本金不允许 floor、ceil 或任何四舍五入。
 
 ## 最小可成交单位
 
-设 tick 原始步长为 $`t>0`$，lot 原始步长为 $`l>0`$。最小成交本金 $`K`$ 为：
+设 tick 原始步长为 $`t\gt 0`$，lot 原始步长为 $`l\gt 0`$。最小成交本金 $`K`$ 为：
 
 ```math
 K = \frac{t \cdot l \cdot 10^{s_a}}{10^{s_p+s_q}}.
@@ -88,7 +88,7 @@ S=\sum_i a_i, \qquad U=B-S, \qquad S+U=B, \qquad 0\leq S\leq B.
 
 ## 市价保护边界
 
-设命令开始时固定的参考价格原始值为 $`r>0`$，tick 原始步长为 $`t>0`$，滑点参数为 $`b`$，并令基点分母为：
+设命令开始时固定的参考价格原始值为 $`r\gt 0`$，tick 原始步长为 $`t\gt 0`$，滑点参数为 $`b`$，并令基点分母为：
 
 ```math
 D=10\,000, \qquad 0\leq b\leq 9\,999.
@@ -128,7 +128,7 @@ P_{\mathrm{bps,sell}}
 q, & u=0,\\
 q+1, & u\ne0,
 \end{cases}
-\qquad a=qd+u, \quad 0\leq u<d.
+\qquad a=qd+u, \quad 0\leq u\lt d.
 ```
 
 实现必须只在 $`u\ne0`$ 时执行 checked 的 $`q+1`$；不得用 $`\left(a+d-1\right)/d`$ 替代此式。所有中间乘法、加减法、取整增量、tick 对齐乘法和目标整数域转换都必须 checked。
@@ -152,8 +152,8 @@ P_{\mathrm{effective,sell}}
 ```math
 S_{\mathrm{buy}}=
 \begin{cases}
-\mathrm{User}, & P_u<P_b,\\
-\mathrm{MarketBand}, & P_b<P_u,\\
+\mathrm{User}, & P_u\lt P_b,\\
+\mathrm{MarketBand}, & P_b\lt P_u,\\
 \mathrm{Both}, & P_u=P_b.
 \end{cases}
 ```
@@ -163,8 +163,8 @@ S_{\mathrm{buy}}=
 ```math
 S_{\mathrm{sell}}=
 \begin{cases}
-\mathrm{User}, & P_u>P_b,\\
-\mathrm{MarketBand}, & P_b>P_u,\\
+\mathrm{User}, & P_u\gt P_b,\\
+\mathrm{MarketBand}, & P_b\gt P_u,\\
 \mathrm{Both}, & P_u=P_b.
 \end{cases}
 ```
