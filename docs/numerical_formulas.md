@@ -94,19 +94,19 @@ S=\sum_i a_i, \qquad U=B-S, \qquad S+U=B, \qquad 0\leq S\leq B.
 D=10\,000, \qquad 0\leq b\leq 9\,999.
 ```
 
-参考价格、保护边界和 maker 价格使用同一原始价格整数空间。参考价格可以不对齐 tick；计算出的保护边界必须对齐。定义原始整数空间中的定向 tick 对齐：
+参考价格、保护边界和 maker 价格使用同一原始价格整数空间。参考价格可以不对齐 tick；计算出的保护边界必须对齐。以 F 和 C 分别表示原始整数空间中向下、向上的 tick 对齐函数：
 
 ```math
-\operatorname{floor}_t(x)=t\left\lfloor\frac{x}{t}\right\rfloor,
+F_t(x)=t\left\lfloor\frac{x}{t}\right\rfloor,
 \qquad
-\operatorname{ceil}_t(x)=t\left\lceil\frac{x}{t}\right\rceil.
+C_t(x)=t\left\lceil\frac{x}{t}\right\rceil.
 ```
 
 买方允许的最高价格为先向下取整、再向下对齐的结果：
 
 ```math
 P_{\mathrm{bps,buy}}
-=\operatorname{floor}_t\!\left(
+=F_t\!\left(
 \left\lfloor\frac{r(D+b)}{D}\right\rfloor
 \right).
 ```
@@ -115,7 +115,7 @@ P_{\mathrm{bps,buy}}
 
 ```math
 P_{\mathrm{bps,sell}}
-=\operatorname{ceil}_t\!\left(
+=C_t\!\left(
 \left\lceil\frac{r(D-b)}{D}\right\rceil
 \right).
 ```
