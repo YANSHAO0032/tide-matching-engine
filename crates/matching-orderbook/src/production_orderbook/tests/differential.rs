@@ -1,4 +1,5 @@
 use super::{level_snapshot, order, policy, validate_book};
+mod execution_constraints;
 use std::collections::BTreeSet;
 
 use crate::production_orderbook::ProductionOrderBook;
@@ -16,12 +17,10 @@ use matching_domain::{
     RejectReason, Side, TradeEvent, TradeId, UserId,
 };
 
-/// T05.1 只覆盖固定短 tape：
+/// 基础 differential 命令：Limit GTC、Cancel 与两类 Market。
 ///
-/// - Place Limit GTC
-/// - Cancel
-///
-/// 随机 tape 和 100k 流式回放由后续 T05.2b–T05.4 测试覆盖。
+/// 固定 tape 覆盖各分支；此文件的固定 seed 随机生成器只生成 GTC/Cancel。
+/// 保护市价与 IOC/FOK/PostOnly 使用各自的命令结构和独立执行适配。
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Place(LimitGtcOrder),
@@ -30,7 +29,7 @@ enum Command {
     MarketByQuote(MarketByQuote, Vec<TradeId>),
 }
 
-/// T05.2 的测试域约束：在创建订单簿之前检查完整 tape。
+/// 基础 tape 的测试域约束：在创建订单簿之前检查完整 tape。
 ///
 /// Reference adapter 采用 fills -> residual rest，尚未实现一般情况下的
 /// 失败原子事务；因此极值输入不能进入逐命令执行阶段。
@@ -613,7 +612,7 @@ fn assert_regular_book_invariants(book: &ObservedBook, next_priority: u128, step
 ///         -> actual remainder
 ///         -> rest(actual remainder)
 ///
-/// T05.1 使用小数量、远离 priority 上限的固定输入，因此这里只允许：
+/// 此适配使用小数量、远离 priority 上限的受控输入，因此这里只允许：
 ///
 /// - DuplicateOrderId 作为受控 Place 错误；
 /// - 正常成交 / rest。
@@ -912,7 +911,7 @@ fn execute_tape(commands: &[Command], mut on_record: impl FnMut(StepRecord)) {
                     }
 
                     // ------------------------------------------------
-                    // T05.1 唯一受控 Place error：
+                    // 此受控 GTC 输入域唯一允许的 Place error：
                     // active duplicate。
                     // ------------------------------------------------
                     (Err(RejectReason::DuplicateOrderId), Err(RejectReason::DuplicateOrderId)) => {
@@ -1142,7 +1141,7 @@ fn execute_tape(commands: &[Command], mut on_record: impl FnMut(StepRecord)) {
                     }
 
                     // ------------------------------------------------
-                    // T05.1 唯一受控 Cancel error。
+                    // 此受控输入域唯一允许的 Cancel error。
                     // ------------------------------------------------
                     (Err(RejectReason::OrderNotFound), Err(RejectReason::OrderNotFound)) => {
                         assert_eq!(

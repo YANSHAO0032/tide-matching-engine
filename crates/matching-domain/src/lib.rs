@@ -1,15 +1,20 @@
-//! 领域 ID、整数数值类型、订单与市场语义、命令、事件和错误模型的规划边界。
+//! 领域 ID、整数数值、市场金额换算、订单载荷、执行结果与稳定错误码。
+//!
+//! 当前提供撮合所需的领域子集，不包含完整命令 envelope、资金账本或持久化协议。
 
-/// 当前参考生命周期使用的最小事件载荷。
+/// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
 /// 具有业务类型隔离的标识符包装。
 pub mod ids;
-/// 当前参考模型支持的最小 GTC 限价订单。
+/// IOC/FOK 的终结结果与当前基础订单组合校验。
+pub mod limit_execution;
+/// 限价身份、价格和数量载荷，执行策略由订单簿入口选择。
 pub mod limit_gtc_order;
 /// 不依赖 wall clock 的逻辑时间值。
 pub mod logical_time;
 /// 市场整数金额换算的已验证配置与内部错误分类。
 pub mod market_math;
+/// 市价输入、执行结果与固定参考价的保护边界。
 pub mod market_order;
 /// 价格、数量和金额的整数值对象及 checked 算术。
 pub mod numbers;
@@ -35,7 +40,11 @@ pub use ids::{ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, U
 
 /// 最小订单生命周期事件。
 pub use engine_event::EngineEvent;
-/// 最小 GTC 限价订单值对象。
+/// 限价立即执行结果、稳定取消原因与基础订单组合校验。
+pub use limit_execution::{
+    CancelReason, LimitImmediateExecution, validate_basic_order_combination,
+};
+/// 保留历史类型名的最小限价订单载荷。
 pub use limit_gtc_order::LimitGtcOrder;
 /// 确定性逻辑时间值。
 pub use logical_time::LogicalTime;
@@ -61,6 +70,7 @@ pub use trade_event::TradeEvent;
 /// 市场整数金额换算的已验证配置与构造错误分类。
 pub use market_math::{MarketMath, MathConfigError, MathError};
 
+/// 市价输入、报价执行结果与保护参数的常用重导出。
 pub use market_order::{
     MarketByBase, MarketByQuote, MarketByQuoteExecution, MarketProtection, ProtectionSource,
 };

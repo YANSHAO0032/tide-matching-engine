@@ -1,6 +1,8 @@
 use crate::reject_reason::RejectReason;
 
-/// 以 ticks 表示的严格正价格。
+/// 以 price scale 定义的原始整数表示的严格正价格。
+///
+/// 原始值不是 tick 个数；构造只检查正值，市场 tick 对齐由 MarketMath 校验。
 ///
 /// 数值排序仅表示底层整数大小，不表示撮合优先级。
 ///
@@ -26,7 +28,7 @@ use crate::reject_reason::RejectReason;
 pub struct Price(i64);
 
 impl Price {
-    /// 仅接受严格大于零的 ticks
+    /// 仅接受严格大于零的价格原始整数；不检查市场 tick 对齐。
     pub const fn try_new(value: i64) -> Result<Self, RejectReason> {
         if value > 0 {
             Ok(Self(value))
@@ -35,13 +37,15 @@ impl Price {
         }
     }
 
-    /// 读取原始 ticks
+    /// 读取价格原始整数；不乘除 tick 或 scale。
     pub const fn get(self) -> i64 {
         self.0
     }
 }
 
-/// 以 lots 表示的严格正数量。
+/// 以 quantity scale 定义的原始整数表示的严格正数量。
+///
+/// 原始值不是 lot 个数；构造只检查正值，市场 lot 对齐由 MarketMath 校验。
 ///
 /// 自然排序仅表示底层整数的数值顺序。
 #[repr(transparent)]
@@ -49,7 +53,7 @@ impl Price {
 pub struct Qty(u64);
 
 impl Qty {
-    /// 仅接受严格大于零的 lots；零返回 [`RejectReason::InvalidQty`]。
+    /// 仅接受严格大于零的数量原始整数；零返回 [`RejectReason::InvalidQty`]。
     pub const fn try_new(value: u64) -> Result<Self, RejectReason> {
         if value > 0 {
             Ok(Self(value))
@@ -58,7 +62,7 @@ impl Qty {
         }
     }
 
-    /// 读取原始 lots。
+    /// 读取数量原始整数；不乘除 lot 或 scale。
     pub const fn get(self) -> u64 {
         self.0
     }

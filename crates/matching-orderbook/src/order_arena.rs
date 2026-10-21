@@ -80,8 +80,8 @@ impl OrderArena {
     /// 越界、空槽及尚未复用前的重复删除返回 None，
     /// 并保持 slots 和 free 不变。
     ///
-    /// 拥有者必须先解除订单 ID 和链表中的相关引用，
-    /// 再释放槽位，避免旧索引在复用后指向其他订单。
+    /// 调用前必须解除链表引用。若 owner 在同一独占 mutation 内随后清理
+    /// OrderId 映射，则清理完成前不得查询旧映射、复用槽位或暴露中间状态。
     pub fn remove(&mut self, index: OrderIndex) -> Option<OrderNode> {
         let position = usize::try_from(index.get()).ok()?;
         #[cfg(test)]

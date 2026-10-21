@@ -19,7 +19,8 @@ pub enum MathConfigError {
 
 /// 已验证配置下计算单笔成交本金的内部失败分类。
 ///
-/// 当前不属于 wire 协议；命令入口将在后续范围中负责稳定映射。
+/// 此枚举本身不是 wire 协议；现有撮合入口通过 [`MathError::to_reject_reason`]
+/// 映射可拒绝错误，不能将配置/状态不变量损坏降级为业务拒绝。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathError {
     /// price 未对齐当前市场的 tick_size。
@@ -128,9 +129,8 @@ impl MarketMath {
 
     /// 计算成交本金，单位为 quote atoms。
     ///
-    /// 前置条件：
-    /// - price 必须符合当前市场 tick_size。
-    /// - qty 必须符合当前市场 lot_size。
+    /// 先校验 price 的 tick 对齐，再校验 qty 的 lot 对齐；不满足时分别返回
+    /// InvalidTick / InvalidLot。两项都失败时价格错误优先。
     ///
     /// 使用 N × M × K，所有乘法均执行 checked 检查。
     pub fn trade_notional(&self, price: Price, qty: Qty) -> Result<QuoteAmount, MathError> {
@@ -160,7 +160,7 @@ impl MarketMath {
         Ok(QuoteAmount::new(notional))
     }
 
-    /// 根据 quote 预算计算当前价格下最多可以买入的合法 Qty。
+    /// 根据 quote 本金额度计算当前价格下最多可执行的合法 Qty，买卖方向均适用。
     ///
     /// - price 必须与 tick_size 对齐。
     /// - 向下取整到完整 lot。

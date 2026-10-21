@@ -1,6 +1,7 @@
 /// 订单附加约束标志。
 ///
-/// 该结构只保存声明值；合法性和执行效果由命令与风险阶段验证。
+/// 该结构只保存声明值；基础组合由 validate_basic_order_combination 校验，
+/// 完整命令接入及 ReduceOnly 风险执行仍由后续层承担。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderFlags {
     /// 要求订单不得作为 taker 立即成交的约束。

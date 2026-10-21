@@ -4,7 +4,7 @@ use matching_domain::{Qty, RejectReason};
 /// 单个价格档位的运行态。
 ///
 /// 使用双向链表维护同价订单的 FIFO 顺序。
-/// 支持尾插、头删和只读访问。
+/// 支持尾插、头部部分成交、头删、中尾删除和只读访问。
 /// 修改前执行涉及节点的只读预检；内部状态损坏时直接 panic。
 #[derive(Debug, Default)]
 pub struct PriceLevel {
@@ -347,7 +347,8 @@ impl PriceLevel {
     /// 但不再携带任何链表链接。
     ///
     /// 该操作只维护档位和 Arena 生命周期；不执行 Cancel 业务语义，也不维护
-    /// 未来 ProductionOrderBook 的订单索引。
+    /// ProductionOrderBook 的订单索引；owner 须在同一独占 mutation 内清理，
+    /// 且清理前不能再次查询旧映射或复用已释放槽位。
     pub fn pop_front(&mut self, arena: &mut OrderArena) -> Option<OrderNode> {
         // 1. 空档必须满足全部空状态不变量。
         if self.count == 0 {

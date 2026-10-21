@@ -11,7 +11,7 @@ pub struct TradeEvent {
     pub maker_order_id: OrderId,
     /// 主动消耗流动性的 taker 订单身份。
     pub taker_order_id: OrderId,
-    /// 成交价格；在当前参考模型中取 maker 的限价。
+    /// 成交价格；Reference 和 Production 均取 resting maker 的价格。
     pub price: Price,
     /// 实际成交的严格正数量。
     pub qty: Qty,

@@ -194,7 +194,7 @@ impl ProtectedMarketByQuoteExecution {
 /// `effective_worst_price` 必须由上游提前计算完成：
 /// - Buy: maker_price <= boundary 时允许；
 /// - Sell: maker_price >= boundary 时允许；
-/// - None: 当前命令没有用户保护边界，始终允许。
+/// - None: 当前命令没有有效保护边界，此项价格检查允许。
 ///
 /// 本函数不负责：
 /// - 计算 slippage bps；
@@ -275,7 +275,8 @@ pub fn effective_protection_with_source(
 ///
 /// reference_price_at_command_start 由调用方提前捕获。
 /// math 提供已验证的 tick_size。
-/// market_band_worst 由外部配置/市场参考价计算层提供。
+/// market_band_worst 由外部配置/市场参考价计算层提供并完成 tick 校验；
+/// 本函数不会再次验证 band 对齐。
 ///
 /// 先验证用户输入，再合并有效候选。
 /// 本函数不获取市场状态，也不判断是否必须要求保护。
