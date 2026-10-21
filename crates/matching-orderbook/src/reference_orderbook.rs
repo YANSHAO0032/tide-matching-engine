@@ -18,6 +18,8 @@ use matching_domain::{
 #[cfg(test)]
 use matching_domain::ProtectionSource;
 
+mod limit_execution;
+
 /// 为 priority 计数器保留不可分配的高位保护空间。
 ///
 /// 到达该边界前必须拒绝新 resting order，避免计数器 wrap 后破坏 FIFO 语义。
@@ -124,6 +126,34 @@ impl ReferenceOrderBook {
             .map(|index| &self.orders[index])
     }
 
+    /// PostOnly 候选的只读预检。
+    ///
+    /// 输入代表 Limit GTC + PostOnly 候选。
+    ///
+    /// 检查顺序：
+    /// 1. 全簿重复 OrderId
+    /// 2. 是否与对手盘交叉
+    ///
+    /// Ok(()) 仅表示通过当前两项预检，
+    /// 不表示订单已经接受或成功挂簿。
+    ///
+    /// 不修改订单簿，不检查或分配 QueuePriority。
+    fn preflight_post_only(&self, order: &LimitGtcOrder) -> Result<(), RejectReason> {
+        if self
+            .orders
+            .iter()
+            .any(|existing| existing.original_order().order_id == order.order_id)
+        {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        if self.best_crossing_maker(order).is_some() {
+            return Err(RejectReason::PostOnlyWouldCross);
+        }
+
+        Ok(())
+    }
+
     /// 查找最佳可成交 maker 在源 `Vec` 中的索引。
     ///
     /// 该索引只在当前不可变借用期间有效，供后续规划和一次性执行定位同一 maker。
@@ -171,7 +201,7 @@ impl ReferenceOrderBook {
 
     /// 返回下一笔成交的 maker 与数量，但不修改双方运行态。
     ///
-    /// 与 [`Self::plan_next_fill`] 相同的价格/FIFO 选择逻辑被用于只读预览；
+    /// 与内部 `plan_next_fill` 共用价格/FIFO 选择逻辑进行只读预览；
     /// 返回的引用在订单簿发生可变操作前有效。
     pub fn next_fill_plan(
         &self,
@@ -467,7 +497,7 @@ impl ReferenceOrderBook {
         })
     }
 
-    /// 受保护 MarketByQuote 的测试专用只读计划。
+    /// 受保护 MarketByQuote 执行入口使用的只读计划。
     ///
     /// 顺序：Duplicate → command-start protection → maker 边界
     ///      → quote 预算反推 → 本金计算 → 本地金额累计。
@@ -1086,7 +1116,7 @@ impl ReferenceOrderBook {
             return Err(RejectReason::DuplicateOrderId);
         }
 
-        // 2. 使用 T06.28 已验收的带来源命令开始 helper。
+        // 2. 使用带来源的命令开始保护 helper。
         //    只计算一次，错误原样传播。
         let effective = effective_protection_at_command_start_with_source(
             incoming.market_protection.as_ref(),
@@ -1942,6 +1972,236 @@ mod maker_query_tests {
         assert_index_matches_reference(&book, &order(200, Side::Buy, 105, 1), Some(2));
 
         assert_index_matches_reference(&book, &order(201, Side::Sell, 95, 1), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod post_only_preflight_tests {
+    use super::*;
+    use matching_domain::UserId;
+
+    fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
+        LimitGtcOrder {
+            order_id: OrderId::new(id),
+            user_id: UserId::new(id as u64),
+            side,
+            price: Price::try_new(price).unwrap(),
+            qty: Qty::try_new(qty).unwrap(),
+        }
+    }
+
+    fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitGtcOrder, u64, QueuePriority)>, u128) {
+        (
+            book.orders
+                .iter()
+                .map(|resting| {
+                    (
+                        resting.original_order().clone(),
+                        resting.remaining(),
+                        resting.priority(),
+                    )
+                })
+                .collect(),
+            book.next_priority,
+        )
+    }
+
+    fn assert_read_only(
+        book: &ReferenceOrderBook,
+        candidate: LimitGtcOrder,
+        expected: Result<(), RejectReason>,
+    ) {
+        let before = snapshot(book);
+        let candidate_before = candidate.clone();
+
+        for _ in 0..3 {
+            assert_eq!(book.preflight_post_only(&candidate), expected);
+
+            assert_eq!(snapshot(book), before);
+            assert_eq!(candidate, candidate_before);
+        }
+    }
+    #[test]
+    fn post_only_crossing_boundaries_on_both_sides() {
+        for (side, maker_side, maker_price, crossing, equal, non_crossing) in [
+            (Side::Buy, Side::Sell, 105, 106, 105, 104),
+            (Side::Sell, Side::Buy, 95, 94, 95, 96),
+        ] {
+            let mut book = ReferenceOrderBook::new();
+
+            book.rest(order(1, maker_side, maker_price, 10)).unwrap();
+
+            for (i, (price, expected)) in [
+                (crossing, Err(RejectReason::PostOnlyWouldCross)),
+                (equal, Err(RejectReason::PostOnlyWouldCross)),
+                (non_crossing, Ok(())),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_read_only(&book, order(100 + i as u128, side, price, 5), expected);
+            }
+        }
+    }
+    #[test]
+    fn post_only_accepts_empty_or_same_side_book() {
+        for side in [Side::Buy, Side::Sell] {
+            let mut book = ReferenceOrderBook::new();
+
+            assert_read_only(&book, order(100, side, 100, 1), Ok(()));
+
+            book.rest(order(1, side, 100, 10)).unwrap();
+
+            assert_read_only(&book, order(101, side, 100, 1), Ok(()));
+
+            assert_read_only(&book, order(102, side, i64::MAX, 1), Ok(()));
+        }
+    }
+    #[test]
+    fn duplicate_id_precedes_post_only_crossing() {
+        let mut book = ReferenceOrderBook::new();
+
+        book.rest(order(7, Side::Buy, 90, 10)).unwrap();
+
+        book.rest(order(8, Side::Sell, 105, 10)).unwrap();
+
+        // 与本方现存 ID 重复，同时交叉。
+        assert_read_only(
+            &book,
+            order(7, Side::Buy, 105, 1),
+            Err(RejectReason::DuplicateOrderId),
+        );
+
+        assert_read_only(
+            &book,
+            order(8, Side::Sell, 90, 1),
+            Err(RejectReason::DuplicateOrderId),
+        );
+
+        // 与对手方 ID 重复，同时交叉。
+        assert_read_only(
+            &book,
+            order(8, Side::Buy, 105, 1),
+            Err(RejectReason::DuplicateOrderId),
+        );
+
+        assert_read_only(
+            &book,
+            order(7, Side::Sell, 90, 1),
+            Err(RejectReason::DuplicateOrderId),
+        );
+
+        // 即使不交叉，重复 ID 仍然拒绝。
+        assert_read_only(
+            &book,
+            order(7, Side::Buy, 89, 1),
+            Err(RejectReason::DuplicateOrderId),
+        );
+    }
+    #[test]
+    fn multi_level_fifo_and_remaining_are_preserved() {
+        let mut book = ReferenceOrderBook::new();
+
+        for resting in [
+            order(90, Side::Sell, 110, 10),
+            order(30, Side::Sell, 105, 10),
+            order(10, Side::Sell, 105, 10),
+            order(290, Side::Buy, 90, 10),
+            order(230, Side::Buy, 95, 10),
+            order(210, Side::Buy, 95, 10),
+        ] {
+            book.rest(resting).unwrap();
+        }
+
+        // 模拟一张已经部分成交的 maker。
+        book.orders[1].apply_fill(Qty::try_new(3).unwrap()).unwrap();
+
+        // 验证现有 maker 查询选择的 FIFO 首单。
+        assert_eq!(
+            book.best_crossing_maker(&order(300, Side::Buy, 105, 1))
+                .unwrap()
+                .original_order()
+                .order_id,
+            OrderId::new(30),
+        );
+
+        assert_eq!(
+            book.best_crossing_maker(&order(301, Side::Sell, 95, 1))
+                .unwrap()
+                .original_order()
+                .order_id,
+            OrderId::new(230),
+        );
+
+        for (id, side, price, expected) in [
+            (300, Side::Buy, 105, Err(RejectReason::PostOnlyWouldCross)),
+            (302, Side::Buy, 104, Ok(())),
+            (301, Side::Sell, 95, Err(RejectReason::PostOnlyWouldCross)),
+            (303, Side::Sell, 96, Ok(())),
+        ] {
+            assert_read_only(&book, order(id, side, price, 1), expected);
+        }
+
+        assert_eq!(book.orders[1].remaining(), 7);
+    }
+    #[test]
+    fn post_only_handles_price_extremes() {
+        let mut sell_book = ReferenceOrderBook::new();
+
+        sell_book.rest(order(1, Side::Sell, i64::MAX, 1)).unwrap();
+
+        assert_read_only(
+            &sell_book,
+            order(2, Side::Buy, i64::MAX, 1),
+            Err(RejectReason::PostOnlyWouldCross),
+        );
+
+        assert_read_only(&sell_book, order(3, Side::Buy, i64::MAX - 1, 1), Ok(()));
+
+        let mut buy_book = ReferenceOrderBook::new();
+
+        buy_book.rest(order(4, Side::Buy, 1, 1)).unwrap();
+
+        assert_read_only(
+            &buy_book,
+            order(5, Side::Sell, 1, 1),
+            Err(RejectReason::PostOnlyWouldCross),
+        );
+
+        assert_read_only(&buy_book, order(6, Side::Sell, 2, 1), Ok(()));
+
+        let mut extreme_book = ReferenceOrderBook::new();
+
+        extreme_book.rest(order(7, Side::Buy, i64::MAX, 1)).unwrap();
+
+        assert_read_only(
+            &extreme_book,
+            order(8, Side::Sell, 1, 1),
+            Err(RejectReason::PostOnlyWouldCross),
+        );
+    }
+    #[test]
+    fn preflight_does_not_check_or_consume_priority() {
+        let mut book = ReferenceOrderBook::new();
+
+        book.rest(order(1, Side::Sell, 105, 10)).unwrap();
+
+        // 测试专用：模拟已达到 priority 极值。
+        book.next_priority = u128::MAX;
+
+        assert_read_only(&book, order(2, Side::Buy, 104, 1), Ok(()));
+
+        assert_read_only(
+            &book,
+            order(3, Side::Buy, 105, 1),
+            Err(RejectReason::PostOnlyWouldCross),
+        );
+
+        assert_read_only(
+            &book,
+            order(1, Side::Buy, 105, 1),
+            Err(RejectReason::DuplicateOrderId),
+        );
     }
 }
 

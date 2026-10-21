@@ -4,9 +4,11 @@
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
-    /// 价格不是该字段所要求的严格正 ticks。
+    /// 当前执行入口不支持该订单类型、有效期或标志组合。
+    InvalidOrderCombination = 2001,
+    /// 价格原始整数不是该字段要求的严格正值。
     InvalidPrice = 2002,
-    /// 数量不是该字段所要求的严格正 lots。
+    /// 数量或初始 quote 预算不是该字段要求的严格正值。
     InvalidQty = 2003,
     /// 价格不符合市场 tick_size 的对齐要求。
     InvalidTick = 2004,
@@ -18,6 +20,10 @@ pub enum RejectReason {
     OrderNotFound = 2010,
     /// 到期时间不满足命令的逻辑时间约束。
     InvalidExpireTime = 2013,
+    /// PostOnly 候选会立即作为 taker 成交，必须在改簿前拒绝。
+    PostOnlyWouldCross = 2015,
+    /// 限价和数量约束下的可执行流动性不足以完整成交 FOK。
+    FokInsufficientLiquidity = 2016,
     /// 订单需要有效保护边界，但用户和市场均未提供可用边界。
     MarketProtectionRequired = 3005,
     /// 下一笔候选 maker 成交将越过有效保护边界。
@@ -37,6 +43,8 @@ mod tests {
 
     #[test]
     fn reason_code_golden_tests() {
+        assert_eq!(RejectReason::InvalidOrderCombination as u16, 2001);
+        assert_eq!(RejectReason::FokInsufficientLiquidity as u16, 2016);
         assert_eq!(RejectReason::InvalidPrice as u16, 2002);
         assert_eq!(RejectReason::InvalidQty as u16, 2003);
         assert_eq!(RejectReason::InvalidTick as u16, 2004);
@@ -44,6 +52,7 @@ mod tests {
         assert_eq!(RejectReason::DuplicateOrderId as u16, 2008);
         assert_eq!(RejectReason::ArithmeticOverflow as u16, 5001);
         assert_eq!(RejectReason::InvalidExpireTime as u16, 2013);
+        assert_eq!(RejectReason::PostOnlyWouldCross as u16, 2015);
         assert_eq!(RejectReason::MarketProtectionRequired as u16, 3005);
         assert_eq!(RejectReason::MarketProtectionExceeded as u16, 3006);
         assert_eq!(RejectReason::InvalidSlippageBps as u16, 3007);

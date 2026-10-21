@@ -20,6 +20,8 @@ use matching_domain::{
 use matching_domain::ProtectionSource;
 use std::collections::{BTreeMap, HashMap};
 
+mod immediate_execution;
+
 #[derive(Debug, Clone, Copy)]
 /// 指明已预检的 residual 将追加到既有档位还是新建档位。
 ///
@@ -89,12 +91,12 @@ struct QuotePreflightState {
     fills: Vec<QuoteFillPlan>,
 }
 
-/// 单市场生产簿的容器组合与只读查询入口。
+/// 单市场生产订单簿的查询、挂单、取消和撮合入口。
 ///
 /// 价格顺序由双侧有序索引保存，同价 FIFO 由 PriceLevel 链表维护；
 /// OrderId 索引只承担定位，不决定业务顺序。当前支持已确定应挂单的
-/// Limit GTC 余量、已知 ID 的 Cancel，以及完整 Limit GTC 的连续
-/// maker/taker 成交与 taker 余量挂单。
+/// Limit GTC 余量、已知 ID 的 Cancel、完整 Limit GTC、市价订单，以及
+/// Limit IOC/FOK/PostOnly。仅实际 rest 分配 priority；不包含完整资金和命令协议。
 #[derive(Debug)]
 pub struct ProductionOrderBook {
     /// 买侧价格档位；合法非空条目中的节点必须具有相同价格和 Buy 方向。
@@ -1857,7 +1859,7 @@ impl ProductionOrderBook {
         })
     }
 
-    /// T06.31：Production 独立只读规划；不触碰 Arena、价档、ID 索引或 allocator。
+    /// Production 独立只读规划；不触碰 Arena、价档、ID 索引或 allocator。
     /// 业务拒绝优先级：duplicate -> command-start protection -> 扫描。
     /// 返回成交前缀及首个越界价，终结保护本身不消耗 TradeId。
     fn preflight_protected_market_by_base_plan(
@@ -2859,6 +2861,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     mod differential;
+    mod immediate_constraints;
 
     /// 使用与参考模型一致的真实 guard 创建有效测试策略。
     fn policy() -> QueuePriorityPolicy {

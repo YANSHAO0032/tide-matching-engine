@@ -7,7 +7,7 @@ use matching_domain::{LimitGtcOrder, Qty, RejectReason};
 pub struct IncomingOrder {
     /// 调用方提交的不可变订单载荷。
     original: LimitGtcOrder,
-    /// 当前尚未成交的 lots，可以在完全成交后为零。
+    /// 当前尚未成交的数量原始整数，可以在完全成交后为零。
     remaining: u64,
 }
 
@@ -26,7 +26,7 @@ impl IncomingOrder {
         &self.original
     }
 
-    /// 返回当前尚未成交的 lots；零表示此 incoming 已耗尽。
+    /// 返回当前尚未成交的数量原始整数；零表示此 incoming 已耗尽。
     pub fn remaining(&self) -> u64 {
         self.remaining
     }

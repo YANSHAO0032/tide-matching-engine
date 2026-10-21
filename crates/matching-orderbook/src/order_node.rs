@@ -4,7 +4,7 @@ use matching_domain::{LimitGtcOrder, QueuePriority};
 /// Arena 中的订单节点。
 ///
 /// 保存原始订单、剩余数量、队列优先级及双向链表链接。
-/// 链接使用 Option<OrderIndex>，不保留特殊空值。
+/// 链接使用 `Option<OrderIndex>`，不保留特殊空值。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderNode {
     /// 创建时的不可变订单请求；运行态链接和剩余量不回写该值。

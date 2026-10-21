@@ -1,6 +1,6 @@
 use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason};
 
-/// T02 参考订单簿使用的最小 resting 订单运行态。
+/// 参考订单簿使用的最小 resting 订单运行态。
 ///
 /// 此对象保存剩余量与 market-local priority。它不维护生产簿的 intrusive FIFO 链接；
 /// 参考模型的同价 FIFO 由源 `Vec` 的稳定顺序表达。
@@ -8,9 +8,9 @@ use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason};
 pub struct ReferenceOrder {
     /// 不随成交扣减改变的原始订单载荷。
     original: LimitGtcOrder,
-    /// 尚未成交的 lots，可以在移除前短暂为零。
+    /// 尚未成交的数量原始整数，可以在移除前短暂为零。
     remaining: u64,
-    /// 仅由 [`ReferenceOrderBook::rest`] 分配的市场本地 queue priority。
+    /// 仅由 [`crate::ReferenceOrderBook::rest`] 分配的市场本地 queue priority。
     priority: QueuePriority,
 }
 
@@ -18,7 +18,7 @@ impl ReferenceOrder {
     /// 用已分配的 priority 构造 resting 运行态。
     ///
     /// 该 crate-private 构造器供参考簿和测试 fixture 使用；实际挂单必须经
-    /// [`ReferenceOrderBook::rest`] 完成重复 ID 与 high-water 校验。
+    /// [`crate::ReferenceOrderBook::rest`] 完成重复 ID 与 high-water 校验。
     pub(crate) fn new(original: LimitGtcOrder, priority: QueuePriority) -> Self {
         let remaining = original.qty.get();
         Self {
@@ -33,7 +33,7 @@ impl ReferenceOrder {
         &self.original
     }
 
-    /// 返回当前尚未成交的 lots。
+    /// 返回当前尚未成交的数量原始整数。
     pub fn remaining(&self) -> u64 {
         self.remaining
     }

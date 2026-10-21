@@ -1,6 +1,6 @@
-use crate::{OrderId, Price, ProtectionSource, Qty, RejectReason, TradeEvent};
+use crate::{CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, TradeEvent};
 
-/// 当前参考模型产生的最小订单生命周期事件。
+/// 当前订单簿使用的最小订单生命周期事件载荷。
 ///
 /// 它不是完整 durable event envelope：不携带 market event sequence、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -15,6 +15,12 @@ pub enum EngineEvent {
     OrderPartiallyFilled { order_id: OrderId, remaining: Qty },
     /// 订单因成交完毕而结束。
     OrderFilled { order_id: OrderId },
+    /// 未成交的严格正 base 余量按指定原因终结；不表示取消了一张 resting order。
+    OrderCanceled {
+        order_id: OrderId,
+        remaining: Qty,
+        reason: CancelReason,
+    },
     /// 一笔已提交的成交及其 maker/taker 载荷。
     Trade(TradeEvent),
     /// 下一候选 maker 越过有效保护边界，市价订单据此终结。

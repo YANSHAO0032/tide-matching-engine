@@ -1,8 +1,9 @@
 use crate::{OrderId, Price, Qty, Side, UserId};
 
-/// 最小 GTC 限价订单值对象。
+/// 限价订单的最小身份、价格与数量载荷（保留既有类型名）。
 ///
-/// 它不含市场、有效期、标志、状态或资金预留；这些契约由后续命令模型承载。
+/// 它不含市场、有效期、标志、状态或资金预留；GTC/IOC/FOK/PostOnly 由所调用的
+/// 显式订单簿入口选择，不应根据本载荷的历史类型名推断执行策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitGtcOrder {
     /// 在订单簿内唯一定位该订单的业务身份。
@@ -11,15 +12,15 @@ pub struct LimitGtcOrder {
     pub user_id: UserId,
     /// 买入或卖出方向。
     pub side: Side,
-    /// 限价价格，必须为严格正 ticks。
+    /// 严格正的价格原始整数；市场 tick 对齐须由使用该载荷的校验层保证。
     pub price: Price,
-    /// 原始下单数量，必须为严格正 lots。
+    /// 严格正的原始下单数量；市场 lot 对齐须由使用该载荷的校验层保证。
     pub qty: Qty,
 }
 
 #[cfg(test)]
 mod tests {
-    //! 验证最小 GTC 订单的字段级值语义。
+    //! 验证最小限价载荷的字段及值语义，不决定执行策略。
     use super::*;
     use crate::{OrderId, Price, Qty, Side, UserId};
 

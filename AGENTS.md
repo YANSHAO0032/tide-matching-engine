@@ -1,26 +1,26 @@
 # Matching Engine Engineering Rules v6
 
+> 2026-10-21 最新授权：用户明确“解除导师模式，帮我完成T07”。本次 T07 改为直接实现与审查模式，允许 Codex 修改 Rust 行为/API/测试并完成 gate；下文旧导师限制及逐步等待用户实现的流程对本次授权已 superseded。其余工程约束、保留用户改动和不扩展 T08 等范围仍有效。
+
 ## 角色与授权边界
 
-本项目采用长期导师和 Code Reviewer 模式。用户负责实现，Codex 负责读取事实、解释设计、拆分小步、审查、运行验证和维护交接。
+当前采用直接实现和 Code Review 模式。用户已于 2026-10-21 明确解除导师模式并授权 Codex 完成 T07，Codex 负责实现、测试、审查、文档与交接。
 
-- 不创建、修改或覆盖 Rust **行为实现** `.rs` 文件，不提供可直接复制的完整 struct/enum/trait/function/module 实现，不输出整项任务的完整实现 patch。用户于 2026-09-29 额外持续授权 Codex 直接新增、修订或删除 `.rs` 中的 Rustdoc 与普通注释，并在运行检查时主动补全与当前变更直接相关的注释；该授权仅限注释 token，不得改变行为、接口、derive、测试、依赖、格式以外的非注释文本，亦不得借此实现未来任务。纯 Rustfmt 例外仍有效：当 `cargo fmt --check` 已报告差异时，Codex 可直接运行 `cargo fmt`，仅接受格式化器生成的排版变更；不得借此改变行为、补写逻辑或绕过后续 review/gate。
-- 可以给文件位置、类型职责、函数签名、非编译级伪代码、测试场景，以及针对真实 diff 的修改建议。
-- 可以运行 cargo check/test/clippy/fmt --check、benchmark 和 Git 只读检查；不得为通过检查而弱化约束。
-- 可以直接维护 `assignment/SESSION_HANDOFF.md`。用户已分别授权 Codex 完成 T00.1 文档、T00.2 工具链配置及验证、T00.3 workspace 配置与仅含职责注释的空库骨架（包括移除 Hello World 入口）、T00.4 lint 配置/说明及临时独立探针验证。这些单步授权不取消业务 Rust 实现的导师模式，也不代表授权实现后续小步。
-- 除非用户明确取消导师模式，普通“帮我完成”请求不能被解释为可代写 Rust 实现。
-- 保留用户已有改动，不把其他任务或未来 Phase 顺手实现。
+- 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
+- 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
+- 可维护任务相关文档及唯一 `assignment/SESSION_HANDOFF.md`；修改数值/事件协议须同步契约与边界证据。
+- 不把其他任务或未来范围顺手实现，不在没有明确授权时提交、推送或发布。用户于 2026-10-21 已明确授权更新完成记录后提交并推送 T07；该授权不包括合并主分支或启动 T08。
 
 ## 当前范围与文档入口
 
-**当前授权范围为 T06_P3_market_orders**（2026-10-10 用户明确从 T05 切换）。T00–T05 已验收；T02 提交为 `161abf7`，T03 为 `f96e81b`，T04 为 `c860543`，T05 为 `e752fdb`，后者也是 T06 启动基线。T06 只推进 MarketByBase / MarketByQuote、checked MarketMath、quote dust 与命令开始时固定的保护参考边界；§18/§27 reservation 仅预留接口边界。导师模式始终有效，未授权 Codex 代写 Rust 实现；T07 及其他后续任务未授权。
+**当前授权范围为 T07_P3_ioc_fok_postonly**（2026-10-16 用户明确从已验收的 T06 切换）。T00–T07 已验收；T02 提交为 `161abf7`，T03 为 `f96e81b`，T04 为 `c860543`，T05 为 `e752fdb`，T06 提交及 T07 启动基线为 `a57b8d89be86f13368f2db406088bbc7a604363d`。T07 已于 2026-10-21 完成本地验收：Limit IOC、Limit FOK、Limit GTC + PostOnly 及独立 reference/differential/property 验证；workspace 495 unit + 2 doctest、fmt、严格 Clippy 通过。交付分支为 `codex/t07-ioc-fok-postonly`，远端 CI 未核验。MarketByBase + FOK 按 §8.2 的 P3 可暂禁选项处理；MarketByQuote + FOK 始终禁止。2026-10-21 用户解除导师模式并授权 Codex 直接实现 T07；T08 及其他后续任务未授权。
 
 每轮开始先读取：
 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
-3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §6.5.1–§6.5.2、§13、§18/§27（reservation 仅按接口边界）、§64，按当前小步核对 §8、§26.3–§26.5、§45–§46.1、§58；保留 §54、§55.2–§55.4、§63 的回归要求，核对当前适用不变量 1–11/16/17/26/28–30/49–52，53 仅作后续资金契约；始终遵守 §77 和 Appendix E。读取未来契约不扩大实现范围。
-4. [T06 任务书](assignment/tasks/T06_P3_market_orders.md)（实际文件名是复数 `orders`）；保留已验收的 [T05](assignment/tasks/T05_P2_differential_invariants.md) differential/invariant gate。
+3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §8、§14–§16、§54（重点不变量 18）、§64；按当前小步核对 §9、§13、§45–§46.1、§58，保留 §6.5.1–§6.5.2、§26.3–§26.5、§55.2–§55.4、§63 的数值/保护和回归要求。保留当前适用不变量 1–11/16/17/26/28–30/49–52/54–56；§54.53 及 §18/§27 reservation 仅作后续资金接口契约。始终遵守 §77 和 Appendix E；读取未来契约不扩大实现范围。
+4. [T07 任务书](assignment/tasks/T07_P3_ioc_fok_postonly.md)；保留已验收的 [T06](assignment/tasks/T06_P3_market_orders.md) Market/math/protection 与 [T05](assignment/tasks/T05_P2_differential_invariants.md) differential/invariant gate。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
@@ -29,16 +29,17 @@ T00 已建立六个 crate 的最小骨架、固定工具链、CI 和工程规则
 
 T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/count/total_visible_qty、intrusive 双向 FIFO 和 market-local QueuePriority allocator/high-water guard，并通过结构 unit/edge/property 与 O(1) 尾插访问计数验证。T04 复用这些结构，组合 BTreeMap 双侧价格索引、HashMap<OrderId, OrderIndex> 与 Arena，实现 best price、按 ID 定位/Cancel、双向 Limit GTC 多档撮合、maker 移除和余量挂单。链表顺序是 FIFO 权威；槽位释放/复用必须与全部 ID/链表引用同步。每次 book mutation 完成后检查 active index、聚合和 uncrossed 等适用不变量，不将 T04 自身的行为/失败原子性/不变量测试延期。
 
-T05 已以独立流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，验收可复现 100k command tape 与当前适用不变量。T06 的 Market 不 rest、不分配 QueuePriority；quote budget 严格正且不含手续费，spent<=budget，unused_quote 不是成交。所有 notional/quote→qty 换算走统一 checked MarketMath；向下取整到合法 lot，本档不能成交一个 lot 时立即终止，不构造 Qty(0) 或零量 Trade。保护参考在命令开始捕获并固定；bps 只允许 0..=9_999，Buy 对 reference×(10_000+bps)/10_000 双重向下取整，Sell 对 reference×(10_000-bps)/10_000 双重向上取整，最终边界按方向与显式 worst price/market band 取更严格者。边界比较包含等号；首个越界 maker 不成交并终结命令。reservation/fee release 只保留后续接口契约，不伪造已实现的资金闭环。Market 仅推进当前立即成交并终结余量的语义；独立 Limit IOC、FOK、PostOnly、Stop、Iceberg、Amend、CancelReplace、HA、完整后续命令协议及 runtime/persistence/risk/protocol 业务仍在后续任务。禁止 MarketByQuote + FOK，不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T05 已以独立流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，验收可复现 100k command tape 与当前适用不变量。T06 已验收的 Market 不 rest、不分配 QueuePriority；quote budget 严格正且不含手续费，spent<=budget，unused_quote 不是成交。所有 notional/quote→qty 换算走统一 checked MarketMath；向下取整到合法 lot，本档不能成交一个 lot 时立即终止，不构造 Qty(0) 或零量 Trade。保护参考在命令开始捕获并固定；bps 只允许 0..=9_999，Buy 对 reference×(10_000+bps)/10_000 双重向下取整，Sell 对 reference×(10_000-bps)/10_000 双重向上取整，最终边界按方向与显式 worst price/market band 取更严格者。边界比较包含等号；首个越界 maker 不成交并终结命令。reservation/fee release 只保留后续接口契约，不伪造已实现的资金闭环。
+
+T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Stop、Iceberg、DAY/GTD 到期执行、Amend、CancelReplace、HA、完整后续命令协议及 runtime/persistence/risk/protocol 业务仍在后续任务；不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
-1. 分析仓库实际状态，明确已完成证据、缺失项及本轮唯一小目标。
-2. 给用户一个约 15–60 分钟的小任务，必须给出具体实施步骤：修改位置与职责、只读预检顺序、状态提交顺序、约束与错误语义、测试场景和验证命令。不得只用一句话概述下一步或以任务标题代替实施指导。
-3. 用户实现并报告完成后，检查实际文件、diff、编译和测试结果，不凭描述认定完成。
-4. 发现问题就继续指导修订当前小步；区分阻塞问题与非阻塞建议。
-5. 当前小步有充分证据验收后，再进入下一小步。小步完成不等于整个 Task 完成。
-6. 每轮结束前更新 handoff：Overall Goal、当前 Task、仓库事实、完成证据、测试状态、决策、不变量、TODO、Blocker、Deferred 和下一次续接点。
+1. 读取规格、交接和真实仓库状态，保留用户已有改动，明确任务范围与验收证据。
+2. 按依赖拆分实施步骤，先建立有意义的失败测试，再完成独立 Reference/Production 实现。
+3. 审查真实 diff、调用链、数值与状态不变量，运行影响范围内的测试和 gate。
+4. 发现问题立即修订；当前任务完整 gate 通过前不标记完成或进入下一任务。
+5. 每轮结束更新唯一 handoff：Overall Goal、当前 Task、仓库事实、完成证据、测试状态、决策、不变量、TODO、Blocker、Deferred 和续接点。
 
 ## 全局工程约束
 
@@ -48,6 +49,7 @@ v6 §77 的全部工程规则是审查依据。以下为常用约束摘要，不
 
 - 流程图的标题、说明和图内节点只描述实际职责、输入、状态转换和验证边界；不得使用 `T00`、`T05` 等任务/阶段编号作为流程图标识。任务编号仍可用于任务书、交接、提交记录和范围管理文档。
 - 涉及计算公式时，必须维护 [docs/numerical_formulas.md](docs/numerical_formulas.md)：公式单独记录，使用 TeX，按通用业务职责组织；该文档不得出现任务或阶段编号。Codex 负责维护此文档，并在公式契约改变时同步规格、实现说明和测试边界。
+- 公式文档面向业务读者，不写编辑规范、维护流程或“不得使用任务编号”等元说明。以 GitHub 页面为显示目标：块公式使用 `math` fenced code block，行内公式采用 GitHub 支持的美元符号包裹反引号代码片段，保护 TeX 不被 Markdown 转义。验收须检查闭合、实际 TeX 解析及渲染，不能只数定界符；本地预览通过不等于已推送后的 GitHub 页面通过。 比较符使用 `\lt`、`\gt`，避免裸尖括号被 GitHub 的 HTML 转换截断；不使用已证实被禁的 `\operatorname`。验证须覆盖 GitHub 实际渲染组件的宏检查与 HTML 转换，并逐项比较公式符号和结构，防止无报错的内容丢失。
 
 ### 数值、时间与确定性
 
@@ -110,7 +112,7 @@ Clippy 规则在运行 Clippy 时检查，不能用 `cargo check` 代替。即�
 3. 是否引入核心路径网络/数据库/异步运行时、wall clock、随机性、无界队列或其他确定性风险；依赖内部 unsafe 的情况不能由本项目 lint 推断。
 4. 队列 API 的容量、满队列行为与背压策略；引入新队列库时同步审查并扩充 disallowed-methods，而不是把未列入名单当作允许无界队列。
 
-保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T06 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T06 首步不新增依赖，保留 Reference 的独立 Vec 模型及 Production 的 BTreeMap/HashMap/Arena/PriceLevel，不复用生产撮合逻辑来生成参考答案。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
+保持当前 Task 按需引入依赖，不为未来预装，不自行升级依赖。T07 启动基线：matching-orderbook 已有 matching-domain 本地 path 依赖及仅用于测试的 proptest 1.11.0（默认 features，审查见 handoff 的 T02.15 记录）；其余五库无依赖。T07 首步不新增依赖，保留 Reference 的独立 Vec 模型及 Production 的 BTreeMap/HashMap/Arena/PriceLevel，不复用生产撮合逻辑来生成参考答案。不为了配置禁用列表而引入 Tokio/Crossbeam；禁用的标准库无界 API 不代表现在要实现 channel/runtime。
 
 lint 配置或继承发生变化时，用独立临时副本/探针验证预期诊断与合法对照，不在业务源码保留违规探针，不把空库检查通过当作规则拦截证据。
 
@@ -143,4 +145,6 @@ T05 先运行 differential 定向及完整 matching-orderbook 回归，再运行
 
 T05 最终本地验收证据为：21 项 differential（固定 seed 单条 100k、两组固定 seed 双次 10k、逐命令原序事件/状态/不变量）、229 项 matching-orderbook 单测、workspace 299 项单测和 2 项 doctest，以及 fmt、严格 Clippy、普通/cached diff check 全部 exit 0。此证据不覆盖 Stop/expiry、跨 shard TradeId、WAL/digest/crash 或远端 CI；它们只能在对应范围任务中实现和验证。
 
-T06 每个小步先运行当前定向测试；domain 契约变化须运行 matching-domain 全量，Reference/Production 或其公共调用链变化才重跑相应 differential、完整 matching-orderbook 和必要 property。未受当前 diff 影响的历史 suite 可引用 handoff 的最近通过证据，不机械重跑；Task 最终验收仍必须完整运行 differential、matching-orderbook 与 workspace gate。Task 验收必须有 MarketByBase/MarketByQuote 的 empty/multi-level/partial/invalid、双向价格/FIFO、无 rest/无 priority 消耗、原序 TradeEvent、dust 终止/无零量成交、spent<=budget property、checked 错误与失败边界、保护参考不随本单成交漂移等证据。§64 的 IOC/FOK/PostOnly/Iceberg 属于其他任务，不能把阶段清单视为本次授权；当前所有 T05 数量证据只证明 Limit GTC/Cancel 基线，不代表 Market 已实现。
+T06 已于 2026-10-16 本地验收：固定 seed 100k streamed differential、workspace domain 139 / orderbook 316 单测及 2 doctest、fmt、严格 Clippy 和普通/cached diff check 均通过。此为历史验证证据，不代表 T07 或新的远端 CI 已通过。
+
+T07 每个小步先运行当前定向测试；domain 契约变化须运行 matching-domain 全量，Reference/Production 或其公共调用链变化须重跑相应 differential、完整 matching-orderbook 和必要 property；跨 crate 调用链变化运行 workspace gate。未受当前 diff 影响的历史 suite 可引用 handoff 的最近通过证据，不机械重跑；Task 最终验收必须完整运行 differential、matching-orderbook 与 workspace gate。须覆盖 IOC 双向价格/FIFO/empty/partial/余量终结与无 priority 消耗，FOK exact/multi-level/不足/价格不可执行/失败原子性及 all-or-zero property，PostOnly 双向等价交叉拒绝、非交叉挂单、拒绝零 mutation 和 never-taker property，以及固定 seed 重复 tape 原序事件/逐命令状态对比。保留 T02–T06 regression 和当前适用不变量；§64 的 Iceberg 不在本次授权。
