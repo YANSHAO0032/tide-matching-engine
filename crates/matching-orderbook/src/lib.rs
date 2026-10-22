@@ -1,33 +1,34 @@
-//! 独立参考订单簿、生产订单簿及其 Arena/FIFO/priority 基础结构。
+//! 独立参考订单簿、生产订单簿及其 Arena/先进先出/优先级基础结构。
 //!
-//! Reference 使用 `Vec + sort`；Production 使用 BTreeMap 价格索引、HashMap
-//! 身份定位和 Arena 内 intrusive FIFO。两者独立实现市价、限价 IOC/FOK/PostOnly；
-//! Production 另有自动挂入余量的完整 Limit GTC 入口，Reference 的底层限价撮合不自动 rest。
-//! 市价与 IOC/FOK 不挂单、不分配 priority；PostOnly 只在成功 rest 时分配。
-//! 本 crate 不包含完整命令生命周期、资金闭环、持久化或 market 管理。
+//! 参考簿使用 `Vec + sort`；生产簿使用 BTreeMap 价格索引、HashMap
+//! 身份定位和 Arena 内侵入式先进先出。两者独立实现市价、限价 IOC/FOK/PostOnly 与冰山可见片生命周期；
+//! 两者都有带事件的 GTC 余量挂单入口，参考簿的底层限价撮合仍不自动挂单。
+//! 市价与 IOC/FOK 的新到订单不挂单、不分配优先级；冰山挂单补量会取得新优先级。
+//! PostOnly 只在成功挂单时分配；冰山每次补量移动到同价队尾。
+//! 本库不包含完整命令生命周期、资金闭环、持久化或市场管理。
 
-/// 进入撮合流程但尚未 rest 的最小运行态订单。
+/// 进入撮合流程但尚未挂单的最小运行态。
 pub mod incoming_order;
-/// Reference 与 Production 共享的只读市价计划数据；不含撮合算法。
+/// 参考簿与生产簿共享的只读市价计划数据；不含撮合算法。
 mod market_plan;
-/// 保存稳定槽位与 LIFO free-list 的 Arena 容器。
+/// 保存稳定槽位与后进先出空闲链表的 Arena 容器。
 pub mod order_arena;
 /// 稳定但可复用的 Arena 槽位位置。
 pub mod order_index;
-/// 承载订单运行态和 intrusive 双向链接的 Arena 节点。
+/// 承载订单运行态和侵入式双向链接的 Arena 节点。
 pub mod order_node;
-/// 单价格档位的 FIFO 端点、聚合值与局部链表维护。
+/// 单价格档位的先进先出端点、聚合值与局部链表维护。
 pub mod price_level;
-/// 单市场生产簿的查询、Cancel、限价和市价执行。
+/// 单市场生产簿的查询、取消、限价和市价执行。
 pub mod production_orderbook;
-/// market-local QueuePriority 的分配与 high-water 边界。
+/// 市场内 QueuePriority 的分配与高水位边界。
 pub mod queue_priority_allocator;
-/// 参考模型中持有剩余量与 priority 的 resting 订单。
+/// 参考模型中持有剩余量与优先级的挂单订单。
 pub mod reference_order;
 /// `Vec + sort` 的确定性参考订单簿与成交基线。
 pub mod reference_orderbook;
 
-/// incoming 运行态订单。
+/// 新到订单运行态。
 pub use incoming_order::IncomingOrder;
 /// Arena 的槽位生命周期容器。
 pub use order_arena::OrderArena;
@@ -35,13 +36,13 @@ pub use order_arena::OrderArena;
 pub use order_index::OrderIndex;
 /// Arena 中的订单运行态节点。
 pub use order_node::OrderNode;
-/// 单价 FIFO 链表档位。
+/// 单价先进先出链表档位。
 pub use price_level::PriceLevel;
-/// market-local priority policy、allocator 与初始化错误。
+/// 市场内优先级策略、分配器与初始化错误。
 pub use queue_priority_allocator::{
     QueuePriorityAllocator, QueuePriorityInitError, QueuePriorityPolicy,
 };
-/// 参考 resting 订单。
+/// 参考挂单订单。
 pub use reference_order::ReferenceOrder;
 /// `Vec + sort` 参考订单簿。
 pub use reference_orderbook::ReferenceOrderBook;

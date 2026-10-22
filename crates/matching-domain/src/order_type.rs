@@ -7,9 +7,9 @@ pub enum OrderType {
     Limit,
     /// 以当时可得流动性为目标的市价订单。
     Market,
-    /// 触发后形成市价 child 的止损订单。
+    /// 触发后形成市价子订单的止损订单。
     StopMarket,
-    /// 触发后形成限价 child 的止损订单。
+    /// 触发后形成限价子订单的止损订单。
     StopLimit,
     /// 具有可见量与隐藏量语义的冰山订单。
     Iceberg,

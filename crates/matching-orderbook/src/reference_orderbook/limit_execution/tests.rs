@@ -45,7 +45,7 @@ fn post_only_checks_level_aggregate_after_crossing_and_priority() {
             Err(RejectReason::ArithmeticOverflow)
         );
         assert_eq!(snapshot(&book), before);
-        // Current remaining, rather than original quantity, determines level capacity.
+        // 价档容量取决于当前剩余量，而不是原始下单量。
         book.orders[0].apply_fill(Qty::try_new(2).unwrap()).unwrap();
         book.place_limit_post_only(order(2, side, 100, 2)).unwrap();
         assert_eq!(book.next_priority, 2);

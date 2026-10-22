@@ -2,20 +2,20 @@ use crate::{OrderId, Price, Qty, Side, TradeId};
 
 /// 最小成交事件值对象。
 ///
-/// 它不含费用、结算、持久化序列或公开 feed 元数据。
+/// 它不含费用、结算、持久化序列或公开行情流元数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradeEvent {
     /// 此笔实际成交的唯一身份。
     pub trade_id: TradeId,
-    /// 提供 resting 流动性的 maker 订单身份。
+    /// 提供挂单流动性的挂单订单身份。
     pub maker_order_id: OrderId,
-    /// 主动消耗流动性的 taker 订单身份。
+    /// 主动消耗流动性的吃单方订单身份。
     pub taker_order_id: OrderId,
-    /// 成交价格；Reference 和 Production 均取 resting maker 的价格。
+    /// 成交价格；参考簿和生产簿均取挂单的价格。
     pub price: Price,
     /// 实际成交的严格正数量。
     pub qty: Qty,
-    /// maker 订单的买卖方向，用于确定双方角色。
+    /// 挂单订单的买卖方向，用于确定双方角色。
     pub maker_side: Side,
 }
 
@@ -24,7 +24,7 @@ mod tests {
     //! 验证成交载荷各字段均参与值语义。
     use super::*;
 
-    /// 构造可复用的成交载荷 fixture。
+    /// 构造可复用的成交载荷测试数据。
     fn sample_trade() -> TradeEvent {
         TradeEvent {
             trade_id: TradeId::new(100),

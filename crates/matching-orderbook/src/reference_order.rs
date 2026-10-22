@@ -1,31 +1,85 @@
 use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason};
 
-/// 参考订单簿使用的最小 resting 订单运行态。
+/// 参考订单簿使用的最小挂单订单运行态。
 ///
-/// 此对象保存剩余量与 market-local priority。它不维护生产簿的 intrusive FIFO 链接；
-/// 参考模型的同价 FIFO 由源 `Vec` 的稳定顺序表达。
-#[derive(Debug)]
+/// 此对象保存剩余量与市场内优先级。它不维护生产簿的侵入式先进先出链接；
+/// 参考模型的同价先进先出由源 `Vec` 的稳定顺序表达。
+#[derive(Clone, Debug)]
 pub struct ReferenceOrder {
     /// 不随成交扣减改变的原始订单载荷。
     original: LimitGtcOrder,
-    /// 尚未成交的数量原始整数，可以在移除前短暂为零。
+    /// 当前可见片的剩余量，可以在移除或补量前短暂为零。
     remaining: u64,
-    /// 仅由 [`crate::ReferenceOrderBook::rest`] 分配的市场本地 queue priority。
+    hidden_remaining: u64,
+    peak_size: Option<Qty>,
+    /// 实际挂单或冰山补量时分配的市场本地队列优先级。
     priority: QueuePriority,
 }
 
 impl ReferenceOrder {
-    /// 用已分配的 priority 构造 resting 运行态。
+    /// 用已分配的优先级构造挂单运行态。
     ///
-    /// 该 crate-private 构造器供参考簿和测试 fixture 使用；实际挂单必须经
-    /// [`crate::ReferenceOrderBook::rest`] 完成重复 ID 与 high-water 校验。
+    /// 该库内私有构造器供参考簿和测试数据使用；实际挂单必须经
+    /// [`crate::ReferenceOrderBook::rest`] 完成重复标识符与高水位校验。
     pub(crate) fn new(original: LimitGtcOrder, priority: QueuePriority) -> Self {
         let remaining = original.qty.get();
         Self {
             original,
             remaining,
+            hidden_remaining: 0,
+            peak_size: None,
             priority,
         }
+    }
+
+    /// 根据已验证的冰山余量构造运行态，同时保留原始输入。
+    pub(crate) fn iceberg(
+        original: LimitGtcOrder,
+        remaining: u64,
+        peak: Qty,
+        priority: QueuePriority,
+    ) -> Self {
+        let visible = remaining.min(peak.get());
+        Self {
+            original,
+            remaining: visible,
+            hidden_remaining: remaining
+                .checked_sub(visible)
+                .expect("visible bounded by total"),
+            peak_size: Some(peak),
+            priority,
+        }
+    }
+    /// 公开深度只统计当前可见片的数量。
+    pub fn visible_remaining(&self) -> u64 {
+        self.remaining
+    }
+    /// 尚未公开、等待后续补量的隐藏数量。
+    pub fn hidden_remaining(&self) -> u64 {
+        self.hidden_remaining
+    }
+    /// 包含全部可见片和隐藏片的剩余基础资产数量。
+    pub fn total_remaining(&self) -> u64 {
+        self.remaining
+            .checked_add(self.hidden_remaining)
+            .expect("reference total invariant")
+    }
+    /// 配置的显示上限；普通订单没有该上限。
+    pub fn peak_size(&self) -> Option<Qty> {
+        self.peak_size
+    }
+    /// 调用方须预先检查优先级分配和同价档数量聚合。
+    pub(crate) fn refresh(&mut self, priority: QueuePriority) -> Qty {
+        let visible = self
+            .hidden_remaining
+            .min(self.peak_size.expect("iceberg peak").get());
+        self.hidden_remaining = self
+            .hidden_remaining
+            .checked_sub(visible)
+            .expect("refresh hidden underflow");
+        self.remaining = visible;
+        self.priority = priority;
+        Qty::try_new(visible).expect("positive refresh")
     }
 
     /// 借用不可变的原始订单载荷。
@@ -33,12 +87,12 @@ impl ReferenceOrder {
         &self.original
     }
 
-    /// 返回当前尚未成交的数量原始整数。
+    /// 返回当前可见剩余量；订单总剩余量见 `total_remaining`。
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
 
-    /// 返回该订单获得的市场本地 queue priority。
+    /// 返回该订单获得的市场本地队列优先级。
     pub fn priority(&self) -> QueuePriority {
         self.priority
     }
@@ -60,14 +114,14 @@ impl ReferenceOrder {
 
 #[cfg(test)]
 mod tests {
-    //! 验证参考 resting 订单的剩余量、priority 和失败原子性。
+    //! 验证参考挂单订单的剩余量、优先级和失败原子性。
     use matching_domain::{
         LimitGtcOrder, OrderId, Price, Qty, QueuePriority, RejectReason, Side, UserId,
     };
 
     use super::ReferenceOrder;
 
-    /// 构造合法的买入订单 fixture。
+    /// 构造合法的买入订单测试数据。
     fn make_order(qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(1),

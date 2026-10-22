@@ -3,18 +3,18 @@ use matching_domain::{Qty, RejectReason};
 
 /// 单个价格档位的运行态。
 ///
-/// 使用双向链表维护同价订单的 FIFO 顺序。
+/// 使用双向链表维护同价订单的先进先出顺序。
 /// 支持尾插、头部部分成交、头删、中尾删除和只读访问。
-/// 修改前执行涉及节点的只读预检；内部状态损坏时直接 panic。
+/// 修改前执行涉及节点的只读预检；内部状态损坏时直接触发不变量断言。
 #[derive(Debug, Default)]
 pub struct PriceLevel {
-    /// FIFO 头节点的 Arena 槽位；合法空档必须为 `None`。
+    /// 先进先出头节点的 Arena 槽位；合法空档必须为 `None`。
     head: Option<OrderIndex>,
-    /// FIFO 尾节点的 Arena 槽位；合法空档必须为 `None`。
+    /// 先进先出尾节点的 Arena 槽位；合法空档必须为 `None`。
     tail: Option<OrderIndex>,
-    /// 本档位链表中可达 live 节点数量，必须与端点和链接一致。
+    /// 本档位链表中可达有效节点数量，必须与端点和链接一致。
     count: u32,
-    /// 所有可达节点 `remaining` 的 checked 聚合，合法空档必须为零。
+    /// 对所有可达节点的 `remaining` 进行溢出检查后得到的聚合量，合法空档必须为零。
     total_visible_qty: u64,
 }
 
@@ -24,17 +24,17 @@ impl PriceLevel {
         Self::default()
     }
 
-    /// 返回 FIFO 头节点槽位；不遍历或验证 Arena 中的链接。
+    /// 返回先进先出头节点槽位；不遍历或验证 Arena 中的链接。
     pub fn head(&self) -> Option<OrderIndex> {
         self.head
     }
 
-    /// 返回 FIFO 尾节点槽位；不遍历或验证 Arena 中的链接。
+    /// 返回先进先出尾节点槽位；不遍历或验证 Arena 中的链接。
     pub fn tail(&self) -> Option<OrderIndex> {
         self.tail
     }
 
-    /// 返回本档位声明的 live 节点数量。
+    /// 返回本档位声明的有效节点数量。
     pub fn count(&self) -> u32 {
         self.count
     }
@@ -46,7 +46,7 @@ impl PriceLevel {
 
     /// 报告计数是否为零。
     ///
-    /// 合法空档还要求 head/tail 为 `None` 且可见数量为零；这些更强条件由
+    /// 合法空档还要求头节点/尾节点为 `None` 且可见数量为零；这些更强条件由
     /// 状态转换预检和测试校验器维护。
     pub fn is_empty(&self) -> bool {
         self.count == 0
@@ -54,14 +54,14 @@ impl PriceLevel {
 
     /// 将未连接的订单节点追加到当前价格档位尾部。
     ///
-    /// 保持同价 FIFO，priority 必须严格递增。
+    /// 保持同价先进先出，优先级必须严格递增。
     /// 可复用 Arena 的空槽，但不能改变队列顺序。
     ///
-    /// 校验失败不修改 Level、Arena 或 free-list。
-    /// 内部链接不变量违反时直接 panic。
+    /// 校验失败不修改价档、Arena 或空闲链表。
+    /// 内部链接不变量违反时直接触发不变量断言。
     ///
-    /// 此低层原语不建立 OrderId lookup，也不分配 QueuePriority；调用方必须
-    /// 提供同 side/price、严格高于旧尾 priority 的未链接节点。
+    /// 此低层原语不建立 OrderId 查找，也不分配 QueuePriority；调用方必须
+    /// 提供同方向/价格、严格高于旧尾优先级的未链接节点。
     pub fn push_back(
         &mut self,
         arena: &mut OrderArena,
@@ -127,7 +127,7 @@ impl PriceLevel {
             .ok_or(RejectReason::ArithmeticOverflow)?;
 
         // 第三阶段：分配槽位。
-        // 只有成功分配后才允许修改已有节点和 Level。
+        // 只有成功分配后才允许修改已有节点和价档。
         node.set_prev(previous_tail);
         let new_index = arena.insert(node)?;
 
@@ -149,17 +149,17 @@ impl PriceLevel {
         Ok(new_index)
     }
 
-    /// 对当前 FIFO head 应用严格部分成交。
+    /// 对当前先进先出头节点应用严格部分成交。
     ///
     /// 只允许 `0 < fill < head.remaining()`。
     /// 完整成交必须由后续路径使用 `pop_front`，
-    /// 不允许把 remaining=0 的节点留在价格档中。
+    /// 不允许把剩余量=0 的节点留在价格档中。
     ///
     /// 成功时仅修改：
-    /// - head.remaining
-    /// - total_visible_qty
+    /// - 头节点可见余量 `head.remaining`
+    /// - 价档总可见量 `total_visible_qty`
     ///
-    /// 不修改 count、head/tail、prev/next、priority 或 Arena 生命周期。
+    /// 不修改节点数、头节点/尾节点、前驱/`next`、优先级或 Arena 生命周期。
     pub(crate) fn apply_head_partial_fill(&mut self, arena: &mut OrderArena, fill: Qty) {
         // 1. PriceLevel 基本状态只读预检。
         assert!(
@@ -178,7 +178,7 @@ impl PriceLevel {
             self.total_visible_qty > 0,
             "PriceLevel invariant violation: zero aggregate"
         );
-        // 2. 只读取得 head 状态。
+        // 2. 只读取得头节点状态。
         let (head_remaining, successor_index, head_side, head_price, head_priority) = {
             let head = arena
                 .get(head_index)
@@ -205,8 +205,8 @@ impl PriceLevel {
 
         let fill_lots = fill.get();
 
-        // Qty 已保证 fill > 0。
-        // equality 属于完整成交，不属于本原语。
+        // Qty 已保证成交 > 0。
+        // 相等关系属于完整成交，不属于本原语。
         assert!(
             fill_lots < head_remaining,
             "PriceLevel invariant violation: \
@@ -228,7 +228,7 @@ impl PriceLevel {
             "PriceLevel invariant violation: partial fill exhausted head"
         );
 
-        // 4. 检查当前 head 所在档位的局部结构。
+        // 4. 检查当前头节点所在档位的局部结构。
         if self.count == 1 {
             assert_eq!(
                 head_index, tail_index,
@@ -240,7 +240,7 @@ impl PriceLevel {
                 "PriceLevel invariant violation: single node has successor"
             );
 
-            // 单节点可以精确证明 aggregate 正确。
+            // 单节点可以精确证明聚合量正确。
             assert_eq!(
                 self.total_visible_qty, head_remaining,
                 "PriceLevel invariant violation: single-node aggregate mismatch"
@@ -318,7 +318,7 @@ impl PriceLevel {
                 "PriceLevel invariant violation: tail has next"
             );
 
-            // 多节点至少还有其它正 remaining。
+            // 多节点至少还有其它正剩余量。
             assert!(
                 new_total > new_remaining,
                 "PriceLevel invariant violation: invalid multi-node aggregate"
@@ -327,27 +327,27 @@ impl PriceLevel {
 
         // ---------- 到这里之前绝不能发生任何写入 ----------
 
-        // 5. 提交节点 remaining。
+        // 5. 提交节点剩余量。
         arena
             .get_mut(head_index)
             .expect("prechecked head must exist")
             .commit_partial_remaining(new_remaining);
 
-        // 6. 提交档位 aggregate。
+        // 6. 提交档位聚合量。
         self.total_visible_qty = new_total;
     }
 
-    /// 移除并返回当前档位的 FIFO 头节点。
+    /// 移除并返回当前档位的先进先出头节点。
     ///
     /// 合法空档返回 None。
-    /// 内部状态损坏时在修改前 panic。
+    /// 内部状态损坏时在修改前触发不变量断言。
     ///
     /// 先解除本档链接，最后释放 Arena 槽位。
-    /// 返回节点保留原始订单、remaining 和 priority，
+    /// 返回节点保留原始订单、剩余量和优先级，
     /// 但不再携带任何链表链接。
     ///
-    /// 该操作只维护档位和 Arena 生命周期；不执行 Cancel 业务语义，也不维护
-    /// ProductionOrderBook 的订单索引；owner 须在同一独占 mutation 内清理，
+    /// 该操作只维护档位和 Arena 生命周期；不执行取消业务语义，也不维护
+    /// ProductionOrderBook 的订单索引；所有者须在同一独占状态变更内清理，
     /// 且清理前不能再次查询旧映射或复用已释放槽位。
     pub fn pop_front(&mut self, arena: &mut OrderArena) -> Option<OrderNode> {
         // 1. 空档必须满足全部空状态不变量。
@@ -534,14 +534,14 @@ impl PriceLevel {
     /// 仅支持中间节点和尾节点；头节点应使用 `pop_front`。
     ///
     /// 不遍历链表，只对目标节点及其直接相邻节点执行 O(1) 预检。
-    /// 内部状态损坏时必须在任何修改发生前 panic。
+    /// 内部状态损坏时必须在任何修改发生前触发不变量断言。
     ///
     /// 成功后返回已解除链接的节点，并最后释放 Arena 槽位。
     ///
-    /// 调用者必须提供当前 live、属于本档且不是头节点的 index。该低层接口
+    /// 调用者必须提供当前有效、属于本档且不是头节点的索引。该低层接口
     /// 不扫描整条链以建立成员归属；头删除统一由 `pop_front` 处理。
     pub fn unlink(&mut self, arena: &mut OrderArena, index: OrderIndex) -> OrderNode {
-        // 1. Level 基本只读预检。
+        // 1. 价档基本只读预检。
         assert!(
             self.count >= 2,
             "PriceLevel invariant violation: unlink requires at least two nodes"
@@ -559,7 +559,7 @@ impl PriceLevel {
             "PriceLevel invariant violation: zero aggregate"
         );
 
-        // head 统一交给 pop_front，避免两套头删语义。
+        // 头节点统一交给 pop_front，避免两套头删语义。
         assert_ne!(
             index, head_index,
             "PriceLevel invariant violation: unlink target is head"
@@ -602,7 +602,7 @@ impl PriceLevel {
             )
         };
 
-        // 3. predecessor <-> target 局部不变量。
+        // 3. 前驱节点 <-> 目标局部不变量。
         {
             let predecessor = arena
                 .get(predecessor_index)
@@ -632,7 +632,7 @@ impl PriceLevel {
             );
         }
 
-        // 4. target <-> successor 或 tail 不变量。
+        // 4. 目标 <-> 后继节点或尾节点不变量。
         if let Some(successor_index) = successor_index {
             assert_ne!(
                 successor_index, index,
@@ -688,7 +688,7 @@ impl PriceLevel {
             );
         }
 
-        // 5. 统计值 checked 预计算。
+        // 5. 统计值带溢出检查的预计算。
         let new_count = self
             .count
             .checked_sub(1)
@@ -699,7 +699,7 @@ impl PriceLevel {
             .checked_sub(target_qty)
             .expect("PriceLevel invariant violation: quantity underflow");
 
-        // unlink 不处理 head，因此至少仍存在 predecessor。
+        // 解除链接不处理头节点，因此至少仍存在前驱节点。
         assert!(
             new_count > 0,
             "PriceLevel invariant violation: unlink removed last node"
@@ -724,13 +724,13 @@ impl PriceLevel {
 
         // ---------- 到这里之前绝不能发生任何写入 ----------
 
-        // 6. 重接 predecessor -> successor。
+        // 6. 重接前驱节点 -> 后继节点。
         arena
             .get_mut(predecessor_index)
             .expect("prechecked predecessor must exist")
             .set_next(successor_index);
 
-        // 7. successor -> predecessor；如果没有 successor，则 predecessor 成为新 tail。
+        // 7. 后继节点 -> 前驱节点；如果没有后继节点，则前驱节点成为新尾节点。
         if let Some(successor_index) = successor_index {
             arena
                 .get_mut(successor_index)
@@ -758,9 +758,9 @@ impl PriceLevel {
 
 #[cfg(test)]
 mod tests {
-    //! 单档 FIFO、局部 fail-closed 预检与独立结构模型的验证。
+    //! 单档先进先出、局部故障时停止处理预检与独立结构模型的验证。
     //!
-    //! 验证器和 property 模型只在测试中存在，不是生产订单簿的不变量入口。
+    //! 验证器和性质测试模型只在测试中存在，不是生产订单簿的不变量入口。
 
     use super::*;
     use proptest::prelude::*;
@@ -786,7 +786,7 @@ mod tests {
         OrderIndex::try_from_usize(position).unwrap()
     }
 
-    /// 构造具有显式 side、price 和正 qty 的最小测试订单。
+    /// 构造具有显式方向、价格和正数量的最小测试订单。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -807,7 +807,7 @@ mod tests {
         )
     }
 
-    /// 复制节点的完整可观察状态，包括两条 intrusive 链接。
+    /// 复制节点的完整可观察状态，包括两条侵入式链接。
     fn node_state(
         node: &OrderNode,
     ) -> (
@@ -851,44 +851,44 @@ mod tests {
             "failed partial fill mutated Arena slots/free-list"
         );
     }
-    /// 独立 Vec FIFO 模型生成的单步结构操作。
+    /// 独立 Vec 先进先出模型生成的单步结构操作。
     #[derive(Debug, Clone)]
     enum LevelOp {
         /// 在尾部追加给定正数量的同价节点。
         Push(u64),
-        /// 移除当前 FIFO 头；空档时应保持不变并返回 `None`。
+        /// 移除当前先进先出头；空档时应保持不变并返回 `None`。
         PopFront,
         /// 选择非头逻辑位置的选择器，由模型映射为中间或尾节点。
         Unlink(u16),
     }
 
-    /// 独立 FIFO 模型中一个仍应存在的逻辑成员。
+    /// 独立先进先出模型中一个仍应存在的逻辑成员。
     #[derive(Debug, Clone)]
     struct ModelEntry {
-        /// 原始订单 payload，用于验证复用槽位没有改变逻辑成员。
+        /// 原始订单载荷，用于验证复用槽位没有改变逻辑成员。
         original: LimitGtcOrder,
         /// 该成员当前应计入档位聚合的数量。
         remaining: u64,
-        /// 模型分配的严格递增 priority。
+        /// 模型分配的严格递增优先级。
         priority: QueuePriority,
-        /// 真实操作返回的 live 槽位，用于与 Arena 集成状态比对。
+        /// 真实操作返回的有效槽位，用于与 Arena 集成状态比对。
         slot: OrderIndex,
     }
 
-    /// 生成有界混合操作；权重保证有足够的非空 FIFO 状态可验证。
+    /// 生成有界混合操作；权重保证有足够的非空先进先出状态可验证。
     fn level_op_strategy() -> impl Strategy<Value = LevelOp> {
         prop_oneof![
-            // Push 略微提高权重，否则大量空档 Pop/Unlink 的覆盖价值较低。
+            // 尾插略微提高权重，否则大量空档移除头节点/解除链接的覆盖价值较低。
             5 => (1u16..=1000u16).prop_map(|qty| LevelOp::Push(qty as u64)),
             3 => Just(LevelOp::PopFront),
             3 => any::<u16>().prop_map(LevelOp::Unlink),
         ]
     }
 
-    /// 比较独立 Vec 模型与真实 Level/Arena 的完整可观察结构。
+    /// 比较独立 Vec 模型与真实价档/Arena 的完整可观察结构。
     ///
-    /// 每一步同时检查元数据、每个 live 节点的 payload/双链、严格 priority
-    /// 和测试校验器，以便 shrink 后仍能指出首个偏离操作。
+    /// 每一步同时检查元数据、每个有效节点的载荷/双链、严格优先级
+    /// 和测试校验器，以便缩减后仍能指出首个偏离操作。
     fn assert_level_matches_model(
         level: &PriceLevel,
         arena: &OrderArena,
@@ -1116,7 +1116,7 @@ mod tests {
             let mut arena = OrderArena::new();
             let mut level = PriceLevel::new();
 
-            // 两个独立空槽，用于验证失败后 LIFO 顺序不变。
+            // 两个独立空槽，用于验证失败后后进先出顺序不变。
             let hole0 = arena
                 .insert(OrderNode::new(
                     order(90, Side::Sell, 110, 1),
@@ -1144,7 +1144,7 @@ mod tests {
             arena.remove(hole1).unwrap();
 
             if count_overflow {
-                // 只在测试中合成 count 溢出边界。
+                // 只在测试中合成节点数溢出边界。
                 level.count = u32::MAX;
             }
             let arena_before = arena.test_snapshot();
@@ -1167,7 +1167,7 @@ mod tests {
             assert!(arena.get(hole0).is_none());
             assert!(arena.get(hole1).is_none());
 
-            // 失败没有消费 free，仍按原来的 LIFO 顺序复用。
+            // 失败没有消费空闲，仍按原来的后进先出顺序复用。
             for (expected, id) in [(hole1, 92), (hole0, 93)] {
                 let actual = arena
                     .insert(OrderNode::new(
@@ -1232,7 +1232,7 @@ mod tests {
                 8 => level.head = None,
 
                 9 => {
-                    // 已有 maker remaining=5，但档位总量被破坏为 0。
+                    // 已有挂单剩余量=5，但档位总量被破坏为 0。
                     level.total_visible_qty = 0;
                 }
                 _ => unreachable!(),
@@ -1370,13 +1370,13 @@ mod tests {
             }
         }
     }
-    /// 验证单价 FIFO 的全链结构，返回可读失败原因而不是 panic。
+    /// 验证单价先进先出的全链结构，返回可读失败原因而不是触发不变量断言。
     ///
-    /// 该测试辅助从 head 正向和 tail 反向遍历，核对端点、双链、count、
-    /// visible qty、同 side/price 和严格递增 priority；无关 live Arena
+    /// 该测试辅助从头节点正向和尾节点反向遍历，核对端点、双链、节点数、
+    /// 可见数量、同方向/价格和严格递增优先级；无关有效 Arena
     /// 槽位不属于此档位，故不参与检查。
     fn validate_level(level: &PriceLevel, arena: &OrderArena) -> Result<(), String> {
-        // count 是空档的权威判断。
+        // 节点数是空档的权威判断。
         if level.count() == 0 {
             if level.head().is_some() || level.tail().is_some() || level.total_visible_qty() != 0 {
                 return Err("empty level has inconsistent endpoints or quantity".into());
@@ -1397,7 +1397,7 @@ mod tests {
             return Err("non-empty level has zero total_visible_qty".into());
         }
 
-        // ---------- forward: head -> next ----------
+        // ---------- 正向遍历: 头节点 -> `next` ----------
 
         let mut forward = Vec::new();
         let mut visited = BTreeSet::new();
@@ -1424,7 +1424,7 @@ mod tests {
                 .get(index)
                 .ok_or_else(|| format!("forward chain references missing node: {}", index.get()))?;
 
-            // 当前节点必须反向指回真实 predecessor。
+            // 当前节点必须反向指回真实前驱节点。
             if node.prev() != expected_prev {
                 return Err(format!("broken prev link at index {}", index.get()));
             }
@@ -1494,7 +1494,7 @@ mod tests {
             ));
         }
 
-        // ---------- reverse: tail -> prev ----------
+        // ---------- 反向遍历: 尾节点 -> 前驱 ----------
 
         let mut reverse = Vec::new();
         let mut reverse_visited = BTreeSet::new();
@@ -1514,7 +1514,7 @@ mod tests {
                 .get(index)
                 .ok_or_else(|| format!("reverse chain references missing node: {}", index.get()))?;
 
-            // 当前节点必须正向指回真实 successor。
+            // 当前节点必须正向指回真实后继节点。
             if node.next() != expected_next {
                 return Err(format!("broken next link at index {}", index.get()));
             }
@@ -1533,16 +1533,16 @@ mod tests {
 
         Ok(())
     }
-    /// validator 测试注入的单一损坏维度，每种样本只应违反其目标不变量。
+    /// 校验器测试注入的单一损坏维度，每种样本只应违反其目标不变量。
     #[derive(Debug, Clone, Copy)]
     enum LevelDamage {
-        /// 元数据 count 与实际链长不一致。
+        /// 元数据节点数与实际链长不一致。
         WrongCount,
         /// 元数据可见量与节点数量聚合不一致。
         WrongQty,
-        /// 非空档缺少 head 端点。
+        /// 非空档缺少头节点端点。
         MissingHead,
-        /// 非空档缺少 tail 端点。
+        /// 非空档缺少尾节点端点。
         MissingTail,
         /// 前驱节点没有正向指向其后继。
         BrokenForwardLink,
@@ -1552,15 +1552,15 @@ mod tests {
         MissingNode,
         /// 同一档位节点拥有不同价格。
         PriceMismatch,
-        /// FIFO 链中的 priority 不再严格递增。
+        /// 先进先出链中的优先级不再严格递增。
         PriorityViolation,
-        /// 空 count 与非空端点或数量的矛盾状态。
+        /// 空节点数与非空端点或数量的矛盾状态。
         NonEmptyCountZero,
         /// 后继节点没有反向指向其前驱。
         BrokenBackwardLink,
-        /// 同一档位节点拥有不同 side。
+        /// 同一档位节点拥有不同方向。
         SideMismatch,
-        /// 测试遍历累加 visible qty 时发生 checked overflow。
+        /// 测试遍历累加可见数量时发生溢出。
         QtyOverflow,
     }
     #[test]
@@ -1623,12 +1623,12 @@ mod tests {
                 }
 
                 LevelDamage::Cycle => {
-                    // head -> second -> head
+                    // 头节点 -> 第二个 -> 头节点
                     arena.get_mut(second).unwrap().set_next(Some(first));
                 }
 
                 LevelDamage::MissingNode => {
-                    // level 仍引用 second，但 Arena 已无该节点。
+                    // 价档仍引用第二个，但 Arena 已无该节点。
                     arena.remove(second).unwrap();
                 }
 
@@ -1658,18 +1658,18 @@ mod tests {
                     assert_eq!(reused, second);
                 }
                 LevelDamage::NonEmptyCountZero => {
-                    // head、tail 仍然存在，但 count 错误地归零。
+                    // 头节点、尾节点仍然存在，但节点数错误地归零。
                     level.count = 0;
                 }
 
                 LevelDamage::BrokenBackwardLink => {
-                    // first.next 仍指向 second，
-                    // 但 second.prev 不再指向 first。
+                    // `first.next` 仍指向第二个，
+                    // 但 `second.prev` 不再指向第一个。
                     arena.get_mut(second).unwrap().set_prev(None);
                 }
 
                 LevelDamage::SideMismatch => {
-                    // 复用原槽位，保持链接、价格和 priority 不变，
+                    // 复用原槽位，保持链接、价格和优先级不变，
                     // 只改变节点方向。
                     arena.remove(second).unwrap();
 
@@ -1683,9 +1683,9 @@ mod tests {
                 }
 
                 LevelDamage::QtyOverflow => {
-                    // first.remaining = 5
-                    // second.remaining = u64::MAX
-                    // 仅替换第二个节点，保留合法链接和 priority。
+                    // `first.remaining` = 5
+                    // `second.remaining` = `u64::MAX`
+                    // 仅替换第二个节点，保留合法链接和优先级。
                     arena.remove(second).unwrap();
 
                     let mut replacement =
@@ -1724,7 +1724,7 @@ mod tests {
                 .unwrap();
         }
 
-        // 不属于当前档位，方向、价格及 priority 均不同。
+        // 不属于当前档位，方向、价格及优先级均不同。
         let unrelated = arena
             .insert(OrderNode::new(
                 order(99, Side::Sell, 999, 3),
@@ -1775,22 +1775,22 @@ mod tests {
 
             assert_eq!(level.total_visible_qty(), 14);
 
-            // Level 结构不变。
+            // 价档结构不变。
             assert_eq!(level.head(), head_before);
             assert_eq!(level.tail(), tail_before);
             assert_eq!(level.count(), count_before);
 
-            // Head 除 remaining 外全部不变。
+            // 头节点除剩余量外全部不变。
             let first_after = arena.get(first).unwrap();
 
             assert_eq!(first_after.priority(), first_priority);
             assert_eq!(first_after.prev(), first_prev);
             assert_eq!(first_after.next(), first_next);
 
-            // 非 maker 节点完全不变。
+            // 未参与本次成交的节点完全不变。
             assert_eq!(node_state(arena.get(second).unwrap()), second_before);
 
-            // partial fill 不操作 Arena 生命周期。
+            // 部分成交不操作 Arena 生命周期。
             let (_, free_after) = arena.test_snapshot();
             assert_eq!(free_after, free_before);
 
@@ -1843,34 +1843,34 @@ mod tests {
                 .unwrap();
 
             match case {
-                // 非空档缺 head。
+                // 非空档缺头节点。
                 1 => {
                     level.head = None;
                 }
 
-                // 非空档缺 tail。
+                // 非空档缺尾节点。
                 2 => {
                     level.tail = None;
                 }
 
-                // Level 仍引用 head，但 Arena slot 已释放。
+                // 价档仍引用头节点，但 Arena 槽位已释放。
                 3 => {
                     arena.remove(head).unwrap();
                 }
 
-                // aggregate 为零。
+                // 聚合量为零。
                 4 => {
                     level.total_visible_qty = 0;
                 }
 
-                // aggregate 小于 fill，checked_sub 必须 fail-closed。
+                // 聚合量小于成交，checked_sub 发生错误时必须停止处理。
                 5 => {
                     level.total_visible_qty = 1;
                 }
 
-                // remaining=5，但 aggregate 错误为 6。
+                // 剩余量=5，但聚合量错误为 6。
                 // checked_sub 自身仍然成功，因此必须由单节点
-                // aggregate invariant 捕获。
+                // 聚合量不变量捕获。
                 6 => {
                     level.total_visible_qty = 6;
                 }
@@ -1904,8 +1904,8 @@ mod tests {
             )
             .unwrap();
 
-        // head.next 仍指向 second，
-        // 但 successor.prev 被破坏。
+        // `head.next` 仍指向第二个，
+        // 但 `successor.prev` 被破坏。
         arena.get_mut(second).unwrap().set_prev(None);
 
         assert_eq!(arena.get(first).unwrap().next(), Some(second));
@@ -1937,7 +1937,7 @@ mod tests {
 
                 assert_eq!(validate_level(&level, &arena), Ok(()));
 
-                // 空档返回 None，Arena 和 Level 均不变。
+                // 空档返回 None，Arena 和价档均不变。
                 if len == 0 {
                     let before_arena = arena.test_snapshot();
                     let before_level = level_state(&level);
@@ -1974,7 +1974,7 @@ mod tests {
                     assert_eq!(level.head(), surviving.first().map(|(slot, _, _)| *slot));
                     assert_eq!(level.tail(), surviving.last().map(|(slot, _, _)| *slot));
 
-                    // 其余节点的订单内容、数量和 priority 不变。
+                    // 其余节点的订单内容、数量和优先级不变。
                     for (slot, original, priority) in surviving {
                         let node = arena.get(*slot).unwrap();
 
@@ -2110,10 +2110,10 @@ mod tests {
                 }
                 10..=13 => {
                     let (side, price, priority) = match case {
-                        10 => (Side::Sell, 100, 11), // successor 方向错误
-                        11 => (Side::Buy, 101, 11),  // successor 价格错误
-                        12 => (Side::Buy, 100, 10),  // priority 与 head 相等
-                        13 => (Side::Buy, 100, 9),   // priority 小于 head
+                        10 => (Side::Sell, 100, 11), // 后继节点方向错误
+                        11 => (Side::Buy, 101, 11),  // 后继节点价格错误
+                        12 => (Side::Buy, 100, 10),  // 优先级与头节点相等
+                        13 => (Side::Buy, 100, 9),   // 优先级小于头节点
                         _ => unreachable!(),
                     };
 
@@ -2137,7 +2137,7 @@ mod tests {
 
             assert!(result.is_err(), "case={case}");
 
-            // 必须比较包含全部 slots 和有序 free 的完整快照。
+            // 必须比较包含全部槽位和有序空闲的完整快照。
             assert_eq!(
                 level_state(&level),
                 before_level,
@@ -2162,7 +2162,7 @@ mod tests {
             )
             .unwrap();
 
-        // 单节点 remaining=5，但档位统计值错误地增加至 6。
+        // 单节点剩余量=5，但档位统计值错误地增加至 6。
         level.total_visible_qty = 6;
 
         let before_level = level_state(&level);
@@ -2356,32 +2356,32 @@ mod tests {
                 .unwrap();
 
             let target = match case {
-                // middle unlink
+                // 中间节点解除链接
                 0..=7 => second,
 
-                // tail unlink
+                // 尾节点解除链接
                 8..=9 => third,
 
                 _ => unreachable!(),
             };
 
             match case {
-                // target.prev 缺失
+                // `target.prev` 缺失
                 0 => {
                     arena.get_mut(second).unwrap().set_prev(None);
                 }
 
-                // predecessor.next 没有指回 target
+                // `predecessor.next` 没有指回目标
                 1 => {
                     arena.get_mut(first).unwrap().set_next(Some(third));
                 }
 
-                // successor.prev 没有指回 target
+                // `successor.prev` 没有指回目标
                 2 => {
                     arena.get_mut(third).unwrap().set_prev(Some(first));
                 }
 
-                // target 与 predecessor 方向不一致
+                // 目标与前驱节点方向不一致
                 3 => {
                     arena.remove(second).unwrap();
 
@@ -2393,7 +2393,7 @@ mod tests {
                     assert_eq!(arena.insert(replacement).unwrap(), second);
                 }
 
-                // target 与 predecessor 价格不一致
+                // 目标与前驱节点价格不一致
                 4 => {
                     arena.remove(second).unwrap();
 
@@ -2405,7 +2405,7 @@ mod tests {
                     assert_eq!(arena.insert(replacement).unwrap(), second);
                 }
 
-                // predecessor priority 与 target 相等
+                // 前驱节点优先级与目标相等
                 5 => {
                     arena.remove(second).unwrap();
 
@@ -2417,7 +2417,7 @@ mod tests {
                     assert_eq!(arena.insert(replacement).unwrap(), second);
                 }
 
-                // successor priority 没有严格大于 target
+                // 后继节点优先级没有严格大于目标
                 6 => {
                     arena.remove(third).unwrap();
 
@@ -2428,17 +2428,17 @@ mod tests {
                     assert_eq!(arena.insert(replacement).unwrap(), third);
                 }
 
-                // aggregate 小于被删节点 remaining
+                // 聚合量小于被删节点剩余量
                 7 => {
                     level.total_visible_qty = 4;
                 }
 
-                // tail 却还有 next
+                // 尾节点却还有 `next`
                 8 => {
                     arena.get_mut(third).unwrap().set_next(Some(first));
                 }
 
-                // Level.tail 与实际待删除 tail 不一致
+                // `Level.tail` 与实际待删除尾节点不一致
                 9 => {
                     level.tail = Some(second);
                 }
@@ -2496,17 +2496,17 @@ mod tests {
                 .unwrap();
 
             let target = match case {
-                // 已释放的 target。
+                // 已释放的目标。
                 0 => {
                     let removed = arena.remove(second).unwrap();
                     assert_eq!(removed.original_order().order_id, OrderId::new(2));
                     second
                 }
 
-                // head 不允许通过 unlink 删除。
+                // 头节点不允许通过解除链接删除。
                 1 => first,
 
-                // 仅 successor side 错误。
+                // 仅后继节点方向错误。
                 2 => {
                     arena.remove(third).unwrap();
 
@@ -2520,7 +2520,7 @@ mod tests {
                     second
                 }
 
-                // 仅 successor price 错误。
+                // 仅后继节点价格错误。
                 3 => {
                     arena.remove(third).unwrap();
 
@@ -2594,7 +2594,7 @@ mod tests {
             // Arena 槽位已经释放。
             assert!(arena.get(second).is_none());
 
-            // 原 head 成为唯一节点，同时也是 head / tail。
+            // 原头节点成为唯一节点，同时也是头节点 / 尾节点。
             assert_eq!(level.head(), Some(first));
             assert_eq!(level.tail(), Some(first));
             assert_eq!(level.count(), 1);
@@ -2633,12 +2633,12 @@ mod tests {
             let mut arena = OrderArena::new();
             let mut level = PriceLevel::new();
 
-            // 独立 FIFO 模型。
+            // 独立先进先出模型。
             let mut model = Vec::<ModelEntry>::new();
 
-            // 每个 property case 自己维护有界 ID / priority。
+            // 每个性质测试 `case` 自己维护有界标识符 / 优先级。
             //
-            // 最多只有 96 次 Push，因此不会接近 u128 边界。
+            // 最多只有 96 次尾插，因此不会接近 u128 边界。
             let mut next_id = 1u128;
             let mut next_priority = 1u128;
 
@@ -2682,14 +2682,14 @@ mod tests {
                             slot,
                         });
 
-                        // ID / priority 只在成功 Push 后提交递增。
+                        // 标识符 / 优先级只在成功尾插后提交递增。
                         next_id = following_id;
                         next_priority = following_priority;
                     }
 
                     LevelOp::PopFront => {
                         if model.is_empty() {
-                            // 合法空档 Pop 必须是完整 no-op。
+                            // 合法空档移除头节点必须保持全部状态不变。
                             let level_before = level_state(&level);
                             let arena_before = arena.test_snapshot();
 
@@ -2745,7 +2745,7 @@ mod tests {
                                 expected.slot
                             );
 
-                            // 必须在任何后续 Push 发生前验证旧 slot 已释放。
+                            // 必须在任何后续尾插发生前验证旧槽位已释放。
                             prop_assert!(
                                 arena.get(expected.slot).is_none(),
                                 "popped slot still live in arena: step={}, op={:?}, slot={:?}",
@@ -2759,9 +2759,9 @@ mod tests {
                     }
 
                     LevelOp::Unlink(selector) => {
-                        // unlink 明确不处理 head。
+                        // 解除链接明确不处理头节点。
                         //
-                        // len == 0/1 时，本操作不调用生产接口。
+                        // `len` == 0/1 时，本操作不调用生产接口。
                         if model.len() >= 2 {
                             let position =
                                 1 + (*selector as usize % (model.len() - 1));
@@ -2787,9 +2787,9 @@ mod tests {
                                 expected.slot
                             );
 
-                            // 删除当刻旧数值 slot 必须为空。
+                            // 删除当刻旧数值槽位必须为空。
                             //
-                            // 下一次 Push 可以合法复用相同数值 slot。
+                            // 下一次尾插可以合法复用相同数值槽位。
                             prop_assert!(
                                 arena.get(expected.slot).is_none(),
                                 "unlinked slot still live in arena: step={}, op={:?}, position={}, slot={:?}",
@@ -2804,9 +2804,9 @@ mod tests {
                     }
                 }
 
-                // priority 的所有权在 property 模型自身。
+                // 优先级的所有权在性质测试模型自身。
                 //
-                // Push 恰好消耗一个；PopFront / Unlink 不能消耗。
+                // 尾插恰好消耗一个；PopFront / 解除链接不能消耗。
                 let expected_next_priority = if matches!(&op, LevelOp::Push(_)) {
                     priority_before
                         .checked_add(1)

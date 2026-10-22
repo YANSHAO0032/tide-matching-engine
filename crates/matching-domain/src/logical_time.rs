@@ -1,6 +1,6 @@
 /// 撮合域逻辑时间。
 ///
-/// 该计数值不读取或表示 wall clock；推进仅能由持久化的时间命令完成。
+/// 该计数值不读取或表示系统时钟；推进仅能由持久化的时间命令完成。
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct LogicalTime(u64);

@@ -1,6 +1,6 @@
-/// 单市场内的 FIFO 队列优先级。
+/// 单市场内的先进先出队列优先级。
 ///
-/// 数值越小，表示同价位下越早获得队列优先级。它不代表全局身份、时间戳或订单 ID；
+/// 数值越小，表示同价位下越早获得队列优先级。它不代表全局身份、时间戳或订单标识符；
 /// 生产簿中实际的同价顺序仍以 PriceLevel 链表为权威。
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -20,7 +20,7 @@ impl QueuePriority {
 
 #[cfg(test)]
 mod tests {
-    //! 验证 priority 的整数边界、排序和哈希值语义。
+    //! 验证优先级的整数边界、排序和哈希值语义。
     use super::QueuePriority;
     use std::collections::HashSet;
 

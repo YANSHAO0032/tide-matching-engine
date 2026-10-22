@@ -1,5 +1,5 @@
 use crate::OrderIndex;
-use matching_domain::{LimitGtcOrder, QueuePriority};
+use matching_domain::{IcebergOrder, LimitGtcOrder, Qty, QueuePriority};
 
 /// Arena 中的订单节点。
 ///
@@ -9,9 +9,13 @@ use matching_domain::{LimitGtcOrder, QueuePriority};
 pub struct OrderNode {
     /// 创建时的不可变订单请求；运行态链接和剩余量不回写该值。
     order: LimitGtcOrder,
-    /// 当前仍显示在本档位的正数量，初始化为原始订单数量。
+    /// 当前仍显示在本档位的正数量；冰山挂单只显示当前可见片。
     remaining: u64,
-    /// 当前 market-local 排队优先级；链表链接才是 FIFO 权威顺序。
+    /// 未计入公开深度、等待后续补量的数量；普通订单为零。
+    hidden_remaining: u64,
+    /// 冰山每次展示量的上限；普通订单为 None。
+    peak_size: Option<Qty>,
+    /// 当前市场内排队优先级；链表链接才是先进先出权威顺序。
     priority: QueuePriority,
     /// 同一 `PriceLevel` 中的前驱槽位；头节点为 `None`。
     prev: Option<OrderIndex>,
@@ -20,7 +24,7 @@ pub struct OrderNode {
 }
 
 impl OrderNode {
-    /// 从原始 Limit GTC 订单创建尚未链接的运行态节点。
+    /// 从原始限价单 GTC 订单创建尚未链接的运行态节点。
     ///
     /// `remaining` 精确复制原始 `Qty`，两个链接均为空；只有 `PriceLevel`
     /// 在完成局部不变量预检后才可连接该节点。
@@ -29,6 +33,30 @@ impl OrderNode {
         OrderNode {
             order,
             remaining,
+            hidden_remaining: 0,
+            peak_size: None,
+            priority,
+            prev: None,
+            next: None,
+        }
+    }
+
+    /// 根据冰山未成交总余量构造挂单的可见片。
+    pub(crate) fn new_iceberg(
+        iceberg: IcebergOrder,
+        total_remaining: u64,
+        priority: QueuePriority,
+    ) -> Self {
+        assert!(total_remaining > 0);
+        let visible = total_remaining.min(iceberg.peak_size().get());
+        let hidden = total_remaining
+            .checked_sub(visible)
+            .expect("visible <= total");
+        Self {
+            order: iceberg.order().clone(),
+            remaining: visible,
+            hidden_remaining: hidden,
+            peak_size: Some(iceberg.peak_size()),
             priority,
             prev: None,
             next: None,
@@ -45,10 +73,50 @@ impl OrderNode {
         self.remaining
     }
 
+    /// 返回参与当前撮合与公开深度聚合的可见量。
+    pub fn visible_remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// 返回尚未展示的余量，不计入公开深度。
+    pub fn hidden_remaining(&self) -> u64 {
+        self.hidden_remaining
+    }
+
+    /// 返回可见量与隐藏量之和，供取消和生命周期事件使用。
+    pub fn total_remaining(&self) -> u64 {
+        self.remaining
+            .checked_add(self.hidden_remaining)
+            .expect("iceberg total remaining overflow")
+    }
+
+    /// 返回冰山展示上限；普通订单返回 None。
+    pub fn peak_size(&self) -> Option<Qty> {
+        self.peak_size
+    }
+
+    /// 完成优先级预检后，替换已全部成交且已脱离链表的可见片。
+    /// 调用方已从价档聚合中扣除旧可见量；节点仍保存该旧值，
+    /// 直到此处用新可见片的数量替换。
+    pub(crate) fn replenish(&mut self, priority: QueuePriority) -> Qty {
+        assert!(self.remaining > 0 && self.hidden_remaining > 0 && self.peak_size.is_some());
+        assert!(self.prev.is_none() && self.next.is_none());
+        let visible = self
+            .hidden_remaining
+            .min(self.peak_size.expect("iceberg peak").get());
+        self.hidden_remaining = self
+            .hidden_remaining
+            .checked_sub(visible)
+            .expect("visible <= hidden");
+        self.remaining = visible;
+        self.priority = priority;
+        Qty::try_new(visible).expect("replenished slice positive")
+    }
+
     /// 提交已经完成全部外部预检的严格部分成交剩余量。
     ///
-    /// 该方法只负责最终写入，不负责计算 fill。
-    /// 新 remaining 必须保持正数且严格小于旧 remaining；
+    /// 该方法只负责最终写入，不负责计算成交。
+    /// 新剩余量必须保持正数且严格小于旧剩余量；
     /// 完整成交必须由 PriceLevel 的删除路径处理。
     pub(crate) fn commit_partial_remaining(&mut self, new_remaining: u64) {
         assert!(
@@ -64,7 +132,7 @@ impl OrderNode {
         self.remaining = new_remaining;
     }
 
-    /// 返回 market-local 排队优先级；它不替代链表定义的 FIFO 顺序。
+    /// 返回市场内排队优先级；它不替代链表定义的先进先出顺序。
     pub fn priority(&self) -> QueuePriority {
         self.priority
     }
@@ -79,16 +147,16 @@ impl OrderNode {
         self.next
     }
 
-    /// 仅由完成局部链表预检的 crate 内维护路径设置前驱。
+    /// 仅由完成局部链表预检的库内维护路径设置前驱。
     ///
-    /// 单独调用不会验证双向链接、side/price 或 priority 不变量。
+    /// 单独调用不会验证双向链接、方向/价格或优先级不变量。
     pub(crate) fn set_prev(&mut self, prev: Option<OrderIndex>) {
         self.prev = prev;
     }
 
-    /// 仅由完成局部链表预检的 crate 内维护路径设置后继。
+    /// 仅由完成局部链表预检的库内维护路径设置后继。
     ///
-    /// 单独调用不会验证双向链接、side/price 或 priority 不变量。
+    /// 单独调用不会验证双向链接、方向/价格或优先级不变量。
     pub(crate) fn set_next(&mut self, next: Option<OrderIndex>) {
         self.next = next;
     }
@@ -149,5 +217,27 @@ mod tests {
         assert_eq!(node.priority(), priority);
         assert_eq!(node.prev(), None);
         assert_eq!(node.next(), None);
+    }
+
+    #[test]
+    fn iceberg_tracks_visible_hidden_and_total_independently() {
+        use matching_domain::IcebergOrder;
+        let original = LimitGtcOrder {
+            order_id: OrderId::new(11),
+            user_id: UserId::new(1),
+            side: Side::Sell,
+            price: Price::try_new(100).unwrap(),
+            qty: Qty::try_new(10).unwrap(),
+        };
+        let iceberg = IcebergOrder::try_new(original.clone(), Qty::try_new(3).unwrap()).unwrap();
+        let mut node = OrderNode::new_iceberg(iceberg, 10, QueuePriority::new(4));
+        assert_eq!(node.remaining(), 3);
+        assert_eq!(node.visible_remaining(), 3);
+        assert_eq!(node.hidden_remaining(), 7);
+        assert_eq!(node.total_remaining(), 10);
+        assert_eq!(node.peak_size(), Some(Qty::try_new(3).unwrap()));
+        node.commit_partial_remaining(1);
+        assert_eq!(node.total_remaining(), 8);
+        assert_eq!(node.hidden_remaining(), 7);
     }
 }

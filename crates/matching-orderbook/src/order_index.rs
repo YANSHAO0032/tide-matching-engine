@@ -3,7 +3,7 @@ use matching_domain::RejectReason;
 /// `OrderArena` 内稳定槽位位置的紧凑表示。
 ///
 /// 此值只定位当前 Arena 的一个物理槽位：它不是业务 `OrderId`、
-/// 不是 generation，也不表达 FIFO 或 `QueuePriority`。释放并复用槽位后，
+/// 不是代次，也不表达先进先出或 `QueuePriority`。释放并复用槽位后，
 /// 同一数值可能指向不同订单；持有者必须先解除所有旧引用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OrderIndex(u32);
@@ -20,7 +20,7 @@ impl OrderIndex {
 
     /// 返回底层槽位数值。
     ///
-    /// 仅用于 Arena 下标转换或测试观察；调用它不验证槽位存在、occupied，
+    /// 仅用于 Arena 下标转换或测试观察；调用它不验证槽位存在、已占用，
     /// 或属于某个 `PriceLevel`。
     pub const fn get(self) -> u32 {
         self.0

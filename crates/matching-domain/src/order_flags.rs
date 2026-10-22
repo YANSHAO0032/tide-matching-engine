@@ -4,7 +4,7 @@
 /// 完整命令接入及 ReduceOnly 风险执行仍由后续层承担。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderFlags {
-    /// 要求订单不得作为 taker 立即成交的约束。
+    /// 要求订单不得作为吃单方立即成交的约束。
     pub post_only: bool,
     /// 要求订单仅降低现有风险敞口的约束。
     pub reduce_only: bool,
