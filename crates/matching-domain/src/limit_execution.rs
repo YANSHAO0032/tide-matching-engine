@@ -12,7 +12,7 @@ pub enum CancelReason {
 
 /// 限价立即执行的成交事件及已取消余量。
 ///
-/// 不携带 durable envelope、资金释放或完整 Place 生命周期；事件保持成交原序，
+/// 不携带持久化封装、资金释放或完整下单生命周期；事件保持成交原序，
 /// 仅在 IOC 有正余量时追加一次 OrderCanceled，绝不产生 OrderOpened。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LimitImmediateExecution {
@@ -23,14 +23,28 @@ pub struct LimitImmediateExecution {
 impl LimitImmediateExecution {
     /// 包装按提交顺序生成的成交，并在尾部记录正余量取消。
     ///
-    /// 调用方须保证成交已提交、taker 身份一致且数量守恒；本构造只保存载荷，
-    /// 不校验 TradeId 唯一性、成交总量或 FOK 的 all-or-zero 条件。
+    /// 调用方须保证成交已提交、吃单方身份一致且数量守恒；本构造只保存载荷，
+    /// 不校验 TradeId 唯一性、成交总量或 FOK 的全部成交或零成交条件。
     pub fn new(
         order_id: OrderId,
         trades: Vec<TradeEvent>,
         canceled_remaining: Option<Qty>,
     ) -> Self {
-        let mut events: Vec<_> = trades.into_iter().map(EngineEvent::Trade).collect();
+        Self::from_events(
+            order_id,
+            trades.into_iter().map(EngineEvent::Trade).collect(),
+            canceled_remaining,
+        )
+    }
+
+    /// 保留已提交成交及挂单冰山生命周期的顺序，最后追加 IOC 正余量取消。
+    ///
+    /// 同 `new` 一样只包装载荷；调用方负责身份、事件语义、数量守恒和唯一性。
+    pub fn from_events(
+        order_id: OrderId,
+        mut events: Vec<EngineEvent>,
+        canceled_remaining: Option<Qty>,
+    ) -> Self {
         if let Some(remaining) = canceled_remaining {
             events.push(EngineEvent::OrderCanceled {
                 order_id,
@@ -57,22 +71,24 @@ impl LimitImmediateExecution {
 
 /// 校验当前基础订单执行范围的类型/TIF/标志组合。
 ///
-/// Limit 支持 GTC/IOC/FOK，PostOnly 仅允许 Limit GTC。两类 Market 均仅开放
-/// IOC，因此 Market FOK（包括按 base 下单）在此范围暂禁。Stop、Iceberg、
+/// 限价单支持 GTC/IOC/FOK，冰山支持 GTC；PostOnly 允许限价单/冰山 GTC。
+/// 两类市价单均仅开放 IOC，因此市价单 FOK 在此范围暂禁。止损订单、
 /// DAY/GTD 与 ReduceOnly 的执行支持尚未接入，返回 InvalidOrderCombination。
-/// 这只是命令适配层可调用的 schema 校验，不代替数值、簿或资金校验。
+/// 这只是命令适配层可调用的结构定义校验，不代替数值、簿或资金校验。
 pub fn validate_basic_order_combination(
     kind: OrderType,
     tif: TimeInForce,
     flags: OrderFlags,
 ) -> Result<(), RejectReason> {
     if flags.reduce_only
-        || (flags.post_only && (kind != OrderType::Limit || tif != TimeInForce::Gtc))
+        || (flags.post_only
+            && (!matches!(kind, OrderType::Limit | OrderType::Iceberg) || tif != TimeInForce::Gtc))
     {
         return Err(RejectReason::InvalidOrderCombination);
     }
     match (kind, tif) {
         (OrderType::Limit, TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok)
+        | (OrderType::Iceberg, TimeInForce::Gtc)
         | (OrderType::Market, TimeInForce::Ioc) => Ok(()),
         _ => Err(RejectReason::InvalidOrderCombination),
     }
@@ -82,6 +98,37 @@ pub fn validate_basic_order_combination(
 mod tests {
     use super::*;
     use crate::{LogicalTime, Price, Side, TradeId};
+
+    #[test]
+    fn iceberg_events_remain_before_ioc_cancel() {
+        let maker = OrderId::new(1);
+        let incoming = OrderId::new(2);
+        let qty = Qty::try_new(3).unwrap();
+        let events = vec![
+            EngineEvent::OrderPartiallyFilled {
+                order_id: maker,
+                remaining: Qty::try_new(7).unwrap(),
+            },
+            EngineEvent::IcebergRefreshed {
+                order_id: maker,
+                visible: qty,
+            },
+        ];
+        let result = LimitImmediateExecution::from_events(incoming, events.clone(), Some(qty));
+        assert_eq!(&result.events()[..2], &events);
+        assert_eq!(
+            result.events()[2],
+            EngineEvent::OrderCanceled {
+                order_id: incoming,
+                remaining: qty,
+                reason: CancelReason::IocRemainder,
+            }
+        );
+        assert_eq!(
+            LimitImmediateExecution::from_events(incoming, events.clone(), None).events(),
+            &events
+        );
+    }
 
     #[test]
     fn limit_execution_preserves_trade_order_and_cancels_only_positive_remainder() {
@@ -146,6 +193,7 @@ mod tests {
                                     _ => false,
                                 },
                                 OrderType::Market => tif == TimeInForce::Ioc && !post_only,
+                                OrderType::Iceberg => tif == TimeInForce::Gtc,
                                 _ => false,
                             };
                         assert_eq!(

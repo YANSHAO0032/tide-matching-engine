@@ -15,9 +15,9 @@ pub struct UserId(pub u64);
 
 /// 订单身份
 ///
-/// 数值顺序不表示 FIFO、创建时间或撮合优先级。
+/// 数值顺序不表示先进先出、创建时间或撮合优先级。
 ///
-/// 不同业务 ID 不可互换：
+/// 不同业务标识符不可互换：
 ///
 /// ```compile_fail
 /// use matching_domain::{OrderId, TradeId};
@@ -33,7 +33,7 @@ pub struct OrderId(pub u128);
 
 /// 客户端命令身份，用于幂等请求及其审计关联。
 ///
-/// 它不是订单、成交或 durable sequence，不能据数值顺序推导处理次序。
+/// 它不是订单、成交或持久化序列，不能据数值顺序推导处理次序。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommandId(pub u128);
@@ -51,11 +51,11 @@ pub struct TradeId(pub u128);
 pub struct ReservationId(pub u128);
 
 // 仅为现有整数提供类型安全的封装和读取能力。
-// 不提供 ID 分配、算术、非零约束或唯一性校验。
+// 不提供标识符分配、算术、非零约束或唯一性校验。
 macro_rules! impl_id {
     ($name:ident, $inner:ty) => {
         impl $name {
-            /// 从调用方已持有的原始数值构造 ID，不分配或验证其唯一性。
+            /// 从调用方已持有的原始数值构造标识符，不分配或验证其唯一性。
             pub const fn new(value: $inner) -> Self {
                 Self(value)
             }
@@ -78,7 +78,7 @@ impl_id!(ReservationId, u128);
 
 #[cfg(test)]
 mod tests {
-    //! 验证透明 ID 包装的值语义与整数边界保真。
+    //! 验证透明标识符包装的值语义与整数边界保真。
     use super::*;
     use std::collections::HashSet;
 
@@ -103,7 +103,7 @@ mod tests {
                 values.sort();
                 assert_eq!(values, [zero, one, max]);
 
-                //相等的ID在HashSet中视为同一个值
+                //相等的标识符在HashSet中视为同一个值
                 let mut set = HashSet::new();
                 assert!(set.insert(one));
                 assert!(!set.insert($id::new(1)));
@@ -115,7 +115,7 @@ mod tests {
                 assert_eq!(copied, cloned);
                 assert!(!format!("{one:?}").is_empty());
 
-                // repr(transparent) 不引入额外存储大小
+                // `repr(transparent)` 不引入额外存储大小
                 assert_eq!(std::mem::size_of::<$id>(), std::mem::size_of::<$inner>());
             }
         };

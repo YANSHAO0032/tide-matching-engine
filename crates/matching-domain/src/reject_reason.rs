@@ -8,7 +8,7 @@ pub enum RejectReason {
     InvalidOrderCombination = 2001,
     /// 价格原始整数不是该字段要求的严格正值。
     InvalidPrice = 2002,
-    /// 数量或初始 quote 预算不是该字段要求的严格正值。
+    /// 数量或初始报价资产预算不是该字段要求的严格正值。
     InvalidQty = 2003,
     /// 价格不符合市场 tick_size 的对齐要求。
     InvalidTick = 2004,
@@ -18,27 +18,29 @@ pub enum RejectReason {
     DuplicateOrderId = 2008,
     /// 请求引用的订单不在当前订单簿中。
     OrderNotFound = 2010,
+    /// 冰山显示上限不满足严格小于订单总量的关系。
+    InvalidIceberg = 2011,
     /// 到期时间不满足命令的逻辑时间约束。
     InvalidExpireTime = 2013,
-    /// PostOnly 候选会立即作为 taker 成交，必须在改簿前拒绝。
+    /// PostOnly 候选会立即作为吃单方成交，必须在改簿前拒绝。
     PostOnlyWouldCross = 2015,
     /// 限价和数量约束下的可执行流动性不足以完整成交 FOK。
     FokInsufficientLiquidity = 2016,
     /// 订单需要有效保护边界，但用户和市场均未提供可用边界。
     MarketProtectionRequired = 3005,
-    /// 下一笔候选 maker 成交将越过有效保护边界。
+    /// 下一笔候选挂单成交将越过有效保护边界。
     MarketProtectionExceeded = 3006,
     /// 市价滑点参数不在 0..=9_999 的稳定合法范围内。
     InvalidSlippageBps = 3007,
-    /// 所需 checked 算术无法以目标整数类型精确表示。
+    /// 所需带溢出检查的算术无法以目标整数类型精确表示。
     ArithmeticOverflow = 5001,
-    /// 市场本地 priority 已进入不可分配的保护区。
+    /// 市场本地优先级已进入不可分配的保护区。
     PrioritySpaceExhaustion = 5006,
 }
 
 #[cfg(test)]
 mod tests {
-    //! 固定拒绝原因的 wire 编号，防止协议兼容性回退。
+    //! 固定拒绝原因的线协议编号，防止协议兼容性回退。
     use crate::reject_reason::RejectReason;
 
     #[test]

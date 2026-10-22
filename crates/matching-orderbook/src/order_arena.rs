@@ -11,43 +11,43 @@ use std::cell::Cell;
 pub struct OrderArena {
     /// 按 `OrderIndex` 定位的稳定槽位；删除留下 `None`，不会压缩或重排。
     slots: Vec<Option<OrderNode>>,
-    /// 已释放空槽的 LIFO 栈；每个元素必须有效且恰好对应一个 `None` 槽位。
+    /// 已释放空槽的后进先出栈；每个元素必须有效且恰好对应一个 `None` 槽位。
     free: Vec<OrderIndex>,
-    /// 仅测试中的实际槽位访问计数，不是业务状态，也不参与 replay。
+    /// 仅测试中的实际槽位访问计数，不是业务状态，也不参与重放。
     #[cfg(test)]
     slot_accesses: Cell<usize>,
 }
 
 impl OrderArena {
-    /// 创建没有槽位和 free-list 条目的空 Arena。
+    /// 创建没有槽位和空闲链表条目的空 Arena。
     pub fn new() -> Self {
         Self::default()
     }
 
     /// 插入订单节点，返回其槽位索引。
     ///
-    /// 优先按照 LIFO 顺序复用 free-list 中的空槽；
-    /// 没有空槽时，进行 checked 索引转换后追加。
+    /// 优先按照后进先出顺序复用空闲链表中的空槽；
+    /// 没有空槽时，进行带溢出检查的索引转换后追加。
     ///
     /// 复用前必须验证索引有效且槽位为空，
-    /// 内部不变量被破坏时直接 panic，不覆盖现存节点。
+    /// 内部不变量被破坏时直接触发不变量断言，不覆盖现存节点。
     ///
     /// 删除后旧逻辑索引失效；复用后，相同的 OrderIndex
-    /// 数值会指向新节点。当前尚无 generation 校验。
+    /// 数值会指向新节点。当前尚无代次校验。
     pub fn insert(&mut self, node: OrderNode) -> Result<OrderIndex, RejectReason> {
-        // LIFO：优先复用最后释放的槽位。
+        // 后进先出：优先复用最后释放的槽位。
         if let Some(&index) = self.free.last() {
             let position = usize::try_from(index.get()).expect("OrderIndex must fit usize");
-            // 验证 free 尾部指向的槽位。
+            // 验证空闲尾部指向的槽位。
             #[cfg(test)]
             self.record_slot_access();
-            // 必须先验证，不能先 pop。
-            // 越界或指向 occupied 槽位时，在修改任何状态前 panic。
+            // 必须先验证，不能先 `pop`。
+            // 越界或指向已占用槽位时，在修改任何状态前触发不变量断言。
             assert!(
                 matches!(self.slots.get(position), Some(None)),
                 "OrderArena invariant violation: free index is invalid or occupied"
             );
-            // 只有验证成功，才能消费 free 并写入节点。
+            // 只有验证成功，才能消费空闲并写入节点。
             self.free.pop();
             // 写入复用槽位。
             #[cfg(test)]
@@ -74,19 +74,19 @@ impl OrderArena {
         self.slots.get(position)?.as_ref()
     }
 
-    /// 取走节点并将其槽位登记到 free-list。
+    /// 取走节点并将其槽位登记到空闲链表。
     ///
-    /// 仅成功删除时登记一次，不压缩 slots。
+    /// 仅成功删除时登记一次，不压缩槽位。
     /// 越界、空槽及尚未复用前的重复删除返回 None，
-    /// 并保持 slots 和 free 不变。
+    /// 并保持槽位和空闲不变。
     ///
-    /// 调用前必须解除链表引用。若 owner 在同一独占 mutation 内随后清理
+    /// 调用前必须解除链表引用。若所有者在同一独占状态变更内随后清理
     /// OrderId 映射，则清理完成前不得查询旧映射、复用槽位或暴露中间状态。
     pub fn remove(&mut self, index: OrderIndex) -> Option<OrderNode> {
         let position = usize::try_from(index.get()).ok()?;
         #[cfg(test)]
         self.record_slot_access();
-        // 只有成功取出节点才登记 free。
+        // 只有成功取出节点才登记空闲。
         let node = self.slots.get_mut(position)?.take()?;
 
         self.free.push(index);
@@ -94,7 +94,7 @@ impl OrderArena {
         Some(node)
     }
 
-    /// 仅供 crate 内部在完成局部不变量预检后维护节点运行态。
+    /// 仅供库内部在完成局部不变量预检后维护节点运行态。
     ///
     /// `None` 同时表示越界或已释放槽位；此访问不修复链接，也不验证
     /// 节点属于某个 PriceLevel。
@@ -105,7 +105,7 @@ impl OrderArena {
         self.slots.get_mut(position)?.as_mut()
     }
 
-    /// 记录一次真实 slots 读取或写入，仅用于 O(1) 访问路径测试。
+    /// 记录一次真实槽位读取或写入，仅用于 O(1) 访问路径测试。
     ///
     /// 计数溢出是测试诊断失败，不能改变生产错误语义。
     #[cfg(test)]
@@ -119,7 +119,7 @@ impl OrderArena {
         self.slot_accesses.set(next);
     }
 
-    /// 将测试访问计数归零；不会触碰 slots 或 free-list。
+    /// 将测试访问计数归零；不会触碰槽位或空闲链表。
     #[cfg(test)]
     pub(crate) fn reset_slot_accesses(&self) {
         self.slot_accesses.set(0);
@@ -131,9 +131,9 @@ impl OrderArena {
         self.slot_accesses.get()
     }
 
-    /// 只读验证下一次 insert 是否可执行。
+    /// 只读验证下一次 `insert` 是否可执行。
     ///
-    /// 不弹出 free-list，不扩展 slots，不修改任何 Arena 状态。
+    /// 不弹出空闲链表，不扩展槽位，不修改任何 Arena 状态。
     pub(crate) fn preflight_insert(&self) -> Result<(), RejectReason> {
         if let Some(index) = self.free.last().copied() {
             let position = usize::try_from(index.get())
@@ -157,8 +157,8 @@ impl OrderArena {
             return Ok(());
         }
 
-        // 没有 free slot 时，下一次 insert 必须 append。
-        // 这里只验证 index 可表示性，不真正扩容。
+        // 没有空闲槽位时，下一次 `insert` 必须追加。
+        // 这里只验证索引可表示性，不真正扩容。
         OrderIndex::try_from_usize(self.slots.len())?;
 
         Ok(())
@@ -169,7 +169,7 @@ impl OrderArena {
 impl OrderArena {
     /// 复制完整 Arena 内存态，用于测试失败原子性。
     ///
-    /// 此 helper 不模拟快照、WAL 或 replay，也不会暴露给生产调用方。
+    /// 此辅助函数不模拟快照、WAL 或重放，也不会暴露给生产调用方。
     pub(crate) fn test_snapshot(&self) -> (Vec<Option<OrderNode>>, Vec<OrderIndex>) {
         (self.slots.clone(), self.free.clone())
     }
@@ -177,9 +177,9 @@ impl OrderArena {
 
 #[cfg(test)]
 mod tests {
-    //! Arena 生命周期、free-list 和常数槽位访问证据。
+    //! Arena 生命周期、空闲链表和常数槽位访问证据。
     //!
-    //! 此模块的模型与快照只用于验证实现，不参与生产状态或 replay。
+    //! 此模块的模型与快照只用于验证实现，不参与生产状态或重放。
 
     use super::*;
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
@@ -203,7 +203,7 @@ mod tests {
         OrderIndex::try_from_usize(position).unwrap()
     }
 
-    /// 断言一个 live 槽位完整保留订单、数量、priority 和未链接状态。
+    /// 断言一个有效槽位完整保留订单、数量、优先级和未链接状态。
     fn assert_node(
         arena: &OrderArena,
         index: OrderIndex,
@@ -239,7 +239,7 @@ mod tests {
         )
     }
 
-    /// 复制 slots 的内容投影，用于验证失败不会改变任何槽位。
+    /// 复制槽位的内容投影，用于验证失败不会改变任何槽位。
     fn snapshot_slots(arena: &OrderArena) -> Vec<Option<NodeState>> {
         arena
             .slots
@@ -442,7 +442,7 @@ mod tests {
             let before = snapshot_slots(&arena);
             let removed = arena.remove(index(remove_at)).unwrap();
 
-            // 返回完整原节点，包括原订单、remaining、priority 和链接。
+            // 返回完整原节点，包括原订单、剩余量、优先级和链接。
             assert_eq!(node_state(&removed), before[remove_at].clone().unwrap());
 
             let mut expected = before.clone();
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(snapshot_slots(&arena)[0], before[0]);
         assert_eq!(snapshot_slots(&arena)[2], before[2]);
 
-        // free 用尽后恢复追加。
+        // 空闲用尽后恢复追加。
         let appended = arena
             .insert(OrderNode::new(
                 order(50, Side::Buy, 5),
@@ -553,8 +553,8 @@ mod tests {
         assert_eq!(appended, index(3));
         assert_eq!(arena.slots.len(), 4);
     }
-    /// 每个 None 槽位必须在 free 中恰好出现一次。
-    /// occupied 槽位不能出现在 free 中。
+    /// 每个 None 槽位必须在空闲中恰好出现一次。
+    /// 已占用槽位不能出现在空闲中。
     fn assert_free_bijection(arena: &OrderArena) {
         let mut seen = vec![0usize; arena.slots.len()];
 
@@ -628,7 +628,7 @@ mod tests {
         assert!(arena.free.is_empty());
         assert_free_bijection(&arena);
 
-        // free 用尽后才追加。
+        // 空闲用尽后才追加。
         let third = arena
             .insert(OrderNode::new(
                 order(70, Side::Buy, 7),
@@ -650,7 +650,7 @@ mod tests {
     fn invalid_removal_preserves_slots_and_free() {
         let mut arena = OrderArena::new();
 
-        // 空 arena。
+        // 空 `arena`。
         assert!(arena.remove(index(0)).is_none());
         assert!(arena.remove(index(u32::MAX as usize)).is_none());
         assert!(arena.free.is_empty());
@@ -682,7 +682,7 @@ mod tests {
     fn corrupted_free_must_panic_without_overwriting_nodes() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        // 分别制造 occupied 和越界的 free 索引。
+        // 分别制造已占用和越界的空闲索引。
         for bad_index in [index(0), index(99)] {
             let mut arena = OrderArena::new();
 
@@ -764,7 +764,7 @@ mod tests {
 
         assert_eq!(first, second);
 
-        // 初始追加 0..3；LIFO 复用 3、1、0。
+        // 初始追加 0..3；后进先出复用 3、1、0。
         assert_eq!(
             first.0,
             vec![
@@ -779,10 +779,10 @@ mod tests {
         );
     }
 
-    /// property 模型选择的槽位类别，而非实际 Arena index。
+    /// 性质测试模型选择的槽位类别，而非实际 Arena 索引。
     #[derive(Debug, Clone, Copy)]
     enum SlotTarget {
-        /// 当前模型中的 live 槽位。
+        /// 模型中当前有效的槽位。
         Live(u8),
         /// 当前模型中已释放但尚未复用的槽位。
         Empty(u8),
@@ -792,10 +792,10 @@ mod tests {
         Max,
     }
 
-    /// property 操作集，覆盖插入、删除及只读访问的生命周期分支。
+    /// 性质测试操作集，覆盖插入、删除及只读访问的生命周期分支。
     #[derive(Debug, Clone, Copy)]
     enum ArenaAction {
-        /// 插入正数量节点；布尔值只选择 Buy/Sell fixture。
+        /// 插入正数量节点；布尔值只选择买入/卖出测试数据。
         Insert { qty: u64, sell: bool },
         /// 对模型选定的类别执行删除。
         Remove(SlotTarget),
@@ -803,7 +803,7 @@ mod tests {
         Get(SlotTarget),
     }
 
-    /// 生成有界、偏向有效插入和 live 访问的 property 操作序列。
+    /// 生成有界、偏向有效插入和有效访问的性质测试操作序列。
     fn action_strategy() -> impl Strategy<Value = ArenaAction> {
         prop_oneof![
             5 => (1u64..=100, any::<bool>())
@@ -830,9 +830,9 @@ mod tests {
             1 => Just(ArenaAction::Get(SlotTarget::Max)),
         ]
     }
-    /// 将抽象槽位类别确定性映射为模型当前的具体 `u32` index。
+    /// 将抽象槽位类别确定性映射为模型当前的具体 `u32` 索引。
     ///
-    /// 选择 live/empty 时使用有序 `BTreeMap`，避免测试模型依赖 HashMap
+    /// 选择有效/空时使用有序 `BTreeMap`，避免测试模型依赖 HashMap
     /// 迭代顺序；没有对应项时故意返回越界值以覆盖 `None` 分支。
     fn model_target(
         target: SlotTarget,
@@ -876,10 +876,10 @@ mod tests {
         ) {
             let mut arena = OrderArena::new();
 
-            // 独立模型：不使用 arena 返回的索引更新预期。
+            // 独立模型：不使用 `arena` 返回的索引更新预期。
             let mut live: BTreeMap<u32, NodeState> = BTreeMap::new();
 
-            // release_seq -> slot，序号越大表示越晚释放。
+            // release_seq -> 槽位，序号越大表示越晚释放。
             let mut released: BTreeMap<u64, u32> = BTreeMap::new();
 
             let mut allocated = 0usize;
@@ -939,7 +939,7 @@ mod tests {
                             None,
                         );
 
-                        // 按最新释放序号预测 LIFO 复用。
+                        // 按最新释放序号预测后进先出复用。
                         let expected_position =
                             if let Some((&seq, &position)) =
                                 released.iter().next_back()
@@ -1002,7 +1002,7 @@ mod tests {
                             action
                         );
 
-                        // 失败 Remove 不允许改变任何状态。
+                        // 失败删除不允许改变任何状态。
                         if !succeeded {
                             prop_assert_eq!(
                                 snapshot_slots(&arena),
@@ -1042,7 +1042,7 @@ mod tests {
                             action
                         );
 
-                        // Get 无论命中与否，均不得修改状态。
+                        // 读取无论命中与否，均不得修改状态。
                         prop_assert_eq!(
                             snapshot_slots(&arena),
                             slots_before,
@@ -1059,7 +1059,7 @@ mod tests {
                     }
                 }
 
-                // 每一步均由独立模型生成完整预期 slots。
+                // 每一步均由独立模型生成完整预期槽位。
                 let expected_slots: Vec<Option<NodeState>> =
                     (0..allocated)
                         .map(|position| {
@@ -1097,7 +1097,7 @@ mod tests {
                     action
                 );
 
-                // 独立检查 free 与空槽一一对应。
+                // 独立检查空闲与空槽一一对应。
                 let mut free_positions = BTreeSet::new();
 
                 for &free_index in &arena.free {
@@ -1172,7 +1172,7 @@ mod tests {
 
         assert_eq!(arena.slot_accesses(), 2);
 
-        // free 耗尽后，追加新槽只访问一次。
+        // 空闲耗尽后，追加新槽只访问一次。
         arena.reset_slot_accesses();
 
         let second = arena
@@ -1238,7 +1238,7 @@ mod tests {
         assert_eq!(arena.preflight_insert(), Ok(()));
         assert_eq!(arena.test_snapshot(), before);
 
-        // 真正 insert 仍然复用最后进入 free-list 的 second。
+        // 真正 `insert` 仍然复用最后进入空闲链表的第二个。
         let reused = arena
             .insert(OrderNode::new(
                 order(3, Side::Buy, 100),
@@ -1262,7 +1262,7 @@ mod tests {
                 .unwrap();
 
             if occupied {
-                // 故意把仍 occupied 的 slot 塞进 free tail。
+                // 故意把仍已占用的槽位塞进空闲尾节点。
                 arena.free.push(live);
             } else {
                 arena.free.push(OrderIndex::try_from_usize(99).unwrap());

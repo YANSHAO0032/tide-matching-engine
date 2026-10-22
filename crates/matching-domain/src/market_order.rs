@@ -42,10 +42,10 @@ pub struct MarketProtection {
 
 /// 市价保护触发事件的来源标签。
 ///
-/// Wire 编码固定为 u8：
-/// - 1: User
-/// - 2: MarketBand
-/// - 3: Both
+/// 线协议编码固定为 u8：
+/// - 1：用户边界 `User`
+/// - 2：市场价格区间 `MarketBand`
+/// - 3：双方共同约束 `Both`
 ///
 /// 已发布的数值不可修改、重排或复用。
 /// 此类型不负责判断实际保护来源。
@@ -59,15 +59,15 @@ pub enum ProtectionSource {
 
 /// 单次命令开始时固定的市价保护上下文。
 ///
-/// reference_price_at_command_start:
+/// 命令开始时的参考价格 `reference_price_at_command_start`：
 ///   由外层在命令开始时捕获的严格正参考价格。
 ///
-/// market_band_worst:
+/// 市场价格区间边界 `market_band_worst`：
 ///   由外层根据市场配置预先计算完成的可选价格带边界。
 ///
 /// 本对象仅保存不可变值语义，不负责：
-/// - 选择或更新 reference 来源；
-/// - 计算 market band；
+/// - 选择或更新参考值来源；
+/// - 计算市场价格区间；
 /// - 校验用户保护参数；
 /// - 判断是否必须要求保护；
 /// - 执行撮合或产生事件。
@@ -84,7 +84,7 @@ impl MarketProtection {
     /// - max_slippage_bps 派生出的保护价；
     /// - 显式 worst_price。
     ///
-    /// 不处理 market band、reference state、maker price 或任何撮合副作用。
+    /// 不处理市场价格区间、参考值状态、挂单价格或任何撮合副作用。
     pub fn user_protection_price(
         &self,
         reference: Price,
@@ -97,18 +97,18 @@ impl MarketProtection {
             Side::Sell => false,
         };
 
-        // 1. bps 候选必须优先计算。
+        // 1. 基点候选必须优先计算。
         //
         // 因此：
-        // - bps >= 10_000 仍稳定优先返回 InvalidSlippageBps(3007)；
-        // - tick / overflow 完全复用已验收 helper 的语义；
-        // - 此处绝不复制 bps 公式。
+        // - 基点 >= 10_000 仍稳定优先返回 InvalidSlippageBps(3007)；
+        // - 价格步长 / 溢出完全复用已验收辅助函数的语义；
+        // - 此处绝不复制基点公式。
         let bps_price = match self.max_slippage_bps {
             Some(bps) => Some(slippage_protection_price(reference, side, bps, tick_size)?),
             None => None,
         };
 
-        // 2. explicit worst price 单独验证 tick。
+        // 2. 显式最差价格单独验证价格步长。
         let explicit_price = match self.worst_price {
             Some(price) => {
                 if tick_size <= 0 {
@@ -132,10 +132,10 @@ impl MarketProtection {
 
             (Some(bps), Some(explicit)) => {
                 if buy_side {
-                    // Buy 越低越严格。
+                    // 买入越低越严格。
                     Some(if bps <= explicit { bps } else { explicit })
                 } else {
-                    // Sell 越高越严格。
+                    // 卖出越高越严格。
                     Some(if bps >= explicit { bps } else { explicit })
                 }
             }
@@ -178,29 +178,29 @@ impl ProtectedMarketByQuoteExecution {
         &self.events
     }
 
-    /// 返回已执行的 quote 本金；零表示没有成交。
+    /// 返回已执行的报价资产本金；零表示没有成交。
     pub fn spent_quote(&self) -> QuoteAmount {
         self.spent_quote
     }
 
-    /// 返回未使用的初始 quote 预算；该金额不是成交。
+    /// 返回未使用的初始报价资产预算；该金额不是成交。
     pub fn unused_quote(&self) -> QuoteAmount {
         self.unused_quote
     }
 }
 
-/// 判断 maker 价格是否位于已经计算好的用户保护边界内。
+/// 判断挂单价格是否位于已经计算好的用户保护边界内。
 ///
 /// `effective_worst_price` 必须由上游提前计算完成：
-/// - Buy: maker_price <= boundary 时允许；
-/// - Sell: maker_price >= boundary 时允许；
+/// - 买入: maker_price <= 边界时允许；
+/// - 卖出: maker_price >= 边界时允许；
 /// - None: 当前命令没有有效保护边界，此项价格检查允许。
 ///
 /// 本函数不负责：
-/// - 计算 slippage bps；
-/// - 校验 tick；
-/// - 合并 explicit worst price；
-/// - 获取 reference；
+/// - 计算滑点基点；
+/// - 校验价格步长；
+/// - 合并显式最差价格；
+/// - 获取参考值；
 /// - 生成事件或修改任何撮合状态。
 pub fn maker_price_within_protection(
     side: Side,
@@ -219,7 +219,7 @@ pub fn maker_price_within_protection(
 /// 合并用户保护价格和市场价格带候选边界。
 ///
 /// 两个输入均应由调用方预先计算完成。
-/// Buy 取更低价格，Sell 取更高价格。
+/// 买入取更低价格，卖出取更高价格。
 ///
 /// None 只表示没有有效边界，不决定订单是否必须要求保护。
 pub fn effective_protection_price(
@@ -240,21 +240,21 @@ pub fn effective_protection_price(
 
 /// 合并已计算的用户保护与市场价格带候选，并归因有效边界。
 ///
-/// Buy 取较小边界，Sell 取较大边界。
+/// 买入取较小边界，卖出取较大边界。
 ///
 /// 来源表示哪个候选决定最终有效边界：
 /// - 仅用户候选生效：User
-/// - 仅市场 band 候选生效：MarketBand
+/// - 仅市场价格区间候选生效：MarketBand
 /// - 两个候选边界相等：Both
 ///
-/// 不计算 bps/tick，不获取 reference 或市场状态，
-/// 不判断 maker 是否越界，也不产生事件。
+/// 不计算基点/价格步长，不获取参考值或市场状态，
+/// 不判断挂单是否越界，也不产生事件。
 pub fn effective_protection_with_source(
     side: Side,
     user_worst: Option<Price>,
     market_band_worst: Option<Price>,
 ) -> Option<(Price, ProtectionSource)> {
-    // 完全复用已验收的 Buy/Sell 取严逻辑。
+    // 完全复用已验收的买入/卖出取严逻辑。
     let effective_worst = effective_protection_price(side, user_worst, market_band_worst)?;
 
     // 只根据哪项候选等于有效边界决定来源。
@@ -271,12 +271,12 @@ pub fn effective_protection_with_source(
     Some((effective_worst, source))
 }
 
-/// 在命令开始时组合用户保护候选与已计算的 market-band 候选。
+/// 在命令开始时组合用户保护候选与已计算的市场价格区间候选。
 ///
 /// reference_price_at_command_start 由调用方提前捕获。
-/// math 提供已验证的 tick_size。
-/// market_band_worst 由外部配置/市场参考价计算层提供并完成 tick 校验；
-/// 本函数不会再次验证 band 对齐。
+/// 算术提供已验证的 tick_size。
+/// market_band_worst 由外部配置/市场参考价计算层提供并完成价格步长校验；
+/// 本函数不会再次验证市场价格区间对齐。
 ///
 /// 先验证用户输入，再合并有效候选。
 /// 本函数不获取市场状态，也不判断是否必须要求保护。
@@ -295,7 +295,7 @@ pub fn effective_protection_at_command_start(
 /// 根据命令开始时捕获的保护上下文，计算有效价格及其来源。
 ///
 /// 原有用户保护校验错误直接传播。
-/// 不获取市场状态，不更新 context，不判断 maker 是否越界。
+/// 不获取市场状态，不更新上下文，不判断挂单是否越界。
 pub fn effective_protection_at_command_start_with_source(
     protection: Option<&MarketProtection>,
     context: &CommandStartProtectionContext,
@@ -320,14 +320,14 @@ pub fn effective_protection_at_command_start_with_source(
 
 const BPS_DENOMINATOR: u128 = 10_000;
 
-/// 根据命令开始时捕获的 reference price 计算用户滑点保护边界。
+/// 根据命令开始时捕获的参考值价格计算用户滑点保护边界。
 ///
 /// 这是纯整数计算：
-/// - Buy: 先按 bps 向下取整，再向下对齐 tick；
-/// - Sell: 先按 bps 向上取整，再向上对齐 tick。
+/// - 买入: 先按基点向下取整，再向下对齐价格步长；
+/// - 卖出: 先按基点向上取整，再向上对齐价格步长。
 ///
 /// 本函数只负责单一 `max_slippage_bps` 边界：
-/// 不读取 `MarketProtection`，不合并 `worst_price` / price band。
+/// 不读取 `MarketProtection`，不合并 `worst_price` / 市场价格区间。
 pub fn slippage_protection_price(
     reference: Price,
     side: Side,
@@ -357,13 +357,13 @@ pub fn slippage_protection_price(
                 .checked_mul(factor)
                 .ok_or(RejectReason::ArithmeticOverflow)?;
 
-            // Buy:
-            // floor(reference * (10000 + bps) / 10000)
+            // 买入:
+            // 向下取整：`floor(reference * (10000 + bps) / 10000)`
             let raw = numerator
                 .checked_div(BPS_DENOMINATOR)
                 .ok_or(RejectReason::ArithmeticOverflow)?;
 
-            // 再向下对齐 tick。
+            // 再向下对齐价格步长。
             let tick_count = raw
                 .checked_div(tick)
                 .ok_or(RejectReason::ArithmeticOverflow)?;
@@ -382,8 +382,8 @@ pub fn slippage_protection_price(
                 .checked_mul(factor)
                 .ok_or(RejectReason::ArithmeticOverflow)?;
 
-            // Sell:
-            // ceil(reference * (10000 - bps) / 10000)
+            // 卖出:
+            // 向上取整：`ceil(reference * (10000 - bps) / 10000)`
             //
             // 禁止使用 `(a + d - 1) / d`，显式使用商和余数。
             let quotient = numerator
@@ -401,7 +401,7 @@ pub fn slippage_protection_price(
                     .ok_or(RejectReason::ArithmeticOverflow)?
             };
 
-            // 再向上对齐 tick，同样只使用商和余数。
+            // 再向上对齐价格步长，同样只使用商和余数。
             let tick_quotient = raw
                 .checked_div(tick)
                 .ok_or(RejectReason::ArithmeticOverflow)?;
@@ -425,7 +425,7 @@ pub fn slippage_protection_price(
 
     let aligned = i64::try_from(aligned).map_err(|_| RejectReason::ArithmeticOverflow)?;
 
-    // reference 合法、bps/tick 合法后，如果结果无法构造合法 Price，
+    // 参考值合法、基点/价格步长合法后，如果结果无法构造合法 Price，
     // 对本纯计算边界统一视为“结果不可表示”。
     Price::try_new(aligned).map_err(|_| RejectReason::ArithmeticOverflow)
 }
@@ -460,12 +460,12 @@ impl MarketByQuoteExecution {
         &self.trades
     }
 
-    /// 返回已执行的 quote 本金；零表示没有成交。
+    /// 返回已执行的报价资产本金；零表示没有成交。
     pub fn spent_quote(&self) -> QuoteAmount {
         self.spent_quote
     }
 
-    /// 返回未使用的初始 quote 预算；该金额不是成交。
+    /// 返回未使用的初始报价资产预算；该金额不是成交。
     pub fn unused_quote(&self) -> QuoteAmount {
         self.unused_quote
     }
@@ -535,7 +535,7 @@ mod tests {
         changed.qty = Qty::try_new(200).unwrap();
         assert_ne!(original, changed);
 
-        // 原始 fixture 明确没有保护。
+        // 原始测试数据明确没有保护。
         assert_eq!(original.market_protection, None);
         assert_eq!(original, same);
 
@@ -578,7 +578,7 @@ mod tests {
         changed.quote_budget = QuoteBudget::try_new(2000).unwrap();
         assert_ne!(original, changed);
 
-        // 原始 fixture 明确没有保护。
+        // 原始测试数据明确没有保护。
         assert_eq!(original.market_protection, None);
         assert_eq!(original, same);
 
@@ -657,7 +657,7 @@ mod tests {
         // Debug 可用。
         assert!(format!("{original:?}").contains("MarketProtection"));
 
-        // 修改 bps 后不相等。
+        // 修改基点后不相等。
         let mut changed = original.clone();
         changed.max_slippage_bps = Some(200);
         assert_ne!(original, changed);
@@ -667,7 +667,7 @@ mod tests {
         changed.worst_price = Some(Price::try_new(110).unwrap());
         assert_ne!(original, changed);
 
-        // bps: Some -> None 后不相等。
+        // 基点: Some -> None 后不相等。
         let mut changed = original.clone();
         changed.max_slippage_bps = None;
         assert_ne!(original, changed);
@@ -857,7 +857,7 @@ mod tests {
 
         assert!(format!("{original:?}").contains("ProtectedMarketByQuoteExecution"));
 
-        // 仅改变 events。
+        // 仅改变 `events`。
         let changed_events = ProtectedMarketByQuoteExecution::new(
             vec![
                 EngineEvent::Trade(execution_trade(21, 30)),
@@ -1072,11 +1072,11 @@ mod tests {
 
     #[test]
     fn user_protection_price_buy_chooses_stricter_lower_candidate() {
-        // 25bps helper:
-        // reference=100_003, tick=10
-        // => Buy bps candidate = 100_250
+        // 25 个基点 辅助函数:
+        // 参考值=100_003, 价格步长=10
+        // => 买入基点候选 = 100_250
         //
-        // explicit=100_200 更严格。
+        // 显式=100_200 更严格。
         let protection = MarketProtection {
             max_slippage_bps: Some(25),
             worst_price: Some(price(100_200)),
@@ -1090,11 +1090,11 @@ mod tests {
 
     #[test]
     fn user_protection_price_sell_chooses_stricter_higher_candidate() {
-        // 25bps helper:
-        // reference=100_003, tick=10
-        // => Sell bps candidate = 99_760
+        // 25 个基点 辅助函数:
+        // 参考值=100_003, 价格步长=10
+        // => 卖出基点候选 = 99_760
         //
-        // explicit=99_800 更严格。
+        // 显式=99_800 更严格。
         let protection = MarketProtection {
             max_slippage_bps: Some(25),
             worst_price: Some(price(99_800)),
@@ -1128,7 +1128,7 @@ mod tests {
     fn user_protection_price_prioritizes_invalid_bps_over_explicit_tick_error() {
         let protection = MarketProtection {
             max_slippage_bps: Some(10_000),
-            // 同时故意未对齐 tick。
+            // 同时故意未对齐价格步长。
             worst_price: Some(price(100_003)),
         };
 
@@ -1184,7 +1184,7 @@ mod tests {
     fn maker_price_within_protection_buy_uses_inclusive_upper_boundary() {
         let boundary = Some(price(100_000));
 
-        // 内侧：低于 Buy 最大允许价格。
+        // 内侧：低于买入最大允许价格。
         assert!(maker_price_within_protection(
             Side::Buy,
             price(99_990),
@@ -1198,7 +1198,7 @@ mod tests {
             boundary,
         ));
 
-        // 越界：高于 Buy 最大允许价格。
+        // 越界：高于买入最大允许价格。
         assert!(!maker_price_within_protection(
             Side::Buy,
             price(100_010),
@@ -1210,7 +1210,7 @@ mod tests {
     fn maker_price_within_protection_sell_uses_inclusive_lower_boundary() {
         let boundary = Some(price(100_000));
 
-        // 内侧：高于 Sell 最低允许价格。
+        // 内侧：高于卖出最低允许价格。
         assert!(maker_price_within_protection(
             Side::Sell,
             price(100_010),
@@ -1224,7 +1224,7 @@ mod tests {
             boundary,
         ));
 
-        // 越界：低于 Sell 最低允许价格。
+        // 越界：低于卖出最低允许价格。
         assert!(!maker_price_within_protection(
             Side::Sell,
             price(99_990),
@@ -1260,7 +1260,7 @@ mod tests {
                 Some(p100)
             );
 
-            // 仅有 Market Band 候选。
+            // 仅有市场价格区间候选。
             assert_eq!(
                 effective_protection_price(side, None, Some(p105)),
                 Some(p105)
@@ -1273,7 +1273,7 @@ mod tests {
             );
         }
 
-        // Buy：取较小值，与候选参数位置无关。
+        // 买入：取较小值，与候选参数位置无关。
         assert_eq!(
             effective_protection_price(Side::Buy, Some(p100), Some(p110)),
             Some(p100)
@@ -1284,7 +1284,7 @@ mod tests {
             Some(p100)
         );
 
-        // Sell：取较大值，与候选参数位置无关。
+        // 卖出：取较大值，与候选参数位置无关。
         assert_eq!(
             effective_protection_price(Side::Sell, Some(p100), Some(p110)),
             Some(p110)
@@ -1323,20 +1323,20 @@ mod tests {
         };
 
         for side in [Side::Buy, Side::Sell] {
-            // 1. 用户和 band 均不存在。
+            // 1. 用户和市场价格区间均不存在。
             assert_eq!(
                 effective_protection_at_command_start(None, &no_band_context, side, &math,),
                 Ok(None)
             );
 
-            // 2. 仅有 band，原样返回。
+            // 2. 仅有市场价格区间，原样返回。
             assert_eq!(
                 effective_protection_at_command_start(None, &band_context, side, &math,),
                 Ok(Some(band))
             );
 
-            // 3. 仅有用户 bps。
-            // 期望由已验收 helper 产生，不复制 bps 公式。
+            // 3. 仅有用户基点。
+            // 期望由已验收辅助函数产生，不复制基点公式。
             let expected_user = bps_only
                 .user_protection_price(
                     no_band_context.reference_price_at_command_start,
@@ -1368,7 +1368,7 @@ mod tests {
             market_band_worst: Some(Price::try_new(100_060).unwrap()),
         };
 
-        // Buy：band 更严格。
+        // 买入：市场价格区间更严格。
         assert_eq!(
             effective_protection_at_command_start(
                 Some(&explicit_only),
@@ -1379,7 +1379,7 @@ mod tests {
             Ok(Some(Price::try_new(100_040).unwrap()))
         );
 
-        // Buy：用户更严格。
+        // 买入：用户更严格。
         assert_eq!(
             effective_protection_at_command_start(
                 Some(&explicit_only),
@@ -1390,7 +1390,7 @@ mod tests {
             Ok(Some(Price::try_new(100_050).unwrap()))
         );
 
-        // Sell：band 更严格。
+        // 卖出：市场价格区间更严格。
         assert_eq!(
             effective_protection_at_command_start(
                 Some(&explicit_only),
@@ -1401,7 +1401,7 @@ mod tests {
             Ok(Some(Price::try_new(100_060).unwrap()))
         );
 
-        // Sell：用户更严格。
+        // 卖出：用户更严格。
         assert_eq!(
             effective_protection_at_command_start(
                 Some(&explicit_only),
@@ -1423,20 +1423,20 @@ mod tests {
             market_band_worst: band,
         };
 
-        // 非法 bps。
+        // 非法基点。
         let invalid_bps = MarketProtection {
             max_slippage_bps: Some(u32::MAX),
             worst_price: None,
         };
 
-        // 显式价格不符合 tick=10。
+        // 显式价格不符合价格步长=10。
         let invalid_explicit = MarketProtection {
             max_slippage_bps: None,
             worst_price: Some(Price::try_new(100_003).unwrap()),
         };
 
         for side in [Side::Buy, Side::Sell] {
-            // 1. 已验收用户 helper 必须返回 3007。
+            // 1. 已验收用户辅助函数必须返回 3007。
             let expected_error = invalid_bps
                 .user_protection_price(
                     context.reference_price_at_command_start,
@@ -1447,7 +1447,7 @@ mod tests {
 
             assert_eq!(expected_error as u16, 3007);
 
-            // 即使 band 有效，也必须原样传播用户错误。
+            // 即使市场价格区间有效，也必须原样传播用户错误。
             assert_eq!(
                 effective_protection_at_command_start(Some(&invalid_bps), &context, side, &math,),
                 Err(expected_error)
@@ -1478,13 +1478,13 @@ mod tests {
         let reference = Price::try_new(100_003).unwrap();
         let band = Price::try_new(100_010).unwrap();
 
-        // 1. 相同 reference，band=None。
+        // 1. 相同参考值，市场价格区间=None。
         let without_band = CommandStartProtectionContext {
             reference_price_at_command_start: reference,
             market_band_worst: None,
         };
 
-        // 2. 相同 reference，band=Some。
+        // 2. 相同参考值，市场价格区间=Some。
         let with_band = CommandStartProtectionContext {
             reference_price_at_command_start: reference,
             market_band_worst: Some(band),
@@ -1514,17 +1514,17 @@ mod tests {
         };
         assert_eq!(with_band, same);
 
-        // 相同 reference，但 None 与 Some 不相等。
+        // 相同参考值，但 None 与 Some 不相等。
         assert_ne!(without_band, with_band);
 
-        // 仅改变 reference，不相等。
+        // 仅改变参考值，不相等。
         let changed_reference = CommandStartProtectionContext {
             reference_price_at_command_start: Price::try_new(100_013).unwrap(),
             market_band_worst: Some(band),
         };
         assert_ne!(with_band, changed_reference);
 
-        // 仅改变 band，不相等。
+        // 仅改变市场价格区间，不相等。
         let changed_band = CommandStartProtectionContext {
             reference_price_at_command_start: reference,
             market_band_worst: Some(Price::try_new(100_020).unwrap()),
@@ -1542,12 +1542,12 @@ mod tests {
         // 明确固定单字节表示。
         assert_eq!(std::mem::size_of::<ProtectionSource>(), 1);
 
-        // Golden Wire：数值必须与协议规格完全一致。
+        // 固定期望线协议：数值必须与协议规格完全一致。
         for (source, expected) in golden {
             assert_eq!(source as u8, expected);
             assert_eq!([source as u8], [expected]);
 
-            // Copy / Clone / Debug / Eq。
+            // 验证 `Copy`、`Clone`、`Debug`、`Eq` 的值语义。
             let copied = source;
             assert_eq!(copied, source);
             assert_eq!(source.clone(), source);
@@ -1586,7 +1586,7 @@ mod tests {
                 None,
                 Some((p(100), ProtectionSource::User)),
             ),
-            // 只有 market band。
+            // 只有市场价格区间。
             (
                 Side::Buy,
                 None,
@@ -1599,7 +1599,7 @@ mod tests {
                 Some(p(110)),
                 Some((p(110), ProtectionSource::MarketBand)),
             ),
-            // Buy：较小值更严格。
+            // 买入：较小值更严格。
             (
                 Side::Buy,
                 Some(p(100)),
@@ -1612,7 +1612,7 @@ mod tests {
                 Some(p(100)),
                 Some((p(100), ProtectionSource::MarketBand)),
             ),
-            // Sell：较大值更严格。
+            // 卖出：较大值更严格。
             (
                 Side::Sell,
                 Some(p(110)),
@@ -1648,7 +1648,7 @@ mod tests {
                 "side={side:?}, user={user:?}, band={band:?}"
             );
 
-            // 新 helper 与已有纯合并函数的有效价格必须一致。
+            // 新辅助函数与已有纯合并函数的有效价格必须一致。
             assert_eq!(
                 actual.map(|(price, _)| price),
                 effective_protection_price(side, user, band),
@@ -1678,7 +1678,7 @@ mod tests {
                 None,
                 Some((100, ProtectionSource::User)),
             ),
-            // 仅市场 Band。
+            // 仅市场价格区间。
             (
                 Side::Buy,
                 None,
@@ -1691,7 +1691,7 @@ mod tests {
                 Some(110),
                 Some((110, ProtectionSource::MarketBand)),
             ),
-            // Buy：较小价格更严格。
+            // 买入：较小价格更严格。
             (
                 Side::Buy,
                 Some(100),
@@ -1704,7 +1704,7 @@ mod tests {
                 Some(100),
                 Some((100, ProtectionSource::MarketBand)),
             ),
-            // Sell：较大价格更严格。
+            // 卖出：较大价格更严格。
             (
                 Side::Sell,
                 Some(110),
@@ -1773,8 +1773,8 @@ mod tests {
             worst_price: None,
         };
 
-        // reference=100000，滑点 100bps：
-        // Buy 用户边界=101000，Sell 用户边界=99000。
+        // 参考值=100000，滑点 100 个基点：
+        // 买入用户边界=101000，卖出用户边界=99000。
         let cases = [
             (Side::Buy, None, 101_000, ProtectionSource::User),
             (Side::Sell, None, 99_000, ProtectionSource::User),
@@ -1823,7 +1823,7 @@ mod tests {
         let math = MarketMath::try_new(0, 0, 0, 10, 1).unwrap();
 
         let cases = [
-            // 非法 bps。
+            // 非法基点。
             (
                 Side::Buy,
                 100_000,
@@ -1832,7 +1832,7 @@ mod tests {
                     worst_price: None,
                 },
             ),
-            // 显式价格不符合 tick=10。
+            // 显式价格不符合价格步长=10。
             (
                 Side::Sell,
                 100_000,
@@ -1841,7 +1841,7 @@ mod tests {
                     worst_price: Some(p(100_003)),
                 },
             ),
-            // Buy 边界计算 checked overflow。
+            // 买入边界计算溢出。
             (
                 Side::Buy,
                 i64::MAX,

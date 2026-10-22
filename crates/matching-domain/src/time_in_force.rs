@@ -11,7 +11,7 @@ pub enum TimeInForce {
     Ioc,
     /// 只有可完整成交时才允许执行。
     Fok,
-    /// 仅在给定交易 session 内有效。
+    /// 仅在给定交易会话内有效。
     Day { session_id: u64 },
     /// 在给定逻辑时间到达后到期。
     Gtd { expire_at: LogicalTime },

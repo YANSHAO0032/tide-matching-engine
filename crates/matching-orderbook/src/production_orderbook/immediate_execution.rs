@@ -2,11 +2,11 @@ use super::*;
 use matching_domain::LimitImmediateExecution;
 
 impl ProductionOrderBook {
-    /// 仅当 Limit 不会立即作为 taker 时，将其挂入本侧 FIFO 尾部。
+    /// 仅当限价单不会立即作为吃单方时，将其挂入本侧先进先出尾部。
     ///
-    /// Duplicate 优先于含等价的 crossing 拒绝；只有全部挂单预检成功后才
-    /// 消耗 QueuePriority。正值由领域类型保证；市场 tick/lot 对齐须由调用方校验。
-    /// 不接受 Market 或 IOC/FOK 标志组合。
+    /// 重复标识符优先于含等价的价格交叉拒绝；只有全部挂单预检成功后才
+    /// 消耗 QueuePriority。正值由领域类型保证；市场价格步长/数量步长对齐须由调用方校验。
+    /// 不接受市价单或 IOC/FOK 标志组合。
     pub fn place_limit_post_only(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
         if self.orders.contains_key(&order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
@@ -25,16 +25,17 @@ impl ProductionOrderBook {
         self.rest(order)
     }
 
-    /// 按价格/FIFO 立即成交 Limit，正余量以 OrderCanceled 终结且永不入簿。
+    /// 按价格/先进先出立即成交限价单，正余量以 OrderCanceled 终结且永不入簿。
     ///
     /// 此入口选择 IOC 策略；LimitGtcOrder 仅复用基础限价载荷。
-    /// 整单及所有可执行 fill 的 MarketMath 本金和累计金额均在 mutation 前校验。
-    /// IOC 不分配 priority，不预留/释放资金，也不实现完整命令生命周期。
+    /// 整单及所有可执行成交的 MarketMath 本金和累计金额均在状态变更前校验。
+    /// IOC 新到订单不分配优先级；冰山挂单补量取新优先级。
+    /// 不预留/释放资金，也不实现完整命令生命周期。
     ///
-    /// # Panics
+    /// # 不变量断言
     ///
-    /// TradeId 数量不足或内部簿结构损坏时，在提交前 fail-closed。
-    /// TradeId 的全局唯一性由调用方保证，多余 ID 不使用。
+    /// TradeId 数量不足或内部簿结构损坏时，在提交前故障时停止处理。
+    /// TradeId 的全局唯一性由调用方保证，多余标识符不使用。
     pub fn place_limit_ioc(
         &mut self,
         order: LimitGtcOrder,
@@ -44,17 +45,17 @@ impl ProductionOrderBook {
         self.place_immediate_limit(order, math, trade_ids, false)
     }
 
-    /// 只读预检通过后完整成交 Limit，否则拒绝且保持物理簿与 priority 不变。
+    /// 只读预检通过后完整成交限价单，否则拒绝且保持物理簿与优先级不变。
     ///
-    /// 此入口选择 FOK 策略；不会先部分成交再回滚。只计入限价可执行 maker，
+    /// 此入口选择 FOK 策略；不会先部分成交再回滚。只计入限价可执行挂单，
     /// 并预检整单、每笔及累计本金。流动性不足返回 FokInsufficientLiquidity；
-    /// 成功结果仅含原序 Trade，既不 rest 也不取消剩余量。
-    /// Market FOK、资金 reservation 及完整命令协议不在此接口范围。
+    /// 成功结果保留原序成交和冰山挂单生命周期事件；新到订单没有挂单或取消余量。
+    /// 市价单 FOK、资金预留及完整命令协议不在此接口范围。
     ///
-    /// # Panics
+    /// # 不变量断言
     ///
-    /// 完整成交需要的 TradeId 不足或内部簿结构损坏时，在提交前 fail-closed。
-    /// TradeId 的全局唯一性由调用方保证，多余 ID 不使用。
+    /// 完整成交需要的 TradeId 不足或内部簿结构损坏时，在提交前故障时停止处理。
+    /// TradeId 的全局唯一性由调用方保证，多余标识符不使用。
     pub fn place_limit_fok(
         &mut self,
         order: LimitGtcOrder,
@@ -71,6 +72,9 @@ impl ProductionOrderBook {
         trade_ids: &[TradeId],
         fill_or_kill: bool,
     ) -> Result<LimitImmediateExecution, RejectReason> {
+        if self.has_iceberg_maker(order.side) {
+            return self.place_immediate_iceberg(order, math, trade_ids, fill_or_kill);
+        }
         if self.orders.contains_key(&order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -78,8 +82,8 @@ impl ProductionOrderBook {
             .map_err(Self::reject_immediate_math_error)?;
         let mut incoming = IncomingOrder::new(order.clone());
 
-        // 既有结构预检验证链、ID 索引和模拟 count/aggregate，使后续数学扫描
-        // 与 commit 依赖的所有可执行节点均在首个写入前检查完毕。
+        // 既有结构预检验证链、标识符索引和模拟节点数/聚合量，使后续数学扫描
+        // 与提交依赖的所有可执行节点均在首个写入前检查完毕。
         let plan = self.preflight_fill_plan(&incoming);
         let math_plan = match order.side {
             Side::Buy => self.preflight_immediate_notionals(
@@ -109,7 +113,7 @@ impl ProductionOrderBook {
         );
 
         // 写屏障：所有可预期业务拒绝、算术和 TradeId 检查已完成。
-        // 复用 Production 自身的提交逻辑，不依赖 Reference 的扫描/答案。
+        // 复用生产簿自身的提交逻辑，不依赖参考簿的扫描/答案。
         let priority_before = self.next_queue_priority();
         let trades = self
             .execute_fill_trades(&mut incoming, &trade_ids[..plan.trade_count])
@@ -133,7 +137,7 @@ impl ProductionOrderBook {
         ))
     }
 
-    /// 对结构已验证的可执行价档按 FIFO 校验每笔及累计本金，不修改簿。
+    /// 对结构已验证的可执行价档按先进先出校验每笔及累计本金，不修改簿。
     fn preflight_immediate_notionals<'a>(
         &self,
         levels: impl Iterator<Item = (&'a Price, &'a PriceLevel)>,

@@ -2,28 +2,30 @@ use crate::{CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, T
 
 /// 当前订单簿使用的最小订单生命周期事件载荷。
 ///
-/// 它不是完整 durable event envelope：不携带 market event sequence、WAL 位置或发布元数据。
+/// 它不是完整持久化事件封装：不携带市场事件序列、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
     /// 命令在状态变更前被拒绝，并携带稳定的原因码。
     CommandRejected { reason: RejectReason },
     /// 订单已通过接收阶段。
     OrderAccepted { order_id: OrderId },
-    /// 订单已进入订单簿并成为 resting 流动性。
+    /// 订单已进入订单簿并成为挂单流动性。
     OrderOpened { order_id: OrderId },
-    /// 订单成交后仍有严格正的剩余数量。
+    /// 订单成交后仍有严格正的总剩余量；冰山包含可见量 + 隐藏量。
     OrderPartiallyFilled { order_id: OrderId, remaining: Qty },
     /// 订单因成交完毕而结束。
     OrderFilled { order_id: OrderId },
-    /// 未成交的严格正 base 余量按指定原因终结；不表示取消了一张 resting order。
+    /// 未成交的严格正基础资产余量按指定原因终结；不表示取消了一张挂单订单。
     OrderCanceled {
         order_id: OrderId,
         remaining: Qty,
         reason: CancelReason,
     },
-    /// 一笔已提交的成交及其 maker/taker 载荷。
+    /// 一笔已提交的成交及其挂单/吃单方载荷。
     Trade(TradeEvent),
-    /// 下一候选 maker 越过有效保护边界，市价订单据此终结。
+    /// 冰山可见片耗尽后补量并取得新队列优先级；`visible` 是本次显示量。
+    IcebergRefreshed { order_id: OrderId, visible: Qty },
+    /// 下一候选挂单越过有效保护边界，市价订单据此终结。
     MarketProtectionTriggered {
         order_id: OrderId,
         next_price: Price,
@@ -130,7 +132,7 @@ mod tests {
         );
     }
 
-    /// 构造可复用的成交事件 fixture。
+    /// 构造可复用的成交事件测试数据。
     fn sample_trade() -> TradeEvent {
         TradeEvent {
             trade_id: crate::TradeId::new(100),
@@ -309,7 +311,7 @@ mod tests {
         };
         assert_ne!(original, changed_effective_worst_price);
 
-        // 7. 仅改变 source。
+        // 7. 仅改变来源。
         let changed_source = EngineEvent::MarketProtectionTriggered {
             order_id: OrderId::new(100),
             next_price: Price::try_new(110).unwrap(),

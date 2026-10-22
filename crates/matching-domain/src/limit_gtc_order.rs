@@ -12,9 +12,9 @@ pub struct LimitGtcOrder {
     pub user_id: UserId,
     /// 买入或卖出方向。
     pub side: Side,
-    /// 严格正的价格原始整数；市场 tick 对齐须由使用该载荷的校验层保证。
+    /// 严格正的价格原始整数；市场价格步长对齐须由使用该载荷的校验层保证。
     pub price: Price,
-    /// 严格正的原始下单数量；市场 lot 对齐须由使用该载荷的校验层保证。
+    /// 严格正的原始下单数量；市场数量步长对齐须由使用该载荷的校验层保证。
     pub qty: Qty,
 }
 
@@ -45,7 +45,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// 构造可复用的合法订单 fixture。
+    /// 构造可复用的合法订单测试数据。
     fn sample_order() -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(1),

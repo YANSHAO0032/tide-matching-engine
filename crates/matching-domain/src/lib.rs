@@ -1,22 +1,24 @@
-//! 领域 ID、整数数值、市场金额换算、订单载荷、执行结果与稳定错误码。
+//! 领域标识符、整数数值、市场金额换算、订单载荷、执行结果与稳定错误码。
 //!
-//! 当前提供撮合所需的领域子集，不包含完整命令 envelope、资金账本或持久化协议。
+//! 当前提供撮合所需的领域子集，不包含完整命令封装、资金账本或持久化协议。
 
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
+/// 已验证显示量与总量关系的冰山限价订单输入。
+pub mod iceberg_order;
 /// 具有业务类型隔离的标识符包装。
 pub mod ids;
 /// IOC/FOK 的终结结果与当前基础订单组合校验。
 pub mod limit_execution;
 /// 限价身份、价格和数量载荷，执行策略由订单簿入口选择。
 pub mod limit_gtc_order;
-/// 不依赖 wall clock 的逻辑时间值。
+/// 不依赖系统时钟的逻辑时间值。
 pub mod logical_time;
 /// 市场整数金额换算的已验证配置与内部错误分类。
 pub mod market_math;
 /// 市价输入、执行结果与固定参考价的保护边界。
 pub mod market_order;
-/// 价格、数量和金额的整数值对象及 checked 算术。
+/// 价格、数量和金额的整数值对象及带溢出检查的算术。
 pub mod numbers;
 /// 附加订单约束标志。
 pub mod order_flags;
@@ -24,7 +26,7 @@ pub mod order_flags;
 pub mod order_state;
 /// 订单类型标签。
 pub mod order_type;
-/// 市场本地 FIFO priority 值对象。
+/// 市场本地先进先出优先级值对象。
 pub mod queue_priority;
 /// 稳定编号的拒绝原因。
 pub mod reject_reason;
@@ -40,6 +42,8 @@ pub use ids::{ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, U
 
 /// 最小订单生命周期事件。
 pub use engine_event::EngineEvent;
+/// 包含总量与严格较小显示上限的冰山限价输入。
+pub use iceberg_order::IcebergOrder;
 /// 限价立即执行结果、稳定取消原因与基础订单组合校验。
 pub use limit_execution::{
     CancelReason, LimitImmediateExecution, validate_basic_order_combination,
@@ -56,7 +60,7 @@ pub use order_flags::OrderFlags;
 pub use order_state::OrderState;
 /// 订单类型标签。
 pub use order_type::OrderType;
-/// 市场本地 FIFO priority 值。
+/// 市场本地先进先出优先级值。
 pub use queue_priority::QueuePriority;
 /// 稳定编号的业务拒绝原因。
 pub use reject_reason::RejectReason;

@@ -18,34 +18,35 @@ use matching_domain::{
 #[cfg(test)]
 use matching_domain::ProtectionSource;
 
+mod iceberg;
 mod limit_execution;
 
-/// 为 priority 计数器保留不可分配的高位保护空间。
+/// 为优先级计数器保留不可分配的高位保护空间。
 ///
-/// 到达该边界前必须拒绝新 resting order，避免计数器 wrap 后破坏 FIFO 语义。
+/// 到达该边界前必须拒绝新挂单订单，避免计数器回绕后破坏先进先出语义。
 const PRIORITY_GUARD: u128 = 1_024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProtectedMarketByBasePlan {
-    // 保留此前已验收的 maker ID + Qty fill plan。
+    // 保留此前已验收的挂单标识符 + Qty 成交计划。
     fills: Vec<(OrderId, Qty)>,
 
-    // 至多一个终止点，即价格优先顺序中的首个越界 maker。
+    // 至多一个终止点，即价格优先顺序中的首个越界挂单。
     stop: Option<ProtectionBoundaryStop>,
 }
 /// 单市场参考订单簿
 ///
-/// orders 的原始顺序表示已知挂单先后。
+/// 订单集合的原始顺序表示已知挂单先后。
 #[derive(Debug, Default)]
 pub struct ReferenceOrderBook {
-    /// 挂单的权威存储顺序；同价 FIFO 的参考基线由该顺序加稳定排序得出。
+    /// 挂单的权威存储顺序；同价先进先出的参考基线由该顺序加稳定排序得出。
     orders: Vec<ReferenceOrder>,
-    /// 下一张成功 rest 的订单将取得的 market-local priority 值。
+    /// 下一次实际挂单或冰山补量将取得的市场内优先级。
     next_priority: u128,
 }
 
 impl ReferenceOrderBook {
-    /// 创建不含挂单且 priority 从零开始的单市场参考订单簿。
+    /// 创建不含挂单且优先级从零开始的单市场参考订单簿。
     pub fn new() -> Self {
         Self::default()
     }
@@ -53,14 +54,14 @@ impl ReferenceOrderBook {
     /// 将订单加入当前市场的参考订单簿。
     ///
     /// 校验顺序：
-    /// 1. 拒绝重复订单 ID；
-    /// 2. 检查 priority 高水位；
-    /// 3. checked increment；
+    /// 1. 拒绝重复订单标识符；
+    /// 2. 检查优先级高水位；
+    /// 3. 检查溢出后递增；
     /// 4. 创建运行态订单并追加到源 Vec。
     ///
     /// 失败时不修改现有订单、剩余量或 next_priority。
     pub fn rest(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
-        // 必须先检查重复 ID，即使计数器已经耗尽也是如此。
+        // 必须先检查重复标识符，即使计数器已经耗尽也是如此。
         if self
             .orders
             .iter()
@@ -88,10 +89,10 @@ impl ReferenceOrderBook {
         Ok(())
     }
 
-    /// 返回指定侧按价格优先、同价 FIFO 排列的只读视图
+    /// 返回指定侧按价格优先、同价先进先出排列的只读视图
     ///
-    /// Buy: 价格降序
-    /// Sell: 价格升序
+    /// 买入: 价格降序
+    /// 卖出: 价格升序
     ///
     /// 使用稳定排序保留同价订单在源 Vec 中的顺序
     /// 排序仅作用于引用列表，不修改底层订单
@@ -112,15 +113,15 @@ impl ReferenceOrderBook {
         result
     }
 
-    /// 返回指定侧价格/FIFO 优先级最高的订单。
+    /// 返回指定侧价格/先进先出优先级最高的订单。
     ///
     pub fn best(&self, side: Side) -> Option<&ReferenceOrder> {
         self.orders(side).into_iter().next()
     }
 
-    /// 返回对 `incoming` 价格可成交的最优 resting maker。
+    /// 返回对 `incoming` 价格可成交的最优挂单。
     ///
-    /// 选择遵循对手方价格优先和同价 FIFO，并忽略已经耗尽的运行态订单。
+    /// 选择遵循对手方价格优先和同价先进先出，并忽略已经耗尽的运行态。
     pub fn best_crossing_maker(&self, incoming: &LimitGtcOrder) -> Option<&ReferenceOrder> {
         self.best_crossing_maker_index(incoming)
             .map(|index| &self.orders[index])
@@ -128,7 +129,7 @@ impl ReferenceOrderBook {
 
     /// PostOnly 候选的只读预检。
     ///
-    /// 输入代表 Limit GTC + PostOnly 候选。
+    /// 输入代表限价单 GTC + PostOnly 候选。
     ///
     /// 检查顺序：
     /// 1. 全簿重复 OrderId
@@ -154,9 +155,9 @@ impl ReferenceOrderBook {
         Ok(())
     }
 
-    /// 查找最佳可成交 maker 在源 `Vec` 中的索引。
+    /// 查找最佳可成交挂单在源 `Vec` 中的索引。
     ///
-    /// 该索引只在当前不可变借用期间有效，供后续规划和一次性执行定位同一 maker。
+    /// 该索引只在当前不可变借用期间有效，供后续规划和一次性执行定位同一挂单。
     pub(crate) fn best_crossing_maker_index(&self, incoming: &LimitGtcOrder) -> Option<usize> {
         let opposite_side = match incoming.side {
             Side::Buy => Side::Sell,
@@ -199,9 +200,9 @@ impl ReferenceOrderBook {
         Ok(Some((maker_index, fill_qty)))
     }
 
-    /// 返回下一笔成交的 maker 与数量，但不修改双方运行态。
+    /// 返回下一笔成交的挂单与数量，但不修改双方运行态。
     ///
-    /// 与内部 `plan_next_fill` 共用价格/FIFO 选择逻辑进行只读预览；
+    /// 与内部 `plan_next_fill` 共用价格/先进先出选择逻辑进行只读预览；
     /// 返回的引用在订单簿发生可变操作前有效。
     pub fn next_fill_plan(
         &self,
@@ -213,14 +214,19 @@ impl ReferenceOrderBook {
         Ok(Some((&self.orders[maker_index], fill_qty)))
     }
 
-    /// 执行至多一笔 next-fill，不生成事件，也不将 incoming 剩余量挂簿。
+    /// 执行至多一笔 `next`-成交，不生成事件，也不将新到订单剩余量挂簿。
     ///
     /// 先规划并预检双方扣减，再修改运行态。
-    /// 返回 maker 身份、maker 价格和成交量。
+    /// 返回挂单身份、挂单价格和成交量。
     pub fn execute_next_fill(
         &mut self,
         incoming: &mut IncomingOrder,
     ) -> Result<Option<(OrderId, Price, Qty)>, RejectReason> {
+        if self.has_iceberg_maker(incoming.original_order().side) {
+            return self
+                .execute_slice_fills(incoming, true)
+                .map(|fills| fills.into_iter().next());
+        }
         let Some((maker_index, fill_qty)) = self.plan_next_fill(incoming)? else {
             return Ok(None);
         };
@@ -249,14 +255,18 @@ impl ReferenceOrderBook {
         Ok(Some((maker_id, maker_price, fill_qty)))
     }
 
-    /// 持续执行单笔成交，直到 incoming 耗尽或不存在可成交 maker。
+    /// 持续执行单笔成交，直到新到订单耗尽或不存在可成交挂单。
     ///
-    /// 结果按实际成交顺序排列，价格取各 resting maker 的价格。
-    /// 每笔成交沿用 execute_next_fill 的双侧预检；不生成事件，也不 rest 剩余 incoming。
+    /// 结果按实际成交顺序排列，价格取各挂单的价格。
+    /// 冰山挂单存在时，先对整条命令模拟补量/优先级再提交。
+    /// 此既有接口仅投影成交；不挂单新到订单，富事件接口保留生命周期事件。
     pub fn execute_fills(
         &mut self,
         incoming: &mut IncomingOrder,
     ) -> Result<Vec<(OrderId, Price, Qty)>, RejectReason> {
+        if self.has_iceberg_maker(incoming.original_order().side) {
+            return self.execute_slice_fills(incoming, false);
+        }
         let mut fills = Vec::new();
         while let Some(fill) = self.execute_next_fill(incoming)? {
             fills.push(fill)
@@ -264,10 +274,10 @@ impl ReferenceOrderBook {
         Ok(fills)
     }
 
-    /// 按 OrderId 取消一张 resting order。
+    /// 按 OrderId 取消一张挂单订单。
     ///
     /// 订单不存在时返回 OrderNotFound，不修改订单簿。
-    /// 成功时返回被移除的订单，不消耗或重排 priority。
+    /// 成功时返回被移除的订单，不消耗或重排优先级。
     pub fn cancel(&mut self, order_id: OrderId) -> Result<ReferenceOrder, RejectReason> {
         let index = self
             .orders
@@ -279,8 +289,8 @@ impl ReferenceOrderBook {
 
     /// 执行至多一笔真实成交，并转换为 TradeEvent。
     ///
-    /// TradeId 由调用方提供；无可成交 maker 时返回 None。
-    /// 不生成 EngineEvent，不写 WAL，不自动 rest。
+    /// TradeId 由调用方提供；无可成交挂单时返回 None。
+    /// 此既有接口仅投影 TradeEvent；不写 WAL，不自动挂单新到订单。
     pub fn execute_next_fill_trade(
         &mut self,
         incoming: &mut IncomingOrder,
@@ -319,9 +329,9 @@ impl ReferenceOrderBook {
     /// 只读预检 MarketByBase。
     ///
     /// 返回完成本次撮合需要的 TradeId 数量。
-    /// 不修改订单、remaining 或 next_priority。
+    /// 不修改订单、剩余量或 next_priority。
     fn preflight_market_by_base(&self, incoming: &MarketByBase) -> Result<usize, RejectReason> {
-        // 1. 活动订单 ID 重复必须优先拒绝。
+        // 1. 活动订单标识符重复必须优先拒绝。
         if self
             .orders
             .iter()
@@ -339,9 +349,9 @@ impl ReferenceOrderBook {
         let mut remaining = incoming.qty.get();
         let mut required_trade_ids = 0usize;
 
-        // orders(side) 已保证：
-        // Sell: price ASC + same-price FIFO
-        // Buy: price DESC + same-price FIFO
+        // `orders(side)` 已保证：
+        // 卖出: 价格升序 + 同价先进先出
+        // 买入: 价格降序 + 同价先进先出
         for maker in self.orders(maker_side) {
             if remaining == 0 {
                 break;
@@ -349,14 +359,14 @@ impl ReferenceOrderBook {
 
             let maker_remaining = maker.remaining();
 
-            // 防御测试 fixture 中可能残留的耗尽订单。
+            // 防御测试数据中可能残留的耗尽订单。
             if maker_remaining == 0 {
                 continue;
             }
 
             let fill = remaining.min(maker_remaining);
 
-            // fill 必须严格大于零。
+            // 成交必须严格大于零。
             remaining = remaining
                 .checked_sub(fill)
                 .expect("preflight MarketByBase remaining underflow");
@@ -371,8 +381,8 @@ impl ReferenceOrderBook {
 
     /// 只读规划带保护的 MarketByBase。
     ///
-    /// 返回按价格优先、同价 FIFO 排列的 maker ID 与计划数量。
-    /// 遇到首个保护价之外的 maker 立即停止。
+    /// 返回按价格优先、同价先进先出排列的挂单标识符与计划数量。
+    /// 遇到首个保护价之外的挂单立即停止。
     ///
     /// 不修改盘口、不消耗 TradeId、不分配 QueuePriority。
     #[cfg(test)]
@@ -390,8 +400,8 @@ impl ReferenceOrderBook {
     /// 只读规划 MarketByQuote。
     ///
     /// - 重复活动 OrderId 优先拒绝；
-    /// - maker 按价格优先、同价 FIFO；
-    /// - 不足一 lot 时立即 dust 停止；
+    /// - 挂单按价格优先、同价先进先出；
+    /// - 不足一手时立即不足一手的预算停止；
     /// - 不修改订单簿、不消耗 QueuePriority；
     /// - 不生成 TradeEvent 或 MarketByQuoteExecution。
     fn preflight_market_by_quote(
@@ -399,7 +409,7 @@ impl ReferenceOrderBook {
         incoming: &MarketByQuote,
         math: &MarketMath,
     ) -> Result<MarketByQuotePlan, RejectReason> {
-        // 1. 重复 ID 必须先于盘口读取。
+        // 1. 重复标识符必须先于盘口读取。
         if self
             .orders
             .iter()
@@ -420,7 +430,7 @@ impl ReferenceOrderBook {
         let mut fills = Vec::new();
         let mut required_trade_ids = 0usize;
 
-        // 2. orders() 返回已经按价格优先、同价 FIFO
+        // 2. `orders()` 返回已经按价格优先、同价先进先出
         // 排列的引用视图，不修改原始 Vec。
         for maker in self.orders(maker_side) {
             if remaining_quote.get() == 0 {
@@ -440,12 +450,12 @@ impl ReferenceOrderBook {
                 .max_qty_for_quote(remaining_quote, maker_price)
                 .map_err(Self::reject_quote_math_error)?;
 
-            // 余额不足一 lot，整张市价订单停止。
+            // 余额不足一手，整张市价订单停止。
             let Some(max_qty) = affordable else {
                 break;
             };
 
-            // 4. Maker 当前剩余量限制实际成交量。
+            // 4. 挂单当前剩余量限制实际成交量。
             let fill_lots = max_qty.get().min(maker_remaining);
 
             let fill_qty =
@@ -461,7 +471,7 @@ impl ReferenceOrderBook {
                 "MarketByQuote planned notional must be positive"
             );
 
-            // 6. Checked 金额更新，仍然只修改局部变量。
+            // 6. 以受检算术更新金额，仍然只修改局部变量。
             remaining_quote = remaining_quote.checked_sub(notional)?;
 
             spent_quote = spent_quote.checked_add(notional)?;
@@ -499,8 +509,8 @@ impl ReferenceOrderBook {
 
     /// 受保护 MarketByQuote 执行入口使用的只读计划。
     ///
-    /// 顺序：Duplicate → command-start protection → maker 边界
-    ///      → quote 预算反推 → 本金计算 → 本地金额累计。
+    /// 顺序：重复标识符 → 命令开始时保护 → 挂单边界
+    ///      → 报价资产预算反推 → 本金计算 → 本地金额累计。
     ///
     /// 不生成事件、不消耗 TradeId、不修改 ReferenceOrderBook。
     fn preflight_market_by_quote_with_protection(
@@ -509,7 +519,7 @@ impl ReferenceOrderBook {
         context: &CommandStartProtectionContext,
         math: &MarketMath,
     ) -> Result<ProtectedMarketByQuotePlan, RejectReason> {
-        // 1. Duplicate 永远先于保护及数学计算。
+        // 1. 重复标识符永远先于保护及数学计算。
         if self
             .orders
             .iter()
@@ -538,7 +548,7 @@ impl ReferenceOrderBook {
         let mut fills = Vec::new();
         let mut stop = None;
 
-        // orders(maker_side) 已经是价格优先、同价 FIFO 的只读视图。
+        // `orders(maker_side)` 已经是价格优先、同价先进先出的只读视图。
         for maker in self.orders(maker_side) {
             if remaining_quote.get() == 0 {
                 break;
@@ -568,7 +578,7 @@ impl ReferenceOrderBook {
                     source,
                 });
 
-                // 首个越界 maker 立即停止。
+                // 首个越界挂单立即停止。
                 break;
             }
 
@@ -577,7 +587,7 @@ impl ReferenceOrderBook {
                 .max_qty_for_quote(remaining_quote, maker_price)
                 .map_err(Self::reject_quote_math_error)?;
 
-            // Dust：不足一个合法 lot，整单停止；不生成保护 stop。
+            // 预算不足一手：不足一个合法手，整单停止；不生成保护终止。
             let Some(max_qty) = affordable else {
                 break;
             };
@@ -628,21 +638,37 @@ impl ReferenceOrderBook {
 
     /// 市价按基础币数量立即成交。
     ///
-    /// - 活动重复 ID 在任何 mutation 前拒绝。
-    /// - TradeId 不足在任何 mutation 前 panic（测试/Reference fail-closed）。
-    /// - maker 按价格优先、同价 FIFO 选择。
-    /// - 市价 taker 剩余量不挂簿。
+    /// - 活动重复标识符在任何状态变更前拒绝。
+    /// - TradeId 不足在任何状态变更前触发不变量断言（测试/参考簿故障时停止处理）。
+    /// - 挂单按价格优先、同价先进先出选择。
+    /// - 市价吃单方剩余量不挂簿。
     /// - 不分配 QueuePriority。
     pub fn execute_market_by_base(
         &mut self,
         incoming: MarketByBase,
         trade_ids: &[TradeId],
     ) -> Result<Vec<TradeEvent>, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            return self
+                .slice_market_base(incoming, None, trade_ids)
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .filter_map(|event| {
+                            if let EngineEvent::Trade(t) = event {
+                                Some(t)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                });
+        }
         // 1. 只读预检。
         let required = self.preflight_market_by_base(&incoming)?;
 
-        // 2. 必须先验证 TradeId 足够，再允许任何 mutation。
-        // 与现有 differential Reference adapter 的 fail-closed 断言约定一致。
+        // 2. 必须先验证 TradeId 足够，再允许任何状态变更。
+        // 与现有差分参考簿适配器的失败即停止的断言约定一致。
         assert!(
             trade_ids.len() >= required,
             "insufficient TradeIds for Reference MarketByBase: \
@@ -660,7 +686,7 @@ impl ReferenceOrderBook {
         let mut trades = Vec::with_capacity(required);
 
         for trade_id in trade_ids.iter().copied().take(required) {
-            // 按当前盘口重新取得最佳 maker。
+            // 按当前盘口重新取得最佳挂单。
             // 使用原有只读排序语义，不依赖 OrderId 数值排序。
             let maker_index = {
                 let maker = self
@@ -685,7 +711,7 @@ impl ReferenceOrderBook {
             let fill_qty =
                 Qty::try_new(fill_lots).expect("preflighted MarketByBase fill must be positive");
 
-            // 4. 扣减 maker。
+            // 4. 扣减挂单。
             self.orders[maker_index]
                 .apply_fill(fill_qty)
                 .expect("preflighted MarketByBase maker fill must succeed");
@@ -694,12 +720,12 @@ impl ReferenceOrderBook {
                 .checked_sub(fill_lots)
                 .expect("preflighted MarketByBase remaining underflow");
 
-            // 5. 耗尽 maker 直接删除，部分 maker 保留。
+            // 5. 耗尽挂单直接删除，部分挂单保留。
             if self.orders[maker_index].remaining() == 0 {
                 self.orders.remove(maker_index);
             }
 
-            // 6. TradeEvent 必须使用真实 maker 成交价格。
+            // 6. TradeEvent 必须使用真实挂单成交价格。
             trades.push(TradeEvent {
                 trade_id,
                 maker_order_id,
@@ -712,14 +738,14 @@ impl ReferenceOrderBook {
 
         debug_assert_eq!(trades.len(), required);
 
-        // remaining 即使大于 0，也直接终结，不执行 rest。
+        // 剩余量即使大于 0，也直接终结，不执行挂单。
         Ok(trades)
     }
 
-    /// Reference-only：按命令开始时固定的保护边界执行 MarketByBase。
+    /// 参考簿专用：按命令开始时固定的保护边界执行 MarketByBase。
     ///
     /// 先完整预检，再提交成交；保护终止不消耗 TradeId。
-    /// 不自动 rest taker，不修改 next_priority。
+    /// 不自动挂单吃单方；冰山挂单补量分配新优先级。
     pub fn execute_market_by_base_with_protection(
         &mut self,
         incoming: MarketByBase,
@@ -727,12 +753,15 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            return self.slice_market_base(incoming, Some((context, math)), trade_ids);
+        }
         // 阶段一：完整只读计划。
         let plan = self.preflight_protected_market_by_base_plan(&incoming, context, math)?;
 
         // TradeId 只为 Trade 分配，不为 ProtectionTriggered 分配。
-        // 与现有 Reference MarketByBase 保持一致：
-        // 数量不足时，在任何 mutation 前 fail-closed panic。
+        // 与现有参考簿 MarketByBase 保持一致：
+        // 数量不足时，在任何状态变更前触发不变量断言并停止处理。
         assert!(
             trade_ids.len() >= plan.fills.len(),
             "insufficient TradeIds for protected Reference MarketByBase"
@@ -755,8 +784,8 @@ impl ReferenceOrderBook {
         for ((maker_order_id, qty), trade_id) in
             plan.fills.into_iter().zip(trade_ids.iter().copied())
         {
-            // 按预检时记录的 maker ID 定位。
-            // 不重新选择最佳 maker，也不重新判断保护边界。
+            // 按预检时记录的挂单标识符定位。
+            // 不重新选择最佳挂单，也不重新判断保护边界。
             let maker_index = self
                 .orders
                 .iter()
@@ -767,7 +796,7 @@ impl ReferenceOrderBook {
 
             let maker_price = maker.original_order().price;
 
-            // 预检已验证计划数量不超过 maker.remaining。
+            // 预检已验证计划数量不超过 `maker.remaining`。
             maker
                 .apply_fill(qty)
                 .expect("preflighted protected fill must succeed");
@@ -799,28 +828,43 @@ impl ReferenceOrderBook {
             });
         }
 
-        // 不将未成交的 taker 余量挂入 Reference。
+        // 不将未成交的吃单方余量挂入参考簿。
         Ok(events)
     }
 
     /// 按报价币预算执行市价订单。
     ///
-    /// 所有可预期失败都发生在首笔 mutation 前：
-    /// 1. 只读规划整个 maker 成交序列；
+    /// 所有可预期失败都发生在首笔状态变更前：
+    /// 1. 只读规划整个挂单成交序列；
     /// 2. 检查调用方 TradeId 数量；
-    /// 3. 按计划逐笔提交，不重新计算 notional。
+    /// 3. 按计划逐笔提交，不重新计算本金。
     ///
-    /// 市价 taker 不挂簿，不消耗 QueuePriority。
+    /// 市价吃单方不挂簿；冰山挂单补量仍分配 QueuePriority。
     pub fn execute_market_by_quote(
         &mut self,
         incoming: MarketByQuote,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<MarketByQuoteExecution, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            let (events, spent, unused) =
+                self.slice_market_quote(incoming, None, math, trade_ids)?;
+            let trades = events
+                .into_iter()
+                .filter_map(|event| {
+                    if let EngineEvent::Trade(t) = event {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return Ok(MarketByQuoteExecution::new(trades, spent, unused));
+        }
         // 1. 全量只读预检。
         let plan = self.preflight_market_by_quote(&incoming, math)?;
 
-        // 2. TradeId 必须在任何 maker mutation 前充足。
+        // 2. TradeId 必须在任何挂单状态变更前充足。
         assert!(
             trade_ids.len() >= plan.required_trade_ids,
             "ReferenceOrderBook invariant violation: \
@@ -845,7 +889,7 @@ impl ReferenceOrderBook {
 
         // 3. 严格按照只读计划的原序提交。
         for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
-            // 使用计划中的 maker ID 定位，而不是重新选择最优 maker。
+            // 使用计划中的挂单标识符定位，而不是重新选择最优挂单。
             let maker_index = self
                 .orders
                 .iter()
@@ -854,7 +898,7 @@ impl ReferenceOrderBook {
 
             let maker = &self.orders[maker_index];
 
-            // 预检与提交处于同一 writer 生命周期，
+            // 预检与提交处于同一写入者生命周期，
             // 计划中的身份、方向、价格和数量必须仍然有效。
             assert_eq!(maker.original_order().order_id, fill.maker_order_id,);
             assert_eq!(maker.original_order().side, maker_side,);
@@ -872,7 +916,7 @@ impl ReferenceOrderBook {
                 .checked_sub(fill_lots)
                 .expect("preflighted MarketByQuote maker underflow");
 
-            // 先构造事件，再修改 maker。
+            // 先构造事件，再修改挂单。
             // 成交价、数量来自计划；不调用 MarketMath。
             let trade = TradeEvent {
                 trade_id,
@@ -892,7 +936,7 @@ impl ReferenceOrderBook {
                     )
                 });
 
-            // Fully filled maker 从 Reference Vec 中物理移除。
+            // 完全成交挂单从参考簿 Vec 中物理移除。
             if maker_after == 0 {
                 let removed = self.orders.remove(maker_index);
 
@@ -917,16 +961,16 @@ impl ReferenceOrderBook {
         ))
     }
 
-    /// Reference 受保护 MarketByQuote 执行。
+    /// 参考簿受保护 MarketByQuote 执行。
     ///
     /// 完整只读预检、TradeId 数量校验及事件容量准备
-    /// 必须先于任何订单簿 mutation。
+    /// 必须先于任何订单簿状态变更。
     ///
-    /// 使用预检计划中的 maker、价格、数量和 notional；
+    /// 使用预检计划中的挂单、价格、数量和本金；
     /// 不重新计算保护边界或成交名义额。
     ///
     /// 保护终结事件不消耗 TradeId。
-    /// 市价 taker 的未使用报价预算不重新挂簿。
+    /// 市价吃单方的未使用报价预算不重新挂簿。
     pub fn execute_market_by_quote_with_protection(
         &mut self,
         incoming: MarketByQuote,
@@ -934,6 +978,11 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            let (events, spent, unused) =
+                self.slice_market_quote(incoming, Some(context), math, trade_ids)?;
+            return Ok(ProtectedMarketByQuoteExecution::new(events, spent, unused));
+        }
         // ========================================================
         // 第一阶段：完整只读预检
         // ========================================================
@@ -949,9 +998,9 @@ impl ReferenceOrderBook {
             trade_ids.len(),
         );
 
-        // 只聚合预检已经确定的 notional，
-        // 不重新调用 MarketMath 或重新计算 price * qty。
-        // 在第一次 mutation 前确认金额计划内部一致。
+        // 只聚合预检已经确定的本金，
+        // 不重新调用 MarketMath 或重新计算价格 * 数量。
+        // 在第一次状态变更前确认金额计划内部一致。
         let mut planned_spent = QuoteAmount::new(0);
 
         for fill in &plan.fills {
@@ -981,7 +1030,7 @@ impl ReferenceOrderBook {
             .checked_add(usize::from(plan.stop.is_some()))
             .expect("protected MarketByQuote event count overflow");
 
-        // 在修改 maker 前完成完整事件容量分配。
+        // 在修改挂单前完成完整事件容量分配。
         let mut events = Vec::with_capacity(event_count);
 
         let maker_side = match incoming.side {
@@ -992,11 +1041,11 @@ impl ReferenceOrderBook {
         let priority_before = self.next_priority;
 
         // ========================================================
-        // 第二阶段：严格按已通过预检的 fill plan 提交
+        // 第二阶段：严格按已通过预检的成交计划提交
         // ========================================================
 
         for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
-            // Reference 重新读取当前最佳 maker，
+            // 参考簿重新读取当前最佳挂单，
             // 只用于确认提交顺序未偏离计划，不重新计算保护。
             let best_maker_id = self
                 .orders(maker_side)
@@ -1010,7 +1059,7 @@ impl ReferenceOrderBook {
                 "protected Quote maker diverged from price/FIFO plan",
             );
 
-            // 按计划 maker ID 定位源 Vec 中的运行态订单。
+            // 按计划挂单标识符定位源 Vec 中的运行态。
             let maker_index = self
                 .orders
                 .iter()
@@ -1036,8 +1085,8 @@ impl ReferenceOrderBook {
                 .checked_sub(fill_lots)
                 .expect("preflighted protected Quote maker underflow");
 
-            // 事件价、量直接来自 plan。
-            // notional 已在第一阶段确认并计入 plan.spent_quote。
+            // 事件价、量直接来自计划。
+            // 本金已在第一阶段确认并计入 `plan.spent_quote`。
             let trade = TradeEvent {
                 trade_id,
                 maker_order_id: fill.maker_order_id,
@@ -1047,13 +1096,13 @@ impl ReferenceOrderBook {
                 maker_side,
             };
 
-            // 从这里开始首次修改 maker。
+            // 从这里开始首次修改挂单。
             self.orders[maker_index]
                 .apply_fill(fill.qty)
                 .expect("preflighted protected Quote fill must succeed");
 
             if maker_after == 0 {
-                // 完全成交：物理移除 maker。
+                // 完全成交：物理移除挂单。
                 let removed = self.orders.remove(maker_index);
 
                 assert_eq!(removed.original_order().order_id, fill.maker_order_id);
@@ -1082,7 +1131,7 @@ impl ReferenceOrderBook {
 
         assert_eq!(events.len(), event_count);
 
-        // 市价成交不消耗 priority，也不 rest taker。
+        // 此普通挂单路径不消耗优先级，也不挂入市价吃单方。
         assert_eq!(self.next_priority, priority_before);
 
         assert!(
@@ -1107,7 +1156,7 @@ impl ReferenceOrderBook {
         context: &CommandStartProtectionContext,
         math: &MarketMath,
     ) -> Result<ProtectedMarketByBasePlan, RejectReason> {
-        // 1. Duplicate 优先于保护计算。
+        // 1. 重复标识符优先于保护计算。
         if self
             .orders
             .iter()
@@ -1116,7 +1165,7 @@ impl ReferenceOrderBook {
             return Err(RejectReason::DuplicateOrderId);
         }
 
-        // 2. 使用带来源的命令开始保护 helper。
+        // 2. 使用带来源的命令开始保护辅助函数。
         //    只计算一次，错误原样传播。
         let effective = effective_protection_at_command_start_with_source(
             incoming.market_protection.as_ref(),
@@ -1134,7 +1183,7 @@ impl ReferenceOrderBook {
         let mut fills = Vec::new();
         let mut stop = None;
 
-        // 3. 只读扫描，复用 Reference 的价格/FIFO 排序。
+        // 3. 只读扫描，复用参考簿的价格/先进先出排序。
         for maker in self.orders(maker_side) {
             if remaining == 0 {
                 break;
@@ -1148,7 +1197,7 @@ impl ReferenceOrderBook {
 
             let maker_price = maker.original_order().price;
 
-            // 4. 判断当前 maker 是否位于有效保护边界内。
+            // 4. 判断当前挂单是否位于有效保护边界内。
             if !maker_price_within_protection(
                 incoming.side,
                 maker_price,
@@ -1163,7 +1212,7 @@ impl ReferenceOrderBook {
                     source,
                 });
 
-                // 首个越界 maker 不计入成交计划。
+                // 首个越界挂单不计入成交计划。
                 break;
             }
 
@@ -1184,11 +1233,11 @@ impl ReferenceOrderBook {
 
 #[cfg(test)]
 mod tests {
-    //! 覆盖 T02 参考模型的排序、成交、取消和 priority 边界。
+    //! 覆盖 T02 参考模型的排序、成交、取消和优先级边界。
     use super::*;
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, UserId};
 
-    /// 构造带指定业务字段的 resting order fixture。
+    /// 构造带指定业务字段的挂单订单测试数据。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> ReferenceOrder {
         ReferenceOrder::new(
             LimitGtcOrder {
@@ -1210,7 +1259,7 @@ mod tests {
         }
     }
 
-    /// 提取只读视图中的 order ID，便于断言显示顺序。
+    /// 提取只读视图中的订单标识符，便于断言显示顺序。
     fn ids(orders: &[&ReferenceOrder]) -> Vec<OrderId> {
         orders
             .iter()
@@ -1238,7 +1287,7 @@ mod tests {
 
     #[test]
     fn buy_and_sell_views_are_isolated_and_price_sorted() {
-        // 最高 bid=95，最低 ask=101，不构成交叉盘口。
+        // 最高买价=95，最低卖价=101，不构成交叉盘口。
         let book = book(vec![
             order(1, Side::Buy, 90, 10),
             order(2, Side::Sell, 105, 10),
@@ -1368,7 +1417,7 @@ mod tests {
         assert_eq!(book.orders[0].original_order().qty.get(), 10);
     }
 
-    /// 构造经公开 `rest` 路径写入参考簿的合法订单 fixture。
+    /// 构造经公开 `rest` 路径写入参考簿的合法订单测试数据。
     fn candidate(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -1379,7 +1428,7 @@ mod tests {
         }
     }
 
-    /// 保存完整可观察 resting 状态，用于失败原子性断言。
+    /// 保存完整可观察挂单状态，用于失败原子性断言。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -1424,7 +1473,7 @@ mod tests {
     fn real_rest_preserves_price_priority_and_both_sides_fifo() {
         let mut book = ReferenceOrderBook::new();
 
-        // 双侧盘口不交叉：最高 bid=95，最低 ask=105。
+        // 双侧盘口不交叉：最高买价=95，最低卖价=105。
         for order in [
             candidate(30, Side::Buy, 90, 10),
             candidate(40, Side::Sell, 110, 10),
@@ -1473,7 +1522,7 @@ mod tests {
         let before = snapshot(&book);
         let next_before = book.next_priority;
 
-        // 同一订单 ID，即使方向、价格、数量不同也必须拒绝。
+        // 同一订单标识符，即使方向、价格、数量不同也必须拒绝。
         let result = book.rest(candidate(1, Side::Sell, 110, 20));
 
         assert_eq!(result, Err(RejectReason::DuplicateOrderId));
@@ -1482,7 +1531,7 @@ mod tests {
         assert_eq!(book.orders[0].original_order(), &original);
         assert_eq!(book.orders[0].remaining(), 10);
 
-        // 失败不消耗 priority，下一张合法订单获得紧接着的值。
+        // 失败不消耗优先级，下一张合法订单获得紧接着的值。
         book.rest(candidate(2, Side::Buy, 90, 10)).unwrap();
 
         assert_eq!(book.orders[1].priority().get(), 1);
@@ -1507,7 +1556,7 @@ mod tests {
 
         let before = snapshot(&book);
 
-        // 达到阈值后，不能再消耗 priority。
+        // 达到阈值后，不能再消耗优先级。
         assert_eq!(
             book.rest(candidate(2, Side::Buy, 90, 10)),
             Err(RejectReason::PrioritySpaceExhaustion)
@@ -1530,7 +1579,7 @@ mod tests {
 
         let before = snapshot(&book);
 
-        // 同时满足重复 ID 和高水位耗尽时，必须先返回 2008。
+        // 同时满足重复标识符和高水位耗尽时，必须先返回 2008。
         assert_eq!(
             book.rest(candidate(1, Side::Buy, 90, 10)),
             Err(RejectReason::DuplicateOrderId)
@@ -1581,7 +1630,7 @@ mod tests {
         assert_eq!(canceled.remaining(), 7);
         assert_eq!(canceled.priority(), before[1].2);
 
-        // 其余订单保持原有 FIFO 顺序及运行态。
+        // 其余订单保持原有先进先出顺序及运行态。
         assert_eq!(snapshot(&book), vec![before[0].clone(), before[2].clone()]);
         assert_eq!(book.next_priority, priority_before);
 
@@ -1599,7 +1648,7 @@ mod tests {
         book.rest(candidate(1, Side::Sell, 105, 10)).unwrap();
         book.rest(candidate(2, Side::Sell, 105, 10)).unwrap();
 
-        // 包含部分成交 maker，防止只验证原始订单。
+        // 包含部分成交挂单，防止只验证原始订单。
         book.orders[0].apply_fill(Qty::try_new(4).unwrap()).unwrap();
 
         let before = snapshot(&book);
@@ -1610,11 +1659,11 @@ mod tests {
             Err(RejectReason::OrderNotFound)
         ));
 
-        // 完整原始订单、remaining、priority、源顺序不变。
+        // 完整原始订单、剩余量、优先级、源顺序不变。
         assert_eq!(snapshot(&book), before);
         assert_eq!(book.next_priority, priority_before);
 
-        // 失败后仍能按原有 FIFO 选择 maker。
+        // 失败后仍能按原有先进先出选择挂单。
         let best = book.best(Side::Sell).unwrap();
         assert_eq!(best.original_order().order_id, OrderId::new(1));
         assert_eq!(best.remaining(), 6);
@@ -1639,19 +1688,19 @@ mod tests {
     #[test]
     fn cancel_preserves_fifo_and_remaining_on_both_sides() {
         for side in [Side::Buy, Side::Sell] {
-            // 分别取消同价 FIFO 队列的首项、中间项和尾项。
+            // 分别取消同价先进先出队列的首项、中间项和尾项。
             for cancel_index in 0..3 {
                 let mut book = ReferenceOrderBook::new();
 
-                // ID 顺序故意不同于挂单顺序。
+                // 标识符顺序故意不同于挂单顺序。
                 for id in [30, 10, 20] {
                     book.rest(candidate(id, side, 100, 10)).unwrap();
                 }
 
                 // 制造不同的运行态剩余量：
-                // ID=30 -> 9
-                // ID=10 -> 7
-                // ID=20 -> 5
+                // 标识符=30 -> 9
+                // 标识符=10 -> 7
+                // 标识符=20 -> 5
                 for (index, filled) in [1, 3, 5].into_iter().enumerate() {
                     book.orders[index]
                         .apply_fill(Qty::try_new(filled).unwrap())
@@ -1688,11 +1737,11 @@ mod tests {
                 // 原始委托数量不能被之前的部分成交修改。
                 assert_eq!(canceled.original_order().qty.get(), 10);
 
-                // source Vec 的相对顺序、完整原始订单、
-                // remaining 和 QueuePriority 均保持不变。
+                // 来源 Vec 的相对顺序、完整原始订单、
+                // 剩余量和 QueuePriority 均保持不变。
                 assert_eq!(snapshot(&book), expected_remaining);
 
-                // 同价订单仍保持原来的 FIFO 相对顺序。
+                // 同价订单仍保持原来的先进先出相对顺序。
                 assert_eq!(ids(&book.orders(side)), expected_fifo);
 
                 // 取消不分配新的 QueuePriority。
@@ -1712,11 +1761,11 @@ mod tests {
 
 #[cfg(test)]
 mod maker_query_tests {
-    //! 验证 maker 查询的价格交叉、FIFO 与只读性质。
+    //! 验证挂单查询的价格交叉、先进先出与只读性质。
     use super::*;
     use matching_domain::{OrderId, Price, Qty, UserId};
 
-    /// 构造指定方向、价格和数量的订单 fixture。
+    /// 构造指定方向、价格和数量的订单测试数据。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -1727,7 +1776,7 @@ mod maker_query_tests {
         }
     }
 
-    /// 将 maker 查询结果投影为订单身份，便于断言选择结果。
+    /// 将挂单查询结果投影为订单身份，便于断言选择结果。
     fn maker_id(maker: Option<&ReferenceOrder>) -> Option<OrderId> {
         maker.map(|maker| maker.original_order().order_id)
     }
@@ -1845,7 +1894,7 @@ mod maker_query_tests {
             book.rest(resting).unwrap();
         }
 
-        // ID 的数值顺序故意不同于挂单顺序。
+        // 标识符的数值顺序故意不同于挂单顺序。
         assert_eq!(
             maker_id(book.best_crossing_maker(&order(200, Side::Buy, 105, 10))),
             Some(OrderId::new(30))
@@ -1864,7 +1913,7 @@ mod maker_query_tests {
         book.rest(order(30, Side::Sell, 105, 1)).unwrap();
         book.rest(order(10, Side::Sell, 105, 1)).unwrap();
 
-        // 测试模块内部模拟已经完整成交的 resting 订单。
+        // 测试模块内部模拟已经完整成交的挂单订单。
         book.orders[0].apply_fill(Qty::try_new(1).unwrap()).unwrap();
 
         assert_eq!(book.orders[0].remaining(), 0);
@@ -1889,7 +1938,7 @@ mod maker_query_tests {
 
         book.orders[0].apply_fill(Qty::try_new(3).unwrap()).unwrap();
 
-        // 包括源顺序、全部原始字段、remaining 和 priority。
+        // 包括源顺序、全部原始字段、剩余量和优先级。
         let snapshot = |book: &ReferenceOrderBook| {
             book.orders
                 .iter()
@@ -1960,7 +2009,7 @@ mod maker_query_tests {
             book.rest(resting).unwrap();
         }
 
-        // 仅测试 fixture 修改运行态，查询自身不负责扣减。
+        // 仅测试数据修改运行态，查询自身不负责扣减。
         book.orders[0].apply_fill(Qty::try_new(1).unwrap()).unwrap();
 
         book.orders[1].apply_fill(Qty::try_new(1).unwrap()).unwrap();
@@ -1968,7 +2017,7 @@ mod maker_query_tests {
         assert_eq!(book.orders[0].remaining(), 0);
         assert_eq!(book.orders[1].remaining(), 0);
 
-        // 跳过耗尽订单，选择下一张同价 maker。
+        // 跳过耗尽订单，选择下一张同价挂单。
         assert_index_matches_reference(&book, &order(200, Side::Buy, 105, 1), Some(2));
 
         assert_index_matches_reference(&book, &order(201, Side::Sell, 95, 1), Some(3));
@@ -2065,7 +2114,7 @@ mod post_only_preflight_tests {
 
         book.rest(order(8, Side::Sell, 105, 10)).unwrap();
 
-        // 与本方现存 ID 重复，同时交叉。
+        // 与本方现存标识符重复，同时交叉。
         assert_read_only(
             &book,
             order(7, Side::Buy, 105, 1),
@@ -2078,7 +2127,7 @@ mod post_only_preflight_tests {
             Err(RejectReason::DuplicateOrderId),
         );
 
-        // 与对手方 ID 重复，同时交叉。
+        // 与对手方标识符重复，同时交叉。
         assert_read_only(
             &book,
             order(8, Side::Buy, 105, 1),
@@ -2091,7 +2140,7 @@ mod post_only_preflight_tests {
             Err(RejectReason::DuplicateOrderId),
         );
 
-        // 即使不交叉，重复 ID 仍然拒绝。
+        // 即使不交叉，重复标识符仍然拒绝。
         assert_read_only(
             &book,
             order(7, Side::Buy, 89, 1),
@@ -2113,10 +2162,10 @@ mod post_only_preflight_tests {
             book.rest(resting).unwrap();
         }
 
-        // 模拟一张已经部分成交的 maker。
+        // 模拟一张已经部分成交的挂单。
         book.orders[1].apply_fill(Qty::try_new(3).unwrap()).unwrap();
 
-        // 验证现有 maker 查询选择的 FIFO 首单。
+        // 验证现有挂单查询选择的先进先出首单。
         assert_eq!(
             book.best_crossing_maker(&order(300, Side::Buy, 105, 1))
                 .unwrap()
@@ -2186,7 +2235,7 @@ mod post_only_preflight_tests {
 
         book.rest(order(1, Side::Sell, 105, 10)).unwrap();
 
-        // 测试专用：模拟已达到 priority 极值。
+        // 测试专用：模拟已达到优先级极值。
         book.next_priority = u128::MAX;
 
         assert_read_only(&book, order(2, Side::Buy, 104, 1), Ok(()));
@@ -2207,12 +2256,12 @@ mod post_only_preflight_tests {
 
 #[cfg(test)]
 mod next_fill_planner_tests {
-    //! 验证只读 next-fill 规划的 maker、数量和状态保持性质。
+    //! 验证只读 `next`-成交规划的挂单、数量和状态保持性质。
     use super::ReferenceOrderBook;
     use crate::IncomingOrder;
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
 
-    /// 构造指定方向、价格和数量的订单 fixture。
+    /// 构造指定方向、价格和数量的订单测试数据。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -2223,12 +2272,12 @@ mod next_fill_planner_tests {
         }
     }
 
-    /// 将指定订单包装为尚未成交的 incoming 运行态。
+    /// 将指定订单包装为尚未成交的新到订单运行态。
     fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
         IncomingOrder::new(order(id, side, price, qty))
     }
 
-    /// 构造最高 bid 为 95、最低 ask 为 105 的不交叉盘口。
+    /// 构造最高买价为 95、最低卖价为 105 的不交叉盘口。
     fn two_sided_book() -> ReferenceOrderBook {
         let mut book = ReferenceOrderBook::new();
 
@@ -2238,7 +2287,7 @@ mod next_fill_planner_tests {
         book
     }
 
-    /// 验证公开规划结果、maker 对象身份与成交数量。
+    /// 验证公开规划结果、挂单对象身份与成交数量。
     fn assert_plan(
         book: &ReferenceOrderBook,
         incoming: &IncomingOrder,
@@ -2258,7 +2307,7 @@ mod next_fill_planner_tests {
                 // 必须是源 Vec 中的同一个 ReferenceOrder。
                 assert!(std::ptr::eq(maker, &book.orders[index]));
 
-                // 必须与已有的 maker 选择逻辑保持一致。
+                // 必须与已有的挂单选择逻辑保持一致。
                 let selected = book.best_crossing_maker(incoming.original_order()).unwrap();
 
                 assert!(std::ptr::eq(maker, selected));
@@ -2277,7 +2326,7 @@ mod next_fill_planner_tests {
         }
     }
 
-    /// 保存完整订单、运行态剩余量和 FIFO priority。
+    /// 保存完整订单、运行态剩余量和先进先出优先级。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -2295,10 +2344,10 @@ mod next_fill_planner_tests {
     fn buy_and_sell_exact_fill() {
         let book = two_sided_book();
 
-        // Buy @105 = Ask @105。
+        // 买入 @105 = 卖价 @105。
         assert_plan(&book, &incoming(100, Side::Buy, 105, 10), Some((0, 10)));
 
-        // Sell @95 = Bid @95。
+        // 卖出 @95 = 买价 @95。
         assert_plan(&book, &incoming(101, Side::Sell, 95, 10), Some((1, 10)));
 
         // 查询不会执行成交。
@@ -2319,7 +2368,7 @@ mod next_fill_planner_tests {
     fn maker_partial_fill_on_both_sides() {
         let book = two_sided_book();
 
-        // incoming 比 maker 小，maker 只会部分成交。
+        // 新到订单比挂单小，挂单只会部分成交。
         assert_plan(&book, &incoming(100, Side::Buy, 105, 4), Some((0, 4)));
 
         assert_plan(&book, &incoming(101, Side::Sell, 95, 6), Some((1, 6)));
@@ -2337,7 +2386,7 @@ mod next_fill_planner_tests {
 
         book.rest(order(2, Side::Buy, 95, 4)).unwrap();
 
-        // incoming 比 maker 大，只能成交 maker 的剩余量。
+        // 新到订单比挂单大，只能成交挂单的剩余量。
         assert_plan(&book, &incoming(100, Side::Buy, 105, 10), Some((0, 3)));
 
         assert_plan(&book, &incoming(101, Side::Sell, 95, 10), Some((1, 4)));
@@ -2359,10 +2408,10 @@ mod next_fill_planner_tests {
     fn non_crossing_prices_return_no_plan() {
         let book = two_sided_book();
 
-        // Buy @104 < Ask @105。
+        // 买入 @104 < 卖价 @105。
         assert_plan(&book, &incoming(100, Side::Buy, 104, 10), None);
 
-        // Sell @96 > Bid @95。
+        // 卖出 @96 > 买价 @95。
         assert_plan(&book, &incoming(101, Side::Sell, 96, 10), None);
     }
 
@@ -2372,14 +2421,14 @@ mod next_fill_planner_tests {
 
         buy_only.rest(order(1, Side::Buy, 95, 10)).unwrap();
 
-        // incoming 也是 Buy，没有卖盘。
+        // 新到订单也是买入，没有卖盘。
         assert_plan(&buy_only, &incoming(100, Side::Buy, 200, 10), None);
 
         let mut sell_only = ReferenceOrderBook::new();
 
         sell_only.rest(order(2, Side::Sell, 105, 10)).unwrap();
 
-        // incoming 也是 Sell，没有买盘。
+        // 新到订单也是卖出，没有买盘。
         assert_plan(&sell_only, &incoming(101, Side::Sell, 1, 10), None);
     }
 
@@ -2387,7 +2436,7 @@ mod next_fill_planner_tests {
     fn best_price_takes_precedence_over_earlier_worse_price() {
         let mut book = ReferenceOrderBook::new();
 
-        // 更优价格的 maker 后挂入。
+        // 更优价格的挂单后挂入。
         for resting in [
             order(11, Side::Sell, 110, 10),
             order(21, Side::Buy, 90, 10),
@@ -2406,7 +2455,7 @@ mod next_fill_planner_tests {
     fn same_price_preserves_fifo_on_both_sides() {
         let mut book = ReferenceOrderBook::new();
 
-        // 同价 ID 顺序故意与数值顺序不同。
+        // 同价标识符顺序故意与数值顺序不同。
         for resting in [
             order(30, Side::Sell, 105, 3),
             order(130, Side::Buy, 95, 3),
@@ -2421,7 +2470,7 @@ mod next_fill_planner_tests {
         let buy = incoming(200, Side::Buy, 105, 10);
         let sell = incoming(201, Side::Sell, 95, 10);
 
-        // 最早挂入的同价 maker 获得优先级。
+        // 最早挂入的同价挂单获得优先级。
         assert_plan(&book, &buy, Some((0, 3)));
         assert_plan(&book, &sell, Some((1, 3)));
 
@@ -2462,7 +2511,7 @@ mod next_fill_planner_tests {
         assert_plan(&book, &buy, Some((0, 3)));
         assert_plan(&book, &sell, Some((1, 3)));
 
-        // 模拟已有成交，耗尽最早的两张 maker。
+        // 模拟已有成交，耗尽最早的两张挂单。
         book.orders[0].apply_fill(Qty::try_new(3).unwrap()).unwrap();
 
         book.orders[1].apply_fill(Qty::try_new(3).unwrap()).unwrap();
@@ -2470,7 +2519,7 @@ mod next_fill_planner_tests {
         assert_eq!(book.orders[0].remaining(), 0);
         assert_eq!(book.orders[1].remaining(), 0);
 
-        // 跳过耗尽订单，选择下一张同价 maker。
+        // 跳过耗尽订单，选择下一张同价挂单。
         assert_plan(&book, &buy, Some((2, 7)));
         assert_plan(&book, &sell, Some((3, 8)));
     }
@@ -2519,7 +2568,7 @@ mod next_fill_planner_tests {
             book.rest(resting).unwrap();
         }
 
-        // 预先制造部分成交的 resting maker。
+        // 预先制造部分成交的挂单。
         book.orders[0].apply_fill(Qty::try_new(3).unwrap()).unwrap();
 
         let buy = incoming(100, Side::Buy, 105, 9);
@@ -2544,7 +2593,7 @@ mod next_fill_planner_tests {
         assert_eq!(book.next_priority, next_priority_before);
         assert_eq!(book.orders.len(), 3);
 
-        // incoming 的原始订单和运行态也保持不变。
+        // 新到订单的原始订单和运行态也保持不变。
         assert_eq!(buy.original_order(), &buy_original);
         assert_eq!(sell.original_order(), &sell_original);
 
@@ -2559,10 +2608,10 @@ mod next_fill_planner_tests {
     fn partially_filled_buy_uses_current_remaining() {
         let mut book = two_sided_book();
 
-        // Sell maker: original=10, remaining=8。
+        // 卖出挂单: 原始量=10, 剩余量=8。
         book.orders[0].apply_fill(Qty::try_new(2).unwrap()).unwrap();
 
-        // Buy incoming: original=10, remaining=3。
+        // 买入新到订单: 原始量=10, 剩余量=3。
         let mut buy = incoming(100, Side::Buy, 105, 10);
         buy.apply_fill(Qty::try_new(7).unwrap()).unwrap();
 
@@ -2571,7 +2620,7 @@ mod next_fill_planner_tests {
         let original_before = buy.original_order().clone();
         let remaining_before = buy.remaining();
 
-        // min(current remaining=3, maker remaining=8) = 3。
+        // 取新到订单余量 3 与挂单余量 8 的较小值，成交量为 3。
         for _ in 0..3 {
             assert_plan(&book, &buy, Some((0, 3)));
         }
@@ -2591,10 +2640,10 @@ mod next_fill_planner_tests {
     fn partially_filled_sell_uses_current_remaining() {
         let mut book = two_sided_book();
 
-        // Buy maker: original=10, remaining=4。
+        // 买入挂单: 原始量=10, 剩余量=4。
         book.orders[1].apply_fill(Qty::try_new(6).unwrap()).unwrap();
 
-        // Sell incoming: original=10, remaining=7。
+        // 卖出新到订单: 原始量=10, 剩余量=7。
         let mut sell = incoming(101, Side::Sell, 95, 10);
         sell.apply_fill(Qty::try_new(3).unwrap()).unwrap();
 
@@ -2603,7 +2652,7 @@ mod next_fill_planner_tests {
         let original_before = sell.original_order().clone();
         let remaining_before = sell.remaining();
 
-        // min(current remaining=7, maker remaining=4) = 4。
+        // 取新到订单余量 7 与挂单余量 4 的较小值，成交量为 4。
         for _ in 0..3 {
             assert_plan(&book, &sell, Some((1, 4)));
         }
@@ -2633,7 +2682,7 @@ mod next_fill_planner_tests {
 
         assert_eq!(buy.remaining(), 0);
 
-        // 确认存在 crossing maker，避免测试因无对手盘而通过。
+        // 确认存在价格交叉挂单，避免测试因无对手盘而通过。
         assert!(book.best_crossing_maker(buy.original_order()).is_some());
 
         for _ in 0..3 {
@@ -2665,7 +2714,7 @@ mod next_fill_planner_tests {
 
         assert_eq!(sell.remaining(), 0);
 
-        // 确认存在 crossing maker。
+        // 确认存在价格交叉挂单。
         assert!(book.best_crossing_maker(sell.original_order()).is_some());
 
         for _ in 0..3 {
@@ -2686,11 +2735,11 @@ mod next_fill_planner_tests {
 
 #[cfg(test)]
 mod next_fill_execution_tests {
-    //! 验证 next-fill 执行、连续成交、TradeEvent 与固定命令带确定性。
+    //! 验证 `next`-成交执行、连续成交、TradeEvent 与固定命令带确定性。
     use super::*;
     use matching_domain::{OrderId, Price, Qty, UserId};
 
-    /// 构造指定方向、价格和数量的订单 fixture。
+    /// 构造指定方向、价格和数量的订单测试数据。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -2701,12 +2750,12 @@ mod next_fill_execution_tests {
         }
     }
 
-    /// 将指定订单包装为尚未成交的 incoming 运行态。
+    /// 将指定订单包装为尚未成交的新到订单运行态。
     fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
         IncomingOrder::new(order(id, side, price, qty))
     }
 
-    /// 保存源 `Vec` 顺序、原始订单、remaining 和 priority。
+    /// 保存源 `Vec` 顺序、原始订单、剩余量和优先级。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -2832,7 +2881,7 @@ mod next_fill_execution_tests {
 
             assert!(book.orders.is_empty());
 
-            // 剩余量保留在 incoming，不自动 rest。
+            // 剩余量保留在新到订单，不自动挂单。
             assert_eq!(taker.remaining(), 6);
             assert_eq!(taker.original_order(), &original);
         }
@@ -2931,7 +2980,7 @@ mod next_fill_execution_tests {
             (Side::Sell, Side::Buy, 80, 95, 90),
         ] {
             let mut book = ReferenceOrderBook::new();
-            // 故意让更差价格先挂入；同价订单的 ID 与 FIFO 顺序相反。
+            // 故意让更差价格先挂入；同价订单的标识符与先进先出顺序相反。
             book.rest(order(90, maker_side, worse, 3)).unwrap();
             book.rest(order(30, maker_side, better, 2)).unwrap();
             book.rest(order(10, maker_side, better, 4)).unwrap();
@@ -3177,34 +3226,34 @@ mod next_fill_execution_tests {
         let mut book = ReferenceOrderBook::new();
         let mut trades = Vec::new();
 
-        // 固定挂单顺序，priority 分别为 0、1、2、3。
+        // 固定挂单顺序，优先级分别为 0、1、2、3。
         book.rest(order(30, Side::Sell, 105, 3)).unwrap();
         book.rest(order(10, Side::Sell, 105, 7)).unwrap();
         book.rest(order(20, Side::Buy, 95, 5)).unwrap();
         book.rest(order(40, Side::Sell, 110, 6)).unwrap();
 
-        // Buy @105，初始数量 8。
+        // 买入 @105，初始数量 8。
         let mut taker = incoming(100, Side::Buy, 105, 8);
 
-        // 第一笔：maker 30 完全成交 3。
+        // 第一笔：挂单 30 完全成交 3。
         trades.push(
             book.execute_next_fill_trade(&mut taker, TradeId::new(501))
                 .unwrap()
                 .expect("first trade"),
         );
 
-        // 第二笔：maker 10 成交 5，剩余 2。
+        // 第二笔：挂单 10 成交 5，剩余 2。
         trades.push(
             book.execute_next_fill_trade(&mut taker, TradeId::new(502))
                 .unwrap()
                 .expect("second trade"),
         );
 
-        // Incoming 已耗尽，不应继续成交。
+        // 新到订单已耗尽，不应继续成交。
         assert_eq!(taker.remaining(), 0);
         assert_eq!(taker.original_order().qty.get(), 8);
 
-        // 取消部分成交后的 maker 10。
+        // 取消部分成交后的挂单 10。
         let canceled = book.cancel(OrderId::new(10)).unwrap();
 
         assert_eq!(canceled.original_order().order_id, OrderId::new(10));
@@ -3249,9 +3298,9 @@ mod next_fill_execution_tests {
 
         assert_eq!(trades, expected_trades);
 
-        // maker 30 因完全成交被移除。
-        // maker 10 因 Cancel 被移除。
-        // 剩余订单保持原 source 顺序与 priority。
+        // 挂单 30 因完全成交被移除。
+        // 挂单 10 因取消被移除。
+        // 剩余订单保持原来源顺序与优先级。
         let expected_book = vec![
             (order(20, Side::Buy, 95, 5), 5, QueuePriority::new(2)),
             (order(40, Side::Sell, 110, 6), 6, QueuePriority::new(3)),
@@ -3259,19 +3308,19 @@ mod next_fill_execution_tests {
 
         assert_eq!(final_book, expected_book);
 
-        // 成交、移除和取消均不消耗新的 priority。
+        // 成交、移除和取消均不消耗新的优先级。
         assert_eq!(next_priority, 4);
     }
 }
 
 #[cfg(test)]
 mod property_tests {
-    //! 用生成式输入覆盖 FIFO、数量守恒、取消和失败原子性。
+    //! 用生成式输入覆盖先进先出、数量守恒、取消和失败原子性。
     use super::*;
     use matching_domain::UserId;
     use proptest::prelude::*;
 
-    /// 构造生成式测试使用的合法订单 fixture。
+    /// 构造生成式测试使用的合法订单测试数据。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -3282,7 +3331,7 @@ mod property_tests {
         }
     }
 
-    /// 保存源 `Vec` 顺序、原始订单、remaining 和 priority。
+    /// 保存源 `Vec` 顺序、原始订单、剩余量和优先级。
     fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
         book.orders
             .iter()
@@ -3296,13 +3345,13 @@ mod property_tests {
             .collect()
     }
 
-    /// 将指定订单包装为尚未成交的 incoming 运行态。
+    /// 将指定订单包装为尚未成交的新到订单运行态。
     fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
         IncomingOrder::new(order(id, side, price, qty))
     }
 
     proptest! {
-        // 性质一：成交守恒、正成交量、同价 FIFO 前缀。
+        // 性质一：成交守恒、正成交量、同价先进先出前缀。
         #[test]
         fn prop_same_price_fifo_and_quantity_conservation(
             maker_qtys in prop::collection::vec(1u64..=32, 1..=8),
@@ -3347,7 +3396,7 @@ mod property_tests {
             let fills = book.execute_fills(&mut taker).unwrap();
 
             // 期望成交量由生成的数据直接计算，
-            // 不调用 planner 或其他撮合算法。
+            // 不调用计划生成器或其他撮合算法。
             let expected_total = taker_qty.min(total_maker);
             let actual_total: u64 =
                 fills.iter().map(|(_, _, qty)| qty.get()).sum();
@@ -3362,7 +3411,7 @@ mod property_tests {
                 taker_qty
             );
 
-            // 手工构建 FIFO 前缀及每张 maker 的期望成交量。
+            // 手工构建先进先出前缀及每张挂单的期望成交量。
             let mut unfilled = taker_qty;
             let mut expected_fills = Vec::new();
             let mut expected_book = Vec::new();
@@ -3396,11 +3445,11 @@ mod property_tests {
                 );
             }
 
-            // 同时验证 FIFO 前缀、每笔数量及 maker-price。
+            // 同时验证先进先出前缀、每笔数量及挂单-价格。
             prop_assert_eq!(fills, expected_fills);
 
-            // 完全成交的 maker 被移除；
-            // 未耗尽的 maker 保持 source 顺序及 priority。
+            // 完全成交的挂单被移除；
+            // 未耗尽的挂单保持来源顺序及优先级。
             prop_assert_eq!(snapshot(&book), expected_book);
             prop_assert_eq!(book.next_priority, priority_before);
         }
@@ -3428,7 +3477,7 @@ mod property_tests {
                     qty,
                 )).unwrap();
 
-                // 预先制造不同的 maker remaining，
+                // 预先制造不同的挂单剩余量，
                 // 同时保留 Qty 严格正值约束。
                 let filled = qty / 2;
                 if filled > 0 {
@@ -3468,8 +3517,8 @@ mod property_tests {
                 expected_canceled.2
             );
 
-            // 完整快照同时验证 source/FIFO 顺序、
-            // 原始订单、remaining 和 QueuePriority。
+            // 完整快照同时验证来源/先进先出顺序、
+            // 原始订单、剩余量和 QueuePriority。
             prop_assert_eq!(snapshot(&book), expected_remaining);
                 let target_removed = book
             .orders
@@ -3617,7 +3666,7 @@ mod market_by_base_tests {
                 vec![TradeId::new(501), TradeId::new(502), TradeId::new(503)]
             );
 
-            // 最后一张 maker 部分成交，保留原始 payload 和 priority。
+            // 最后一张挂单部分成交，保留原始载荷和优先级。
             assert_eq!(book.orders.len(), 1);
             assert_eq!(book.orders[0].original_order().order_id, OrderId::new(20));
             assert_eq!(book.orders[0].remaining(), 2);
@@ -3683,8 +3732,8 @@ mod market_by_base_tests {
         ] {
             let mut book = ReferenceOrderBook::new();
 
-            // 故意打乱价格与 ID 的顺序。
-            // ID=40 先于 ID=10 挂在边界价 100。
+            // 故意打乱价格与标识符的顺序。
+            // 标识符=40 先于标识符=10 挂在边界价 100。
             for (id, price, qty) in [
                 (90, farther, 2),
                 (40, 100, 4),
@@ -3703,9 +3752,9 @@ mod market_by_base_tests {
             let before = snapshot(&book);
             let priority_before = book.next_priority;
 
-            // 数量足够扫过全部 maker。
-            // 只能规划 better + 两张边界价订单；
-            // 首张 outside maker 必须终止扫描。
+            // 数量足够扫过全部挂单。
+            // 只能规划更优价格 + 两张边界价订单；
+            // 首张边界外价格挂单必须终止扫描。
             let plan = book
                 .preflight_market_by_base_with_protection(
                     &market(100, taker_side, 20),
@@ -3727,7 +3776,7 @@ mod market_by_base_tests {
             assert_eq!(book.next_priority, priority_before);
 
             // 数量不足：第二张订单仅部分计划成交。
-            // 同价 FIFO 必须先选择 ID=40，而不是 ID=10。
+            // 同价先进先出必须先选择标识符=40，而不是标识符=10。
             let plan = book
                 .preflight_market_by_base_with_protection(
                     &market(101, taker_side, 5),
@@ -3759,7 +3808,7 @@ mod market_by_base_tests {
         ] {
             let mut book = ReferenceOrderBook::new();
 
-            // 与已有保护边界测试使用相同的多档、同价 FIFO 数据。
+            // 与已有保护边界测试使用相同的多档、同价先进先出数据。
             // 源 Vec 顺序故意不同于实际撮合顺序。
             for (id, price, qty) in [
                 (90, farther, 2),
@@ -3771,7 +3820,7 @@ mod market_by_base_tests {
                 book.rest(limit(id, maker_side, price, qty)).unwrap();
             }
 
-            // 没有用户保护，也没有市场 band。
+            // 没有用户保护，也没有市场价格区间。
             let incoming = market(100, taker_side, 20);
             assert_eq!(incoming.market_protection, None);
 
@@ -3788,10 +3837,10 @@ mod market_by_base_tests {
                 .unwrap();
 
             // 无有效边界时，不能在 100 价位终止。
-            // 必须继续纳入此前因保护边界而被排除的更远 maker。
+            // 必须继续纳入此前因保护边界而被排除的更远挂单。
             //
-            // Buy:  90 -> 100 -> 100 -> 110 -> 120
-            // Sell: 110 -> 100 -> 100 -> 90 -> 80
+            // 买入:  90 -> 100 -> 100 -> 110 -> 120
+            // 卖出: 110 -> 100 -> 100 -> 90 -> 80
             assert_eq!(
                 plan,
                 vec![
@@ -3803,7 +3852,7 @@ mod market_by_base_tests {
                 ]
             );
 
-            // 预检不得修改订单内容、remaining、FIFO 或优先级。
+            // 预检不得修改订单内容、剩余量、先进先出或优先级。
             assert_eq!(snapshot(&book), before);
             assert_eq!(book.next_priority, priority_before);
         }
@@ -3825,7 +3874,7 @@ mod market_by_base_tests {
             let before = snapshot(&book);
             let priority_before = book.next_priority;
 
-            // 1. 非法 bps：即使 band 有效，仍必须返回 3007。
+            // 1. 非法基点：即使市场价格区间有效，仍必须返回 3007。
             let invalid_bps = MarketProtection {
                 max_slippage_bps: Some(u32::MAX),
                 worst_price: None,
@@ -3852,7 +3901,7 @@ mod market_by_base_tests {
             assert_eq!(snapshot(&book), before);
             assert_eq!(book.next_priority, priority_before);
 
-            // 2. 显式 worst_price 未按 tick=10 对齐。
+            // 2. 显式 worst_price 未按价格步长=10 对齐。
             let invalid_price = MarketProtection {
                 max_slippage_bps: None,
                 worst_price: Some(Price::try_new(100_003).unwrap()),
@@ -3878,8 +3927,8 @@ mod market_by_base_tests {
             assert_eq!(book.next_priority, priority_before);
         }
 
-        // 3. Buy 的滑点边界超过 i64 正价格值域：
-        //    既有 Domain checked 算术错误必须原样传播。
+        // 3. 买入的滑点边界超过 i64 正价格值域：
+        //    既有领域层带溢出检查的算术错误必须原样传播。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, Side::Sell, 100_000, 5)).unwrap();
 
@@ -3937,7 +3986,7 @@ mod market_by_base_tests {
 
         let before = snapshot(&book);
 
-        // 1. Duplicate 必须优先于非法 protection。
+        // 1. 重复标识符必须优先于非法保护。
         let mut duplicate = market(1, Side::Buy, 10);
         duplicate.market_protection = Some(MarketProtection {
             max_slippage_bps: Some(u32::MAX),
@@ -3950,7 +3999,7 @@ mod market_by_base_tests {
         );
         assert_eq!(snapshot(&book), before);
 
-        // 2. 非法 bps 必须原样传播。
+        // 2. 非法基点必须原样传播。
         let mut invalid = market(100, Side::Buy, 10);
         invalid.market_protection = Some(MarketProtection {
             max_slippage_bps: Some(u32::MAX),
@@ -3976,7 +4025,7 @@ mod market_by_base_tests {
         );
         assert_eq!(snapshot(&book), before);
 
-        // 3. TradeId 不足：需要两个成交 ID，却只提供一个。
+        // 3. TradeId 不足：需要两个成交标识符，却只提供一个。
         let mut incoming = market(100, Side::Buy, 10);
         incoming.market_protection = Some(MarketProtection {
             max_slippage_bps: None,
@@ -3994,7 +4043,7 @@ mod market_by_base_tests {
 
         assert!(result.is_err());
 
-        // 包括 maker payload、remaining、FIFO 和 next_priority。
+        // 包括挂单载荷、剩余量、先进先出和 next_priority。
         assert_eq!(snapshot(&book), before);
     }
     #[test]
@@ -4070,7 +4119,7 @@ mod market_by_base_tests {
         ] {
             let mut book = ReferenceOrderBook::new();
 
-            // 故意打乱源顺序，验证价格优先与同价 FIFO。
+            // 故意打乱源顺序，验证价格优先与同价先进先出。
             for (id, price, qty) in [
                 (90, farther, 2),
                 (40, 100, 4),
@@ -4129,8 +4178,8 @@ mod market_by_base_tests {
                 ]
             );
 
-            // 已成交的三个 maker 被移除。
-            // 越界 maker 及更远 maker 完整保留。
+            // 已成交的三个挂单被移除。
+            // 越界挂单及更远挂单完整保留。
             assert_eq!(
                 snapshot(&book),
                 (
@@ -4142,7 +4191,7 @@ mod market_by_base_tests {
                 )
             );
 
-            // 市价单剩余 11 lots 不得挂簿。
+            // 市价单剩余 11 手不得挂簿。
             assert!(
                 book.orders
                     .iter()
@@ -4208,7 +4257,7 @@ mod market_by_base_tests {
                     );
                     assert_eq!(events.len(), 2);
                 } else {
-                    // Taker 恰好成交完，不能继续探测越界 maker。
+                    // 吃单方恰好成交完，不能继续探测越界挂单。
                     assert_eq!(events.len(), 1);
                 }
 
@@ -4255,7 +4304,7 @@ mod market_by_base_tests {
 
             let before = snapshot(&book);
 
-            // 首个 maker 就越界，不需要任何 TradeId。
+            // 首个挂单就越界，不需要任何 TradeId。
             let events = book
                 .execute_market_by_base_with_protection(market(100, side, 10), &context, &math, &[])
                 .unwrap();
@@ -4472,7 +4521,7 @@ mod market_by_quote_preflight_tests {
     fn market_by_quote_preflight_invalid_lot_is_atomic() {
         let mut book = ReferenceOrderBook::new();
 
-        // maker remaining=11，不满足 lot_size=10。
+        // 挂单剩余量=11，不满足 lot_size=10。
         book.rest(limit(1, Side::Sell, 5, 11)).unwrap();
 
         let before = snapshot(&book);
@@ -4489,8 +4538,8 @@ mod market_by_quote_preflight_tests {
         let math = math(10, 1);
 
         let cases = [
-            // side, maker side, better, outside, farther, user, band,
-            // spent, source
+            // 方向, 挂单方向, 更优价格, 边界外价格, 更远价格, 用户, 市场价格区间,
+            // 已用预算, 来源
             (
                 Side::Buy,
                 Side::Sell,
@@ -4563,7 +4612,7 @@ mod market_by_quote_preflight_tests {
             let mut book = ReferenceOrderBook::new();
 
             // 源 Vec 顺序刻意不等于业务撮合顺序。
-            // 价位 100 上 ID=40 先于 ID=10。
+            // 价位 100 上标识符=40 先于标识符=10。
             for (id, price, qty) in [
                 (90, farther, 2),
                 (40, 100, 4),
@@ -4627,7 +4676,7 @@ mod market_by_quote_preflight_tests {
                 })
             );
 
-            // 包含 Vec 原顺序、订单内容、remaining、priority allocator。
+            // 包含 Vec 原顺序、订单内容、剩余量、优先级分配器。
             assert_eq!(snapshot(&book), before);
         }
     }
@@ -4663,7 +4712,7 @@ mod market_by_quote_preflight_tests {
             assert_eq!(plan.stop, None);
             assert_eq!(snapshot(&book), before);
 
-            // 2. 首档越界：即使预算 1 不够一 lot，也必须先 stop。
+            // 2. 首档越界：即使预算 1 不够一手，也必须先终止。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, outside, 5)).unwrap();
             book.rest(limit(2, maker_side, farther, 5)).unwrap();
@@ -4687,7 +4736,7 @@ mod market_by_quote_preflight_tests {
             );
             assert_eq!(snapshot(&book), before);
 
-            // 3. 第一张 maker 在保护范围内，但预算不足一 lot。
+            // 3. 第一张挂单在保护范围内，但预算不足一手。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, 100, 5)).unwrap();
             let before = snapshot(&book);
@@ -4702,7 +4751,7 @@ mod market_by_quote_preflight_tests {
             assert_eq!(plan.stop, None);
             assert_eq!(snapshot(&book), before);
 
-            // 4. 已经成交一张 maker，下一档在保护边界内，但发生 dust。
+            // 4. 已经成交一张挂单，下一档在保护边界内，但发生不足一手的预算。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, better, 1)).unwrap();
             book.rest(limit(2, maker_side, 100, 5)).unwrap();
@@ -4726,8 +4775,8 @@ mod market_by_quote_preflight_tests {
             assert_eq!(plan.stop, None);
             assert_eq!(snapshot(&book), before);
 
-            // 5. 已成交一张 maker、预算只剩 5，
-            // 但下一张 maker 越界，应当先记录保护 stop，而非 dust。
+            // 5. 已成交一张挂单、预算只剩 5，
+            // 但下一张挂单越界，应当先记录保护终止，而非不足一手的预算。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, better, 1)).unwrap();
             book.rest(limit(2, maker_side, outside, 5)).unwrap();
@@ -4754,7 +4803,7 @@ mod market_by_quote_preflight_tests {
             );
             assert_eq!(snapshot(&book), before);
 
-            // 6. 无用户保护、无 band：所有 maker 可按预算进入计划。
+            // 6. 无用户保护、无市场价格区间：所有挂单可按预算进入计划。
             let mut book = ReferenceOrderBook::new();
 
             for (id, price, qty) in [
@@ -4835,7 +4884,7 @@ mod market_by_quote_preflight_tests {
 
             let before = snapshot(&book);
 
-            // Duplicate 优先于非法 bps。
+            // 重复标识符优先于非法基点。
             let mut duplicate = market(1, side, 1000);
             duplicate.market_protection = Some(invalid_bps.clone());
 
@@ -4845,7 +4894,7 @@ mod market_by_quote_preflight_tests {
             );
             assert_eq!(snapshot(&book), before);
 
-            // 不重复的订单：非法 bps 必须返回稳定 wire 3007。
+            // 不重复的订单：非法基点必须返回稳定线协议 3007。
             let mut invalid = market(100, side, 1000);
             invalid.market_protection = Some(invalid_bps);
 
@@ -4855,7 +4904,7 @@ mod market_by_quote_preflight_tests {
             assert_eq!(RejectReason::InvalidSlippageBps as u16, 3007);
             assert_eq!(snapshot(&book), before);
 
-            // 显式 worst 未按 tick=10 对齐。
+            // 显式最差价格未按价格步长=10 对齐。
             let mut invalid = market(100, side, 1000);
             invalid.market_protection = Some(MarketProtection {
                 max_slippage_bps: None,
@@ -4869,7 +4918,7 @@ mod market_by_quote_preflight_tests {
             assert_eq!(snapshot(&book), before);
         }
 
-        // Buy bps 计算溢出：即使 band 有效也必须拒绝。
+        // 买入基点计算溢出：即使市场价格区间有效也必须拒绝。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, Side::Sell, 100_000, 5)).unwrap();
 
@@ -4892,8 +4941,8 @@ mod market_by_quote_preflight_tests {
         );
         assert_eq!(snapshot(&book), before);
 
-        // 更重要的原子性：即使已只读规划一笔 fill，
-        // 后续 maker 的数学校验失败，也绝不能改簿。
+        // 更重要的原子性：即使已只读规划一笔成交，
+        // 后续挂单的数学校验失败，也绝不能改簿。
         for (side, maker_side, better, invalid_price) in [
             (Side::Buy, Side::Sell, 90, 101),
             (Side::Sell, Side::Buy, 110, 101),
@@ -5021,7 +5070,7 @@ mod market_by_quote_execution_tests {
             assert_eq!(result.spent_quote().get(), 300);
             assert_eq!(result.unused_quote().get(), 50);
 
-            // Partial maker 不删除、不移动。
+            // 部分成交挂单不删除、不移动。
             assert_eq!(book.orders.len(), 2);
             assert_eq!(book.orders[0].remaining(), 7);
             assert_eq!(book.orders[0].priority(), priority_before);
@@ -5047,7 +5096,7 @@ mod market_by_quote_execution_tests {
         ] {
             let mut book = ReferenceOrderBook::new();
 
-            // ID 数值顺序与实际 FIFO 顺序不同。
+            // 标识符数值顺序与实际先进先出顺序不同。
             book.rest(limit(20, maker_side, worse, 4)).unwrap();
             book.rest(limit(30, maker_side, better, 3)).unwrap();
             book.rest(limit(10, maker_side, better, 5)).unwrap();
@@ -5108,7 +5157,7 @@ mod market_by_quote_execution_tests {
             assert_eq!(result.spent_quote().get(), expected_spent);
             assert_eq!(result.unused_quote().get(), 2000 - expected_spent,);
 
-            // 所有 maker 已耗尽，市价 taker 不挂簿。
+            // 所有挂单已耗尽，市价吃单方不挂簿。
             assert!(book.orders.is_empty());
             assert_eq!(book.next_priority, next_before);
         }
@@ -5123,7 +5172,7 @@ mod market_by_quote_execution_tests {
 
             let before = snapshot(&book);
 
-            // 99 quote 不足成交 1 lot。
+            // 99 报价资产不足成交 1 手。
             let result = book
                 .execute_market_by_quote(market(100, taker_side, 99), &math(), &[])
                 .unwrap();
@@ -5133,7 +5182,7 @@ mod market_by_quote_execution_tests {
             assert_eq!(result.unused_quote().get(), 99);
             assert_eq!(snapshot(&book), before);
 
-            // 能先成交、之后产生 dust 的情况。
+            // 能先成交、之后产生不足一手的预算的情况。
             let result = book
                 .execute_market_by_quote(
                     market(101, taker_side, 350),
@@ -5169,7 +5218,7 @@ mod market_by_quote_execution_tests {
 
             let before = snapshot(&book);
 
-            // TradeId 为空，但 duplicate 必须优先于足量检查。
+            // TradeId 为空，但重复标识符必须优先于足量检查。
             let result = book.execute_market_by_quote(market(1, taker_side, 1000), &math(), &[]);
 
             assert_eq!(result, Err(RejectReason::DuplicateOrderId));
@@ -5190,8 +5239,8 @@ mod market_by_quote_execution_tests {
 
             let before = snapshot(&book);
 
-            // 两张 maker 均可成交，需要两个 TradeId。
-            // 仅提供一个，必须在第一笔 mutation 前 panic。
+            // 两张挂单均可成交，需要两个 TradeId。
+            // 仅提供一个，必须在第一笔状态变更前触发不变量断言。
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let _ = book.execute_market_by_quote(
                     market(100, taker_side, 2000),
@@ -5202,7 +5251,7 @@ mod market_by_quote_execution_tests {
 
             assert!(result.is_err());
 
-            // 包含原始订单、剩余量、priority、源 Vec 顺序及计数器。
+            // 包含原始订单、剩余量、优先级、源 Vec 顺序及计数器。
             assert_eq!(snapshot(&book), before);
         }
     }
@@ -5341,7 +5390,7 @@ mod market_by_quote_execution_tests {
 
             assert_eq!(actual, expected);
 
-            // 已成交 maker 删除，越界与更远 maker 完整保留。
+            // 已成交挂单删除，越界与更远挂单完整保留。
             assert_eq!(
                 snapshot(&book),
                 (
@@ -5384,7 +5433,7 @@ mod market_by_quote_execution_tests {
                 .unwrap()
             };
 
-            // 1. 空簿：事件为空、全部预算 unused。
+            // 1. 空簿：事件为空、全部预算未使用。
             let mut book = ReferenceOrderBook::new();
             let before = snapshot(&book);
             let actual = execute(&mut book, 1000, &[]);
@@ -5399,8 +5448,8 @@ mod market_by_quote_execution_tests {
             );
             assert_eq!(snapshot(&book), before);
 
-            // 2. 首档越界，且预算不足一 lot：
-            // 必须先触发保护，而不是按 dust 停止。
+            // 2. 首档越界，且预算不足一手：
+            // 必须先触发保护，而不是按不足一手的预算停止。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, outside, 5)).unwrap();
             let before = snapshot(&book);
@@ -5422,8 +5471,8 @@ mod market_by_quote_execution_tests {
             );
             assert_eq!(snapshot(&book), before);
 
-            // 3. maker 正好在边界上；预算完全耗尽，
-            // 后面即使越界，也不能产生 trigger。
+            // 3. 挂单正好在边界上；预算完全耗尽，
+            // 后面即使越界，也不能产生触发。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, 100, 2)).unwrap();
             book.rest(limit(2, maker_side, outside, 4)).unwrap();
@@ -5449,8 +5498,8 @@ mod market_by_quote_execution_tests {
             assert_eq!(book.orders.len(), 1);
             assert_eq!(book.orders[0].original_order().order_id, OrderId::new(2));
 
-            // 4. 部分 maker 成交：remaining=7，
-            // 原 priority 保留；剩余 50 形成 dust。
+            // 4. 部分挂单成交：剩余量=7，
+            // 原优先级保留；剩余 50 形成不足一手的预算。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, 100, 10)).unwrap();
             let priority_before = book.orders[0].priority();
@@ -5470,7 +5519,7 @@ mod market_by_quote_execution_tests {
             assert_eq!(book.orders[0].priority(), priority_before);
             assert_eq!(book.next_priority, 1);
 
-            // 5. 首档在边界内，但初始预算不足一 lot。
+            // 5. 首档在边界内，但初始预算不足一手。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, 100, 5)).unwrap();
             let before = snapshot(&book);
@@ -5483,7 +5532,7 @@ mod market_by_quote_execution_tests {
             assert_eq!(snapshot(&book), before);
 
             // 6. 成交价 100 用掉 200，还剩 5。
-            // 下一 maker 越界：优先触发保护，而不是 dust。
+            // 下一挂单越界：优先触发保护，而不是不足一手的预算。
             let mut book = ReferenceOrderBook::new();
             book.rest(limit(1, maker_side, 100, 2)).unwrap();
             book.rest(limit(2, maker_side, outside, 4)).unwrap();
@@ -5623,7 +5672,7 @@ mod market_by_quote_execution_tests {
                 worst_price: None,
             };
 
-            // Duplicate 优先于非法 bps。
+            // 重复标识符优先于非法基点。
             let mut incoming = market(1, side, 1000);
             incoming.market_protection = Some(invalid_bps.clone());
 
@@ -5647,7 +5696,7 @@ mod market_by_quote_execution_tests {
                 RejectReason::InvalidSlippageBps,
             );
 
-            // 显式 worst_price 未按 tick=10 对齐。
+            // 显式 worst_price 未按价格步长=10 对齐。
             let mut incoming = market(100, side, 1000);
             incoming.market_protection = Some(MarketProtection {
                 max_slippage_bps: None,
@@ -5663,7 +5712,7 @@ mod market_by_quote_execution_tests {
             );
         }
 
-        // 命令开始时计算 Buy 滑点边界溢出。
+        // 命令开始时计算买入滑点边界溢出。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, Side::Sell, 100_000, 5)).unwrap();
 
@@ -5686,8 +5735,8 @@ mod market_by_quote_execution_tests {
             RejectReason::ArithmeticOverflow,
         );
 
-        // 数学错误发生在已经规划出前序 fill 之后：
-        // 仍然不得提交任何 maker mutation。
+        // 数学错误发生在已经规划出前序成交之后：
+        // 仍然不得提交任何挂单状态变更。
         for (side, maker_side, better) in
             [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
         {
@@ -5766,5 +5815,78 @@ mod market_by_quote_execution_tests {
             assert!(result.is_err());
             assert_eq!(snapshot(&book), before);
         }
+    }
+}
+#[cfg(test)]
+mod iceberg_tests {
+    use super::*;
+    use matching_domain::{IcebergOrder, UserId};
+    fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
+        LimitGtcOrder {
+            order_id: OrderId::new(id),
+            user_id: UserId::new(1),
+            side,
+            price: Price::try_new(100).unwrap(),
+            qty: Qty::try_new(qty).unwrap(),
+        }
+    }
+    #[test]
+    fn reference_iceberg_refreshes_to_tail_and_reports_total() {
+        let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        let mut book = ReferenceOrderBook::new();
+        book.place_iceberg(
+            IcebergOrder::try_new(order(1, Side::Sell, 8), Qty::try_new(3).unwrap()).unwrap(),
+            &math,
+            &[],
+        )
+        .unwrap();
+        book.rest(order(2, Side::Sell, 2)).unwrap();
+        let result = book
+            .place_limit_ioc(
+                order(3, Side::Buy, 6),
+                &math,
+                &[TradeId::new(1), TradeId::new(2), TradeId::new(3)],
+            )
+            .unwrap();
+        let trades: Vec<_> = result
+            .events()
+            .iter()
+            .filter_map(|e| {
+                if let EngineEvent::Trade(t) = e {
+                    Some((t.maker_order_id, t.qty.get()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            trades,
+            vec![
+                (OrderId::new(1), 3),
+                (OrderId::new(2), 2),
+                (OrderId::new(1), 1)
+            ]
+        );
+        let maker = book.best(Side::Sell).unwrap();
+        assert_eq!(
+            (
+                maker.visible_remaining(),
+                maker.hidden_remaining(),
+                maker.total_remaining()
+            ),
+            (2, 2, 4)
+        );
+        assert!(result.events().contains(&EngineEvent::IcebergRefreshed {
+            order_id: OrderId::new(1),
+            visible: Qty::try_new(3).unwrap()
+        }));
+        assert!(
+            result
+                .events()
+                .contains(&EngineEvent::OrderPartiallyFilled {
+                    order_id: OrderId::new(1),
+                    remaining: Qty::try_new(5).unwrap()
+                })
+        );
     }
 }

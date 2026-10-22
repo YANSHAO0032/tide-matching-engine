@@ -121,10 +121,10 @@ PriceLevel::push_back
 count / total_visible_qty updated with checked arithmetic
     |
     v
-QueuePriority allocator advances only after a successful rest
+QueuePriority advances on successful rest or iceberg refresh
 ```
 
-同价 FIFO 的权威顺序是 `PriceLevel` 从 head 到 tail 的 intrusive 链，不是 OrderId、Arena 槽位号或 HashMap 遍历顺序。图中 priority 推进属于生产簿 owner 的成功挂单提交；Arena/PriceLevel 本身不分配 priority。删除时先解除链表引用，释放槽位并在同一独占 mutation 内清理 active ID 映射；映射清理完成前不能复用槽位或对外暴露中间状态。
+同价 FIFO 的权威顺序是 `PriceLevel` 从 head 到 tail 的 intrusive 链，不是 OrderId、Arena 槽位号或 HashMap 遍历顺序。图中 priority 推进属于生产簿 owner 的成功挂单或补量重新排队提交；Arena/PriceLevel 本身不分配 priority。删除时先解除链表引用，释放槽位并在同一独占 mutation 内清理 active ID 映射；映射清理完成前不能复用槽位或对外暴露中间状态。
 
 ## 按身份取消与槽位释放
 
@@ -235,7 +235,7 @@ emit Trades in plan order, then optional protection trigger
                          |
                          v
 end remaining market quantity or quote budget; never rest taker
-and never allocate QueuePriority
+incoming gets no QueuePriority; maker refresh can allocate
 ```
 
 普通市价入口不解释用户保护参数；带保护入口使用调用方在命令开始时捕获的不可变 context，不自行读取行情或 LastTrade。两类入口都在首笔 mutation 前完成可预期拒绝、TradeId 检查和金额计划校验。每个候选先检查保护边界，再执行 Quote 预算反推；边界内但不足一个合法 lot 是正常 dust 终止，不产生零数量 Trade 或保护触发。保护触发只表示首个越界 maker 终结命令，不消耗 TradeId，也不把未用预算当作成交。当前结果不代表完整资金释放或生命周期 envelope 已实现。
@@ -257,7 +257,7 @@ Limit IOC / FOK
      检查 TradeId 足量
   -> 按计划提交 maker 成交与移除
   -> 若 IOC 仍有正余量，追加唯一余量取消事件；否则无取消事件
-  -> 返回原序事件；incoming 永不 rest，priority 不变
+  -> 返回原序事件；incoming 永不 rest；maker 补量会取得新 priority
 ```
 
 ```text
@@ -274,6 +274,41 @@ Limit GTC + PostOnly
 ```
 
 只挂单入口沿用基础限价载荷，调用方须先完成市场 tick/lot 校验；拒绝交叉后才检查 priority、档位聚合与容量。成功挂单后允许被后续订单作为 maker 成交。IOC/FOK 的输入及逐笔本金全部预检，TradeId 不足在 mutation 前 panic。完整入口和取消载荷说明见 [限价订单执行约束](limit_execution.md)。
+
+## 冰山可见片成交与补量
+
+```text
+Iceberg input: positive total and peak, peak < total
+                         |
+                         v
+duplicate / total and peak math / optional PostOnly crossing checks
+                         |
+                         v
+independent read-only virtual execution plan
+  |
+  +--> choose best price, then current FIFO head
+  +--> apply price protection before budget / lot calculation
+  +--> fill only visible quantity; deduct total by the same amount
+  +--> visible exhausted and hidden remains?
+  |       yes: check fresh priority and visible aggregate
+  |            replenish min(peak, hidden), move same-price tail
+  |            retain refresh even when incoming just completed
+  +--> repeat selection; FOK includes executable refreshed slices
+  |
+  +--> input remainder rests? check capacity, aggregate and priority
+  +--> verify required TradeIds and all numeric constraints
+                         |
+             reject <----+----> commit validated plan
+          live state unchanged          |
+                                       v
+                Trade -> iceberg maker total remaining / filled
+                      -> optional IcebergRefreshed
+                                       |
+                                       v
+                 publish visible depth; retain hidden privately
+```
+
+新冰山输入以总量作为限价 taker；余量才分片挂簿。补量只转移 visible/hidden，不改变 total；部分成交事件必须报告 total。Cancel 移除全部余量，公开深度只扣除可见量。预检覆盖整条命令中的每次补量，不能只检查第一片或首次 priority。详细接口与事件边界见 [冰山订单](iceberg.md)。
 
 ## Reference / Production 差分验证
 
@@ -300,13 +335,13 @@ for each command, in original tape order
   |              other policies use independent execution entry points
   |
   +--> Production: dispatch the same GTC / Cancel / Market /
-  |               IOC / FOK / PostOnly operation
+  |               IOC / FOK / PostOnly / Iceberg operation
   |
-  +--> compare outcome and Trade / cancel / protection events in emitted order
+  +--> compare outcome and Trade / cancel / protection / iceberg events in order
   |
   +--> on controlled rejection, require complete state unchanged
   |
-  +--> validate Production internals and compare open orders/depth/FIFO
+  +--> validate Production internals and compare open orders (visible/hidden/total/peak), depth and FIFO
   |
   +--> assert current regular-book invariants and next priority
   |
@@ -316,4 +351,4 @@ for each command, in original tape order
 100k path: stream records only; no final-state-only shortcut
 ```
 
-Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及 GTC/Cancel/IOC/FOK/PostOnly 混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。Stop/expiry、跨 shard TradeId、WAL/digest/crash 仍无实现证据。
+Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。Stop/expiry、跨 shard TradeId、WAL/digest/crash 仍无实现证据。

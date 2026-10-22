@@ -1,6 +1,6 @@
-//! Independent execution-policy differential tapes and semantic properties.
-//! Only observation, invariant checks and the legacy GTC adapter are shared;
-//! IOC/FOK/PostOnly execute through each book's independent public implementation.
+//! 独立执行策略的命令序列差分测试与语义性质测试。
+//! 仅共享状态观察、不变量检查和既有 GTC 适配器；
+//! IOC/FOK/PostOnly 分别调用两本订单簿各自独立的公开实现。
 use super::*;
 use matching_domain::{CancelReason, LimitImmediateExecution};
 
@@ -43,8 +43,8 @@ fn constraint_tape(seed: [u8; 32], length: usize) -> Vec<ConstraintCommand> {
     assert!(length <= MAX_TAPE_LENGTH);
     let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &seed);
     let mut runner = TestRunner::new_with_rng(Config::default(), rng);
-    // Two GTC weights replenish liquidity; bounded IDs also exercise duplicates,
-    // cancellation, reuse, slot reuse, and partially filled makers.
+    // 为 GTC 设置两份生成权重以补充流动性；有限的标识符范围同时覆盖重复，
+    // 以及取消、标识符复用、槽位复用和挂单部分成交。
     let strategy = (0u8..6, 1u128..=128, 80i64..=120, 1u64..=100, any::<bool>());
     (0..length)
         .map(|index| {
@@ -83,8 +83,8 @@ fn crossing_orders<'a>(
         .collect()
 }
 
-/// Checks conservation and the original price/FIFO prefix independently of
-/// either matcher; shared domain arithmetic is deliberately unnecessary here.
+/// 独立于两套撮合器验证数量守恒及原始价格优先、同价先进先出前缀，
+/// 此处无需调用共享领域算术来计算期望结果。
 fn assert_immediate_semantics(
     incoming: &LimitGtcOrder,
     fok: bool,
@@ -164,8 +164,8 @@ fn execute_constraints(
     let mut next_priority = 0u128;
     let mut seen_trade_ids = BTreeSet::new();
     for (index, command) in commands.iter().enumerate() {
-        // Attach replay coordinates even to a panic inside a shared invariant
-        // checker or either matching implementation.
+        // 即使共享不变量检查器或任一撮合实现内部触发断言，
+        // 也附带可用于重放定位的种子和命令位置。
         let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let before = observe_reference(&reference);
             assert_eq!(before, observe_production(&production));
@@ -238,8 +238,8 @@ fn execute_constraints(
                     if actual.is_ok() {
                         next_priority = next_priority.checked_add(1).unwrap();
                         let after = observe_production(&production);
-                        // Every existing maker survives byte-for-byte semantically;
-                        // PostOnly cannot secretly trade even if its API returns ().
+                        // 所有既有挂单的各项状态均保持不变；
+                        // 即使 PostOnly 接口返回空元组，也不能隐藏任何成交行为。
                         for entry in before.bids.orders.iter().chain(&before.asks.orders) {
                             let observed = after
                                 .bids
@@ -347,11 +347,11 @@ fn mirrored_fifo_price_boundary_and_post_only_later_maker_tape() {
             ConstraintCommand::Gtc(order(30, maker_side, 100, 3)),
             ConstraintCommand::Gtc(order(10, maker_side, 100, 7)),
             ConstraintCommand::Gtc(order(20, maker_side, farther, 4)),
-            // Total book qty is sufficient, but only 10 are price-executable.
+            // 订单簿总量足够，但价格范围内可成交量只有 10。
             ConstraintCommand::Fok(order(90, side, 100, 11)),
             ConstraintCommand::PostOnly(order(91, side, 100, 1)),
             ConstraintCommand::Ioc(order(92, side, 100, 8)),
-            // The second maker is now partial; exact FOK spans two prices.
+            // 第二笔挂单现已部分成交；恰好满足总量的 FOK 将跨越两个价格。
             ConstraintCommand::Fok(order(93, side, farther, 6)),
             ConstraintCommand::PostOnly(order(94, maker_side, 100, 6)),
             ConstraintCommand::Ioc(order(95, side, 100, 8)),

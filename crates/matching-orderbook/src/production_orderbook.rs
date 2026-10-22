@@ -20,14 +20,15 @@ use matching_domain::{
 use matching_domain::ProtectionSource;
 use std::collections::{BTreeMap, HashMap};
 
+mod iceberg;
 mod immediate_execution;
 
 #[derive(Debug, Clone, Copy)]
-/// 指明已预检的 residual 将追加到既有档位还是新建档位。
+/// 指明已预检的余量将追加到既有档位还是新建档位。
 ///
-/// 该枚举只保存 commit 前后必须保持一致的值，不保留对容器的借用；
-/// 因而预检完成后仍可执行 maker mutation，再以 fail-closed 断言检查
-/// commit 时的 owner 状态没有发生意外漂移。
+/// 该枚举只保存提交前后必须保持一致的值，不保留对容器的借用；
+/// 因而预检完成后仍可执行挂单状态变更，再通过失败即停止的断言检查
+/// 提交时的所有者状态没有发生意外漂移。
 enum RestTargetPlan {
     Existing {
         tail: OrderIndex,
@@ -45,9 +46,9 @@ enum RestTargetPlan {
 #[derive(Debug, Clone, Copy)]
 /// `preflight_rest_common` 产生的只读挂单提交计划。
 ///
-/// 它记录 identity、计划分配的 priority 及目标档位的聚合快照。
-/// public `rest` 另行施加 strict non-crossing；完整 Limit GTC 则在
-/// maker 已被预检后复用本计划，保证 residual 的可预期拒绝发生在首笔成交前。
+/// 它记录身份、计划分配的优先级及目标档位的聚合快照。
+/// 公开 `rest` 另行施加严格不交叉；完整限价单 GTC 则在
+/// 挂单已被预检后复用本计划，保证余量的可预期拒绝发生在首笔成交前。
 struct RestPlan {
     order_id: OrderId,
     side: Side,
@@ -60,8 +61,8 @@ struct RestPlan {
 /// 连续成交的只读预测结果。
 ///
 /// `trade_count` 决定调用方至少要提供多少 TradeId，`remaining` 是
-/// 本次连续撮合结束后 taker 的预测余量。它不拥有节点或可变引用，
-/// 也不改变 incoming、订单簿或 priority allocator。
+/// 本次连续撮合结束后吃单方的预测余量。它不拥有节点或可变引用，
+/// 也不改变新到订单、订单簿或优先级分配器。
 struct FillPlan {
     trade_count: usize,
     remaining: u64,
@@ -93,26 +94,26 @@ struct QuotePreflightState {
 
 /// 单市场生产订单簿的查询、挂单、取消和撮合入口。
 ///
-/// 价格顺序由双侧有序索引保存，同价 FIFO 由 PriceLevel 链表维护；
+/// 价格顺序由双侧有序索引保存，同价先进先出由 PriceLevel 链表维护；
 /// OrderId 索引只承担定位，不决定业务顺序。当前支持已确定应挂单的
-/// Limit GTC 余量、已知 ID 的 Cancel、完整 Limit GTC、市价订单，以及
-/// Limit IOC/FOK/PostOnly。仅实际 rest 分配 priority；不包含完整资金和命令协议。
+/// 限价单 GTC 余量、已知标识符的取消、完整限价单 GTC、市价订单，以及
+/// 限价单 IOC/FOK/PostOnly 与冰山。实际挂单及冰山补量时分配优先级；不包含完整资金和命令协议。
 #[derive(Debug)]
 pub struct ProductionOrderBook {
-    /// 买侧价格档位；合法非空条目中的节点必须具有相同价格和 Buy 方向。
+    /// 买侧价格档位；合法非空条目中的节点必须具有相同价格和买入方向。
     bids: BTreeMap<Price, PriceLevel>,
-    /// 卖侧价格档位；合法非空条目中的节点必须具有相同价格和 Sell 方向。
+    /// 卖侧价格档位；合法非空条目中的节点必须具有相同价格和卖出方向。
     asks: BTreeMap<Price, PriceLevel>,
-    /// 当前 active OrderId 到 Arena 槽位的定位索引，必须与节点身份一致。
+    /// 当前活动 OrderId 到 Arena 槽位的定位索引，必须与节点身份一致。
     orders: HashMap<OrderId, OrderIndex>,
-    /// 节点的唯一存储；价格档位和 ID 索引通过 OrderIndex 引用它。
+    /// 节点的唯一存储；价格档位和标识符索引通过 OrderIndex 引用它。
     arena: OrderArena,
-    /// 本市场独占的 priority 状态；只读查询不消耗序号。
+    /// 本市场独占的优先级状态；只读查询不消耗序号。
     queue_priority_allocator: QueuePriorityAllocator,
 }
 
 impl ProductionOrderBook {
-    /// 使用已验证的策略创建空簿，market-local priority 从零开始。
+    /// 使用已验证的策略创建空簿，市场内优先级从零开始。
     pub fn new(policy: QueuePriorityPolicy) -> Self {
         Self {
             bids: BTreeMap::new(),
@@ -123,9 +124,9 @@ impl ProductionOrderBook {
         }
     }
 
-    /// 查询指定簿侧的最优价格，空侧返回 None；side 不是 incoming 方向。
+    /// 查询指定簿侧的最优价格，空侧返回 None；方向不是新到订单方向。
     ///
-    /// 契约要求 Buy 取最高 bid、Sell 取最低 ask，不分配 priority 或缓存价格。
+    /// 契约要求买入取最高买价、卖出取最低卖价，不分配优先级或缓存价格。
     pub fn best_price(&self, side: Side) -> Option<Price> {
         match side {
             Side::Buy => self.bids.last_key_value().map(|(price, _)| *price),
@@ -133,9 +134,9 @@ impl ProductionOrderBook {
         }
     }
 
-    /// 经单键 ID 查找借用 Arena 节点；未知 ID 返回 None。
+    /// 经单键标识符查找借用 Arena 节点；未知标识符返回 None。
     ///
-    /// # Panics
+    /// # 不变量断言
     ///
     /// 索引命中但槽位不存在或节点身份不匹配时，按内部不变量损坏停止，
     /// 不将损坏静默解释成订单不存在。此查询不遍历或校验整条价档链。
@@ -160,25 +161,25 @@ impl ProductionOrderBook {
         Some(node)
     }
 
-    /// 读取下一次分配将使用的 priority，不推进 allocator。
+    /// 读取下一次分配将使用的优先级，不推进分配器。
     pub fn next_queue_priority(&self) -> u128 {
         self.queue_priority_allocator.next()
     }
 
-    /// 将已确认不可成交的 Limit GTC 余量挂入对应价格档尾。
+    /// 将已确认不可成交的限价单 GTC 余量挂入对应价格档尾。
     ///
-    /// 此窄 API 不执行撮合或生成事件；调用方必须先保证其不会 crossing/locking。
-    /// 可返回的拒绝保持簿、Arena 和 priority allocator 完全不变。
+    /// 此窄接口不执行撮合或生成事件；调用方必须先保证其不会价格交叉/价格相等。
+    /// 业务拒绝保持订单簿、Arena 和优先级分配器完全不变。
     ///
-    /// # Panics
+    /// # 不变量断言
     ///
-    /// 若调用方传入会 crossing 或 locking 的订单，或内部状态/提交顺序损坏，
-    /// 方法会 fail-closed 而不是将其伪装成另一种业务拒绝。
+    /// 若调用方传入会价格交叉或价格相等的订单，或内部状态/提交顺序损坏，
+    /// 方法会立即停止处理而不是将其伪装成另一种业务拒绝。
     pub fn rest(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
-        // 1. 与 crossing 无关的全部可预期失败先预检。
+        // 1. 与价格交叉无关的全部可预期失败先预检。
         let plan = self.preflight_rest_common(&order)?;
 
-        // 2. public rest 自身要求严格不可成交。
+        // 2. 公开挂单自身要求严格不可成交。
         //    后续完整 GTC 路径不会在成交前调用这一层。
         self.assert_rest_strictly_non_crossing(&plan);
 
@@ -188,11 +189,11 @@ impl ProductionOrderBook {
         Ok(())
     }
 
-    /// 强制 public `rest` 的非成交边界。
+    /// 强制公开 `rest` 的非成交边界。
     ///
-    /// common rest preflight 故意不检查对手侧，使完整 Limit GTC 能在
-    /// 连续 maker 撮合前预检 residual。调用该 helper 的位置必须已经
-    /// 明确：此时 residual 不应再与任何最优对手价 crossing 或 locking。
+    /// 公共挂单预检故意不检查对手侧，使完整限价单 GTC 能在
+    /// 连续挂单撮合前预检余量。调用该辅助函数的位置必须已经
+    /// 明确：此时余量不应再与任何最优对手价价格交叉或价格相等。
     fn assert_rest_strictly_non_crossing(&self, plan: &RestPlan) {
         match plan.side {
             Side::Buy => {
@@ -226,11 +227,11 @@ impl ProductionOrderBook {
     /// 提交已经预检的挂单，且不再暴露可预期的业务拒绝。
     ///
     /// 本函数只允许在单写者已持有 `RestPlan` 的写屏障之后调用。
-    /// 预检/提交之间的 identity、priority、Arena 或目标档位分歧表示
-    /// 内部损坏，必须 fail-closed panic，不能在已经写入部分状态后返回 Err。
+    /// 预检/提交之间的身份、优先级、Arena 或目标档位分歧表示
+    /// 内部损坏，必须触发不变量断言并停止处理，不能在已经写入部分状态后返回 Err。
     fn commit_rest(&mut self, order: LimitGtcOrder, plan: RestPlan) {
         // ------------------------------------------------------------
-        // 0. plan / input identity。
+        // 0. 计划 / 输入身份。
         // ------------------------------------------------------------
 
         assert_eq!(
@@ -248,14 +249,14 @@ impl ProductionOrderBook {
             "rest commit received plan for different price"
         );
 
-        // Common preflight 后不能出现同 ID。
+        // 公共预检后不能出现同标识符。
         assert!(
             !self.orders.contains_key(&plan.order_id),
             "ProductionOrderBook invariant violation: \
          OrderId appeared between rest preflight and commit"
         );
 
-        // matching/cancel 不消费 QueuePriority。
+        // 此普通订单提交路径的成交和取消不消耗 QueuePriority。
         assert_eq!(
             self.queue_priority_allocator.next(),
             plan.priority.get(),
@@ -269,7 +270,7 @@ impl ProductionOrderBook {
          allocator became exhausted between rest preflight and commit"
         );
 
-        // Arena 的具体 free slot 可以变化，但插入能力不能消失。
+        // Arena 的具体空闲槽位可以变化，但插入能力不能消失。
         self.arena.preflight_insert().unwrap_or_else(|reason| {
             panic!(
                 "ProductionOrderBook invariant violation: \
@@ -294,7 +295,7 @@ impl ProductionOrderBook {
          duplicate OrderId appeared during rest commit"
         );
 
-        // priority 必须最后推进。
+        // 优先级必须最后推进。
         let committed_priority =
             self.queue_priority_allocator
                 .allocate()
@@ -313,26 +314,26 @@ impl ProductionOrderBook {
         );
     }
 
-    /// 按已知 OrderId 从生产订单簿中取消 resting order。
+    /// 按已知 OrderId 从生产订单簿中取消挂单订单。
     ///
     /// 成功返回被移除的运行态订单；返回节点已经脱离 PriceLevel，
     /// 其 `prev` / `next` 均为 None。
     ///
-    /// Cancel 不分配、消耗或重排 QueuePriority。
+    /// 取消不分配、消耗或重排 QueuePriority。
     ///
-    /// # Errors
+    /// # 错误
     ///
-    /// - `OrderNotFound`：当前 active book 中不存在该 OrderId。
+    /// - `OrderNotFound`：当前活动订单簿中不存在该 OrderId。
     ///
-    /// # Panics
+    /// # 不变量断言
     ///
-    /// 如果 ID 索引指向不存在的 Arena slot、节点身份不匹配、
+    /// 如果标识符索引指向不存在的 Arena 槽位、节点身份不匹配、
     /// 对应价格档不存在或 PriceLevel 内部链接损坏，视为内部状态损坏，
-    /// fail-closed。
+    /// 故障时停止处理。
     pub fn cancel(&mut self, order_id: OrderId) -> Result<OrderNode, RejectReason> {
-        // 1. 先按 ID 精确定位。
+        // 1. 先按标识符精确定位。
         //
-        // 未知 ID 必须在任何写操作之前返回。
+        // 未知标识符必须在任何写操作之前返回。
         let index = match self.orders.get(&order_id) {
             Some(index) => *index,
             None => return Err(RejectReason::OrderNotFound),
@@ -358,7 +359,7 @@ impl ProductionOrderBook {
         let side = node.original_order().side;
         let price = node.original_order().price;
 
-        // immutable borrow 到这里结束。
+        // 不可变借用在此结束。
         let removed = match side {
             Side::Buy => {
                 let remove_level;
@@ -371,7 +372,7 @@ impl ProductionOrderBook {
                         )
                     });
                     // 3. 头节点必须走 pop_front；
-                    // 中间或尾节点走 unlink。
+                    // 中间或尾节点走解除链接。
                     let removed = if level.head() == Some(index) {
                         level.pop_front(&mut self.arena).unwrap_or_else(|| {
                             panic!(
@@ -432,9 +433,9 @@ impl ProductionOrderBook {
             }
         };
 
-        // 4. 解除 ID -> slot 映射。
+        // 4. 解除标识符 -> 槽位映射。
         //
-        // 从最初查找到这里一直持有 &mut self 的独占访问，
+        // 从最初查找到这里一直持有 `&mut self` 的独占访问，
         // 映射不可能合法地发生变化。
         let mapped = self.orders.remove(&order_id);
 
@@ -448,25 +449,28 @@ impl ProductionOrderBook {
         Ok(removed)
     }
 
-    /// 对当前 incoming 最多执行一笔成交。
+    /// 对当前新到订单最多执行一笔成交。
     ///
-    /// - 仅选择当前对手盘 best price 的 FIFO head maker；
-    /// - 成交价始终取 resting maker price；
-    /// - maker 严格部分成交时保留原 slot/FIFO/priority；
-    /// - maker 完全成交时通过 `pop_front` 移除；
-    /// - 不循环到下一 maker；
-    /// - 不将 incoming 剩余量重新挂簿；
+    /// - 仅选择当前对手盘最优价格的先进先出头节点挂单；
+    /// - 成交价始终取挂单价格；
+    /// - 挂单严格部分成交时保留原槽位/先进先出/优先级；
+    /// - 挂单完全成交时通过 `pop_front` 移除；
+    /// - 不循环到下一挂单；
+    /// - 不将新到订单剩余量重新挂簿；
     /// - TradeId 由调用方提供，本方法不分配。
     ///
-    /// 无可成交 maker 或 incoming 已耗尽时返回 `Ok(None)`，
-    /// 且 book、incoming、allocator 全部保持不变。
+    /// 无可成交挂单或新到订单已耗尽时返回 `Ok(None)`，
+    /// 且订单簿、新到订单、分配器全部保持不变。
     pub fn execute_next_fill_trade(
         &mut self,
         incoming: &mut IncomingOrder,
         trade_id: TradeId,
     ) -> Result<Option<TradeEvent>, RejectReason> {
+        if self.has_iceberg_maker(incoming.original_order().side) {
+            return self.execute_next_fill_iceberg(incoming, trade_id);
+        }
         // ------------------------------------------------------------
-        // 1. exhausted incoming：纯 no-op。
+        // 1. 已耗尽新到订单：不改变任何状态。
         // ------------------------------------------------------------
 
         if incoming.remaining() == 0 {
@@ -484,7 +488,7 @@ impl ProductionOrderBook {
         };
 
         // ------------------------------------------------------------
-        // 2. 只读选择 best price。
+        // 2. 只读选择最优价格。
         // ------------------------------------------------------------
 
         let maker_price = match taker_side {
@@ -514,7 +518,7 @@ impl ProductionOrderBook {
         };
 
         // ------------------------------------------------------------
-        // 3. 只读定位 best level 的 FIFO head。
+        // 3. 只读定位最优价档的先进先出头节点。
         // ------------------------------------------------------------
 
         let (head_index, maker_order_id, maker_remaining) = {
@@ -570,7 +574,7 @@ impl ProductionOrderBook {
         };
 
         // ------------------------------------------------------------
-        // 4. ID index 必须在任何写入前精确匹配 maker。
+        // 4. 标识符索引必须在任何写入前精确匹配挂单。
         // ------------------------------------------------------------
 
         assert_eq!(
@@ -581,7 +585,7 @@ impl ProductionOrderBook {
         );
 
         // ------------------------------------------------------------
-        // 5. 规划本次唯一 fill，并把所有数量运算提前。
+        // 5. 规划本次唯一成交，并把所有数量运算提前。
         // ------------------------------------------------------------
 
         let fill_lots = incoming.remaining().min(maker_remaining);
@@ -597,14 +601,14 @@ impl ProductionOrderBook {
             .checked_sub(fill_lots)
             .ok_or(RejectReason::ArithmeticOverflow)?;
 
-        // min() 保证至少有一侧被吃完。
+        // `min()` 保证至少有一侧被吃完。
         assert!(
             incoming_after == 0 || maker_after == 0,
             "ProductionOrderBook invariant violation: invalid next-fill plan"
         );
 
         // ------------------------------------------------------------
-        // 6. 先构造事件 payload。
+        // 6. 先构造事件载荷。
         //
         // 此时仍然没有任何状态修改。
         // ------------------------------------------------------------
@@ -619,11 +623,11 @@ impl ProductionOrderBook {
         };
 
         // ------------------------------------------------------------
-        // 7. 提交 maker。
+        // 7. 提交挂单。
         // ------------------------------------------------------------
 
         if maker_after > 0 {
-            // strict partial：
+            // 严格部分成交：
             //
             // fill_lots < maker_remaining 必然成立。
             let level = match maker_side {
@@ -640,8 +644,8 @@ impl ProductionOrderBook {
 
             level.apply_head_partial_fill(&mut self.arena, fill_qty);
         } else {
-            // full/exact maker：必须物理移除 head，
-            // 绝不能先把 remaining 改成零再留下来。
+            // 全部成交/恰好全部成交挂单：必须物理移除头节点，
+            // 绝不能先把剩余量改成零再留下来。
             let level_became_empty = match maker_side {
                 Side::Buy => {
                     let level = self
@@ -684,8 +688,8 @@ impl ProductionOrderBook {
                 }
             };
 
-            // pop_front 已经释放 Arena slot。
-            // 这里只解除 OrderId 映射，绝不能再次 arena.remove。
+            // pop_front 已经释放 Arena 槽位。
+            // 这里只解除 OrderId 映射，绝不能再次 `arena.remove`。
             let removed_index = self.orders.remove(&maker_order_id);
 
             assert_eq!(
@@ -711,7 +715,7 @@ impl ProductionOrderBook {
         }
 
         // ------------------------------------------------------------
-        // 8. 最后扣减 incoming。
+        // 8. 最后扣减新到订单。
         //
         // checked_sub 已在任何写入之前成功；
         // 与 ReferenceOrderBook 的执行顺序保持一致。
@@ -722,28 +726,31 @@ impl ProductionOrderBook {
         Ok(Some(trade))
     }
 
-    /// 按价格优先、同价 FIFO 连续执行零笔或多笔 maker 成交。
+    /// 按价格优先、同价先进先出连续执行零笔或多笔挂单成交。
     ///
     /// `trade_ids` 由调用方提供。本订单簿：
     /// - 不自行分配 TradeId；
     /// - 不验证 TradeId 的全局唯一性；
-    /// - 不保存或推进 TradeId allocator。
+    /// - 不保存或推进 TradeId 分配器。
     ///
     /// 调用方必须提供合法且足量的 TradeId 序列。
     /// 多余的 TradeId 不会被使用。
     ///
-    /// 在任何状态修改前，本方法会只读计算本次 incoming 实际需要的
-    /// TradeId 数量；如果 `trade_ids` 不足则 fail-closed panic。
+    /// 在任何状态修改前，本方法会只读计算本次新到订单实际需要的
+    /// TradeId 数量；如果 `trade_ids` 不足则触发不变量断言并停止处理。
     ///
-    /// 本方法只连续消费当前可成交的 resting maker：
-    /// - 不将剩余 incoming 自动 rest；
-    /// - 不分配新的 QueuePriority；
-    /// - 不实现 IOC/FOK/PostOnly/Market/Stop/Iceberg 等更高层语义。
+    /// 本方法只连续消费当前可成交的挂单：
+    /// - 不将剩余新到订单自动挂单；
+    /// - 新到订单不分配 QueuePriority；冰山挂单补量会取得新优先级；
+    /// - 支持冰山挂单补量，但不选择新到订单的 IOC/FOK/PostOnly/市价或止损策略。
     pub fn execute_fill_trades(
         &mut self,
         incoming: &mut IncomingOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<TradeEvent>, RejectReason> {
+        if self.has_iceberg_maker(incoming.original_order().side) {
+            return self.execute_fill_trades_iceberg(incoming, trade_ids);
+        }
         // ---------- 第一阶段：完整只读预检 ----------
 
         let plan = self.preflight_fill_plan(incoming);
@@ -763,7 +770,7 @@ impl ProductionOrderBook {
 
         // ---------- 第二阶段：提交 ----------
         //
-        // 不复制 maker mutation。
+        // 不复制挂单状态变更。
         // 每一笔全部委托已经验收的单步入口。
 
         let mut trades = Vec::with_capacity(expected_fills);
@@ -807,12 +814,17 @@ impl ProductionOrderBook {
     /// 以基础币数量立即成交市价订单。
     ///
     /// 入口先完成只读预检并确认 TradeId 数量，再按对手侧价格优先和
-    /// 同价 FIFO 提交成交。未成交余量不挂簿，也不分配 QueuePriority。
+    /// 同价先进先出提交成交。市价余量不挂簿、不取优先级；冰山挂单补量取新优先级。
     pub fn execute_market_by_base(
         &mut self,
         incoming: MarketByBase,
         trade_ids: &[TradeId],
     ) -> Result<Vec<TradeEvent>, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            return self
+                .execute_market_base_iceberg(incoming, None, trade_ids)
+                .map(Self::trades_only);
+        }
         let plan = self.preflight_market_by_base(&incoming)?;
 
         assert!(
@@ -843,9 +855,9 @@ impl ProductionOrderBook {
 
     /// 按命令开始时固定的保护边界执行 MarketByBase。
     ///
-    /// 完整预检成功后才允许首次 maker mutation。
+    /// 完整预检成功后才允许首次挂单状态变更。
     /// 保护触发最多产生一个事件，不消耗 TradeId；
-    /// 未成交市价余量不挂簿、不分配 QueuePriority。
+    /// 未成交市价余量不挂簿、不分配 QueuePriority；冰山挂单补量取新优先级。
     pub fn execute_market_by_base_with_protection(
         &mut self,
         incoming: MarketByBase,
@@ -853,11 +865,14 @@ impl ProductionOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            return self.execute_market_base_iceberg(incoming, Some((context, math)), trade_ids);
+        }
         // 1. 全量只读预检。
         let plan = self.preflight_protected_market_by_base_plan(&incoming, context, math)?;
 
-        // 2. 在首次 mutation 前校验 TradeId。
-        // 延续当前 Production 的 fail-closed panic 契约。
+        // 2. 在首次状态变更前校验 TradeId。
+        // 延续当前生产簿的触发不变量断言并停止处理契约。
         assert!(
             trade_ids.len() >= plan.fills.len(),
             "insufficient TradeIds for protected MarketByBase: \
@@ -884,14 +899,14 @@ impl ProductionOrderBook {
 
         // 4. 严格按照预检计划提交。
         for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
-            // 当前全市场最优 maker 价格必须等于计划价格。
+            // 当前全市场最优挂单价格必须等于计划价格。
             let best_price = self
                 .best_price(maker_side)
                 .expect("preflighted protected maker side became empty");
 
             assert_eq!(best_price, fill.maker_price);
 
-            // 必须选择最优价档的 FIFO head。
+            // 必须选择最优价档的先进先出头节点。
             let levels = match maker_side {
                 Side::Buy => &self.bids,
                 Side::Sell => &self.asks,
@@ -921,13 +936,13 @@ impl ProductionOrderBook {
             assert!(maker.remaining() > 0);
             assert_eq!(fill.qty.get(), remaining.min(maker.remaining()));
 
-            // 5. 复用已验收的 Production 单笔提交。
+            // 5. 复用已验收的生产簿单笔提交。
             //    本次调用内部完成：
-            //    - maker partial / full
-            //    - PriceLevel 聚合与 FIFO 更新
-            //    - Arena slot 释放
-            //    - OrderId index / 空价档清理
-            //    - taker remaining 扣减
+            //    - 挂单部分成交 / 全部成交
+            //    - PriceLevel 聚合与先进先出更新
+            //    - Arena 槽位释放
+            //    - OrderId 索引 / 空价档清理
+            //    - 吃单方剩余量扣减
             let trade = self.commit_market_by_base_fill(
                 incoming.order_id,
                 incoming.side,
@@ -959,16 +974,24 @@ impl ProductionOrderBook {
         Ok(events)
     }
 
-    /// 市价按 quote 预算立即成交。
+    /// 市价按报价资产预算立即成交。
     ///
-    /// 全部可预期错误发生在首笔 mutation 前。
-    /// 不挂入 taker，不分配 QueuePriority。
+    /// 全部可预期错误发生在首笔状态变更前。
+    /// 不挂入吃单方，也不为吃单方分配 QueuePriority；冰山挂单补量取新优先级。
     pub fn execute_market_by_quote(
         &mut self,
         incoming: MarketByQuote,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<MarketByQuoteExecution, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            let execution = self.execute_market_quote_iceberg(incoming, math, None, trade_ids)?;
+            return Ok(MarketByQuoteExecution::new(
+                Self::trades_only(execution.events().to_vec()),
+                execution.spent_quote(),
+                execution.unused_quote(),
+            ));
+        }
         let plan = self.preflight_market_by_quote(&incoming, math)?;
 
         assert!(
@@ -1001,7 +1024,7 @@ impl ProductionOrderBook {
             }
             .expect("preflighted MarketByQuote level disappeared");
 
-            // 必须仍然是当前最优对手价的 FIFO head。
+            // 必须仍然是当前最优对手价的先进先出头节点。
             assert_eq!(level.head(), Some(index));
 
             let actual_best = self
@@ -1032,7 +1055,7 @@ impl ProductionOrderBook {
                 .expect("preflighted MarketByQuote maker underflow");
 
             // 原序事件使用计划中的价、量。
-            // 不调用 MarketMath，也不重算 notional。
+            // 不调用 MarketMath，也不重算本金。
             let trade = TradeEvent {
                 trade_id,
                 maker_order_id: fill.maker_order_id,
@@ -1067,7 +1090,7 @@ impl ProductionOrderBook {
                     level.is_empty()
                 };
 
-                // pop_front 已释放 Arena slot，不能再 remove 一次。
+                // pop_front 已释放 Arena 槽位，不能再 `remove` 一次。
                 assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index));
 
                 if level_became_empty {
@@ -1097,9 +1120,9 @@ impl ProductionOrderBook {
 
     /// 按命令开始时固定的保护边界执行 MarketByQuote。
     ///
-    /// 预检、TradeId 足量检查和金额计划校验均先于首笔 mutation。
+    /// 预检、TradeId 足量检查和金额计划校验均先于首笔状态变更。
     /// 提交只使用 QuoteFillPlan，不重新计算保护边界、本金或预算。
-    /// 保护事件不消耗 TradeId，市价 taker 不挂簿。
+    /// 保护事件不消耗 TradeId，市价吃单方不挂簿。
     pub fn execute_market_by_quote_with_protection(
         &mut self,
         incoming: MarketByQuote,
@@ -1107,10 +1130,13 @@ impl ProductionOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        if self.has_iceberg_maker(incoming.side) {
+            return self.execute_market_quote_iceberg(incoming, math, Some(context), trade_ids);
+        }
         // 1. 完整只读预检。
         let plan = self.preflight_market_by_quote_with_protection(&incoming, context, math)?;
 
-        // 2. 所有 TradeId 检查必须先于首次 mutation。
+        // 2. 所有 TradeId 检查必须先于首次状态变更。
         assert!(
             trade_ids.len() >= plan.fills.len(),
             "insufficient TradeIds for protected MarketByQuote: required={}, provided={}",
@@ -1118,7 +1144,7 @@ impl ProductionOrderBook {
             trade_ids.len(),
         );
 
-        // 3. 只核对已规划的 notional，不重新调用 MarketMath。
+        // 3. 只核对已规划的本金，不重新调用 MarketMath。
         let mut planned_spent = QuoteAmount::new(0);
 
         for fill in &plan.fills {
@@ -1143,7 +1169,7 @@ impl ProductionOrderBook {
             .checked_add(usize::from(plan.stop.is_some()))
             .expect("protected MarketByQuote event count overflow");
 
-        // 首笔 maker mutation 前完成事件容量预分配。
+        // 首笔挂单状态变更前完成事件容量预分配。
         let mut events = Vec::with_capacity(event_count);
 
         let maker_side = match incoming.side {
@@ -1153,7 +1179,7 @@ impl ProductionOrderBook {
 
         let priority_before = self.next_queue_priority();
 
-        // 4. 严格依照预检 fill 顺序提交。
+        // 4. 严格依照预检成交顺序提交。
         for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
             // 必须仍然是当前最优对手价。
             let best_price = self
@@ -1167,7 +1193,7 @@ impl ProductionOrderBook {
                 .get(&fill.maker_order_id)
                 .expect("preflighted protected Quote maker ID missing");
 
-            // maker 必须位于预检价格档的 FIFO head。
+            // 挂单必须位于预检价格档的先进先出头节点。
             let level = match maker_side {
                 Side::Buy => self.bids.get(&fill.maker_price),
                 Side::Sell => self.asks.get(&fill.maker_price),
@@ -1195,7 +1221,7 @@ impl ProductionOrderBook {
                 .checked_sub(fill_lots)
                 .expect("preflighted protected Quote maker underflow");
 
-            // 事件只读取计划中的 maker、价格和数量。
+            // 事件只读取计划中的挂单、价格和数量。
             let trade = TradeEvent {
                 trade_id,
                 maker_order_id: fill.maker_order_id,
@@ -1205,9 +1231,9 @@ impl ProductionOrderBook {
                 maker_side,
             };
 
-            // 5. 首次 maker mutation。
+            // 5. 首次挂单状态变更。
             if maker_after > 0 {
-                // 部分成交：保留 FIFO slot 和 QueuePriority。
+                // 部分成交：保留先进先出槽位和 QueuePriority。
                 let level = match maker_side {
                     Side::Buy => self.bids.get_mut(&fill.maker_price),
                     Side::Sell => self.asks.get_mut(&fill.maker_price),
@@ -1225,7 +1251,7 @@ impl ProductionOrderBook {
                 assert_eq!(updated.priority(), maker_priority);
                 assert_eq!(self.orders.get(&fill.maker_order_id), Some(&index));
             } else {
-                // 完全成交：FIFO pop_front 释放 Arena slot。
+                // 完全成交：先进先出 pop_front 释放 Arena 槽位。
                 let level_became_empty = {
                     let level = match maker_side {
                         Side::Buy => self.bids.get_mut(&fill.maker_price),
@@ -1243,7 +1269,7 @@ impl ProductionOrderBook {
                     level.is_empty()
                 };
 
-                // pop_front 已释放 slot，不得二次 arena.remove。
+                // pop_front 已释放槽位，不得二次 `arena.remove`。
                 assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index),);
 
                 if level_became_empty {
@@ -1263,7 +1289,7 @@ impl ProductionOrderBook {
         assert_eq!(events.len(), trade_count);
 
         // 6. 所有 Trade 之后最多追加一个保护终结事件。
-        // 不使用 TradeId，也不读取下一张 maker。
+        // 不使用 TradeId，也不读取下一张挂单。
         if let Some(stop) = plan.stop {
             events.push(EngineEvent::MarketProtectionTriggered {
                 order_id: incoming.order_id,
@@ -1275,7 +1301,7 @@ impl ProductionOrderBook {
 
         assert_eq!(events.len(), event_count);
 
-        // MarketByQuote 不消耗 QueuePriority、不挂入 taker。
+        // 此普通挂单路径不消耗 QueuePriority，也不挂入市价吃单方。
         assert_eq!(self.next_queue_priority(), priority_before);
         assert!(!self.orders.contains_key(&incoming.order_id));
 
@@ -1385,7 +1411,7 @@ impl ProductionOrderBook {
                 level.is_empty()
             };
 
-            // 不要重复调用 arena.remove。
+            // 不要重复调用 `arena.remove`。
             assert_eq!(self.orders.remove(&maker_order_id), Some(head_index),);
 
             if level_became_empty {
@@ -1399,17 +1425,17 @@ impl ProductionOrderBook {
             }
         }
 
-        // 最后才更新本次市价 taker 的局部剩余量。
+        // 最后才更新本次市价吃单方的局部剩余量。
         *remaining = taker_after;
 
         trade
     }
 
-    /// 在一个价格档内模拟 FIFO 成交，并验证单步提交依赖的局部结构。
+    /// 在一个价格档内模拟先进先出成交，并验证单步提交依赖的局部结构。
     ///
     /// 该扫描只读地推进 `incoming_remaining`，返回实际需要的 TradeId 数量。
-    /// 它检查的链表、身份、聚合与 priority 关系必须足以让后续
-    /// `execute_next_fill_trade` 不会因可预期数据错误在部分 batch 后返回 Err。
+    /// 它检查的链表、身份、聚合与优先级关系必须足以让后续
+    /// `execute_next_fill_trade` 不会因可预期数据错误在部分批量后返回 Err。
     fn preflight_level_fill_count(
         &self,
         level: &PriceLevel,
@@ -1443,8 +1469,8 @@ impl ProductionOrderBook {
          matching level has zero aggregate"
         );
 
-        // pop_front / partial-fill 都会依赖合法 tail，
-        // 因此在任何成交发生前先验证 tail 局部状态。
+        // pop_front / 部分成交都会依赖合法尾节点，
+        // 因此在任何成交发生前先验证尾节点局部状态。
         {
             let tail = self.arena.get(tail_index).expect(
                 "ProductionOrderBook invariant violation: matching tail missing from Arena",
@@ -1581,7 +1607,7 @@ impl ProductionOrderBook {
             let current_priority = node.priority();
             let successor_index = node.next();
 
-            // 验证当前模拟 head 的结构。
+            // 验证当前模拟头节点的结构。
             if simulated_count == 1 {
                 assert_eq!(
                     current, tail_index,
@@ -1685,8 +1711,8 @@ impl ProductionOrderBook {
                 .checked_add(1)
                 .expect("ProductionOrderBook invariant violation: fill count overflow");
 
-            // maker partial 必然意味着 incoming 已耗尽，
-            // 这一笔就是整个 batch 的最后一笔。
+            // 挂单部分成交必然意味着新到订单已耗尽，
+            // 这一笔就是整个批量的最后一笔。
             if maker_after > 0 {
                 assert_eq!(
                     incoming_after, 0,
@@ -1712,7 +1738,7 @@ impl ProductionOrderBook {
                 break;
             }
 
-            // full maker：模拟 pop_front。
+            // 全部成交挂单：模拟 pop_front。
             let count_after = simulated_count
                 .checked_sub(1)
                 .expect("ProductionOrderBook invariant violation: matching count underflow");
@@ -1735,7 +1761,7 @@ impl ProductionOrderBook {
             simulated_count = count_after;
             simulated_total = total_after;
 
-            // incoming 正好在该 maker 上耗尽。
+            // 新到订单正好在该挂单上耗尽。
             if *incoming_remaining == 0 {
                 break;
             }
@@ -1755,9 +1781,9 @@ impl ProductionOrderBook {
         fills
     }
 
-    /// 按价格优先和同价 FIFO 构造整个连续撮合的只读计划。
+    /// 按价格优先和同价先进先出构造整个连续撮合的只读计划。
     ///
-    /// Buy 只从低到高扫描可成交 asks，Sell 只从高到低扫描可成交 bids；
+    /// 买入只从低到高扫描可成交 `asks`，卖出只从高到低扫描可成交 `bids`；
     /// HashMap 仅在逐节点身份校验中按单键读取，绝不决定扫描或事件顺序。
     fn preflight_fill_plan(&self, incoming: &IncomingOrder) -> FillPlan {
         let mut remaining = incoming.remaining();
@@ -1774,7 +1800,7 @@ impl ProductionOrderBook {
 
         match taker.side {
             Side::Buy => {
-                // ask: 低 -> 高
+                // 卖价: 低 -> 高
                 for (price, level) in &self.asks {
                     if remaining == 0 || *price > taker.price {
                         break;
@@ -1791,7 +1817,7 @@ impl ProductionOrderBook {
             }
 
             Side::Sell => {
-                // bid: 高 -> 低
+                // 买价: 高 -> 低
                 for (price, level) in self.bids.iter().rev() {
                     if remaining == 0 || *price < taker.price {
                         break;
@@ -1859,8 +1885,8 @@ impl ProductionOrderBook {
         })
     }
 
-    /// Production 独立只读规划；不触碰 Arena、价档、ID 索引或 allocator。
-    /// 业务拒绝优先级：duplicate -> command-start protection -> 扫描。
+    /// 生产簿独立只读规划；不触碰 Arena、价档、标识符索引或分配器。
+    /// 业务拒绝优先级：重复标识符 -> 命令开始时保护 -> 扫描。
     /// 返回成交前缀及首个越界价，终结保护本身不消耗 TradeId。
     fn preflight_protected_market_by_base_plan(
         &self,
@@ -2027,7 +2053,7 @@ impl ProductionOrderBook {
             Ok(remaining > 0)
         };
 
-        // 价格树决定档位顺序；每档 intrusive next 链决定 FIFO。
+        // 价格树决定档位顺序；每档侵入式 `next` 链决定先进先出。
         match incoming.side {
             Side::Buy => {
                 for (price, level) in &self.asks {
@@ -2095,7 +2121,7 @@ impl ProductionOrderBook {
         let mut stop = false;
 
         // 即使本单在档位中途耗尽，也扫描剩余链表完成
-        // 本档结构检查，确保提交依赖的 FIFO 链正确。
+        // 本档结构检查，确保提交依赖的先进先出链正确。
         while let Some(index) = current {
             let node = self
                 .arena
@@ -2184,7 +2210,7 @@ impl ProductionOrderBook {
         incoming: &MarketByQuote,
         math: &MarketMath,
     ) -> Result<MarketByQuotePlan, RejectReason> {
-        // Duplicate 必须先于盘口和 MarketMath 检查。
+        // 重复标识符必须先于盘口和 MarketMath 检查。
         if self.orders.contains_key(&incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -2204,7 +2230,7 @@ impl ProductionOrderBook {
 
         match maker_side {
             Side::Sell => {
-                // Buy taker：asks 从低到高。
+                // 买入吃单方：`asks` 从低到高。
                 for (price, level) in &self.asks {
                     if state.remaining_quote.get() == 0 {
                         break;
@@ -2216,7 +2242,7 @@ impl ProductionOrderBook {
                 }
             }
             Side::Buy => {
-                // Sell taker：bids 从高到低。
+                // 卖出吃单方：`bids` 从高到低。
                 for (price, level) in self.bids.iter().rev() {
                     if state.remaining_quote.get() == 0 {
                         break;
@@ -2251,7 +2277,7 @@ impl ProductionOrderBook {
         context: &CommandStartProtectionContext,
         math: &MarketMath,
     ) -> Result<ProtectedMarketByQuotePlan, RejectReason> {
-        // 1. Duplicate 必须优先于保护及数学错误。
+        // 1. 重复标识符必须优先于保护及数学错误。
         if self.orders.contains_key(&incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -2285,8 +2311,8 @@ impl ProductionOrderBook {
                 return Ok(false);
             }
 
-            // 3. 保护先于 dust/MarketMath。
-            // 整档同价，因此在访问 FIFO 节点前检查一次即可。
+            // 3. 保护先于不足一手的预算/MarketMath。
+            // 整档同价，因此在访问先进先出节点前检查一次即可。
             if !maker_price_within_protection(
                 incoming.side,
                 price,
@@ -2316,7 +2342,7 @@ impl ProductionOrderBook {
             let mut observed_total = 0u64;
             let mut halted = false;
 
-            // 4. 同价 FIFO：head -> next -> tail。
+            // 4. 同价先进先出：头节点 -> `next` -> 尾节点。
             while let Some(index) = current {
                 let node = self
                     .arena
@@ -2353,8 +2379,8 @@ impl ProductionOrderBook {
                     .checked_add(node.remaining())
                     .expect("protected Quote aggregate overflow");
 
-                // halted 后仅完成本档的结构检查，
-                // 不再做预算计算或规划新 fill。
+                // 停止扫描后仅完成本档的结构检查，
+                // 不再做预算计算或规划新成交。
                 if !halted && state.remaining_quote.get() > 0 {
                     let affordable = math
                         .max_qty_for_quote(state.remaining_quote, price)
@@ -2362,7 +2388,7 @@ impl ProductionOrderBook {
 
                     match affordable {
                         None => {
-                            // 在保护边界内发生 dust。
+                            // 在保护边界内发生不足一手的预算。
                             halted = true;
                         }
                         Some(max_qty) => {
@@ -2408,7 +2434,7 @@ impl ProductionOrderBook {
             Ok(!halted)
         };
 
-        // 6. 直接使用 Production BTreeMap 的业务价格顺序。
+        // 6. 直接使用生产簿 BTreeMap 的业务价格顺序。
         match incoming.side {
             Side::Buy => {
                 for (price, level) in &self.asks {
@@ -2443,11 +2469,11 @@ impl ProductionOrderBook {
         })
     }
 
-    /// 预检任何将要 rest 的 Limit GTC 载荷，而不检查对手侧价格。
+    /// 预检任何将要挂单的限价单 GTC 载荷，而不检查对手侧价格。
     ///
-    /// 业务拒绝顺序固定为 duplicate、priority high-water、同侧聚合/计数
-    /// 与 Arena feasibility。这样完整 Limit GTC 可以先模拟成交并用实际
-    /// residual 调用本函数，确保所有可预期 rest 错误都发生在首笔成交前。
+    /// 业务拒绝顺序固定为重复标识符、优先级高水位、同侧聚合/计数
+    /// 与 Arena 可行性。这样完整限价单 GTC 可以先模拟成交并用实际
+    /// 余量调用本函数，确保所有可预期挂单错误都发生在首笔成交前。
     fn preflight_rest_common(&self, order: &LimitGtcOrder) -> Result<RestPlan, RejectReason> {
         let order_id = order.order_id;
         let side = order.side;
@@ -2455,7 +2481,7 @@ impl ProductionOrderBook {
         let qty = order.qty.get();
 
         // ------------------------------------------------------------
-        // 1. Duplicate 必须绝对最先检查。
+        // 1. 重复标识符必须绝对最先检查。
         // ------------------------------------------------------------
 
         if self.orders.contains_key(&order_id) {
@@ -2463,7 +2489,7 @@ impl ProductionOrderBook {
         }
 
         // ------------------------------------------------------------
-        // 2. QueuePriority high-water。
+        // 2. QueuePriority 高水位。
         // ------------------------------------------------------------
 
         if self.queue_priority_allocator.is_exhausted() {
@@ -2570,9 +2596,9 @@ impl ProductionOrderBook {
         };
 
         // ------------------------------------------------------------
-        // 4. Arena insert feasibility。
+        // 4. Arena `insert` 可行性。
         //
-        // 必须是 common preflight 的最后一个可预期失败点。
+        // 必须是公共预检的最后一个可预期失败点。
         // ------------------------------------------------------------
 
         self.arena.preflight_insert()?;
@@ -2586,29 +2612,34 @@ impl ProductionOrderBook {
         })
     }
 
-    /// 完整执行一笔 Limit GTC。
+    /// 完整执行一笔限价单 GTC。
     ///
     /// 顺序：
-    /// 1. duplicate precheck；
-    /// 2. 只读规划全部可成交 maker；
+    /// 1. 重复标识符预检；
+    /// 2. 只读规划全部可成交挂单；
     /// 3. 检查 TradeId 数量；
-    /// 4. 若存在 GTC remainder，预检 remainder rest；
+    /// 4. 若存在 GTC 余量，预检余量挂单；
     /// 5. 执行连续成交；
-    /// 6. 若仍有 remainder，将其挂回本方订单簿。
+    /// 6. 若仍有余量，将其挂回本方订单簿。
     ///
     /// TradeId 由调用方负责提供合法且足量的序列；
     /// 本订单簿不分配、不验证全局唯一性。
     ///
-    /// Exact fill 不需要也不会消耗新的 QueuePriority。
+    /// 新到订单全部成交时不为其分配 QueuePriority；冰山挂单补量仍需新优先级。
     pub fn place_limit_gtc(
         &mut self,
         order: LimitGtcOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<TradeEvent>, RejectReason> {
+        if self.has_iceberg_maker(order.side) {
+            return self
+                .place_limit_gtc_with_events(order, trade_ids)
+                .map(Self::trades_only);
+        }
         let order_id = order.order_id;
 
         // ------------------------------------------------------------
-        // 1. Duplicate 必须绝对最先。
+        // 1. 重复标识符必须绝对最先。
         // ------------------------------------------------------------
 
         if self.orders.contains_key(&order_id) {
@@ -2625,7 +2656,7 @@ impl ProductionOrderBook {
 
         let fill_plan = self.preflight_fill_plan(&incoming);
 
-        // preflight 必须只读。
+        // 预检必须只读。
         assert_eq!(
             incoming.remaining(),
             incoming_remaining_before_preflight,
@@ -2647,12 +2678,12 @@ impl ProductionOrderBook {
         );
 
         // ------------------------------------------------------------
-        // 4. 只有真的存在 remainder，才允许触碰 Rest preflight。
+        // 4. 只有真的存在余量，才允许触碰挂单预检。
         //
-        // exact fill:
-        //   不检查 priority
-        //   不检查 same-side aggregate
-        //   不检查 Arena insert
+        // 全部成交:
+        //   不检查优先级
+        //   不检查同侧聚合量
+        //   不检查 Arena `insert`
         // ------------------------------------------------------------
 
         let rest_commit = if fill_plan.remaining > 0 {
@@ -2663,8 +2694,8 @@ impl ProductionOrderBook {
 
             let mut residual_order = order.clone();
 
-            // 当前 OrderNode::new 会以 order.qty 初始化 remaining，
-            // 因此挂簿 payload 必须使用真实 remainder。
+            // 当前 `OrderNode::new` 会以 `order.qty` 初始化剩余量，
+            // 因此挂簿载荷必须使用真实余量。
             residual_order.qty = residual_qty;
 
             let rest_plan = self.preflight_rest_common(&residual_order)?;
@@ -2678,10 +2709,10 @@ impl ProductionOrderBook {
         // 此处为写屏障。
         //
         // 到这里：
-        // - duplicate 已排除
-        // - maker 链已预检
+        // - 重复标识符已排除
+        // - 挂单链已预检
         // - TradeId 已足量
-        // - 若需要 rest，priority / aggregate / Arena 已预检
+        // - 若需要挂单，优先级 / 聚合量 / Arena 已预检
         // ------------------------------------------------------------
 
         let trades = self
@@ -2709,7 +2740,7 @@ impl ProductionOrderBook {
         );
 
         // ------------------------------------------------------------
-        // 5. 有余量才 rest。
+        // 5. 有余量才挂单。
         // ------------------------------------------------------------
 
         if let Some((residual_order, rest_plan)) = rest_commit {
@@ -2726,12 +2757,12 @@ impl ProductionOrderBook {
              residual order qty differs from incoming remaining"
             );
 
-            // 此时所有 <= limit 的对手 maker 应已经处理完成。
-            // 若仍 crossed / locked，属于内部规划/执行分歧。
+            // 此时所有 <= 限价的对手挂单应已经处理完成。
+            // 若仍价格交叉 / 价格相等，属于内部规划/执行分歧。
             self.assert_rest_strictly_non_crossing(&rest_plan);
 
-            // 已经在第一笔成交前完成 preflight，
-            // commit 不允许返回业务错误。
+            // 已经在第一笔成交前完成预检，
+            // 提交不允许返回业务错误。
             self.commit_rest(residual_order, rest_plan);
         } else {
             assert_eq!(
@@ -2746,9 +2777,9 @@ impl ProductionOrderBook {
     }
 }
 
-/// 将已预检 node 接入目标价格档，并返回它的稳定 Arena 槽位。
+/// 将已预检 `node` 接入目标价格档，并返回它的稳定 Arena 槽位。
 ///
-/// 调用方随后才写入 OrderId 索引并推进 allocator。这里的所有断言都在
+/// 调用方随后才写入 OrderId 索引并推进分配器。这里的所有断言都在
 /// `push_back` 或插入新档位前比较预检快照；任何差异是内部状态漂移，
 /// 不能退化为业务 `RejectReason`。
 fn commit_rest_target(
@@ -2770,7 +2801,7 @@ fn commit_rest_target(
                      preflighted existing rest level disappeared",
             );
 
-            // 所有 divergence 检查仍发生在 push_back 写入前。
+            // 所有差异检查仍发生在 push_back 写入前。
             assert_eq!(
                 level.tail(),
                 Some(tail),
@@ -2853,7 +2884,7 @@ fn commit_rest_target(
 
 #[cfg(test)]
 mod tests {
-    //! ProductionOrderBook 的查询、rest、Cancel、状态保持与损坏 fail-closed 验证。
+    //! ProductionOrderBook 的查询、挂单、取消、状态保持与损坏故障时停止处理验证。
     use super::*;
     use crate::OrderNode;
     use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
@@ -2863,12 +2894,12 @@ mod tests {
     mod differential;
     mod immediate_constraints;
 
-    /// 使用与参考模型一致的真实 guard 创建有效测试策略。
+    /// 使用与参考模型一致的真实预留边界创建有效测试策略。
     fn policy() -> QueuePriorityPolicy {
         QueuePriorityPolicy::try_new(1024).unwrap()
     }
 
-    /// 从受控有效样本构造最小 Limit GTC 输入。
+    /// 从受控有效样本构造最小限价单 GTC 输入。
     fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
         LimitGtcOrder {
             order_id: OrderId::new(id),
@@ -2881,7 +2912,7 @@ mod tests {
 
     /// 仅测试代码允许直接构造 ProductionOrderBook 的非空状态。
     ///
-    /// 必须经过真实 allocator + Arena + PriceLevel::push_back，
+    /// 必须经过真实分配器 + Arena + `PriceLevel::push_back`，
     /// 不允许只往 BTreeMap 塞空 PriceLevel。
     fn rest_fixture(book: &mut ProductionOrderBook, original: LimitGtcOrder) -> OrderIndex {
         let order_id = original.order_id;
@@ -2978,9 +3009,9 @@ mod tests {
     /// 一个价格档位的只读测试投影，不是持久化快照格式。
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct LevelSnapshotEntry {
-        /// 有序价格索引中的 key。
+        /// 有序价格索引中的键。
         price: Price,
-        /// 此档声明的 FIFO 首尾槽位。
+        /// 此档声明的先进先出首尾槽位。
         head: Option<OrderIndex>,
         tail: Option<OrderIndex>,
         /// 此档声明的节点数和可见数量合计。
@@ -2988,23 +3019,23 @@ mod tests {
         total_visible_qty: u64,
     }
 
-    /// 按指定 ID 查询得到的完整节点投影，用于查询前后相等性比较。
+    /// 按指定标识符查询得到的完整节点投影，用于查询前后相等性比较。
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct NodeSnapshotEntry {
-        /// 发起查询时使用的 ID，用于保留查询结果与输入的对应关系。
+        /// 发起查询时使用的标识符，用于保留查询结果与输入的对应关系。
         order_id: OrderId,
         /// 原始订单请求及当前剩余量。
         original: LimitGtcOrder,
         remaining: u64,
-        /// 当前 FIFO priority 及双向邻居槽位。
+        /// 当前先进先出优先级及双向邻居槽位。
         priority: QueuePriority,
         prev: Option<OrderIndex>,
         next: Option<OrderIndex>,
     }
 
-    /// 按调用方给定的 ID 顺序投影 live 节点，不依赖 HashMap 迭代序。
+    /// 按调用方给定的标识符顺序投影有效节点，不依赖 HashMap 迭代序。
     ///
-    /// 仅覆盖这些 ID 可达的节点，不包含 Arena 空槽和 free-list。
+    /// 仅覆盖这些标识符可达的节点，不包含 Arena 空槽和空闲链表。
     fn node_snapshot(book: &ProductionOrderBook, ids: &[OrderId]) -> Vec<NodeSnapshotEntry> {
         ids.iter()
             .map(|id| {
@@ -3065,13 +3096,13 @@ mod tests {
             rest_fixture(&mut book, original);
         }
 
-        // Buy 取最高 bid。
+        // 买入取最高买价。
         assert_eq!(
             book.best_price(Side::Buy),
             Some(Price::try_new(105).unwrap())
         );
 
-        // Sell 取最低 ask。
+        // 卖出取最低卖价。
         assert_eq!(
             book.best_price(Side::Sell),
             Some(Price::try_new(110).unwrap())
@@ -3089,7 +3120,7 @@ mod tests {
         let min_price = 1;
         let max_price = i64::MAX;
 
-        // ---------- Buy-only book ----------
+        // ---------- 只有买单订单簿 ----------
 
         let mut bids = ProductionOrderBook::new(policy());
 
@@ -3102,16 +3133,16 @@ mod tests {
             Some(Price::try_new(max_price).unwrap())
         );
 
-        // 单侧 fixture，另一侧必须保持为空。
+        // 单侧测试数据，另一侧必须保持为空。
         assert_eq!(bids.best_price(Side::Sell), None);
         assert!(bids.asks.is_empty());
 
-        // 两个边界价格都真实存在于 bid tree。
+        // 两个边界价格都真实存在于买价树。
         assert!(bids.bids.contains_key(&Price::try_new(min_price).unwrap()));
 
         assert!(bids.bids.contains_key(&Price::try_new(max_price).unwrap()));
 
-        // ---------- Sell-only book ----------
+        // ---------- 只有卖单订单簿 ----------
 
         let mut asks = ProductionOrderBook::new(policy());
 
@@ -3124,7 +3155,7 @@ mod tests {
             Some(Price::try_new(min_price).unwrap())
         );
 
-        // 单侧 fixture，另一侧必须保持为空。
+        // 单侧测试数据，另一侧必须保持为空。
         assert_eq!(asks.best_price(Side::Buy), None);
         assert!(asks.bids.is_empty());
 
@@ -3153,7 +3184,7 @@ mod tests {
         assert_eq!(book.arena.get(first).unwrap().next(), Some(second));
         assert_eq!(book.arena.get(second).unwrap().next(), Some(third));
 
-        // 查询按 OrderId 定位，与数值 ID 排序无关。
+        // 查询按 OrderId 定位，与数值标识符排序无关。
         for id in [30, 10, 20] {
             assert_eq!(
                 book.order(OrderId::new(id))
@@ -3164,7 +3195,7 @@ mod tests {
             );
         }
 
-        // 三次 fixture allocation。
+        // 三次测试数据分配。
         assert_eq!(book.next_queue_priority(), 3);
     }
     #[test]
@@ -3222,13 +3253,13 @@ mod tests {
 
         assert_eq!(node_snapshot(&book, &ids), nodes_before);
 
-        // Arena 的 slots + free-list 必须完整不变。
+        // Arena 的槽位 + 空闲链表必须完整不变。
         assert_eq!(book.arena.test_snapshot(), arena_before);
 
-        // Query 不得消耗 QueuePriority。
+        // 查询不得消耗 QueuePriority。
         assert_eq!(book.next_queue_priority(), next_before);
 
-        // Query 同样不能修改 allocator policy。
+        // 查询同样不能修改分配器策略。
         assert_eq!(
             book.queue_priority_allocator.policy(),
             &allocator_policy_before
@@ -3244,7 +3275,7 @@ mod tests {
 
         assert_eq!(book.orders.get(&order_id), Some(&slot));
 
-        // 只破坏 Arena，orders 索引仍存在。
+        // 只破坏 Arena，订单集合索引仍存在。
         let removed = book.arena.remove(slot).unwrap();
         assert_eq!(removed.original_order().order_id, order_id);
 
@@ -3333,11 +3364,11 @@ mod tests {
                 let mut actual_qty = 0u64;
 
                 while let Some(index) = current {
-                    // 全 book 共用 visited。
+                    // 整个订单簿共用已访问节点集合。
                     //
                     // 因此同时防：
-                    // 1. 单档位内部 cycle；
-                    // 2. 同一个 slot 被多个档位重复引用。
+                    // 1. 单档位内部环；
+                    // 2. 同一个槽位被多个档位重复引用。
                     if !visited_slots.insert(index) {
                         return Err(format!(
                             "link/cycle-or-duplicate: \
@@ -3534,9 +3565,9 @@ mod tests {
         }
 
         // ------------------------------------------------------------
-        // Arena occupied slots 必须全部属于某条价格链。
+        // Arena 已占用槽位必须全部属于某条价格链。
         //
-        // test_snapshot:
+        // 测试快照 `test_snapshot`：
         // (
         //   Vec<Option<OrderNode>>,
         //   Vec<OrderIndex>,
@@ -3560,7 +3591,7 @@ mod tests {
         }
 
         // ------------------------------------------------------------
-        // allocator next 必须严格大于所有 active priority。
+        // 分配器 `next` 必须严格大于所有活动优先级。
         // ------------------------------------------------------------
 
         if let Some(max_active_priority) = max_priority {
@@ -3575,8 +3606,8 @@ mod tests {
         }
 
         // ------------------------------------------------------------
-        // 当前 continuous book 不允许 crossed / locked book。
-        // highest bid 必须严格小于 lowest ask。
+        // 连续交易状态下，订单簿不允许买卖价格交叉或相等。
+        // 最高买价必须严格小于最低卖价。
         // ------------------------------------------------------------
 
         match (book.bids.last_key_value(), book.asks.first_key_value()) {
@@ -3681,21 +3712,21 @@ mod tests {
         assert_eq!(book.queue_priority_allocator.policy(), &policy_before);
     }
     fn assert_book_error(book: &ProductionOrderBook, expected_category: &str) {
-        // validator 调用前记录全部可观察业务状态。
+        // 校验器调用前记录全部可观察业务状态。
         let bids_before = level_snapshot(&book.bids);
         let asks_before = level_snapshot(&book.asks);
 
         let orders_before = book.orders.clone();
 
-        // 完整覆盖 Arena slots + free-list，
-        // 同时也包含所有 occupied OrderNode 状态。
+        // 完整覆盖 Arena 槽位 + 空闲链表，
+        // 同时也包含所有已占用 OrderNode 状态。
         let arena_before = book.arena.test_snapshot();
 
         let next_before = book.queue_priority_allocator.next();
 
         let policy_before = *book.queue_priority_allocator.policy();
 
-        // ---------- validate ----------
+        // ---------- 校验 ----------
 
         let error = validate_book(book).expect_err("corrupted book must fail validation");
 
@@ -3833,8 +3864,8 @@ mod tests {
         let order_id = original.order_id;
         let price = original.price;
 
-        // allocator.next() 仍然是 0，
-        // 但主动构造一个 priority=10 的 active node。
+        // `allocator.next()` 仍然是 0，
+        // 但主动构造一个优先级=10 的活动 `node`。
         let priority = QueuePriority::new(10);
 
         let mut level = PriceLevel::new();
@@ -3883,8 +3914,8 @@ mod tests {
 
         assert_eq!(validate_book(&book), Ok(()));
 
-        // 再直接向 Arena 插入一个与 book 无关的临时节点。
-        // 它从未进入 PriceLevel，也没有进入 orders map。
+        // 再直接向 Arena 插入一个与订单簿无关的临时节点。
+        // 它从未进入 PriceLevel，也没有进入订单集合映射。
         let temporary = book
             .arena
             .insert(OrderNode::new(
@@ -3895,14 +3926,14 @@ mod tests {
 
         assert!(book.arena.get(temporary).is_some());
 
-        // 真实 remove，留下 free-list slot。
+        // 真实 `remove`，留下空闲链表槽位。
         let removed = book.arena.remove(temporary).unwrap();
 
         assert_eq!(removed.original_order().order_id, OrderId::new(999));
 
         assert!(book.arena.get(temporary).is_none());
 
-        // free slot 不属于 occupied node，因此不是 orphan。
+        // 空闲槽位不属于已占用 `node`，因此不是孤立节点。
         // 活动盘口仍然完全合法。
         assert_eq!(validate_book(&book), Ok(()));
     }
@@ -4056,8 +4087,8 @@ mod tests {
 
         assert_rest_error_preserves_state(
             &mut book,
-            // 故意修改 side / price / qty；
-            // ID 相同仍必须首先命中 DuplicateOrderId。
+            // 故意修改方向 / 价格 / 数量；
+            // 标识符相同仍必须首先命中 DuplicateOrderId。
             order(1, Side::Sell, 105, 999),
             RejectReason::DuplicateOrderId,
         );
@@ -4071,7 +4102,7 @@ mod tests {
     fn rest_rejects_priority_exhaustion_without_mutation() {
         let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
 
-        // next=0，可以完成最后一次合法 allocation。
+        // `next`=0，可以完成最后一次合法分配。
         book.rest(order(1, Side::Buy, 95, 5)).unwrap();
 
         assert_eq!(book.next_queue_priority(), 1);
@@ -4116,7 +4147,7 @@ mod tests {
         // 失败不能建立第二张订单。
         assert_eq!(book.order(OrderId::new(2)), None);
 
-        // allocator 同样没有被消耗。
+        // 分配器同样没有被消耗。
         assert_eq!(book.next_queue_priority(), 1);
 
         let level = book.bids.get(&Price::try_new(100).unwrap()).unwrap();
@@ -4127,13 +4158,13 @@ mod tests {
     #[test]
     fn rest_panics_before_mutation_if_candidate_would_cross_or_lock() {
         let cases = [
-            // Buy == best ask：locked。
+            // 买入 == 最优卖价：价格相等。
             (order(1, Side::Sell, 105, 5), order(2, Side::Buy, 105, 1)),
-            // Buy > best ask：crossed。
+            // 买入 > 最优卖价：价格交叉。
             (order(1, Side::Sell, 105, 5), order(2, Side::Buy, 110, 1)),
-            // Sell == best bid：locked。
+            // 卖出 == 最优买价：价格相等。
             (order(1, Side::Buy, 95, 5), order(2, Side::Sell, 95, 1)),
-            // Sell < best bid：crossed。
+            // 卖出 < 最优买价：价格交叉。
             (order(1, Side::Buy, 95, 5), order(2, Side::Sell, 90, 1)),
         ];
 
@@ -4266,7 +4297,7 @@ mod tests {
             assert_eq!(removed.remaining(), 7);
             assert_eq!(removed.priority(), QueuePriority::new(0));
 
-            // 低层删除必须清空 intrusive links。
+            // 低层删除必须清空侵入式链接。
             assert_eq!(removed.prev(), None);
             assert_eq!(removed.next(), None);
 
@@ -4284,7 +4315,7 @@ mod tests {
                 }
             }
 
-            // Cancel 不消费 allocator。
+            // 取消不消费分配器。
             assert_eq!(book.next_queue_priority(), next_before);
 
             assert_eq!(book.queue_priority_allocator.policy(), &policy_before);
@@ -4345,7 +4376,7 @@ mod tests {
 
             assert_eq!(tail_node.prev(), Some(head));
 
-            // survivor priority 不得重排。
+            // 剩余节点优先级不得重排。
             assert_eq!(head_node.priority(), QueuePriority::new(expected[0] - 1));
 
             assert_eq!(tail_node.priority(), QueuePriority::new(expected[1] - 1));
@@ -4387,7 +4418,7 @@ mod tests {
             Some(Price::try_new(95).unwrap())
         );
 
-        // 原 best level 已经空，因此必须从树中消失。
+        // 原最优价档已经空，因此必须从树中消失。
         assert!(!book.bids.contains_key(&Price::try_new(100).unwrap()));
 
         assert_eq!(validate_book(&book), Ok(()));
@@ -4453,14 +4484,14 @@ mod tests {
 
         assert_eq!(book.next_queue_priority(), 1);
 
-        // Arena free-list 应复用刚释放的 slot。
+        // Arena 空闲链表应复用刚释放的槽位。
         book.rest(order(20, Side::Buy, 95, 7)).unwrap();
 
         let new_slot = *book.orders.get(&OrderId::new(20)).unwrap();
 
         assert_eq!(new_slot, old_slot, "canceled Arena slot should be reused");
 
-        // 相同物理 slot 已属于全新的 OrderId。
+        // 相同物理槽位已属于全新的 OrderId。
         assert_eq!(
             book.arena.get(new_slot).unwrap().original_order().order_id,
             OrderId::new(20)
@@ -4471,7 +4502,7 @@ mod tests {
             QueuePriority::new(1)
         );
 
-        // 旧 ID mapping 已彻底解除，不能因为 slot reuse 命中新订单。
+        // 旧标识符映射已彻底解除，不能因为槽位复用命中新订单。
         assert_eq!(book.order(OrderId::new(10)), None);
 
         assert_eq!(
@@ -4507,7 +4538,7 @@ mod tests {
             assert_eq!(removed.prev(), None);
             assert_eq!(removed.next(), None);
 
-            // Cancel 不能消耗 / 重排 QueuePriority。
+            // 取消不能消耗 / 重排 QueuePriority。
             assert_eq!(book.next_queue_priority(), next_before);
 
             assert_eq!(book.order(OrderId::new(target)), None);
@@ -4540,7 +4571,7 @@ mod tests {
             let head_node = book.arena.get(head).unwrap();
             let tail_node = book.arena.get(tail).unwrap();
 
-            // FIFO survivor 顺序。
+            // 先进先出剩余节点顺序。
             assert_eq!(
                 head_node.original_order().order_id,
                 OrderId::new(expected_ids[0])
@@ -4557,7 +4588,7 @@ mod tests {
             assert_eq!(tail_node.prev(), Some(head));
             assert_eq!(tail_node.next(), None);
 
-            // survivor priority 保持原值，不能因为 Cancel 压缩。
+            // 剩余节点优先级保持原值，不能因为取消压缩。
             assert_eq!(
                 head_node.priority(),
                 QueuePriority::new(expected_ids[0] - 1)
@@ -4577,17 +4608,17 @@ mod tests {
         let asks_before = level_snapshot(&book.asks);
         let orders_before = book.orders.clone();
 
-        // 完整包含 occupied slots + free-list。
+        // 完整包含已占用槽位 + 空闲链表。
         let arena_before = book.arena.test_snapshot();
 
         let next_before = book.queue_priority_allocator.next();
 
         let policy_before = *book.queue_priority_allocator.policy();
 
-        // 这里必须直接调用 cancel。
+        // 这里必须直接调用取消。
         //
-        // 不允许先调用 order() 或 validate_book()，
-        // 因为当前 book 本身就是有意构造的损坏状态。
+        // 不允许先调用 `order()` 或 `validate_book()`，
+        // 因为当前订单簿本身就是有意构造的损坏状态。
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _ = book.cancel(order_id);
         }));
@@ -4643,7 +4674,7 @@ mod tests {
 
         assert_eq!(removed.original_order().order_id, order_id);
 
-        // orders 与 PriceLevel 故意保留，只有 Arena slot 被释放。
+        // 订单集合与 PriceLevel 故意保留，只有 Arena 槽位被释放。
         assert!(book.orders.contains_key(&order_id));
         assert!(book.arena.get(slot).is_none());
 
@@ -4662,7 +4693,7 @@ mod tests {
 
         let second_slot = *book.orders.get(&second_id).unwrap();
 
-        // 故意让 first_id 指向第二张 live order。
+        // 故意让 first_id 指向第二张有效订单。
         book.orders.insert(first_id, second_slot);
 
         assert_cancel_panics_without_mutation(&mut book, first_id);
@@ -4680,13 +4711,13 @@ mod tests {
         let removed = book.arena.remove(slot).unwrap();
         let priority = removed.priority();
 
-        // 原节点真实位于 bids[100]，
-        // 但替换后的节点自述为 Sell，因此 cancel 会寻找 asks[100]。
+        // 原节点真实位于 `bids`[100]，
+        // 但替换后的节点自述为卖出，因此取消会寻找 `asks`[100]。
         let replacement = OrderNode::new(order(1, Side::Sell, 100, 5), priority);
 
         assert_eq!(book.arena.insert(replacement).unwrap(), slot);
 
-        // asks[100] 不存在。
+        // `asks`[100] 不存在。
         assert!(!book.asks.contains_key(&Price::try_new(100).unwrap()));
 
         assert_cancel_panics_without_mutation(&mut book, order_id);
@@ -4704,8 +4735,8 @@ mod tests {
         let removed = book.arena.remove(slot).unwrap();
         let priority = removed.priority();
 
-        // PriceLevel 仍然是真实的 bids[100]，
-        // 但节点现在自述 price=101。
+        // PriceLevel 仍然是真实的 `bids`[100]，
+        // 但节点现在自述价格=101。
         let replacement = OrderNode::new(order(1, Side::Buy, 101, 5), priority);
 
         assert_eq!(book.arena.insert(replacement).unwrap(), slot);
@@ -4731,7 +4762,7 @@ mod tests {
             })
             .unwrap();
 
-            // Arena 与 ID map 都仍然存在；
+            // Arena 与标识符映射都仍然存在；
             // 只删除节点应该所属的准确价格档。
             let removed_level = match side {
                 Side::Buy => book.bids.remove(&price),
@@ -4878,7 +4909,7 @@ mod tests {
 
         assert_eq!(book.order(OrderId::new(1)), None);
 
-        // Taker 没有被偷偷挂进 production book。
+        // 吃单方没有被偷偷挂进生产簿。
         assert_eq!(book.order(OrderId::new(2)), None);
 
         assert_eq!(book.next_queue_priority(), next_before);
@@ -4889,10 +4920,10 @@ mod tests {
     fn next_fill_trade_selects_best_price_then_fifo_head() {
         let mut book = ProductionOrderBook::new(policy());
 
-        // 故意先挂更差 ask。
+        // 故意先挂更差卖价。
         book.rest(order(90, Side::Sell, 110, 5)).unwrap();
 
-        // best ask 同价两张，ID 顺序故意与 FIFO 无关。
+        // 最优卖价同价两张，标识符顺序故意与先进先出无关。
         book.rest(order(30, Side::Sell, 105, 5)).unwrap();
 
         book.rest(order(10, Side::Sell, 105, 5)).unwrap();
@@ -4937,16 +4968,16 @@ mod tests {
 
         assert_eq!(trade.maker_order_id, OrderId::new(1));
 
-        // 第一 maker 被完整吃掉。
+        // 第一挂单被完整吃掉。
         assert_eq!(book.order(OrderId::new(1)), None);
 
-        // 本次不能继续吃第二 maker。
+        // 本次不能继续吃第二挂单。
         let second = book.order(OrderId::new(2)).unwrap();
 
         assert_eq!(second.remaining(), 4);
         assert_eq!(second.priority(), second_priority);
 
-        // incoming 只扣这一笔。
+        // 新到订单只扣这一笔。
         assert_eq!(incoming.remaining(), 7);
 
         let level = book.asks.get(&Price::try_new(105).unwrap()).unwrap();
@@ -5028,7 +5059,7 @@ mod tests {
     fn next_fill_trade_buy_with_empty_asks_is_pure_noop() {
         let mut book = ProductionOrderBook::new(policy());
 
-        // 只建立同侧 bids，明确 asks 为空。
+        // 只建立同侧 `bids`，明确 `asks` 为空。
         book.rest(order(1, Side::Buy, 95, 10)).unwrap();
 
         assert!(book.asks.is_empty());
@@ -5043,7 +5074,7 @@ mod tests {
     fn next_fill_trade_sell_with_empty_bids_is_pure_noop() {
         let mut book = ProductionOrderBook::new(policy());
 
-        // 只建立同侧 asks，明确 bids 为空。
+        // 只建立同侧 `asks`，明确 `bids` 为空。
         book.rest(order(1, Side::Sell, 105, 10)).unwrap();
 
         assert!(book.bids.is_empty());
@@ -5198,7 +5229,7 @@ mod tests {
                 &[
                     TradeId::new(1),
                     TradeId::new(2),
-                    // 多余 ID 必须被忽略。
+                    // 多余标识符必须被忽略。
                     TradeId::new(3),
                 ],
             )
@@ -5214,10 +5245,10 @@ mod tests {
 
         assert_eq!(incoming.remaining(), 0);
 
-        // maker 2 partial。
+        // 挂单 2 部分成交。
         assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 1);
 
-        // 后续仍可成交 maker 完全未触碰。
+        // 后续仍可成交挂单完全未触碰。
         assert_eq!(book.order(OrderId::new(3)).unwrap(), &third_before);
 
         assert_eq!(validate_book(&book), Ok(()));
@@ -5245,10 +5276,10 @@ mod tests {
 
         assert_eq!(incoming.remaining(), 7);
 
-        // 110 > taker limit 105。
+        // 110 > 吃单方限价 105。
         assert_eq!(book.order(OrderId::new(2)).unwrap(), &next_level_before);
 
-        // incoming 余量没有自动 rest。
+        // 新到订单余量没有自动挂单。
         assert_eq!(book.order(OrderId::new(100)), None);
 
         assert_eq!(book.next_queue_priority(), next_priority_before);
@@ -5321,10 +5352,10 @@ mod tests {
 
         book.rest(order(3, Side::Sell, 110, 5)).unwrap();
 
-        // qty=8，需要：
-        // id1 2
-        // id2 3
-        // id3 3
+        // 数量=8，需要：
+        // 订单 1 的成交量为 2
+        // 订单 2 的成交量为 3
+        // 订单 3 的成交量为 3
         // 共 3 个 TradeId。
         let mut incoming = IncomingOrder::new(order(100, Side::Buy, 110, 8));
 
@@ -5396,7 +5427,7 @@ mod tests {
             assert_eq!(plan.side, candidate.side);
             assert_eq!(plan.price, candidate.price);
 
-            // common preflight 必须完全只读。
+            // 公共预检必须完全只读。
             assert_eq!(level_snapshot(&book.bids), bids_before);
             assert_eq!(level_snapshot(&book.asks), asks_before);
             assert_eq!(book.orders, orders_before);
@@ -5498,7 +5529,7 @@ mod tests {
         // 115 不可成交，完全没动。
         assert_eq!(book.order(OrderId::new(90)).unwrap().remaining(), 9);
 
-        // GTC remainder = 3。
+        // GTC 余量 = 3。
         let resting = book.order(OrderId::new(200)).unwrap();
 
         assert_eq!(resting.remaining(), 3);
@@ -5506,7 +5537,7 @@ mod tests {
         assert_eq!(resting.original_order().price, Price::try_new(110).unwrap());
         assert_eq!(resting.original_order().qty, Qty::try_new(3).unwrap());
 
-        // 只有 remainder rest 消耗一个 priority。
+        // 只有余量挂单消耗一个优先级。
         assert_eq!(book.next_queue_priority(), next_before + 1);
 
         assert_eq!(validate_book(&book), Ok(()));
@@ -5531,7 +5562,7 @@ mod tests {
 
             assert_eq!(book.order(OrderId::new(1)), None);
 
-            // Taker exact-filled，不应该进入 orders。
+            // 吃单方全部成交，不应该进入订单集合。
             assert_eq!(book.order(OrderId::new(2)), None);
 
             assert_eq!(book.next_queue_priority(), next_before);
@@ -5543,8 +5574,8 @@ mod tests {
     fn place_limit_gtc_exact_fill_succeeds_when_priority_allocator_is_exhausted() {
         let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
 
-        // 唯一一次合法 allocation：
-        // maker priority=0，之后 allocator.next=1 且 exhausted。
+        // 唯一一次合法分配：
+        // 挂单优先级=0，之后 `allocator.next`=1 且已耗尽。
         book.rest(order(1, Side::Sell, 105, 5)).unwrap();
 
         assert_eq!(book.next_queue_priority(), 1);
@@ -5564,17 +5595,17 @@ mod tests {
         assert_eq!(trades[0].qty, Qty::try_new(5).unwrap());
         assert_eq!(trades[0].maker_side, Side::Sell);
 
-        // maker exact full 后移除。
+        // 挂单全部成交后移除。
         assert_eq!(book.order(OrderId::new(1)), None);
 
-        // taker 也 exact fill，不允许 rest。
+        // 吃单方也全部成交，不允许挂单。
         assert_eq!(book.order(OrderId::new(2)), None);
 
         assert!(book.asks.is_empty());
         assert!(book.bids.is_empty());
 
-        // Exact fill 必须完全绕过 rest priority preflight，
-        // allocator 已 exhausted 也不能影响成交。
+        // 全部成交必须完全绕过挂单优先级预检，
+        // 分配器已耗尽也不能影响成交。
         assert_eq!(book.next_queue_priority(), 1);
         assert!(book.queue_priority_allocator.is_exhausted());
 
@@ -5584,23 +5615,23 @@ mod tests {
     fn place_limit_gtc_remainder_priority_exhaustion_is_atomic_before_first_fill() {
         let mut book = ProductionOrderBook::new(policy_with_ceiling(1));
 
-        // 与 exact-fill 测试完全相同的初始状态。
+        // 与全部成交测试完全相同的初始状态。
         //
-        // maker priority=0；
-        // rest 完成后 next=1，并命中 synthetic ceiling。
+        // 挂单优先级=0；
+        // 挂单完成后 `next`=1，并命中测试用上限。
         book.rest(order(1, Side::Sell, 105, 5)).unwrap();
 
         assert_eq!(book.next_queue_priority(), 1);
         assert!(book.queue_priority_allocator.is_exhausted());
         assert_eq!(validate_book(&book), Ok(()));
 
-        // Buy qty=8：
+        // 买入数量=8：
         //
-        // 计划成交 maker qty=5；
-        // residual qty=3；
+        // 计划成交挂单数量=5；
+        // 余量数量=3；
         // 实际只需要一笔成交，所以一个 TradeId 是足量的。
         //
-        // 必须在执行这第一笔成交之前，由 residual rest preflight
+        // 必须在执行这第一笔成交之前，由余量挂单预检
         // 返回 PrioritySpaceExhaustion。
         assert_place_error_preserves_state(
             &mut book,
@@ -5609,15 +5640,15 @@ mod tests {
             RejectReason::PrioritySpaceExhaustion,
         );
 
-        // helper 已比较完整状态，这里再直接锁定最关键的业务证据：
-        // maker 根本没被成交。
+        // 辅助函数已比较完整状态，这里再直接锁定最关键的业务证据：
+        // 挂单根本没被成交。
         let maker = book.order(OrderId::new(1)).unwrap();
 
         assert_eq!(maker.remaining(), 5);
         assert_eq!(maker.original_order().side, Side::Sell);
         assert_eq!(maker.original_order().price, Price::try_new(105).unwrap());
 
-        // rejected taker 未进入 ID index / book。
+        // 已拒绝吃单方未进入标识符索引 / 订单簿。
         assert_eq!(book.order(OrderId::new(2)), None);
 
         assert_eq!(book.next_queue_priority(), 1);
@@ -5684,7 +5715,7 @@ mod tests {
 
         book.rest(order(1, Side::Sell, 105, 5)).unwrap();
 
-        // 同 ID，同时也是可以成交的 Buy。
+        // 同标识符，同时也是可以成交的买入。
         assert_place_error_preserves_state(
             &mut book,
             order(1, Side::Buy, 110, 10),
@@ -5711,7 +5742,7 @@ mod tests {
 
         let policy_before = *book.queue_priority_allocator.policy();
 
-        // qty=8 需要 3 笔，只给 2 个 TradeId。
+        // 数量=8 需要 3 笔，只给 2 个 TradeId。
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _ = book.place_limit_gtc(
                 order(100, Side::Buy, 110, 8),
@@ -5750,7 +5781,7 @@ mod tests {
         // 更差价格故意先挂，证明匹配不是按插入全局顺序。
         book.rest(order(90, Side::Buy, 85, 9)).unwrap();
 
-        // best bid，同价 FIFO。
+        // 最优买价，同价先进先出。
         book.rest(order(30, Side::Buy, 95, 2)).unwrap();
 
         book.rest(order(10, Side::Buy, 95, 3)).unwrap();
@@ -5769,7 +5800,7 @@ mod tests {
 
         assert_eq!(trades.len(), 3);
 
-        // 95 的 FIFO head。
+        // 95 的先进先出头节点。
         assert_eq!(trades[0].trade_id, TradeId::new(200));
         assert_eq!(trades[0].maker_order_id, OrderId::new(30));
         assert_eq!(trades[0].taker_order_id, OrderId::new(200));
@@ -5777,7 +5808,7 @@ mod tests {
         assert_eq!(trades[0].qty, Qty::try_new(2).unwrap());
         assert_eq!(trades[0].maker_side, Side::Buy);
 
-        // 95 的第二个 FIFO maker。
+        // 95 的第二个先进先出挂单。
         assert_eq!(trades[1].trade_id, TradeId::new(201));
         assert_eq!(trades[1].maker_order_id, OrderId::new(10));
         assert_eq!(trades[1].taker_order_id, OrderId::new(200));
@@ -5793,7 +5824,7 @@ mod tests {
         assert_eq!(trades[2].qty, Qty::try_new(2).unwrap());
         assert_eq!(trades[2].maker_side, Side::Buy);
 
-        // 总成交 7，GTC remainder=3。
+        // 总成交 7，GTC 余量=3。
         let resting = book.order(OrderId::new(200)).unwrap();
 
         assert_eq!(resting.remaining(), 3);
@@ -5801,12 +5832,12 @@ mod tests {
         assert_eq!(resting.original_order().price, Price::try_new(90).unwrap());
         assert_eq!(resting.original_order().qty, Qty::try_new(3).unwrap());
 
-        // residual rest 获得撮合前 allocator 的下一 priority。
+        // 余量挂单获得撮合前分配器的下一优先级。
         assert_eq!(resting.priority(), QueuePriority::new(next_before));
 
         assert_eq!(book.next_queue_priority(), next_before + 1);
 
-        // 被完整成交的 maker 已消失。
+        // 被完整成交的挂单已消失。
         assert_eq!(book.order(OrderId::new(30)), None);
         assert_eq!(book.order(OrderId::new(10)), None);
         assert_eq!(book.order(OrderId::new(40)), None);
@@ -5815,8 +5846,8 @@ mod tests {
         assert_eq!(book.order(OrderId::new(90)).unwrap().remaining(), 9);
 
         // 成交完成后：
-        // best bid = 85
-        // residual sell 成为 best ask = 90
+        // 最优买价 = 85
+        // 余量卖出成为最优卖价 = 90
         assert_eq!(
             book.best_price(Side::Buy),
             Some(Price::try_new(85).unwrap())
@@ -5856,9 +5887,9 @@ mod tests {
 
         let next_before = book.next_queue_priority();
 
-        // Buy qty=5:
-        // - full maker 2
-        // - residual 3 rest 到 bid@110
+        // 买入数量=5:
+        // - 全部成交挂单 2
+        // - 余量 3 挂单到买价@110
         let trades = book
             .place_limit_gtc(order(100, Side::Buy, 110, 5), &[TradeId::new(10)])
             .unwrap();
@@ -5871,13 +5902,13 @@ mod tests {
         assert_eq!(trades[0].qty, Qty::try_new(2).unwrap());
         assert_eq!(trades[0].maker_side, Side::Sell);
 
-        // 旧 maker 已从 ID index 消失。
+        // 旧挂单已从标识符索引消失。
         assert_eq!(book.order(maker_id), None);
 
         assert!(!book.orders.contains_key(&maker_id));
 
-        // Arena free-list 是 LIFO。
-        // maker pop_front 释放的 slot 应立即被 residual rest 复用。
+        // Arena 空闲链表是后进先出。
+        // 挂单 pop_front 释放的槽位应立即被余量挂单复用。
         assert_eq!(book.orders.get(&taker_id), Some(&maker_slot));
 
         let taker = book.order(taker_id).unwrap();
@@ -5888,14 +5919,14 @@ mod tests {
 
         assert_eq!(taker.original_order().price, Price::try_new(110).unwrap());
 
-        // 复用 slot ≠ 复用 priority。
+        // 复用槽位 ≠ 复用优先级。
         assert_ne!(taker.priority(), maker_priority);
 
         assert_eq!(taker.priority(), QueuePriority::new(next_before));
 
         assert_eq!(book.next_queue_priority(), next_before + 1);
 
-        // slot 内现在必须是新 taker，而非 stale maker。
+        // 槽位内现在必须是新吃单方，而非失效挂单。
         assert_eq!(
             book.arena
                 .get(maker_slot)
@@ -5934,13 +5965,13 @@ mod tests {
             ProductionOrderBook::new(policy())
         }
 
-        /// 比较完整 Production 状态。
+        /// 比较完整生产簿状态。
         ///
         /// 包括：
         /// - 双侧 BTreeMap 档位
-        /// - OrderId index
-        /// - Arena slots/free-list
-        /// - QueuePriority allocator
+        /// - OrderId 索引
+        /// - Arena 槽位/空闲链表
+        /// - QueuePriority 分配器
         ///
         /// 只用于失败路径的原子性验证。
         fn assert_failure_atomic<F>(book: &mut ProductionOrderBook, action: F)
@@ -6054,7 +6085,7 @@ mod tests {
             ] {
                 let mut book = book();
 
-                // 故意让 OrderId 数值顺序与 FIFO 顺序不同。
+                // 故意让 OrderId 数值顺序与先进先出顺序不同。
                 book.rest(order(20, maker_side, worse, 4)).unwrap();
                 book.rest(order(30, maker_side, better, 3)).unwrap();
                 book.rest(order(10, maker_side, better, 5)).unwrap();
@@ -6096,11 +6127,11 @@ mod tests {
                     assert!(trade.qty.get() > 0);
                 }
 
-                // 前两张 maker 完全成交。
+                // 前两张挂单完全成交。
                 assert!(book.order(OrderId::new(30)).is_none());
                 assert!(book.order(OrderId::new(10)).is_none());
 
-                // 最后一张 maker 部分成交。
+                // 最后一张挂单部分成交。
                 let remaining = book.order(OrderId::new(20)).unwrap();
                 assert_eq!(remaining.remaining(), 2);
                 assert_eq!(remaining.original_order().qty.get(), 4);
@@ -6137,7 +6168,7 @@ mod tests {
                 assert_eq!(trades.len(), 1);
                 assert_eq!(trades[0].qty.get(), 3);
 
-                // Maker 完全成交，市价余量 7 不允许挂簿。
+                // 挂单完全成交，市价余量 7 不允许挂簿。
                 assert!(book.orders.is_empty());
                 assert!(book.bids.is_empty());
                 assert!(book.asks.is_empty());
@@ -6157,7 +6188,7 @@ mod tests {
                 book.rest(order(1, maker_side, 100, 10)).unwrap();
 
                 assert_failure_atomic(&mut book, |book| {
-                    // 重复 ID 与 TradeId 不足同时成立。
+                    // 重复标识符与 TradeId 不足同时成立。
                     // DuplicateOrderId 必须优先返回。
                     let result = book.execute_market_by_base(market(1, taker_side, 5), &[]);
 
@@ -6253,8 +6284,8 @@ mod tests {
             ] {
                 let mut book = book();
 
-                // 插入顺序刻意不同于价格和 ID 顺序。
-                // 边界价 100：ID=40 必须先于 ID=10。
+                // 插入顺序刻意不同于价格和标识符顺序。
+                // 边界价 100：标识符=40 必须先于标识符=10。
                 for (id, price, qty) in [
                     (90, farther, 2),
                     (40, 100, 4),
@@ -6270,7 +6301,7 @@ mod tests {
                     market_band_worst: Some(p(100)),
                 };
 
-                // 完整扫描：允许 better 和两个等于边界的 maker。
+                // 完整扫描：允许更优价格和两个等于边界的挂单。
                 assert_failure_atomic(&mut book, |book| {
                     assert_eq!(
                         book.preflight_market_by_base_with_protection(
@@ -6286,7 +6317,7 @@ mod tests {
                     );
                 });
 
-                // 数量不足以耗尽第二张 maker：仍必须遵循同价 FIFO。
+                // 数量不足以耗尽第二张挂单：仍必须遵循同价先进先出。
                 assert_failure_atomic(&mut book, |book| {
                     assert_eq!(
                         book.preflight_market_by_base_with_protection(
@@ -6330,7 +6361,7 @@ mod tests {
                     );
                 });
 
-                // 首档直接越界：不能跳过它寻找其他 maker。
+                // 首档直接越界：不能跳过它寻找其他挂单。
                 book.rest(order(50, maker_side, outside, 1)).unwrap();
 
                 assert_failure_atomic(&mut book, |book| {
@@ -6344,7 +6375,7 @@ mod tests {
                     );
                 });
 
-                // 再添加多档，其中有同价 FIFO。
+                // 再添加多档，其中有同价先进先出。
                 for (id, price, qty) in [
                     (90, farther, 2),
                     (40, 100, 4),
@@ -6359,7 +6390,7 @@ mod tests {
                     market_band_worst: None,
                 };
 
-                // 无 user/band：必须扫描全部五个 maker。
+                // 无用户/市场价格区间：必须扫描全部五个挂单。
                 assert_failure_atomic(&mut book, |book| {
                     assert_eq!(
                         book.preflight_market_by_base_with_protection(
@@ -6393,7 +6424,7 @@ mod tests {
                     market_band_worst: Some(p(100_000)),
                 };
 
-                // Duplicate 优先于非法 bps。
+                // 重复标识符优先于非法基点。
                 assert_failure_atomic(&mut book, |book| {
                     let mut incoming = market(1, side, 5);
                     incoming.market_protection = Some(MarketProtection {
@@ -6407,7 +6438,7 @@ mod tests {
                     );
                 });
 
-                // 非法 bps：固定 wire code 3007。
+                // 非法基点：固定线协议代码 3007。
                 assert_failure_atomic(&mut book, |book| {
                     let mut incoming = market(100, side, 5);
                     incoming.market_protection = Some(MarketProtection {
@@ -6423,7 +6454,7 @@ mod tests {
                     ));
                 });
 
-                // 显式 worst_price 未对齐 tick=10。
+                // 显式 worst_price 未对齐价格步长=10。
                 assert_failure_atomic(&mut book, |book| {
                     let mut incoming = market(100, side, 5);
                     incoming.market_protection = Some(MarketProtection {
@@ -6438,8 +6469,8 @@ mod tests {
                 });
             }
 
-            // Buy 向上扩张滑点边界，超过 i64::MAX。
-            // 即使 market band 有效，也必须先传播算术错误。
+            // 买入向上扩张滑点边界，超过 `i64::MAX`。
+            // 即使市场价格区间有效，也必须先传播算术错误。
             let mut book = book();
             book.rest(order(1, Side::Sell, 100_000, 5)).unwrap();
 
@@ -6590,7 +6621,7 @@ mod tests {
                     ]
                 );
 
-                // 已成交三张 maker 被移除，越界及更远 maker 保留。
+                // 已成交三张挂单被移除，越界及更远挂单保留。
                 for id in [30, 40, 10] {
                     assert!(book.order(OrderId::new(id)).is_none());
                 }
@@ -6660,7 +6691,7 @@ mod tests {
                     assert_eq!(validate_book(&book), Ok(()));
                 }
 
-                // maker 严格部分成交：保留 slot、priority 和 FIFO 后继。
+                // 挂单严格部分成交：保留槽位、优先级和先进先出后继。
                 let mut book = book();
                 book.rest(order(1, maker_side, 100, 10)).unwrap();
                 book.rest(order(2, maker_side, outside, 4)).unwrap();
@@ -6725,7 +6756,7 @@ mod tests {
                     );
                 });
 
-                // 首个 maker 越界时，仅产生保护事件、不消耗 TradeId。
+                // 首个挂单越界时，仅产生保护事件、不消耗 TradeId。
                 book.rest(order(50, maker_side, outside, 1)).unwrap();
                 assert_failure_atomic(&mut book, |book| {
                     assert_eq!(
@@ -6744,7 +6775,7 @@ mod tests {
                     );
                 });
 
-                // 没有任一保护候选时，扫完价格/FIFO 的完整前缀。
+                // 没有任一保护候选时，扫完价格/先进先出的完整前缀。
                 for (id, price, qty) in [
                     (90, farther, 2),
                     (40, 100, 4),
@@ -6816,7 +6847,7 @@ mod tests {
                     market_band_worst: Some(p(100_000)),
                 };
 
-                // Duplicate 的优先级高于非法 bps。
+                // 重复标识符的优先级高于非法基点。
                 assert_failure_atomic(&mut book, |book| {
                     let mut incoming = market(1, side, 5);
                     incoming.market_protection = Some(MarketProtection {
@@ -6850,7 +6881,7 @@ mod tests {
                     ), Err(RejectReason::InvalidTick));
                 });
 
-                // 无保护：两张 maker 两笔成交，单个 TradeId 必须在修改前 panic。
+                // 无保护：两张挂单两笔成交，单个 TradeId 必须在修改前触发不变量断言。
                 book.rest(order(2, maker_side, 100_000, 5)).unwrap();
                 assert_failure_atomic(&mut book, |book| {
                     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -6985,7 +7016,7 @@ mod tests {
             }
         }
 
-        // 对比全部 Production 内部状态，而不仅是 open orders。
+        // 对比全部生产簿内部状态，而不仅是活动订单。
         fn assert_failure_atomic<F>(book: &mut ProductionOrderBook, action: F)
         where
             F: FnOnce(&mut ProductionOrderBook),
@@ -7153,7 +7184,7 @@ mod tests {
 
                 let next = book.next_queue_priority();
 
-                // 先成交 3 lots，再因剩余 50 不足 1 lot 停止。
+                // 先成交 3 手，再因剩余 50 不足 1 手停止。
                 let result = book
                     .execute_market_by_quote(
                         market(101, taker_side, 350),
@@ -7291,7 +7322,7 @@ mod tests {
                     worst_price: None,
                 };
 
-                // Duplicate 必须优先于非法 bps。
+                // 重复标识符必须优先于非法基点。
                 let mut incoming = market(1, side, 1000);
                 incoming.market_protection = Some(invalid_bps.clone());
 
@@ -7303,7 +7334,7 @@ mod tests {
                     RejectReason::DuplicateOrderId,
                 );
 
-                // ID 不重复，应返回 3007。
+                // 标识符不重复，应返回 3007。
                 let mut incoming = market(100, side, 1000);
                 incoming.market_protection = Some(invalid_bps);
 
@@ -7315,7 +7346,7 @@ mod tests {
                     RejectReason::InvalidSlippageBps,
                 );
 
-                // 显式保护价格未对齐 tick=10。
+                // 显式保护价格未对齐价格步长=10。
                 let mut incoming = market(100, side, 1000);
                 incoming.market_protection = Some(MarketProtection {
                     max_slippage_bps: None,
@@ -7354,8 +7385,8 @@ mod tests {
                 RejectReason::ArithmeticOverflow,
             );
 
-            // 前序 fill 已规划成功，后续 maker 的 tick 错误
-            // 不得导致部分 mutation。
+            // 前序成交已规划成功，后续挂单的价格步长错误
+            // 不得导致部分状态变更。
             for (side, maker_side, better) in
                 [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
             {
@@ -7444,7 +7475,7 @@ mod tests {
             for (side, maker_side, better, outside, farther, user, band, source) in cases {
                 let mut book = ProductionOrderBook::new(policy());
 
-                // ID 数值顺序故意不同于 FIFO。
+                // 标识符数值顺序故意不同于先进先出。
                 for (id, price, qty) in [
                     (90, farther, 2),
                     (40, 100, 4),
@@ -7497,7 +7528,7 @@ mod tests {
             ] {
                 let bounded = protection_context(Some(100));
 
-                // 空簿，不生成 stop，预算全部 unused。
+                // 空簿，不生成终止，预算全部未使用。
                 let mut book = book();
                 assert_failure_atomic(&mut book, |book| {
                     assert_eq!(
@@ -7510,7 +7541,7 @@ mod tests {
                     );
                 });
 
-                // 首档越界：即使预算不足一个 lot，仍优先触发保护。
+                // 首档越界：即使预算不足一个手，仍优先触发保护。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, outside, 5)).unwrap();
                 book.rest(order(2, maker_side, farther, 5)).unwrap();
@@ -7550,7 +7581,7 @@ mod tests {
                     );
                 });
 
-                // 首档在保护范围内，余额不足 1 lot，正常 dust，无 trigger。
+                // 首档在保护范围内，余额不足 1 手，正常不足一手的预算，无触发。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, 100, 5)).unwrap();
                 assert_failure_atomic(&mut book, |book| {
@@ -7564,7 +7595,7 @@ mod tests {
                     );
                 });
 
-                // Maker 部分成交：只规划 3 lots，余 50 quote，原簿只读不变。
+                // 挂单部分成交：只规划 3 手，余 50 报价资产，原簿只读不变。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, 100, 10)).unwrap();
                 assert_failure_atomic(&mut book, |book| {
@@ -7583,7 +7614,7 @@ mod tests {
                     );
                 });
 
-                // 前序成交之后的 dust：下一 maker 在保护范围内，无 stop。
+                // 前序成交之后的不足一手的预算：下一挂单在保护范围内，无终止。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, better, 1)).unwrap();
                 book.rest(order(2, maker_side, 100, 5)).unwrap();
@@ -7603,7 +7634,7 @@ mod tests {
                     );
                 });
 
-                // 前序成交后仅余 5 quote：越界优先于 dust。
+                // 前序成交后仅余 5 报价资产：越界优先于不足一手的预算。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, better, 1)).unwrap();
                 book.rest(order(2, maker_side, outside, 5)).unwrap();
@@ -7623,7 +7654,7 @@ mod tests {
                     );
                 });
 
-                // 无用户保护、无 band，按 BTreeMap + FIFO 扫完五个 maker。
+                // 无用户保护、无市场价格区间，按 BTreeMap + 先进先出扫完五个挂单。
                 let mut book = ProductionOrderBook::new(policy());
                 for (id, price, qty) in [
                     (90, farther, 2),
@@ -7666,7 +7697,7 @@ mod tests {
                 [(Side::Buy, Side::Sell, 111), (Side::Sell, Side::Buy, 99)]
             {
                 let mut book = book();
-                // 价格不满足 tick=10，但已越界，必须先 stop 而非报数学错误。
+                // 价格不满足价格步长=10，但已越界，必须先终止而非报数学错误。
                 book.rest(order(1, maker_side, outside, 2)).unwrap();
                 assert_failure_atomic(&mut book, |book| {
                     assert_eq!(
@@ -7789,7 +7820,7 @@ mod tests {
             for (side, maker_side, better, outside, farther, user, band, source) in cases {
                 let mut book = ProductionOrderBook::new(policy());
 
-                // 挂单源顺序故意与价格优先和 FIFO 顺序不同。
+                // 挂单源顺序故意与价格优先和先进先出顺序不同。
                 for (id, price, qty) in [
                     (90, farther, 2),
                     (40, 100, 4),
@@ -7838,12 +7869,12 @@ mod tests {
                 // 完整事件原序和金额比较。
                 assert_eq!(actual, expected);
 
-                // 已成交 maker 删除。
+                // 已成交挂单删除。
                 for id in [30, 40, 10] {
                     assert!(book.order(OrderId::new(id)).is_none());
                 }
 
-                // 越界 maker 和更远 maker 均未改变。
+                // 越界挂单和更远挂单均未改变。
                 assert_eq!(book.order(OrderId::new(50)).unwrap().remaining(), 1);
                 assert_eq!(book.order(OrderId::new(90)).unwrap().remaining(), 2);
 
@@ -7863,7 +7894,7 @@ mod tests {
             {
                 let context = protection_context(Some(100));
 
-                // 空簿：预算全部 unused。
+                // 空簿：预算全部未使用。
                 let mut book = ProductionOrderBook::new(policy());
 
                 assert_failure_atomic(&mut book, |book| {
@@ -7886,7 +7917,7 @@ mod tests {
                     );
                 });
 
-                // 首档越界，即使预算不足一 lot，仍先触发保护。
+                // 首档越界，即使预算不足一手，仍先触发保护。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, outside, 5)).unwrap();
 
@@ -7915,7 +7946,7 @@ mod tests {
                     );
                 });
 
-                // 边界相等可成交；预算恰好耗尽，不产生 trigger。
+                // 边界相等可成交；预算恰好耗尽，不产生触发。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, 100, 2)).unwrap();
                 book.rest(order(2, maker_side, outside, 4)).unwrap();
@@ -7941,7 +7972,7 @@ mod tests {
                 assert_eq!(book.order(OrderId::new(2)).unwrap().remaining(), 4);
                 assert_eq!(validate_book(&book), Ok(()));
 
-                // 部分 maker 成交，保留原 Arena slot 和 priority。
+                // 部分挂单成交，保留原 Arena 槽位和优先级。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, 100, 10)).unwrap();
 
@@ -7975,7 +8006,7 @@ mod tests {
                 assert_eq!(book.next_queue_priority(), next_before);
                 assert_eq!(validate_book(&book), Ok(()));
 
-                // 首档在保护内，但预算不足一 lot：dust，无事件。
+                // 首档在保护内，但预算不足一手：不足一手的预算，无事件。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, 100, 5)).unwrap();
 
@@ -7999,8 +8030,8 @@ mod tests {
                     );
                 });
 
-                // 成交后剩 5 quote，下一档越界：
-                // 保护必须先于 dust，且 trigger 不需要第二个 TradeId。
+                // 成交后剩 5 报价资产，下一档越界：
+                // 保护必须先于不足一手的预算，且触发不需要第二个 TradeId。
                 let mut book = ProductionOrderBook::new(policy());
                 book.rest(order(1, maker_side, 100, 2)).unwrap();
                 book.rest(order(2, maker_side, outside, 4)).unwrap();
@@ -8122,7 +8153,7 @@ mod tests {
             }
         }
 
-        // 公共执行入口的业务拒绝必须在任何 BTreeMap/Arena/ID/priority 改动之前发生。
+        // 公共执行入口的业务拒绝必须在任何 BTreeMap/Arena/标识符/优先级改动之前发生。
         fn assert_protected_quote_execution_rejected(
             book: &mut ProductionOrderBook,
             incoming: MarketByQuote,
@@ -8152,7 +8183,7 @@ mod tests {
                     worst_price: None,
                 };
 
-                // Duplicate 优先于非法 bps；taker ID 必须确实等于 maker ID。
+                // 重复标识符优先于非法基点；吃单方标识符必须确实等于挂单标识符。
                 let mut incoming = market(1, side, 1000);
                 incoming.market_protection = Some(invalid_bps.clone());
                 assert_protected_quote_execution_rejected(
@@ -8163,7 +8194,7 @@ mod tests {
                     RejectReason::DuplicateOrderId,
                 );
 
-                // 不重复的 ID=100：返回稳定 3007，而非 Duplicate。
+                // 不重复的标识符=100：返回稳定 3007，而非重复标识符。
                 let mut incoming = market(100, side, 1000);
                 incoming.market_protection = Some(invalid_bps);
                 assert_protected_quote_execution_rejected(
@@ -8175,7 +8206,7 @@ mod tests {
                 );
                 assert_eq!(RejectReason::InvalidSlippageBps as u16, 3007);
 
-                // 显式用户 worst_price 不满足 tick=10。
+                // 显式用户 worst_price 不满足价格步长=10。
                 let mut incoming = market(100, side, 1000);
                 incoming.market_protection = Some(MarketProtection {
                     max_slippage_bps: None,
@@ -8190,7 +8221,7 @@ mod tests {
                 );
             }
 
-            // Buy 的滑点价格向上扩张溢出，即使 band 有效也不能提交。
+            // 买入的滑点价格向上扩张溢出，即使市场价格区间有效也不能提交。
             let mut book = ProductionOrderBook::new(policy());
             book.rest(order(1, Side::Sell, 100_000, 5)).unwrap();
             let mut incoming = market(100, Side::Buy, 1000);
@@ -8210,7 +8241,7 @@ mod tests {
                 RejectReason::ArithmeticOverflow,
             );
 
-            // 进入 MarketMath 后的 lot 错误仍保持完整状态不变。
+            // 进入 MarketMath 后的手错误仍保持完整状态不变。
             let lot_math = MarketMath::try_new(0, 0, 0, 1, 10).unwrap();
             for (side, maker_side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
                 let mut book = ProductionOrderBook::new(policy());
@@ -8224,7 +8255,7 @@ mod tests {
                 );
             }
 
-            // 第一个 maker 已被纳入只读计划，第二个 maker 的 tick 错误：
+            // 第一个挂单已被纳入只读计划，第二个挂单的价格步长错误：
             // 整个执行入口必须拒绝且不可提前提交第一笔成交。
             for (side, maker_side, better) in
                 [(Side::Buy, Side::Sell, 90), (Side::Sell, Side::Buy, 110)]
