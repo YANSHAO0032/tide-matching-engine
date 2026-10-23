@@ -49,19 +49,29 @@ impl IceOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IceOrder {
+    /// 不随成交扣减改变的原始限价订单载荷。
     original: LimitGtcOrder,
+    /// 当前可参与深度与撮合的可见基础数量。
     visible: u64,
+    /// 当前尚未展示的隐藏基础数量。
     hidden: u64,
+    /// 可见与隐藏数量相加得到的总剩余基础数量。
     total: u64,
+    /// 冰山订单的可选单次展示峰值。
     peak: Option<Qty>,
+    /// 挂单当前持有的市场本地队列优先级。
     priority: QueuePriority,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct IceState {
+    /// 只含可见数量的整簿业务观察。
     visible_book: ObservedBook,
+    /// 按业务顺序排列的买侧冰山订单投影。
     bids: Vec<IceOrder>,
+    /// 按业务顺序排列的卖侧冰山订单投影。
     asks: Vec<IceOrder>,
+    /// 下一次将分配的队列优先级数值。
     next_priority: u128,
 }
 

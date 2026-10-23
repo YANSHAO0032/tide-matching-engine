@@ -43,3 +43,5 @@ Reference 通过独立 Vec 模拟价格与同价顺序，Production 使用其价
 普通 GTC、IOC/FOK 和市价入口在遇到冰山 maker 时同样遵守补量顺序。IOC/FOK/Market 的 incoming 不挂单、不取得优先级，但其撮合所触发的 maker 补量仍消耗优先级。Cancel 和只读查询不需要新优先级。
 
 数量、补量和档位聚合公式见 [数值计算公式](numerical_formulas.md)，执行顺序见 [关键逻辑流程](logic_flows.md)。
+
+实现文件与测试入口见 [订单簿模块与代码入口](orderbook_modules.md)。

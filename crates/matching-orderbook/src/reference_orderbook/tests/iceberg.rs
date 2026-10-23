@@ -1,5 +1,7 @@
+//! 冰山订单的队尾补量、事件、兼容入口及失败原子性测试。
+
 use super::*;
-use matching_domain::{QuoteBudget, UserId};
+use matching_domain::{IcebergOrder, MarketByBase, QuoteBudget, UserId};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 fn math() -> MarketMath {
     MarketMath::try_new(0, 0, 0, 1, 1).unwrap()
@@ -525,4 +527,73 @@ fn reference_iceberg_protected_boundary_after_refresh_has_raw_event_order() {
     );
     assert_eq!(book.orders.len(), 1);
     assert_eq!(book.next_priority, 4);
+}
+
+fn order_at_100(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
+    LimitGtcOrder {
+        order_id: OrderId::new(id),
+        user_id: UserId::new(1),
+        side,
+        price: Price::try_new(100).unwrap(),
+        qty: Qty::try_new(qty).unwrap(),
+    }
+}
+#[test]
+fn reference_iceberg_refreshes_to_tail_and_reports_total() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.place_iceberg(
+        IcebergOrder::try_new(order_at_100(1, Side::Sell, 8), Qty::try_new(3).unwrap()).unwrap(),
+        &math,
+        &[],
+    )
+    .unwrap();
+    book.rest(order_at_100(2, Side::Sell, 2)).unwrap();
+    let result = book
+        .place_limit_ioc(
+            order_at_100(3, Side::Buy, 6),
+            &math,
+            &[TradeId::new(1), TradeId::new(2), TradeId::new(3)],
+        )
+        .unwrap();
+    let trades: Vec<_> = result
+        .events()
+        .iter()
+        .filter_map(|e| {
+            if let EngineEvent::Trade(t) = e {
+                Some((t.maker_order_id, t.qty.get()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        trades,
+        vec![
+            (OrderId::new(1), 3),
+            (OrderId::new(2), 2),
+            (OrderId::new(1), 1)
+        ]
+    );
+    let maker = book.best(Side::Sell).unwrap();
+    assert_eq!(
+        (
+            maker.visible_remaining(),
+            maker.hidden_remaining(),
+            maker.total_remaining()
+        ),
+        (2, 2, 4)
+    );
+    assert!(result.events().contains(&EngineEvent::IcebergRefreshed {
+        order_id: OrderId::new(1),
+        visible: Qty::try_new(3).unwrap()
+    }));
+    assert!(
+        result
+            .events()
+            .contains(&EngineEvent::OrderPartiallyFilled {
+                order_id: OrderId::new(1),
+                remaining: Qty::try_new(5).unwrap()
+            })
+    );
 }

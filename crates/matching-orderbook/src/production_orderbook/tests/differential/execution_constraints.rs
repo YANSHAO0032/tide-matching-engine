@@ -34,8 +34,11 @@ impl ConstraintOutcome {
 
 #[derive(Debug, PartialEq, Eq)]
 struct ConstraintRecord {
+    /// 当前执行约束命令的统一结果。
     outcome: ConstraintOutcome,
+    /// 当前命令提交后的整簿业务观察。
     book: ObservedBook,
+    /// 生产簿下一次将分配的队列优先级数值。
     next_priority: u128,
 }
 

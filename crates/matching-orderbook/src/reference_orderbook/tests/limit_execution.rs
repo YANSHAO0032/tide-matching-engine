@@ -1,6 +1,9 @@
+//! 限价 IOC、FOK 与 PostOnly 的成交、拒绝及失败原子性测试。
+
 use super::*;
 use matching_domain::{
-    CancelReason, EngineEvent, OrderId, Price, Qty, QueuePriority, Side, TradeEvent, UserId,
+    CancelReason, EngineEvent, LimitImmediateExecution, OrderId, Price, Qty, QueuePriority, Side,
+    TradeEvent, UserId,
 };
 
 fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {

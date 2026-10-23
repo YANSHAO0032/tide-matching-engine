@@ -6,30 +6,59 @@ use crate::{CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, T
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
     /// 命令在状态变更前被拒绝，并携带稳定的原因码。
-    CommandRejected { reason: RejectReason },
+    CommandRejected {
+        /// 拒绝命令的稳定原因码。
+        reason: RejectReason,
+    },
     /// 订单已通过接收阶段。
-    OrderAccepted { order_id: OrderId },
+    OrderAccepted {
+        /// 已被接收的订单标识符。
+        order_id: OrderId,
+    },
     /// 订单已进入订单簿并成为挂单流动性。
-    OrderOpened { order_id: OrderId },
+    OrderOpened {
+        /// 已成为挂单流动性的订单标识符。
+        order_id: OrderId,
+    },
     /// 订单成交后仍有严格正的总剩余量；冰山包含可见量 + 隐藏量。
-    OrderPartiallyFilled { order_id: OrderId, remaining: Qty },
+    OrderPartiallyFilled {
+        /// 发生部分成交的订单标识符。
+        order_id: OrderId,
+        /// 成交后仍严格为正的总基础资产余量。
+        remaining: Qty,
+    },
     /// 订单因成交完毕而结束。
-    OrderFilled { order_id: OrderId },
+    OrderFilled {
+        /// 已全部成交的订单标识符。
+        order_id: OrderId,
+    },
     /// 未成交的严格正基础资产余量按指定原因终结；不表示取消了一张挂单订单。
     OrderCanceled {
+        /// 被终结订单的标识符。
         order_id: OrderId,
+        /// 被取消的严格正基础资产余量。
         remaining: Qty,
+        /// 此次终结的稳定业务原因。
         reason: CancelReason,
     },
     /// 一笔已提交的成交及其挂单/吃单方载荷。
     Trade(TradeEvent),
     /// 冰山可见片耗尽后补量并取得新队列优先级；`visible` 是本次显示量。
-    IcebergRefreshed { order_id: OrderId, visible: Qty },
+    IcebergRefreshed {
+        /// 发生补量的冰山订单标识符。
+        order_id: OrderId,
+        /// 本次重新展示的严格正可见数量。
+        visible: Qty,
+    },
     /// 下一候选挂单越过有效保护边界，市价订单据此终结。
     MarketProtectionTriggered {
+        /// 因保护边界终结的市价订单标识符。
         order_id: OrderId,
+        /// 首个不可继续成交的候选挂单价格。
         next_price: Price,
+        /// 合并用户和市场约束后的最差可成交价格。
         effective_worst_price: Price,
+        /// 形成有效保护边界的来源。
         source: ProtectionSource,
     },
 }

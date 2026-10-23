@@ -7,7 +7,9 @@ use crate::{LimitGtcOrder, Qty, RejectReason};
 /// GTC 与 PostOnly 由所调用的入口选择，不接受 IOC/FOK。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergOrder {
+    /// 冰山订单复用的基础限价订单载荷。
     order: LimitGtcOrder,
+    /// 每次展示在订单簿深度中的严格正峰值数量。
     peak_size: Qty,
 }
 

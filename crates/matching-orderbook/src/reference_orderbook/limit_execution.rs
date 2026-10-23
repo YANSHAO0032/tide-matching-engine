@@ -8,7 +8,9 @@ use matching_domain::{
 
 /// 全部计划挂单扣减完成前，原始 Vec 中的位置保持稳定。
 struct LimitFillPlan {
+    /// 原始 Vec 中待扣减订单的位置及其成交数量。
     fills: Vec<(usize, Qty)>,
+    /// 计划结束后吃单方的基础资产余量。
     remaining: u64,
 }
 
@@ -19,6 +21,34 @@ fn reject_limit_math_error(error: MathError) -> RejectReason {
 }
 
 impl ReferenceOrderBook {
+    /// PostOnly 候选的只读预检。
+    ///
+    /// 输入代表限价单 GTC + PostOnly 候选。
+    ///
+    /// 检查顺序：
+    /// 1. 全簿重复 OrderId
+    /// 2. 是否与对手盘交叉
+    ///
+    /// Ok(()) 仅表示通过当前两项预检，
+    /// 不表示订单已经接受或成功挂簿。
+    ///
+    /// 不修改订单簿，不检查或分配 QueuePriority。
+    pub(super) fn preflight_post_only(&self, order: &LimitGtcOrder) -> Result<(), RejectReason> {
+        if self
+            .orders
+            .iter()
+            .any(|existing| existing.original_order().order_id == order.order_id)
+        {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        if self.best_crossing_maker(order).is_some() {
+            return Err(RejectReason::PostOnlyWouldCross);
+        }
+
+        Ok(())
+    }
+
     /// 通过重复标识符与包含等价的交叉检查后，挂入限价 GTC PostOnly 订单。
     ///
     /// 不尝试主动成交；只有成功挂单才分配队列优先级；
@@ -200,6 +230,3 @@ impl ReferenceOrderBook {
         LimitImmediateExecution::new(order.order_id, trades, canceled_remaining)
     }
 }
-
-#[cfg(test)]
-mod tests;

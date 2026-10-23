@@ -4,6 +4,8 @@
 
 ## 当前状态
 
+订单簿模块已按职责整理：两个模块入口分别保留类型、状态、构造与查询，挂单取消、基础撮合、限价策略、两类市价和冰山实现位于子模块，原有测试迁至对应测试目录。公开 API 与两套独立撮合算法保持不变。2026-10-22 本地回归通过：完整 52 项差分、395 项订单簿测试、workspace 538 项单元测试及 2 项 doctest，另有 fmt、严格 Clippy 和无警告 Rustdoc。文件入口见 [订单簿模块与代码入口](docs/orderbook_modules.md)。
+
 **T08_P3_iceberg 已完成本地验收**，分支 `codex/t08-iceberg`，基线为已合并 T07 的 `7048296`。2026-10-22 本地验收通过：workspace 538 项单元测试（domain 143、orderbook 395）及 2 项 doctest；完整 differential 52 项、fmt、严格 workspace Clippy 均通过。包含冰山固定 seed 100k 混合命令与两组双次 10k 重复 tape。 已实现可见/隐藏量守恒、补量取得新优先级并移到队尾、total remaining 事件、完整取消与既有成交入口兼容。API 见 [冰山订单](docs/iceberg.md)。交付分支为 `codex/t08-iceberg`，本次包含 T00–T08 中文注释规范修订；上述结果为本地验收，远端 CI 状态单独核验。以下旧测试数字保留为历史证据。
 
 **T07_P3_ioc_fok_postonly 已完成（2026-10-21）**。2026-10-21 用户已解除导师模式，授权 Codex 直接完成实现和验收；已在 `codex/t07-ioc-fok-postonly` 分支完成本地验收：495 项单元测试、2 项 doctest，以及 fmt、严格 Clippy 全部通过；包含固定 seed 100k 混合命令和重复 tape 验证。交付分支为 `codex/t07-ioc-fok-postonly`；上述结果为本地验证，远端 CI 未核验。API 与事件契约见 [限价订单执行约束](docs/limit_execution.md)。
@@ -15,6 +17,8 @@
 本说明中的撮合、持久化和多分片能力均为规划目标，不代表当前已经实现或经过生产验证。已完成事项与实际验证结果以 [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md) 中的证据为准。
 
 价格、数量、名义额与预算反推的冻结公式见 [数值计算公式](docs/numerical_formulas.md)。
+
+生产簿与参考簿的文件职责、内部模块关系及测试入口见 [订单簿模块与代码入口](docs/orderbook_modules.md)。
 
 ## 项目范围
 

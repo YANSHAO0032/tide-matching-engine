@@ -39,3 +39,5 @@ IOC/FOK 返回 `LimitImmediateExecution`。`events()` 按真实成交顺序保�
 数值换算及取整契约见 [数值计算公式](numerical_formulas.md)。
 
 冰山输入、可见深度与事件顺序见 [冰山订单](iceberg.md)。
+
+实现文件与测试入口见 [订单簿模块与代码入口](orderbook_modules.md)。

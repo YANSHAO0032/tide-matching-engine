@@ -1,26 +1,49 @@
 //! 基于独立动态 Vec 模型规划挂单的可见量、隐藏量生命周期。
 //! 整条命令和调用方提供的 `TradeId` 全部通过预检前，
 //! 所有变更只作用于可丢弃的虚拟状态，不对真实订单簿执行回滚。
-use super::*;
-use matching_domain::{IcebergOrder, LimitImmediateExecution, ProtectionSource};
+use super::ReferenceOrderBook;
+use crate::{IncomingOrder, ReferenceOrder};
+use matching_domain::market_order::{
+    CommandStartProtectionContext, effective_protection_at_command_start_with_source,
+    maker_price_within_protection,
+};
+use matching_domain::{
+    EngineEvent, IcebergOrder, LimitGtcOrder, LimitImmediateExecution, MarketByBase, MarketByQuote,
+    MarketMath, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason,
+    Side, TradeEvent, TradeId,
+};
 
 pub(super) struct SliceRequest<'a> {
+    /// 正在执行的订单标识符。
     pub id: OrderId,
+    /// 正在执行的买卖方向。
     pub side: Side,
+    /// 尚待执行的基础资产数量。
     pub remaining: u64,
+    /// 限价订单的可选最差可成交价格。
     pub limit: Option<Price>,
+    /// 报价预算订单的可选剩余报价金额。
     pub budget: Option<QuoteAmount>,
+    /// 报价预算计算所需的可选数值规则。
     pub math: Option<&'a MarketMath>,
+    /// 命令开始已计算的可选有效保护价格及其来源。
     pub protection: Option<(Price, ProtectionSource)>,
+    /// 是否在首笔可执行成交后立即停止。
     pub one_fill: bool,
 }
 
 pub(super) struct SlicePlan {
+    /// 提交后按参考模型顺序保存的全部挂单。
     orders: Vec<ReferenceOrder>,
+    /// 提交后预期分配器的下一队列优先级数值。
     next_priority: u128,
+    /// 按撮合顺序产生的生命周期事件。
     events: Vec<EngineEvent>,
+    /// 计划结束后尚待执行的基础资产数量。
     pub remaining: u64,
+    /// 计划使用的报价资产本金。
     pub spent: QuoteAmount,
+    /// 计划结束后未使用的报价资产金额。
     pub unused: QuoteAmount,
 }
 
@@ -474,5 +497,3 @@ impl ReferenceOrderBook {
         Ok((self.commit_slices(plan, ids), spent, unused))
     }
 }
-#[cfg(test)]
-mod tests;

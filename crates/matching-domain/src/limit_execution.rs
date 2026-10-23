@@ -16,7 +16,9 @@ pub enum CancelReason {
 /// 仅在 IOC 有正余量时追加一次 OrderCanceled，绝不产生 OrderOpened。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LimitImmediateExecution {
+    /// 按实际产生顺序保存的成交与可选取消事件。
     events: Vec<EngineEvent>,
+    /// IOC 未成交时被取消的严格正基础数量。
     canceled_remaining: Option<Qty>,
 }
 

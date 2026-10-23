@@ -10,7 +10,9 @@ pub struct ReferenceOrder {
     original: LimitGtcOrder,
     /// 当前可见片的剩余量，可以在移除或补量前短暂为零。
     remaining: u64,
+    /// 当前尚未展示的冰山隐藏基础数量。
     hidden_remaining: u64,
+    /// 冰山订单的可选单次展示峰值。
     peak_size: Option<Qty>,
     /// 实际挂单或冰山补量时分配的市场本地队列优先级。
     priority: QueuePriority,

@@ -54,11 +54,17 @@ impl MathError {
 /// 仅在最小价格步长×数量步长本金是精确、严格正的报价资产最小单位时构造成功。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarketMath {
+    /// 价格整数的十进制缩放位数。
     price_scale: u8,
+    /// 基础数量整数的十进制缩放位数。
     qty_scale: u8,
+    /// 报价金额整数的十进制缩放位数。
     quote_scale: u8,
+    /// 价格必须对齐的严格正最小步长。
     tick_size: i64,
+    /// 基础数量必须对齐的严格正最小步长。
     lot_size: u64,
+    /// 单笔成交允许的最小严格正报价名义额。
     min_trade_notional: u128,
 }
 
