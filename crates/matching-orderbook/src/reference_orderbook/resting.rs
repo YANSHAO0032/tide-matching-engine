@@ -16,11 +16,7 @@ impl ReferenceOrderBook {
     /// 失败时不修改现有订单、剩余量或 next_priority。
     pub fn rest(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
         // 必须先检查重复标识符，即使计数器已经耗尽也是如此。
-        if self
-            .orders
-            .iter()
-            .any(|existing| existing.original_order().order_id == order.order_id)
-        {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 

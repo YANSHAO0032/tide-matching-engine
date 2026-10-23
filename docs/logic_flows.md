@@ -351,4 +351,10 @@ for each command, in original tape order
 100k path: stream records only; no final-state-only shortcut
 ```
 
-Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。Stop/expiry、跨 shard TradeId、WAL/digest/crash 仍无实现证据。
+Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。跨 shard TradeId、WAL/digest/crash 仍无实现证据。
+
+## 未触发止损订单与触发前到期
+
+未触发止损订单进入独立 StopBook。先检查常规簿与 StopBook 的 OrderId，随后验证触发前生命周期：GTC 不登记，DAY 必须属于当前交易时段，GTD 必须晚于当前 LogicalTime。全部检查成功后才分配 StopPriority、在同价位尾部登记订单和到期引用。GTD 到时或 DAY 时段结束会同步删除订单与引用。买方读取为低触发价到高触发价，卖方为高触发价到低触发价；同价位保持 StopPriority 先进先出。
+
+未触发订单只持有 StopPriority，不预占常规 QueuePriority。当前流程止于容器维护和到期删除，不执行触发 child、撮合、资金预留或事件发布。

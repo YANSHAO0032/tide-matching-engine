@@ -483,7 +483,7 @@ impl ProductionOrderBook {
         math: &MarketMath,
     ) -> Result<MarketByQuotePlan, RejectReason> {
         // 重复标识符必须先于盘口和 MarketMath 检查。
-        if self.orders.contains_key(&incoming.order_id) {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 
@@ -550,7 +550,7 @@ impl ProductionOrderBook {
         math: &MarketMath,
     ) -> Result<ProtectedMarketByQuotePlan, RejectReason> {
         // 1. 重复标识符必须优先于保护及数学错误。
-        if self.orders.contains_key(&incoming.order_id) {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 

@@ -26,11 +26,7 @@ impl ReferenceOrderBook {
     /// 不修改订单、剩余量或 next_priority。
     fn preflight_market_by_base(&self, incoming: &MarketByBase) -> Result<usize, RejectReason> {
         // 1. 活动订单标识符重复必须优先拒绝。
-        if self
-            .orders
-            .iter()
-            .any(|maker| maker.original_order().order_id == incoming.order_id)
-        {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 
@@ -294,11 +290,7 @@ impl ReferenceOrderBook {
         math: &MarketMath,
     ) -> Result<ProtectedMarketByBasePlan, RejectReason> {
         // 1. 重复标识符优先于保护计算。
-        if self
-            .orders
-            .iter()
-            .any(|maker| maker.original_order().order_id == incoming.order_id)
-        {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 

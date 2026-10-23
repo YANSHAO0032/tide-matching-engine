@@ -34,11 +34,7 @@ impl ReferenceOrderBook {
     ///
     /// 不修改订单簿，不检查或分配 QueuePriority。
     pub(super) fn preflight_post_only(&self, order: &LimitGtcOrder) -> Result<(), RejectReason> {
-        if self
-            .orders
-            .iter()
-            .any(|existing| existing.original_order().order_id == order.order_id)
-        {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 
@@ -128,11 +124,7 @@ impl ReferenceOrderBook {
         order: &LimitGtcOrder,
         math: &MarketMath,
     ) -> Result<LimitFillPlan, RejectReason> {
-        if self
-            .orders
-            .iter()
-            .any(|maker| maker.original_order().order_id == order.order_id)
-        {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         // 即使订单簿为空或流动性不足，也校验完整提交订单。

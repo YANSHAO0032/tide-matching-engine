@@ -316,7 +316,7 @@ impl ProductionOrderBook {
     }
 
     fn preflight_market_by_base(&self, incoming: &MarketByBase) -> Result<FillPlan, RejectReason> {
-        if self.orders.contains_key(&incoming.order_id) {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 
@@ -369,7 +369,7 @@ impl ProductionOrderBook {
         context: &CommandStartProtectionContext,
         math: &MarketMath,
     ) -> Result<ProtectedMarketByBasePlan, RejectReason> {
-        if self.orders.contains_key(&incoming.order_id) {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 

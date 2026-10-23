@@ -21,6 +21,7 @@
 | 按基础数量执行市价单 | [market_by_base.rs](../crates/matching-orderbook/src/production_orderbook/market_by_base.rs) | [market_by_base.rs](../crates/matching-orderbook/src/reference_orderbook/market_by_base.rs) |
 | 按报价预算执行市价单 | [market_by_quote.rs](../crates/matching-orderbook/src/production_orderbook/market_by_quote.rs) | [market_by_quote.rs](../crates/matching-orderbook/src/reference_orderbook/market_by_quote.rs) |
 | 冰山可见片与补量 | [iceberg.rs](../crates/matching-orderbook/src/production_orderbook/iceberg.rs) | [iceberg.rs](../crates/matching-orderbook/src/reference_orderbook/iceberg.rs) |
+| 未触发止损、触发前到期 | [stop_book.rs](../crates/matching-orderbook/src/stop_book.rs) 与 [production_orderbook.rs](../crates/matching-orderbook/src/production_orderbook.rs) | [reference_orderbook.rs](../crates/matching-orderbook/src/reference_orderbook.rs) |
 
 文件按业务职责组织。预检与提交尽量保留在同一功能模块，便于核对拒绝是否发生在真实改簿之前；共享的结构预检仍由负责该结构的模块维护。限价和市价入口遇到冰山 maker 时，通过本模型的冰山计划完成相应执行。
 
@@ -67,3 +68,11 @@
 阅读时先查看两种订单簿的字段和查询方法，再沿所需公开入口进入对应功能文件，最后查看该功能的单元测试与差分案例。基础参考撮合仍不自动挂入 incoming 余量，完整生命周期入口负责相应挂单；不能仅因两侧方法同名就忽略接口契约差异。
 
 业务说明见 [限价订单执行约束](limit_execution.md)、[冰山订单](iceberg.md)、[数值计算公式](numerical_formulas.md) 与 [关键逻辑流程](logic_flows.md)。
+
+## 未触发止损订单
+
+未触发止损订单不进入常规价格档位、Arena 或常规订单索引。生产簿将它们放在独立 StopBook：买方按触发价由低到高、卖方由高到低读取；同一触发价位按独立 StopPriority 的递增顺序读取。StopPriority 与常规 QueuePriority 使用相同的高水位保护规则，但维护完全独立的市场本地计数器。
+
+StopBook 同时保存订单位置索引与触发前到期索引。GTD 按 LogicalTime 到期，DAY 按交易时段到期；索引引用包含订单标识和止损价位位置，删除、取消或到期后会同步移除引用。参考簿故意使用 Vec 与稳定排序或扫描实现相同外部语义，避免复用生产 StopBook 算法。
+
+当前接口只接受、查询、取消和到期未触发订单；不触发 child、不产生撮合或事件，也不执行 reservation。child 的执行和触发级联属于后续生命周期范围。

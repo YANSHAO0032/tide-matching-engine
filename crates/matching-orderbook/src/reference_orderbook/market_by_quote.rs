@@ -27,11 +27,7 @@ impl ReferenceOrderBook {
         math: &MarketMath,
     ) -> Result<MarketByQuotePlan, RejectReason> {
         // 1. 重复标识符必须先于盘口读取。
-        if self
-            .orders
-            .iter()
-            .any(|maker| maker.original_order().order_id == incoming.order_id)
-        {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 
@@ -137,11 +133,7 @@ impl ReferenceOrderBook {
         math: &MarketMath,
     ) -> Result<ProtectedMarketByQuotePlan, RejectReason> {
         // 1. 重复标识符永远先于保护及数学计算。
-        if self
-            .orders
-            .iter()
-            .any(|maker| maker.original_order().order_id == incoming.order_id)
-        {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 

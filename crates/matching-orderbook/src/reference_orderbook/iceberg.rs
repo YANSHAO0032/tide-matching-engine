@@ -55,11 +55,7 @@ impl ReferenceOrderBook {
     }
 
     pub(super) fn check_duplicate(&self, id: OrderId) -> Result<(), RejectReason> {
-        if self
-            .orders
-            .iter()
-            .any(|maker| maker.original_order().order_id == id)
-        {
+        if self.contains_active_order(id) {
             Err(RejectReason::DuplicateOrderId)
         } else {
             Ok(())
@@ -72,6 +68,8 @@ impl ReferenceOrderBook {
         let mut virtual_book = Self {
             orders: self.orders.clone(),
             next_priority: self.next_priority,
+            stop_orders: self.stop_orders.clone(),
+            next_stop_priority: self.next_stop_priority,
         };
         let mut remaining = request.remaining;
         let mut unused = request.budget.unwrap_or(QuoteAmount::new(0));
@@ -347,6 +345,8 @@ impl ReferenceOrderBook {
         let mut virtual_book = Self {
             orders: plan.orders,
             next_priority: plan.next_priority,
+            stop_orders: self.stop_orders.clone(),
+            next_stop_priority: self.next_stop_priority,
         };
         if plan.remaining != 0 {
             let priority = virtual_book.allocate_slice_priority()?;

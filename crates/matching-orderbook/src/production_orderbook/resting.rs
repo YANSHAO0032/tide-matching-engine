@@ -91,7 +91,7 @@ impl ProductionOrderBook {
 
         // 公共预检后不能出现同标识符。
         assert!(
-            !self.orders.contains_key(&plan.order_id),
+            !self.contains_active_order(plan.order_id),
             "ProductionOrderBook invariant violation: \
          OrderId appeared between rest preflight and commit"
         );
@@ -307,7 +307,7 @@ impl ProductionOrderBook {
         // 1. 重复标识符必须绝对最先检查。
         // ------------------------------------------------------------
 
-        if self.orders.contains_key(&order_id) {
+        if self.contains_active_order(order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 

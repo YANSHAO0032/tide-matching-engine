@@ -21,6 +21,8 @@ fn book(orders: Vec<ReferenceOrder>) -> ReferenceOrderBook {
     ReferenceOrderBook {
         orders,
         next_priority: 0,
+        stop_orders: Vec::new(),
+        next_stop_priority: 0,
     }
 }
 
@@ -311,6 +313,8 @@ fn priority_guard_allows_last_safe_rest_then_rejects() {
     let mut book = ReferenceOrderBook {
         orders: Vec::new(),
         next_priority: threshold - 1,
+        stop_orders: Vec::new(),
+        next_stop_priority: 0,
     };
 
     // 临界点前的最后一次成功挂单。
@@ -338,6 +342,8 @@ fn duplicate_id_takes_precedence_over_priority_exhaustion() {
     let mut book = ReferenceOrderBook {
         orders: Vec::new(),
         next_priority: threshold - 1,
+        stop_orders: Vec::new(),
+        next_stop_priority: 0,
     };
 
     book.rest(candidate(1, Side::Buy, 90, 10)).unwrap();

@@ -27,6 +27,10 @@ pub mod queue_priority_allocator;
 pub mod reference_order;
 /// `Vec + sort` 的确定性参考订单簿与成交基线。
 pub mod reference_orderbook;
+/// 未触发止损订单、触发优先级及触发前到期索引。
+pub mod stop_book;
+/// 未触发 Stop 的独立市场本地优先级分配器。
+pub mod stop_priority_allocator;
 
 /// 新到订单运行态。
 pub use incoming_order::IncomingOrder;
@@ -46,6 +50,10 @@ pub use queue_priority_allocator::{
 pub use reference_order::ReferenceOrder;
 /// `Vec + sort` 参考订单簿。
 pub use reference_orderbook::ReferenceOrderBook;
+/// 未触发止损订单的市场本地容器。
+pub use stop_book::StopBook;
+/// StopPriority 的高水位保护分配器。
+pub use stop_priority_allocator::{StopPriorityAllocator, StopPriorityInitError};
 
 /// 生产簿的挂单、撤单、限价和市价执行入口。
 pub use production_orderbook::ProductionOrderBook;

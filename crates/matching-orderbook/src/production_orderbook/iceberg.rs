@@ -397,7 +397,7 @@ impl ProductionOrderBook {
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let order = iceberg.order();
-        if self.orders.contains_key(&order.order_id) {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         math.trade_notional(order.price, order.qty)
@@ -451,7 +451,7 @@ impl ProductionOrderBook {
         math: &MarketMath,
     ) -> Result<(), RejectReason> {
         let order = iceberg.order();
-        if self.orders.contains_key(&order.order_id) {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         let crosses = match order.side {
@@ -519,7 +519,7 @@ impl ProductionOrderBook {
         order: LimitGtcOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        if self.orders.contains_key(&order.order_id) {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         if !self.has_iceberg_maker(order.side) {
@@ -619,7 +619,7 @@ impl ProductionOrderBook {
         math: Option<(&CommandStartProtectionContext, &MarketMath)>,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        if self.orders.contains_key(&incoming.order_id) {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         let protection = if let Some((context, math)) = math {
@@ -664,7 +664,7 @@ impl ProductionOrderBook {
         context: Option<&CommandStartProtectionContext>,
         trade_ids: &[TradeId],
     ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
-        if self.orders.contains_key(&incoming.order_id) {
+        if self.contains_active_order(incoming.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         let protection = if let Some(context) = context {
@@ -713,7 +713,7 @@ impl ProductionOrderBook {
         trade_ids: &[TradeId],
         fok: bool,
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        if self.orders.contains_key(&order.order_id) {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         math.trade_notional(order.price, order.qty)

@@ -38,7 +38,7 @@ impl ProductionOrderBook {
         // 1. 重复标识符必须绝对最先。
         // ------------------------------------------------------------
 
-        if self.orders.contains_key(&order_id) {
+        if self.contains_active_order(order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
 
@@ -177,7 +177,7 @@ impl ProductionOrderBook {
     /// 消耗 QueuePriority。正值由领域类型保证；市场价格步长/数量步长对齐须由调用方校验。
     /// 不接受市价单或 IOC/FOK 标志组合。
     pub fn place_limit_post_only(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
-        if self.orders.contains_key(&order.order_id) {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         let crosses = match order.side {
@@ -244,7 +244,7 @@ impl ProductionOrderBook {
         if self.has_iceberg_maker(order.side) {
             return self.place_immediate_iceberg(order, math, trade_ids, fill_or_kill);
         }
-        if self.orders.contains_key(&order.order_id) {
+        if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         math.trade_notional(order.price, order.qty)

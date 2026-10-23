@@ -32,10 +32,16 @@ pub mod queue_priority;
 pub mod reject_reason;
 /// 买卖方向。
 pub mod side;
+/// 未触发 Stop 的输入载荷和触发后 child 的数量模式。
+pub mod stop_order;
+/// 未触发 Stop 的市场本地触发优先级值。
+pub mod stop_priority;
 /// 有效期策略参数。
 pub mod time_in_force;
 /// 实际成交的最小载荷。
 pub mod trade_event;
+/// 未触发 Stop 独立于 child TIF 的存活期。
+pub mod trigger_expiry;
 
 /// 对外公开的集群、市场、用户、订单、命令、成交和预留身份。
 pub use ids::{ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, UserId};
@@ -66,10 +72,16 @@ pub use queue_priority::QueuePriority;
 pub use reject_reason::RejectReason;
 /// 买卖方向。
 pub use side::Side;
+/// 未触发 Stop 的领域订单和数量模式。
+pub use stop_order::{StopLimitOrder, StopMarketOrder, StopMarketQuantity, StopOrder};
+/// 未触发 Stop 的市场本地触发优先级。
+pub use stop_priority::StopPriority;
 /// 订单有效期策略。
 pub use time_in_force::TimeInForce;
 /// 一笔实际成交的载荷。
 pub use trade_event::TradeEvent;
+/// Stop 触发前的存活期。
+pub use trigger_expiry::TriggerExpiry;
 
 /// 市场整数金额换算的已验证配置与构造错误分类。
 pub use market_math::{MarketMath, MathConfigError, MathError};
