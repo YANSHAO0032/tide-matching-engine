@@ -1,4 +1,4 @@
-use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason};
+use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason, TimeInForce};
 
 /// 参考订单簿使用的最小挂单订单运行态。
 ///
@@ -16,6 +16,8 @@ pub struct ReferenceOrder {
     peak_size: Option<Qty>,
     /// 实际挂单或冰山补量时分配的市场本地队列优先级。
     priority: QueuePriority,
+    /// 普通挂单的存活期；既有入口始终使用 GTC。
+    tif: TimeInForce,
 }
 
 impl ReferenceOrder {
@@ -24,6 +26,15 @@ impl ReferenceOrder {
     /// 该库内私有构造器供参考簿和测试数据使用；实际挂单必须经
     /// [`crate::ReferenceOrderBook::rest`] 完成重复标识符与高水位校验。
     pub(crate) fn new(original: LimitGtcOrder, priority: QueuePriority) -> Self {
+        Self::new_timed(original, priority, TimeInForce::Gtc)
+    }
+
+    /// 使用已验证有效期构造普通参考挂单。
+    pub(crate) fn new_timed(
+        original: LimitGtcOrder,
+        priority: QueuePriority,
+        tif: TimeInForce,
+    ) -> Self {
         let remaining = original.qty.get();
         Self {
             original,
@@ -31,6 +42,7 @@ impl ReferenceOrder {
             hidden_remaining: 0,
             peak_size: None,
             priority,
+            tif,
         }
     }
 
@@ -50,6 +62,7 @@ impl ReferenceOrder {
                 .expect("visible bounded by total"),
             peak_size: Some(peak),
             priority,
+            tif: TimeInForce::Gtc,
         }
     }
     /// 公开深度只统计当前可见片的数量。
@@ -97,6 +110,21 @@ impl ReferenceOrder {
     /// 返回该订单获得的市场本地队列优先级。
     pub fn priority(&self) -> QueuePriority {
         self.priority
+    }
+
+    /// 返回挂单的存活期元数据。
+    pub fn time_in_force(&self) -> TimeInForce {
+        self.tif
+    }
+
+    /// 在新到订单余量已按既有 GTC 路径完成挂单后写入其已预检的存活期。
+    pub(crate) fn replace_initial_gtc_with_tif(&mut self, tif: TimeInForce) {
+        assert_eq!(
+            self.tif,
+            TimeInForce::Gtc,
+            "ReferenceOrder invariant violation: only initial GTC metadata may be replaced"
+        );
+        self.tif = tif;
     }
 
     /// 扣减一次成交数量。

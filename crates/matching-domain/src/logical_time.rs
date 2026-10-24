@@ -17,6 +17,38 @@ impl LogicalTime {
     }
 }
 
+/// 只由显式业务命令推进的单调逻辑时钟。
+///
+/// 该状态不读取系统时钟；调用方负责将成功推进后的时间分派给订单簿的到期处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalClock {
+    now: LogicalTime,
+}
+
+impl LogicalClock {
+    /// 使用给定的逻辑时间创建时钟。
+    pub const fn new(now: LogicalTime) -> Self {
+        Self { now }
+    }
+
+    /// 读取当前逻辑时间。
+    pub const fn now(&self) -> LogicalTime {
+        self.now
+    }
+
+    /// 将时钟推进到不早于当前值的新时间。
+    ///
+    /// 相同时间是可重放的幂等操作；回退时间以 `InvalidExpireTime` 拒绝，
+    /// 并保证时钟状态完全不变。
+    pub fn advance_to(&mut self, new_time: LogicalTime) -> Result<(), crate::RejectReason> {
+        if new_time < self.now {
+            return Err(crate::RejectReason::InvalidExpireTime);
+        }
+        self.now = new_time;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! 验证逻辑时间的透明值语义，不测试时间推进协议。
@@ -74,5 +106,21 @@ mod tests {
             std::mem::size_of::<LogicalTime>(),
             std::mem::size_of::<u64>()
         );
+    }
+
+    #[test]
+    fn clock_advances_monotonically_and_keeps_its_value_on_regression() {
+        let mut clock = LogicalClock::new(LogicalTime::new(10));
+
+        assert_eq!(clock.now(), LogicalTime::new(10));
+        assert_eq!(clock.advance_to(LogicalTime::new(25)), Ok(()));
+        assert_eq!(clock.now(), LogicalTime::new(25));
+        assert_eq!(clock.advance_to(LogicalTime::new(25)), Ok(()));
+        assert_eq!(clock.now(), LogicalTime::new(25));
+        assert_eq!(
+            clock.advance_to(LogicalTime::new(24)),
+            Err(crate::RejectReason::InvalidExpireTime)
+        );
+        assert_eq!(clock.now(), LogicalTime::new(25));
     }
 }

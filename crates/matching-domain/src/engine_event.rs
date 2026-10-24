@@ -398,4 +398,17 @@ mod tests {
         };
         assert_ne!(original, accepted);
     }
+
+    #[test]
+    fn expired_order_keeps_the_stable_expiry_reason() {
+        let expired = crate::ExpiredOrder {
+            order_id: OrderId::new(88),
+            reason: crate::ExpireReason::GtdReached,
+        };
+
+        assert_eq!(expired.order_id, OrderId::new(88));
+        assert_eq!(expired.reason, crate::ExpireReason::GtdReached);
+        assert_eq!(crate::ExpireReason::GtdReached as u16, 1201);
+        assert_eq!(crate::ExpireReason::SessionEnded as u16, 1202);
+    }
 }

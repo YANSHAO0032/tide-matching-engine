@@ -1,5 +1,6 @@
 //! 差分测试入口与共享观察类型；各场景独立调用参考簿和生产簿。
 mod execution_constraints;
+mod expiry;
 mod iceberg;
 mod limit_gtc;
 mod market_by_base;

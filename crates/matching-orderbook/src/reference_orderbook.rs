@@ -5,6 +5,7 @@ use self::stop_orders::ReferenceStopOrder;
 use crate::ReferenceOrder;
 use matching_domain::{MathError, PriceReferenceState, RejectReason, Side};
 
+mod expiry;
 mod iceberg;
 mod limit_execution;
 mod market_by_base;

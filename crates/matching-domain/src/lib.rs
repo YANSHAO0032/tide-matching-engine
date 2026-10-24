@@ -4,6 +4,10 @@
 
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
+/// 订单到期的稳定业务原因。
+pub mod expire_reason;
+/// 订单到期的最小业务结果。
+pub mod expired_order;
 /// 已验证显示量与总量关系的冰山限价订单输入。
 pub mod iceberg_order;
 /// 具有业务类型隔离的标识符包装。
@@ -51,6 +55,10 @@ pub use ids::{ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, U
 
 /// 最小订单生命周期事件。
 pub use engine_event::EngineEvent;
+/// 订单到期的稳定业务原因。
+pub use expire_reason::ExpireReason;
+/// 到期订单的最小业务结果。
+pub use expired_order::ExpiredOrder;
 /// 包含总量与严格较小显示上限的冰山限价输入。
 pub use iceberg_order::IcebergOrder;
 /// 限价立即执行结果、稳定取消原因与基础订单组合校验。
@@ -60,7 +68,7 @@ pub use limit_execution::{
 /// 保留历史类型名的最小限价订单载荷。
 pub use limit_gtc_order::LimitGtcOrder;
 /// 确定性逻辑时间值。
-pub use logical_time::LogicalTime;
+pub use logical_time::{LogicalClock, LogicalTime};
 /// 整数价格、数量和金额值对象。
 pub use numbers::{Price, Qty, QuoteAmount, QuoteBudget, SignedAmount};
 /// 订单附加约束标志。

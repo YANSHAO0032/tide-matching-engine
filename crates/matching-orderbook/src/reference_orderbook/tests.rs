@@ -8,6 +8,7 @@ use matching_domain::{
     QueuePriority, QuoteAmount, RejectReason, Side, TradeEvent, TradeId,
 };
 mod basic;
+mod expiry;
 mod iceberg;
 mod limit_execution;
 mod maker_query;

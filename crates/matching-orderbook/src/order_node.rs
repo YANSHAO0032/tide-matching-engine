@@ -1,5 +1,5 @@
 use crate::OrderIndex;
-use matching_domain::{IcebergOrder, LimitGtcOrder, Qty, QueuePriority};
+use matching_domain::{IcebergOrder, LimitGtcOrder, Qty, QueuePriority, TimeInForce};
 
 /// Arena 中的订单节点。
 ///
@@ -17,6 +17,8 @@ pub struct OrderNode {
     peak_size: Option<Qty>,
     /// 当前市场内排队优先级；链表链接才是先进先出权威顺序。
     priority: QueuePriority,
+    /// 普通挂单的存活期；既有入口始终使用 GTC。
+    tif: TimeInForce,
     /// 同一 `PriceLevel` 中的前驱槽位；头节点为 `None`。
     prev: Option<OrderIndex>,
     /// 同一 `PriceLevel` 中的后继槽位；尾节点为 `None`。
@@ -29,6 +31,15 @@ impl OrderNode {
     /// `remaining` 精确复制原始 `Qty`，两个链接均为空；只有 `PriceLevel`
     /// 在完成局部不变量预检后才可连接该节点。
     pub fn new(order: LimitGtcOrder, priority: QueuePriority) -> Self {
+        Self::new_timed(order, priority, TimeInForce::Gtc)
+    }
+
+    /// 使用已验证有效期构造尚未链接的普通挂单运行态节点。
+    pub(crate) fn new_timed(
+        order: LimitGtcOrder,
+        priority: QueuePriority,
+        tif: TimeInForce,
+    ) -> Self {
         let remaining = order.qty.get();
         OrderNode {
             order,
@@ -36,6 +47,7 @@ impl OrderNode {
             hidden_remaining: 0,
             peak_size: None,
             priority,
+            tif,
             prev: None,
             next: None,
         }
@@ -58,6 +70,7 @@ impl OrderNode {
             hidden_remaining: hidden,
             peak_size: Some(iceberg.peak_size()),
             priority,
+            tif: TimeInForce::Gtc,
             prev: None,
             next: None,
         }
@@ -135,6 +148,21 @@ impl OrderNode {
     /// 返回市场内排队优先级；它不替代链表定义的先进先出顺序。
     pub fn priority(&self) -> QueuePriority {
         self.priority
+    }
+
+    /// 返回挂单的存活期元数据。
+    pub fn time_in_force(&self) -> TimeInForce {
+        self.tif
+    }
+
+    /// 在新到订单余量已按既有 GTC 路径完成挂单后写入其已预检的存活期。
+    pub(crate) fn replace_initial_gtc_with_tif(&mut self, tif: TimeInForce) {
+        assert_eq!(
+            self.tif,
+            TimeInForce::Gtc,
+            "OrderNode invariant violation: only initial GTC metadata may be replaced"
+        );
+        self.tif = tif;
     }
 
     /// 返回本档位前驱槽位；不能据此推断槽位仍在 Arena 中存活。

@@ -22,6 +22,8 @@ pub enum RejectReason {
     InvalidIceberg = 2011,
     /// 到期时间不满足命令的逻辑时间约束。
     InvalidExpireTime = 2013,
+    /// DAY 订单或会话终结命令引用的交易时段不是当前时段。
+    InvalidSession = 2014,
     /// PostOnly 候选会立即作为吃单方成交，必须在改簿前拒绝。
     PostOnlyWouldCross = 2015,
     /// 限价和数量约束下的可执行流动性不足以完整成交 FOK。
@@ -66,6 +68,7 @@ mod tests {
         assert_eq!(RejectReason::DuplicateOrderId as u16, 2008);
         assert_eq!(RejectReason::ArithmeticOverflow as u16, 5001);
         assert_eq!(RejectReason::InvalidExpireTime as u16, 2013);
+        assert_eq!(RejectReason::InvalidSession as u16, 2014);
         assert_eq!(RejectReason::PostOnlyWouldCross as u16, 2015);
         assert_eq!(RejectReason::MarketProtectionRequired as u16, 3005);
         assert_eq!(RejectReason::MarketProtectionExceeded as u16, 3006);

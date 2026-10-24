@@ -2,7 +2,9 @@
 
 use super::{ProductionOrderBook, RestPlan, RestTargetPlan};
 use crate::{OrderArena, OrderIndex, OrderNode, PriceLevel};
-use matching_domain::{LimitGtcOrder, OrderId, Price, QueuePriority, RejectReason, Side};
+use matching_domain::{
+    LimitGtcOrder, LogicalTime, OrderId, Price, QueuePriority, RejectReason, Side, TimeInForce,
+};
 use std::collections::BTreeMap;
 
 impl ProductionOrderBook {
@@ -27,6 +29,39 @@ impl ProductionOrderBook {
         self.commit_rest(order, plan);
 
         Ok(())
+    }
+
+    /// 将不可成交的普通 DAY/GTD/GTC 订单挂入订单簿并登记必要的到期索引。
+    ///
+    /// 时效和会话校验发生在优先级、Arena 或价格档位发生任何写入之前。
+    pub fn rest_timed(
+        &mut self,
+        order: LimitGtcOrder,
+        tif: TimeInForce,
+        now: LogicalTime,
+        current_session_id: u64,
+    ) -> Result<(), RejectReason> {
+        Self::validate_resting_tif(tif, now, current_session_id)?;
+        let plan = self.preflight_rest_common(&order)?;
+        self.assert_rest_strictly_non_crossing(&plan);
+        self.commit_rest_timed(order, tif, plan);
+        Ok(())
+    }
+
+    /// 校验普通可挂单订单的时效参数。
+    pub(super) fn validate_resting_tif(
+        tif: TimeInForce,
+        now: LogicalTime,
+        current_session_id: u64,
+    ) -> Result<(), RejectReason> {
+        match tif {
+            TimeInForce::Gtc => Ok(()),
+            TimeInForce::Gtd { expire_at } if expire_at > now => Ok(()),
+            TimeInForce::Gtd { .. } => Err(RejectReason::InvalidExpireTime),
+            TimeInForce::Day { session_id } if session_id == current_session_id => Ok(()),
+            TimeInForce::Day { .. } => Err(RejectReason::InvalidSession),
+            TimeInForce::Ioc | TimeInForce::Fok => Err(RejectReason::InvalidOrderCombination),
+        }
     }
 
     /// 强制公开 `rest` 的非成交边界。
@@ -70,6 +105,16 @@ impl ProductionOrderBook {
     /// 预检/提交之间的身份、优先级、Arena 或目标档位分歧表示
     /// 内部损坏，必须触发不变量断言并停止处理，不能在已经写入部分状态后返回 Err。
     pub(super) fn commit_rest(&mut self, order: LimitGtcOrder, plan: RestPlan) {
+        self.commit_rest_timed(order, TimeInForce::Gtc, plan);
+    }
+
+    /// 提交已通过所有时效、索引和挂单预检的普通订单。
+    pub(super) fn commit_rest_timed(
+        &mut self,
+        order: LimitGtcOrder,
+        tif: TimeInForce,
+        plan: RestPlan,
+    ) {
         // ------------------------------------------------------------
         // 0. 计划 / 输入身份。
         // ------------------------------------------------------------
@@ -119,7 +164,7 @@ impl ProductionOrderBook {
             )
         });
 
-        let node = OrderNode::new(order, plan.priority);
+        let node = OrderNode::new_timed(order, plan.priority, tif);
 
         let slot = match plan.side {
             Side::Buy => commit_rest_target(&mut self.bids, &mut self.arena, node, &plan),
@@ -134,6 +179,8 @@ impl ProductionOrderBook {
             "ProductionOrderBook invariant violation: \
          duplicate OrderId appeared during rest commit"
         );
+
+        self.regular_expiry.insert(plan.order_id, tif);
 
         // 优先级必须最后推进。
         let committed_priority =
@@ -285,6 +332,9 @@ impl ProductionOrderBook {
             "ProductionOrderBook invariant violation: \
          cancel mapping changed during mutation"
         );
+
+        self.regular_expiry
+            .remove(order_id, removed.time_in_force());
 
         Ok(removed)
     }

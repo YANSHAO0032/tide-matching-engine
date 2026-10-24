@@ -345,6 +345,7 @@ impl ProductionOrderBook {
                     .expect("planned full maker missing");
                 assert_eq!(removed.original_order().order_id, fill.id);
                 assert_eq!(self.orders.remove(&fill.id), Some(index));
+                self.regular_expiry.remove(fill.id, removed.time_in_force());
                 if level.is_empty() {
                     let removed_level = match maker_side {
                         Side::Buy => self.bids.remove(&fill.price),

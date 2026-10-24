@@ -439,6 +439,9 @@ pub(super) fn validate_book(book: &ProductionOrderBook) -> Result<(), String> {
         _ => {}
     }
 
+    book.validate_regular_expiry()
+        .map_err(|reason| format!("expiry-index/{reason}"))?;
+
     Ok(())
 }
 

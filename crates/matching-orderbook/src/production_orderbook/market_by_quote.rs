@@ -123,7 +123,7 @@ impl ProductionOrderBook {
 
                 level.apply_head_partial_fill(&mut self.arena, fill.qty);
             } else {
-                let level_became_empty = {
+                let (level_became_empty, maker_tif) = {
                     let level = match maker_side {
                         Side::Buy => self.bids.get_mut(&fill.maker_price),
                         Side::Sell => self.asks.get_mut(&fill.maker_price),
@@ -136,11 +136,12 @@ impl ProductionOrderBook {
 
                     assert_eq!(removed.original_order().order_id, fill.maker_order_id);
 
-                    level.is_empty()
+                    (level.is_empty(), removed.time_in_force())
                 };
 
                 // pop_front 已释放 Arena 槽位，不能再 `remove` 一次。
                 assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index));
+                self.regular_expiry.remove(fill.maker_order_id, maker_tif);
 
                 if level_became_empty {
                     let removed_level = match maker_side {
@@ -301,7 +302,7 @@ impl ProductionOrderBook {
                 assert_eq!(self.orders.get(&fill.maker_order_id), Some(&index));
             } else {
                 // 完全成交：先进先出 pop_front 释放 Arena 槽位。
-                let level_became_empty = {
+                let (level_became_empty, maker_tif) = {
                     let level = match maker_side {
                         Side::Buy => self.bids.get_mut(&fill.maker_price),
                         Side::Sell => self.asks.get_mut(&fill.maker_price),
@@ -315,11 +316,12 @@ impl ProductionOrderBook {
                     assert_eq!(removed.original_order().order_id, fill.maker_order_id,);
                     assert_eq!(removed.remaining(), maker_remaining);
 
-                    level.is_empty()
+                    (level.is_empty(), removed.time_in_force())
                 };
 
                 // pop_front 已释放槽位，不得二次 `arena.remove`。
                 assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index),);
+                self.regular_expiry.remove(fill.maker_order_id, maker_tif);
 
                 if level_became_empty {
                     let removed_level = match maker_side {

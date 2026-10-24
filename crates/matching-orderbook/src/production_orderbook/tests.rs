@@ -19,6 +19,7 @@ mod support;
 
 mod cancel;
 mod differential;
+mod expiry;
 mod iceberg;
 mod immediate_constraints;
 mod invariants;

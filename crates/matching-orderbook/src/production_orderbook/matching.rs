@@ -202,7 +202,7 @@ impl ProductionOrderBook {
         } else {
             // 全部成交/恰好全部成交挂单：必须物理移除头节点，
             // 绝不能先把剩余量改成零再留下来。
-            let level_became_empty = match maker_side {
+            let (level_became_empty, maker_tif) = match maker_side {
                 Side::Buy => {
                     let level = self
                         .bids
@@ -220,7 +220,7 @@ impl ProductionOrderBook {
                      removed maker identity changed"
                     );
 
-                    level.is_empty()
+                    (level.is_empty(), removed.time_in_force())
                 }
 
                 Side::Sell => {
@@ -240,7 +240,7 @@ impl ProductionOrderBook {
                      removed maker identity changed"
                     );
 
-                    level.is_empty()
+                    (level.is_empty(), removed.time_in_force())
                 }
             };
 
@@ -254,6 +254,8 @@ impl ProductionOrderBook {
                 "ProductionOrderBook invariant violation: \
              maker OrderId mapping changed during fill"
             );
+
+            self.regular_expiry.remove(maker_order_id, maker_tif);
 
             if level_became_empty {
                 let removed_level = match maker_side {

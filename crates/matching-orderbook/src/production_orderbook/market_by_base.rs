@@ -279,7 +279,7 @@ impl ProductionOrderBook {
 
             level.apply_head_partial_fill(&mut self.arena, fill_qty);
         } else {
-            let level_became_empty = {
+            let (level_became_empty, maker_tif) = {
                 let level = match maker_side {
                     Side::Buy => self.bids.get_mut(&maker_price),
                     Side::Sell => self.asks.get_mut(&maker_price),
@@ -292,11 +292,12 @@ impl ProductionOrderBook {
                     .expect("preflighted head missing");
 
                 assert_eq!(removed.original_order().order_id, maker_order_id);
-                level.is_empty()
+                (level.is_empty(), removed.time_in_force())
             };
 
             // 不要重复调用 `arena.remove`。
             assert_eq!(self.orders.remove(&maker_order_id), Some(head_index),);
+            self.regular_expiry.remove(maker_order_id, maker_tif);
 
             if level_became_empty {
                 let removed = match maker_side {

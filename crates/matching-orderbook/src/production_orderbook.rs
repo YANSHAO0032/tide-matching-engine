@@ -7,6 +7,7 @@ use crate::{
 use matching_domain::{OrderId, Price, PriceReferenceState, QueuePriority, Side};
 use std::collections::{BTreeMap, HashMap};
 
+mod expiry;
 mod iceberg;
 mod limit_execution;
 mod market_by_base;
@@ -15,6 +16,8 @@ mod matching;
 mod resting;
 mod stop_orders;
 mod stop_trigger;
+
+use expiry::RegularExpiryIndex;
 
 /// 指明已预检的余量将追加到既有档位还是新建档位。
 ///
@@ -97,6 +100,8 @@ pub struct ProductionOrderBook {
     stop_book: StopBook,
     /// 未触发止损订单专用的市场本地优先级状态。
     stop_priority_allocator: StopPriorityAllocator,
+    /// 普通 DAY/GTD 挂单的二级到期索引。
+    regular_expiry: RegularExpiryIndex,
     /// 各参考来源的最近已接受价格和序号。
     reference_prices: PriceReferenceState,
 }
@@ -112,6 +117,7 @@ impl ProductionOrderBook {
             queue_priority_allocator: QueuePriorityAllocator::new(policy),
             stop_book: StopBook::new(),
             stop_priority_allocator: StopPriorityAllocator::new(policy),
+            regular_expiry: RegularExpiryIndex::default(),
             reference_prices: PriceReferenceState::default(),
         }
     }
