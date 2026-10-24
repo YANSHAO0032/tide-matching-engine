@@ -188,6 +188,41 @@ impl StopBook {
         result
     }
 
+    /// 按一次实际价格跨越的方向、价格和 FIFO 顺序终结未触发订单。
+    ///
+    /// 买方只在价格上升且 `previous < stop_price <= current` 时触发；卖方只在
+    /// 价格下降且 `current <= stop_price < previous` 时触发。订单先从 StopBook
+    /// 和到期索引删除，调用方才能执行 child。
+    pub fn take_triggered_crossing(
+        &mut self,
+        side: Side,
+        previous: Price,
+        current: Price,
+    ) -> Vec<(StopOrder, StopPriority)> {
+        let crossed = match side {
+            Side::Buy => current > previous,
+            Side::Sell => current < previous,
+        };
+        if !crossed {
+            return Vec::new();
+        }
+        let order_ids = self
+            .ordered(side)
+            .into_iter()
+            .filter(|(order, _)| match side {
+                Side::Buy => previous < order.stop_price() && order.stop_price() <= current,
+                Side::Sell => current <= order.stop_price() && order.stop_price() < previous,
+            })
+            .map(|(order, _)| order.order_id())
+            .collect::<Vec<_>>();
+        let triggered = order_ids
+            .into_iter()
+            .filter_map(|order_id| self.remove(order_id))
+            .collect::<Vec<_>>();
+        debug_assert!(self.validate().is_ok());
+        triggered
+    }
+
     /// 删除一个未触发止损订单。
     pub fn remove(&mut self, order_id: OrderId) -> Option<(StopOrder, StopPriority)> {
         let entry = self.remove_inner(order_id)?;
@@ -265,9 +300,10 @@ impl StopBook {
 
     /// 校验止损触发后 child 的可实现时效组合。
     ///
-    /// 当前未实现 Stop child 触发与执行，因此只接受后续既有入口能够表达的
-    /// 组合：StopLimit 可成为 GTC、DAY 或 GTD 限价 child；StopMarket 只接受
-    /// 不挂单的 IOC child。FOK child 留待具备完整触发预检时再开放。
+    /// 接收阶段允许 StopLimit 携带 GTC、DAY 或 GTD child，StopMarket 只接受
+    /// 不挂单的 IOC child。触发阶段会再次校验当前实际可执行的组合；尚未实现
+    /// 的 DAY/GTD 常规生命周期会在 Trigger-R1 前被拒绝。FOK child 留待具备
+    /// 完整触发预检时再开放。
     fn validate_child_tif(order: &StopOrder) -> Result<(), RejectReason> {
         match order {
             StopOrder::Limit(order)
@@ -411,9 +447,9 @@ mod tests {
     use proptest::prelude::*;
 
     use matching_domain::{
-        LimitGtcOrder, LogicalTime, OrderId, Price, Qty, QuoteBudget, RejectReason, Side,
-        StopLimitOrder, StopMarketOrder, StopMarketQuantity, StopOrder, TimeInForce, TriggerExpiry,
-        UserId,
+        LimitGtcOrder, LogicalTime, OrderId, Price, Qty, QuoteBudget, RejectReason, ReservationId,
+        Side, StopLimitOrder, StopMarketOrder, StopMarketQuantity, StopOrder, TimeInForce,
+        TriggerExpiry, UserId,
     };
 
     use crate::{
@@ -425,6 +461,8 @@ mod tests {
         StopOrder::Limit(StopLimitOrder {
             order_id: OrderId::new(u128::from(id)),
             user_id: UserId::new(1),
+            reservation_id: ReservationId::new(u128::from(id)),
+            fee_schedule_version: 1,
             side,
             stop_price: Price::try_new(i64::try_from(stop).unwrap()).unwrap(),
             price: Price::try_new(i64::try_from(stop + 1).unwrap()).unwrap(),
@@ -438,6 +476,8 @@ mod tests {
         StopOrder::Market(StopMarketOrder {
             order_id: OrderId::new(u128::from(id)),
             user_id: UserId::new(2),
+            reservation_id: ReservationId::new(u128::from(id)),
+            fee_schedule_version: 1,
             side,
             stop_price: Price::try_new(i64::try_from(stop).unwrap()).unwrap(),
             quantity: StopMarketQuantity::Quote(QuoteBudget::try_new(10).unwrap()),
@@ -451,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn 同价触发价位按_stop_priority_先进先出() {
+    fn same_trigger_price_obeys_stop_priority_fifo() {
         let mut book = StopBook::new();
         let mut priorities = allocator();
         let now = LogicalTime::new(40);
@@ -487,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn gtd_与_day_在触发前按各自索引到期() {
+    fn gtd_and_day_expire_from_separate_pretrigger_indices() {
         let mut book = StopBook::new();
         let mut priorities = allocator();
         let now = LogicalTime::new(40);
@@ -533,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn 无效触发前到期条件不消耗_stop_priority_也不改簿() {
+    fn invalid_pretrigger_expiry_does_not_consume_stop_priority_or_mutate_book() {
         let mut book = StopBook::new();
         let mut priorities = allocator();
         let now = LogicalTime::new(40);
@@ -551,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn 止损优先级耗尽拒绝不改变_stop_book() {
+    fn stop_priority_exhaustion_rejects_without_mutating_stop_book() {
         let policy = QueuePriorityPolicy::try_with_synthetic_ceiling(1, Some(1)).unwrap();
         let mut book = StopBook::new();
         let mut priorities = StopPriorityAllocator::new(policy);
@@ -578,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn 生产与参考止损状态按顺序一致且标识符全局唯一() {
+    fn production_and_reference_stop_state_match_and_order_ids_are_globally_unique() {
         let policy = QueuePriorityPolicy::try_new(1024).unwrap();
         let mut production = ProductionOrderBook::new(policy);
         let mut reference = ReferenceOrderBook::new();
@@ -640,7 +680,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn 随机未触发止损序列在生产与参考簿保持相同触发顺序(
+        fn arbitrary_untriggered_stop_sequences_preserve_production_reference_trigger_order(
             entries in proptest::collection::vec((any::<bool>(), 1_u64..1_000_u64), 0..32)
         ) {
             let policy = QueuePriorityPolicy::try_new(1024).unwrap();

@@ -4,9 +4,7 @@ use crate::{
     OrderArena, OrderIndex, OrderNode, PriceLevel, QueuePriorityAllocator, QueuePriorityPolicy,
     StopBook, StopPriorityAllocator,
 };
-use matching_domain::{
-    LogicalTime, OrderId, Price, QueuePriority, RejectReason, Side, StopOrder, StopPriority,
-};
+use matching_domain::{OrderId, Price, PriceReferenceState, QueuePriority, Side};
 use std::collections::{BTreeMap, HashMap};
 
 mod iceberg;
@@ -15,6 +13,8 @@ mod market_by_base;
 mod market_by_quote;
 mod matching;
 mod resting;
+mod stop_orders;
+mod stop_trigger;
 
 /// 指明已预检的余量将追加到既有档位还是新建档位。
 ///
@@ -97,6 +97,8 @@ pub struct ProductionOrderBook {
     stop_book: StopBook,
     /// 未触发止损订单专用的市场本地优先级状态。
     stop_priority_allocator: StopPriorityAllocator,
+    /// 各参考来源的最近已接受价格和序号。
+    reference_prices: PriceReferenceState,
 }
 
 impl ProductionOrderBook {
@@ -110,6 +112,7 @@ impl ProductionOrderBook {
             queue_priority_allocator: QueuePriorityAllocator::new(policy),
             stop_book: StopBook::new(),
             stop_priority_allocator: StopPriorityAllocator::new(policy),
+            reference_prices: PriceReferenceState::default(),
         }
     }
 
@@ -163,57 +166,6 @@ impl ProductionOrderBook {
     /// 判断标识是否被常规订单或未触发止损订单占用。
     pub(crate) fn contains_active_order(&self, order_id: OrderId) -> bool {
         self.orders.contains_key(&order_id) || self.stop_book.contains(order_id)
-    }
-
-    /// 登记一个未触发止损订单。
-    ///
-    /// 该入口只维护 StopBook 和触发前到期索引，不执行触发、child 下单或撮合。
-    /// 订单标识在常规簿与 StopBook 间全局唯一；任一校验失败均不分配 StopPriority。
-    pub fn place_stop(
-        &mut self,
-        order: StopOrder,
-        now: LogicalTime,
-        current_session_id: u64,
-    ) -> Result<StopPriority, RejectReason> {
-        if self.contains_active_order(order.order_id()) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        self.stop_book.insert(
-            order,
-            now,
-            current_session_id,
-            &mut self.stop_priority_allocator,
-        )
-    }
-
-    /// 查询一个未触发止损订单及其 StopPriority。
-    pub fn stop_order(&self, order_id: OrderId) -> Option<(&StopOrder, StopPriority)> {
-        self.stop_book.get(order_id)
-    }
-
-    /// 以确定性的触发顺序返回一个方向的未触发止损订单快照。
-    pub fn stop_orders(&self, side: Side) -> Vec<(&StopOrder, StopPriority)> {
-        self.stop_book.ordered(side)
-    }
-
-    /// 删除一个未触发止损订单。
-    pub fn cancel_stop(&mut self, order_id: OrderId) -> Option<(StopOrder, StopPriority)> {
-        self.stop_book.remove(order_id)
-    }
-
-    /// 使不晚于当前逻辑时间的 GTD 止损订单到期。
-    pub fn expire_stop_gtd_through(&mut self, now: LogicalTime) -> Vec<(StopOrder, StopPriority)> {
-        self.stop_book.expire_gtd_through(now)
-    }
-
-    /// 使指定交易时段结束时仍未触发的 DAY 止损订单到期。
-    pub fn expire_stop_day_session(&mut self, session_id: u64) -> Vec<(StopOrder, StopPriority)> {
-        self.stop_book.expire_day_session(session_id)
-    }
-
-    /// 校验未触发止损容器及其索引。
-    pub fn validate_stop_book(&self) -> Result<(), &'static str> {
-        self.stop_book.validate()
     }
 }
 

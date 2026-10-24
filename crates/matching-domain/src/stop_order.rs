@@ -1,4 +1,18 @@
-use crate::{OrderId, Price, Qty, QuoteBudget, Side, TimeInForce, TriggerExpiry, UserId};
+use crate::{
+    OrderId, Price, Qty, QuoteBudget, ReservationId, Side, TimeInForce, TriggerExpiry, UserId,
+};
+
+/// 止损订单触发后将形成的 child 类型。
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggeredOrderKind {
+    /// 限价 child。
+    Limit = 1,
+    /// 按基础资产数量执行的市价 child。
+    MarketByBase = 2,
+    /// 按报价资产预算执行的市价 child。
+    MarketByQuote = 3,
+}
 
 /// StopMarket 触发后 child 使用的数量计价模式。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +30,10 @@ pub struct StopLimitOrder {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
+    /// 接收阶段锁定、触发拒绝时必须释放的预留身份。
+    pub reservation_id: ReservationId,
+    /// 接收阶段固定的费率版本。
+    pub fee_schedule_version: u64,
     /// 买入或卖出方向。
     pub side: Side,
     /// 决定进入可触发集合的严格正触发价格。
@@ -37,6 +55,10 @@ pub struct StopMarketOrder {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
+    /// 接收阶段锁定、触发拒绝时必须释放的预留身份。
+    pub reservation_id: ReservationId,
+    /// 接收阶段固定的费率版本。
+    pub fee_schedule_version: u64,
     /// 买入或卖出方向。
     pub side: Side,
     /// 决定进入可触发集合的严格正触发价格。
@@ -90,18 +112,41 @@ impl StopOrder {
             Self::Market(order) => order.trigger_expiry,
         }
     }
+
+    /// 返回触发后 child 的稳定类型标签。
+    pub fn child_kind(&self) -> TriggeredOrderKind {
+        match self {
+            Self::Limit(_) => TriggeredOrderKind::Limit,
+            Self::Market(order) => match order.quantity {
+                StopMarketQuantity::Base(_) => TriggeredOrderKind::MarketByBase,
+                StopMarketQuantity::Quote(_) => TriggeredOrderKind::MarketByQuote,
+            },
+        }
+    }
+
+    /// 返回接收阶段锁定的预留身份。
+    pub fn reservation_id(&self) -> ReservationId {
+        match self {
+            Self::Limit(order) => order.reservation_id,
+            Self::Market(order) => order.reservation_id,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LogicalTime, OrderId, Price, QuoteBudget, Side, TimeInForce, UserId};
+    use crate::{
+        LogicalTime, OrderId, Price, QuoteBudget, ReservationId, Side, TimeInForce, UserId,
+    };
 
     #[test]
     fn stop_order_exposes_location_fields_without_child_lifetime_confusion() {
         let order = StopOrder::Market(StopMarketOrder {
             order_id: OrderId::new(7),
             user_id: UserId::new(8),
+            reservation_id: ReservationId::new(9),
+            fee_schedule_version: 2,
             side: Side::Buy,
             stop_price: Price::try_new(100).unwrap(),
             quantity: StopMarketQuantity::Quote(QuoteBudget::try_new(9).unwrap()),
@@ -112,6 +157,8 @@ mod tests {
         });
         assert_eq!(order.order_id(), OrderId::new(7));
         assert_eq!(order.side(), Side::Buy);
+        assert_eq!(order.reservation_id(), ReservationId::new(9));
+        assert_eq!(order.child_kind(), TriggeredOrderKind::MarketByQuote);
         assert_eq!(order.stop_price(), Price::try_new(100).unwrap());
         assert_eq!(
             order.trigger_expiry(),
@@ -119,5 +166,12 @@ mod tests {
                 expire_at: LogicalTime::new(10)
             }
         );
+    }
+
+    #[test]
+    fn triggered_order_kind_codes_are_stable() {
+        assert_eq!(TriggeredOrderKind::Limit as u8, 1);
+        assert_eq!(TriggeredOrderKind::MarketByBase as u8, 2);
+        assert_eq!(TriggeredOrderKind::MarketByQuote as u8, 3);
     }
 }

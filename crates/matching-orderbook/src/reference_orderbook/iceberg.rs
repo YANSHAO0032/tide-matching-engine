@@ -70,6 +70,7 @@ impl ReferenceOrderBook {
             next_priority: self.next_priority,
             stop_orders: self.stop_orders.clone(),
             next_stop_priority: self.next_stop_priority,
+            reference_prices: self.reference_prices.clone(),
         };
         let mut remaining = request.remaining;
         let mut unused = request.budget.unwrap_or(QuoteAmount::new(0));
@@ -347,6 +348,7 @@ impl ReferenceOrderBook {
             next_priority: plan.next_priority,
             stop_orders: self.stop_orders.clone(),
             next_stop_priority: self.next_stop_priority,
+            reference_prices: self.reference_prices.clone(),
         };
         if plan.remaining != 0 {
             let priority = virtual_book.allocate_slice_priority()?;

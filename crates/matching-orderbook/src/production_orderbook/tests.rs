@@ -28,6 +28,7 @@ mod market_by_quote;
 mod matching;
 mod query;
 mod resting;
+mod stop_trigger;
 
 /// 一个价格档位的只读测试投影，不是持久化快照格式。
 #[derive(Debug, Clone, PartialEq, Eq)]

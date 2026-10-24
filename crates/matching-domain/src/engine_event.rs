@@ -1,4 +1,7 @@
-use crate::{CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, TradeEvent};
+use crate::{
+    CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, ReservationId,
+    ReservationReleaseReason, TradeEvent, TriggeredOrderKind,
+};
 
 /// 当前订单簿使用的最小订单生命周期事件载荷。
 ///
@@ -40,6 +43,29 @@ pub enum EngineEvent {
         remaining: Qty,
         /// 此次终结的稳定业务原因。
         reason: CancelReason,
+    },
+    /// 一张止损订单已从 StopBook 终结，并将接受 child 预检。
+    StopTriggered {
+        /// 被触发的止损订单标识符。
+        order_id: OrderId,
+        /// 即将接受 Trigger-R1 的 child 类型。
+        child_kind: TriggeredOrderKind,
+    },
+    /// 已接受的止损订单的 child 在触发预检中被拒绝。
+    TriggeredOrderRejected {
+        /// 原止损订单标识符。
+        order_id: OrderId,
+        /// child 被拒绝的稳定原因。
+        reason: RejectReason,
+    },
+    /// 触发后的 child 未通过预检，原 Stop 的预留已终结释放。
+    ReservationReleased {
+        /// 终结订单的标识符。
+        order_id: OrderId,
+        /// 接收阶段锁定的预留身份。
+        reservation_id: ReservationId,
+        /// 释放发生的稳定业务原因。
+        reason: ReservationReleaseReason,
     },
     /// 一笔已提交的成交及其挂单/吃单方载荷。
     Trade(TradeEvent),

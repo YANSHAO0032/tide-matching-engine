@@ -357,4 +357,25 @@ Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/Price
 
 未触发止损订单进入独立 StopBook。先检查常规簿与 StopBook 的 OrderId，随后验证触发前生命周期：GTC 不登记，DAY 必须属于当前交易时段，GTD 必须晚于当前 LogicalTime。全部检查成功后才分配 StopPriority、在同价位尾部登记订单和到期引用。GTD 到时或 DAY 时段结束会同步删除订单与引用。买方读取为低触发价到高触发价，卖方为高触发价到低触发价；同价位保持 StopPriority 先进先出。
 
-未触发订单只持有 StopPriority，不预占常规 QueuePriority。当前流程止于容器维护和到期删除，不执行触发 child、撮合、资金预留或事件发布。
+未触发订单只持有 StopPriority，不预占常规 QueuePriority。每种可触发的参考来源保存最近价格与严格递增的来源序号；首次更新只建立基线。价格上升时只收集跨越区间内的买方止损，价格下降时只收集跨越区间内的卖方止损。静态开市参考不能驱动止损，重复或倒退的来源序号被拒绝且不改变容器。
+
+```mermaid
+flowchart TD
+    A[接受价格参考更新] --> B{来源有效且序号递增}
+    B -- 否 --> C[拒绝且保持止损容器不变]
+    B -- 是 --> D[保存新参考价格]
+    D --> E{价格跨越止损价}
+    E -- 否 --> F[结束]
+    E -- 是 --> G[按方向和 StopPriority 收集订单]
+    G --> H[从止损容器和到期索引移除]
+    H --> I[写入 StopTriggered 并进入内部先进先出队列]
+    I --> J[执行本地 Trigger-R1]
+    J -- 拒绝 --> K[写入 TriggeredOrderRejected 与 ReservationReleased]
+    J -- 通过 --> L[按 child 规则撮合]
+    L --> M{产生成交}
+    M -- 是 --> N[更新最近成交价并收集新的止损]
+    N --> I
+    M -- 否 --> O[处理下一内部 child]
+```
+
+Trigger-R1 是同步、本地且可重放的预检边界。它在进入普通撮合入口前检查 child 有效期、预留、冻结费率和保护条件；失败不会产生 Trade 或新的 CommandRejected。当前订单簿以调用方提供的本地验证器承载预留、费率和保护状态，不访问网络或时钟。child 只有确实将正余量挂入常规簿时才取得 QueuePriority。

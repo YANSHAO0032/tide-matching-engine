@@ -75,4 +75,6 @@
 
 StopBook 同时保存订单位置索引与触发前到期索引。GTD 按 LogicalTime 到期，DAY 按交易时段到期；索引引用包含订单标识和止损价位位置，删除、取消或到期后会同步移除引用。参考簿故意使用 Vec 与稳定排序或扫描实现相同外部语义，避免复用生产 StopBook 算法。
 
-当前接口只接受、查询、取消和到期未触发订单；不触发 child、不产生撮合或事件，也不执行 reservation。child 的执行和触发级联属于后续生命周期范围。
+每个可触发参考来源保存最近价格和严格递增的来源序号。首次更新只建立基线；价格上升按低到高收集跨越区间内的买方止损，价格下降按高到低收集卖方止损。收集时先从 StopBook 和到期索引删除，再按内部先进先出顺序执行 child。每个 child 先经过本地 Trigger-R1；拒绝时产生 `StopTriggered`、`TriggeredOrderRejected` 与 `ReservationReleased`，不会产生 Trade 或第二个 `CommandRejected`。通过预检的 child 复用常规限价或市价撮合入口；child 成交会更新最近成交价并继续收集后续止损。预留、费率和保护的具体状态由调用方提供的本地、可重放验证器检查，不访问网络或本机时钟。
+
+生产簿将止损容器、取消和到期入口放在 `production_orderbook/stop_orders.rs`，将参考价跨越、Trigger-R1、child 执行和级联队列放在 `production_orderbook/stop_trigger.rs`。参考簿以同名子模块实现对应职责，但保留其 Vec 扫描与稳定排序，绝不调用生产 StopBook 或生产撮合实现。两个根模块只保留订单簿状态、构造和共享查询，使订单类型边界与限价、市价、冰山模块保持一致。

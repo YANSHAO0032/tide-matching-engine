@@ -81,14 +81,9 @@ impl ProductionOrderBook {
             // 必须仍然是当前最优对手价的先进先出头节点。
             assert_eq!(level.head(), Some(index));
 
-            let actual_best = self
-                .best_price(maker_side)
-                .expect("preflighted MarketByQuote best price missing");
-
-            assert_eq!(
-                actual_best, fill.maker_price,
-                "MarketByQuote maker price diverged from plan"
-            );
+            // 报价预算可能不足以再成交当前最优价档的一整手，但仍足以成交更低价
+            // 的后续档位。此处只能复核预检锁定的档位与 FIFO 头，不能要求该档位
+            // 仍是整个对手侧的最优价格。
 
             let maker = self
                 .arena

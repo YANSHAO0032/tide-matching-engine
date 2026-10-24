@@ -26,10 +26,13 @@ pub mod order_flags;
 pub mod order_state;
 /// 订单类型标签。
 pub mod order_type;
+pub mod price_reference;
 /// 市场本地先进先出优先级值对象。
 pub mod queue_priority;
 /// 稳定编号的拒绝原因。
 pub mod reject_reason;
+/// 订单终结时释放本地预留的稳定原因。
+pub mod reservation_release_reason;
 /// 买卖方向。
 pub mod side;
 /// 未触发 Stop 的输入载荷和触发后 child 的数量模式。
@@ -66,14 +69,19 @@ pub use order_flags::OrderFlags;
 pub use order_state::OrderState;
 /// 订单类型标签。
 pub use order_type::OrderType;
+pub use price_reference::{PriceReference, PriceReferenceKind, PriceReferenceState};
 /// 市场本地先进先出优先级值。
 pub use queue_priority::QueuePriority;
 /// 稳定编号的业务拒绝原因。
 pub use reject_reason::RejectReason;
+/// 订单终结时释放本地预留的稳定原因。
+pub use reservation_release_reason::ReservationReleaseReason;
 /// 买卖方向。
 pub use side::Side;
 /// 未触发 Stop 的领域订单和数量模式。
-pub use stop_order::{StopLimitOrder, StopMarketOrder, StopMarketQuantity, StopOrder};
+pub use stop_order::{
+    StopLimitOrder, StopMarketOrder, StopMarketQuantity, StopOrder, TriggeredOrderKind,
+};
 /// 未触发 Stop 的市场本地触发优先级。
 pub use stop_priority::StopPriority;
 /// 订单有效期策略。

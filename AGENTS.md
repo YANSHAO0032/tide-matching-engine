@@ -1,6 +1,8 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-10-23 交付事实：用户已授权将已验证的订单簿模块整理提交、合并到 `main`、删除开发分支并推送。实现提交为 `91d13bc71488db346fe1f9d6afbd61404fa367ac`，已快进合入并推送至 `origin/main`；`codex/orderbook-module-layout` 已在本地删除，且从未存在远端同名分支。用户随后明确授权完成 T09；T09 在 `codex/t09-stopbook-expiry` 完成本地验收，尚未获得提交、推送或合并授权。
+> 2026-10-24 交付授权：用户已授权将 T10 已验证内容提交、合并到 `main`、删除开发分支并推送。T10 在 `codex/t10-stop-trigger-cascade` 完成实现与本地验收；交付结果、提交哈希与远端状态以唯一 `assignment/SESSION_HANDOFF.md` 为准。
+
+> 2026-10-23 交付事实：用户已授权将已验证的订单簿模块整理提交、合并到 `main`、删除开发分支并推送。实现提交为 `91d13bc71488db346fe1f9d6afbd61404fa367ac`，已快进合入并推送至 `origin/main`；`codex/orderbook-module-layout` 已在本地删除，且从未存在远端同名分支。随后 T09 已由 `77761e010cc10179dfc566181f0a3b1397929f78` 合入并推送至 `origin/main`，开发分支已删除。
 
 > 2026-10-22 历史交付授权：用户要求更新交接等文档、标记 T08 完成，然后提交代码并推送远端。T08_P3_iceberg 已完成本地验收，该次交付包含冰山实现、测试、文档和 T00–T08 中文注释修订，交付分支为 `codex/t08-iceberg`；该授权不扩展至本轮模块整理的提交或后续业务任务。
 
@@ -8,7 +10,7 @@
 
 ## 角色与授权边界
 
-当前采用直接实现和 Code Review 模式。T08、订单簿模块整理和 T09 的本地实现均已完成；后续仅在用户授权的新范围内实施、审查、验证、维护文档与交接。
+当前采用直接实现和 Code Review 模式。T08、订单簿模块整理和 T09 均已交付；当前在用户授权范围内完成 T10 的实施、审查、验证与交接维护。
 
 - 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
 - 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
@@ -17,7 +19,7 @@
 
 ## 当前范围与文档入口
 
-**订单簿模块整理已交付**；实现提交 `91d13bc` 已在 main 上，实施计划见 [模块整理计划](assignment/ORDERBOOK_MODULE_LAYOUT_PLAN.md)。T08 原实施基线为 `7048296`、交付分支为 `codex/t08-iceberg`。后续获得新任务授权时，继续读取 [T08 任务书](assignment/tasks/T08_P3_iceberg.md)、v6 §8.1–§8.4、§9 remaining、§10 priority、§17、§54.12–13/26/28–29、§64 与 §77；保留此前全部数值、保护、失败原子性及 differential gate。
+**订单簿模块整理已交付**；实现提交 `91d13bc` 已在 main 上，实施计划见 [模块整理计划](assignment/ORDERBOOK_MODULE_LAYOUT_PLAN.md)。T09 已由 `77761e0` 交付。当前 T10 读取 [T10 任务书](assignment/tasks/T10_P4_stop_trigger_cascade.md)、v6 §18–§19、§24/§26 child 规则、§27.1/§27.4、§54.36–39、§58、§65 与 §77；保留此前全部数值、保护、失败原子性及 differential gate。
 
 **T08 已完成本地验收（2026-10-22）**。2026-10-22 本地验收通过：workspace 538 项单元测试（domain 143、orderbook 395）及 2 项 doctest；完整 differential 52 项、fmt、严格 workspace Clippy 均通过。包含冰山固定 seed 100k 混合命令与两组双次 10k 重复 tape。 注释、12 张流程图与 116 项公式已审查；公式通过 GitHub 实际渲染组件验证；提交后的页面与远端 CI 状态须另行核验。中文注释专项修订覆盖 43 个 Rust 文件、3,200 处注释，非注释代码保持一致。交付分支为 `codex/t08-iceberg`，提交与推送事实见唯一交接。
 
@@ -30,7 +32,7 @@ T08 覆盖 visible/hidden/total 守恒、仅 visible depth、maker 补量时新 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
 3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §8、§14–§17、§54（重点不变量 12、13、18）、§64；按当前小步核对 §9、§13、§45–§46.1、§58，保留 §6.5.1–§6.5.2、§26.3–§26.5、§55.2–§55.4、§63 的数值/保护和回归要求。保留当前适用不变量 1–13/16–18/26/28–30/49–52/54–56；§54.53 及 §18/§27 reservation 仅作后续资金接口契约。始终遵守 §77 和 Appendix E；读取未来契约不扩大实现范围。
-4. [T08 任务书](assignment/tasks/T08_P3_iceberg.md)，并保留已验收的 [T07 任务书](assignment/tasks/T07_P3_ioc_fok_postonly.md)；保留已验收的 [T06](assignment/tasks/T06_P3_market_orders.md) Market/math/protection 与 [T05](assignment/tasks/T05_P2_differential_invariants.md) differential/invariant gate。
+4. 当前 [T10 任务书](assignment/tasks/T10_P4_stop_trigger_cascade.md)，并保留已验收的 [T09](assignment/tasks/T09_P4_stopbook_expiry.md)、[T08](assignment/tasks/T08_P3_iceberg.md)、[T07](assignment/tasks/T07_P3_ioc_fok_postonly.md)、[T06](assignment/tasks/T06_P3_market_orders.md) 与 [T05](assignment/tasks/T05_P2_differential_invariants.md) 的契约和验证门。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
