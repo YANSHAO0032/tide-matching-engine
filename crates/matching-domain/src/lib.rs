@@ -35,8 +35,6 @@ pub mod price_reference;
 pub mod queue_priority;
 /// 稳定编号的拒绝原因。
 pub mod reject_reason;
-/// 订单终结时释放本地预留的稳定原因。
-pub mod reservation_release_reason;
 /// 买卖方向。
 pub mod side;
 /// 未触发 Stop 的输入载荷和触发后 child 的数量模式。
@@ -55,6 +53,8 @@ pub use ids::{ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, U
 
 /// 最小订单生命周期事件。
 pub use engine_event::EngineEvent;
+/// 订单终结时释放本地预留的稳定原因。
+pub use engine_event::ReservationReleaseReason;
 /// 订单到期的稳定业务原因。
 pub use expire_reason::ExpireReason;
 /// 到期订单的最小业务结果。
@@ -82,8 +82,6 @@ pub use price_reference::{PriceReference, PriceReferenceKind, PriceReferenceStat
 pub use queue_priority::QueuePriority;
 /// 稳定编号的业务拒绝原因。
 pub use reject_reason::RejectReason;
-/// 订单终结时释放本地预留的稳定原因。
-pub use reservation_release_reason::ReservationReleaseReason;
 /// 买卖方向。
 pub use side::Side;
 /// 未触发 Stop 的领域订单和数量模式。

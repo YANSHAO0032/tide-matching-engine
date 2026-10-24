@@ -1,7 +1,17 @@
 use crate::{
-    CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, ReservationId,
-    ReservationReleaseReason, TradeEvent, TriggeredOrderKind,
+    CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, ReservationId, TradeEvent,
+    TriggeredOrderKind,
 };
+
+/// 订单终结时释放本地预留的稳定原因。
+///
+/// 数值是 `ReservationReleased` 事件载荷的公开协议；只能追加，不能重排或复用。
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservationReleaseReason {
+    /// 触发后的 child 未通过 Trigger-R1。
+    TriggerRejected = 1305,
+}
 
 /// 当前订单簿使用的最小订单生命周期事件载荷。
 ///
@@ -108,6 +118,11 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn trigger_rejected_release_reason_code_is_stable() {
+        assert_eq!(ReservationReleaseReason::TriggerRejected as u16, 1305);
     }
 
     #[test]
