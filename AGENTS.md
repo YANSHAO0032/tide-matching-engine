@@ -1,6 +1,6 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-10-24 交付授权：用户已授权将 T10 已验证内容提交、合并到 `main`、删除开发分支并推送。T10 在 `codex/t10-stop-trigger-cascade` 完成实现与本地验收；交付结果、提交哈希与远端状态以唯一 `assignment/SESSION_HANDOFF.md` 为准。
+> 2026-10-24 交付事实：T10 已由 `9e23e45f3d5b7c9aedbf16bcf5b1539e58d8f4ac` 快进合入并推送至 `origin/main`；`codex/t10-stop-trigger-cascade` 已在本地删除，远端不存在同名开发分支。T11 及后续工作尚未获得授权。
 
 > 2026-10-23 交付事实：用户已授权将已验证的订单簿模块整理提交、合并到 `main`、删除开发分支并推送。实现提交为 `91d13bc71488db346fe1f9d6afbd61404fa367ac`，已快进合入并推送至 `origin/main`；`codex/orderbook-module-layout` 已在本地删除，且从未存在远端同名分支。随后 T09 已由 `77761e010cc10179dfc566181f0a3b1397929f78` 合入并推送至 `origin/main`，开发分支已删除。
 
