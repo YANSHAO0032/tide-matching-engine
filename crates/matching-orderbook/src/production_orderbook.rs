@@ -4,9 +4,13 @@ use crate::{
     OrderArena, OrderIndex, OrderNode, PriceLevel, QueuePriorityAllocator, QueuePriorityPolicy,
     StopBook, StopPriorityAllocator,
 };
-use matching_domain::{OrderId, Price, PriceReferenceState, QueuePriority, Side};
+use matching_domain::{OrderId, Price, PriceReferenceState, QueuePriority, RejectReason, Side};
+use matching_risk::ReservationState;
 use std::collections::{BTreeMap, HashMap};
 
+pub(crate) mod amend_candidate;
+mod amend_iceberg;
+mod amend_stop;
 mod expiry;
 mod iceberg;
 mod limit_execution;
@@ -92,6 +96,8 @@ pub struct ProductionOrderBook {
     asks: BTreeMap<Price, PriceLevel>,
     /// 当前活动 OrderId 到 Arena 槽位的定位索引，必须与节点身份一致。
     orders: HashMap<OrderId, OrderIndex>,
+    /// 活动普通与未触发止损订单的本地预留快照，仅供身份查询。
+    reservations: HashMap<OrderId, ReservationState>,
     /// 节点的唯一存储；价格档位和标识符索引通过 OrderIndex 引用它。
     arena: OrderArena,
     /// 本市场独占的优先级状态；只读查询不消耗序号。
@@ -113,6 +119,7 @@ impl ProductionOrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: HashMap::new(),
+            reservations: HashMap::new(),
             arena: OrderArena::new(),
             queue_priority_allocator: QueuePriorityAllocator::new(policy),
             stop_book: StopBook::new(),
@@ -157,6 +164,30 @@ impl ProductionOrderBook {
             node.original_order().order_id,
         );
         Some(node)
+    }
+
+    /// 在任何订单簿写入前核对候选预留身份及既有影子状态。
+    fn validate_new_reservation(
+        &self,
+        order_id: OrderId,
+        user_id: matching_domain::UserId,
+        state: &ReservationState,
+    ) -> Result<(), RejectReason> {
+        if self.contains_active_order(order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if state.order_id != order_id
+            || state.user_id != user_id
+            || self.reservations.contains_key(&order_id)
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        Ok(())
+    }
+
+    /// 按订单身份只读查询已登记的本地预留快照。
+    pub fn reservation_state(&self, order_id: OrderId) -> Option<&ReservationState> {
+        self.reservations.get(&order_id)
     }
 
     /// 读取下一次分配将使用的优先级，不推进分配器。

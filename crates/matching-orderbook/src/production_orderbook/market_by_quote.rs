@@ -141,6 +141,7 @@ impl ProductionOrderBook {
 
                 // pop_front 已释放 Arena 槽位，不能再 `remove` 一次。
                 assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index));
+                self.reservations.remove(&fill.maker_order_id);
                 self.regular_expiry.remove(fill.maker_order_id, maker_tif);
 
                 if level_became_empty {
@@ -321,6 +322,7 @@ impl ProductionOrderBook {
 
                 // pop_front 已释放槽位，不得二次 `arena.remove`。
                 assert_eq!(self.orders.remove(&fill.maker_order_id), Some(index),);
+                self.reservations.remove(&fill.maker_order_id);
                 self.regular_expiry.remove(fill.maker_order_id, maker_tif);
 
                 if level_became_empty {

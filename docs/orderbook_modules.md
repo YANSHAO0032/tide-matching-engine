@@ -21,7 +21,12 @@
 | 按基础数量执行市价单 | [market_by_base.rs](../crates/matching-orderbook/src/production_orderbook/market_by_base.rs) | [market_by_base.rs](../crates/matching-orderbook/src/reference_orderbook/market_by_base.rs) |
 | 按报价预算执行市价单 | [market_by_quote.rs](../crates/matching-orderbook/src/production_orderbook/market_by_quote.rs) | [market_by_quote.rs](../crates/matching-orderbook/src/reference_orderbook/market_by_quote.rs) |
 | 冰山可见片与补量 | [iceberg.rs](../crates/matching-orderbook/src/production_orderbook/iceberg.rs) | [iceberg.rs](../crates/matching-orderbook/src/reference_orderbook/iceberg.rs) |
-| 未触发止损、触发前到期 | [stop_book.rs](../crates/matching-orderbook/src/stop_book.rs) 与 [production_orderbook.rs](../crates/matching-orderbook/src/production_orderbook.rs) | [reference_orderbook.rs](../crates/matching-orderbook/src/reference_orderbook.rs) |
+| 普通订单定时挂单与到期 | [expiry.rs](../crates/matching-orderbook/src/production_orderbook/expiry.rs) | [expiry.rs](../crates/matching-orderbook/src/reference_orderbook/expiry.rs) |
+| 未触发止损、触发前到期 | [stop_orders.rs](../crates/matching-orderbook/src/production_orderbook/stop_orders.rs) 与 [stop_book.rs](../crates/matching-orderbook/src/stop_book.rs) | [stop_orders.rs](../crates/matching-orderbook/src/reference_orderbook/stop_orders.rs) |
+| 止损触发与级联 | [stop_trigger.rs](../crates/matching-orderbook/src/production_orderbook/stop_trigger.rs) | [stop_trigger.rs](../crates/matching-orderbook/src/reference_orderbook/stop_trigger.rs) |
+| 改单候选、普通改单与完整上下文入口 | [amend_candidate.rs](../crates/matching-orderbook/src/production_orderbook/amend_candidate.rs) | [amend_candidate.rs](../crates/matching-orderbook/src/reference_orderbook/amend_candidate.rs) |
+| 冰山改单 | [amend_iceberg.rs](../crates/matching-orderbook/src/production_orderbook/amend_iceberg.rs) | [amend_iceberg.rs](../crates/matching-orderbook/src/reference_orderbook/amend_iceberg.rs) |
+| 未触发止损改单 | [amend_stop.rs](../crates/matching-orderbook/src/production_orderbook/amend_stop.rs) | [amend_stop.rs](../crates/matching-orderbook/src/reference_orderbook/amend_stop.rs) |
 
 文件按业务职责组织。预检与提交尽量保留在同一功能模块，便于核对拒绝是否发生在真实改簿之前；共享的结构预检仍由负责该结构的模块维护。限价和市价入口遇到冰山 maker 时，通过本模型的冰山计划完成相应执行。
 
@@ -62,19 +67,30 @@
 | [protected_quote_scenarios.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/protected_quote_scenarios.rs) | 受保护报价市价单的专项固定场景与失败原子性 |
 | [execution_constraints.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/execution_constraints.rs) | IOC、FOK、PostOnly 命令序列与语义性质 |
 | [iceberg.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/iceberg.rs) | 冰山混合命令序列、补量和数量守恒性质 |
+| [expiry.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/expiry.rs) | 逻辑时间、会话与普通/止损到期比较 |
+| [amend_regular.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_regular.rs) | 常规改单、绝对数量、事件原序与完整 TIF 迁移 |
+| [amend_full.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_full.rs) 及其 [scenarios.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_full/scenarios.rs)、[tapes.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_full/tapes.rs) | 全容器改单、真实签名、触发/到期、100k 与两组双次 10k 完整 transcript |
 
 公共工具只统一测试观察和执行驱动；两本订单簿分别执行自己的撮合算法，比较时保留原始事件顺序。测试数据类型的字段保持私有，跨分组辅助函数只在差分测试范围内开放。
 
 阅读时先查看两种订单簿的字段和查询方法，再沿所需公开入口进入对应功能文件，最后查看该功能的单元测试与差分案例。基础参考撮合仍不自动挂入 incoming 余量，完整生命周期入口负责相应挂单；不能仅因两侧方法同名就忽略接口契约差异。
 
-业务说明见 [限价订单执行约束](limit_execution.md)、[冰山订单](iceberg.md)、[数值计算公式](numerical_formulas.md) 与 [关键逻辑流程](logic_flows.md)。
+业务说明见 [限价订单执行约束](limit_execution.md)、[冰山订单](iceberg.md)、[挂单修改与本地预留授权](amend.md)、[数值计算公式](numerical_formulas.md) 与 [关键逻辑流程](logic_flows.md)。
 
 ## 未触发止损订单
 
-未触发止损订单不进入常规价格档位、Arena 或常规订单索引。生产簿将它们放在独立 StopBook：买方按触发价由低到高、卖方由高到低读取；同一触发价位按独立 StopPriority 的递增顺序读取。StopPriority 与常规 QueuePriority 使用相同的高水位保护规则，但维护完全独立的市场本地计数器。
+未触发止损订单不进入常规价格档位、Arena 或常规订单索引。生产簿将它们放在独立 StopBook，档位键为触发价与来源：买方按触发价由低到高、卖方由高到低读取；同来源同价位按独立 StopPriority 的递增顺序读取。StopPriority 与常规 QueuePriority 使用相同的高水位保护规则，但维护完全独立的市场本地计数器。
 
 StopBook 同时保存订单位置索引与触发前到期索引。GTD 按 LogicalTime 到期，DAY 按交易时段到期；索引引用包含订单标识和止损价位位置，删除、取消或到期后会同步移除引用。参考簿故意使用 Vec 与稳定排序或扫描实现相同外部语义，避免复用生产 StopBook 算法。
 
 每个可触发参考来源保存最近价格和严格递增的来源序号。首次更新只建立基线；价格上升按低到高收集跨越区间内的买方止损，价格下降按高到低收集卖方止损。收集时先从 StopBook 和到期索引删除，再按内部先进先出顺序执行 child。每个 child 先经过本地 Trigger-R1；拒绝时产生 `StopTriggered`、`TriggeredOrderRejected` 与 `ReservationReleased`，不会产生 Trade 或第二个 `CommandRejected`。通过预检的 child 复用常规限价或市价撮合入口；child 成交会更新最近成交价并继续收集后续止损。预留、费率和保护的具体状态由调用方提供的本地、可重放验证器检查，不访问网络或本机时钟。
 
 生产簿将止损容器、取消和到期入口放在 `production_orderbook/stop_orders.rs`，将参考价跨越、Trigger-R1、child 执行和级联队列放在 `production_orderbook/stop_trigger.rs`。参考簿以同名子模块实现对应职责，但保留其 Vec 扫描与稳定排序，绝不调用生产 StopBook 或生产撮合实现。两个根模块只保留订单簿状态、构造和共享查询，使订单类型边界与限价、市价、冰山模块保持一致。
+
+## 改单与预留模块边界
+
+[amend_execution_context.rs](../crates/matching-orderbook/src/amend_execution_context.rs) 保存调用者固定的 MarketMath、命令身份、费率、公钥及候选资产需求，只处理共有的数值/资金值契约。各模型的 `amend_candidate.rs` 分别构建只读候选、数值预检与普通改单计划，并路由自身的冰山/止损动作；Production 的 PriceLevel 原位修改和 StopBook replacement 计划负责真实链接、聚合与到期引用，Reference 继续使用自身 Vec。
+
+[领域改单协议](../crates/matching-domain/src/amend_order.rs) 定义绝对目标、patch 和 typed quantity；[预留令牌](../crates/matching-domain/src/reservation_adjustment.rs) 固定签名字节；[本地风控验证器](../crates/matching-risk/src/reservation_adjustment.rs) 负责已加载 Ed25519 公钥验签和 checked 版本应用。两本簿分别按 OrderId 保存 shadow reservation，身份 map 不决定业务顺序。完整核验使用 `amend_with_context`，低层改单入口要求调用者已完成数值与资金校验。
+
+`tests/amend_atomicity.rs` 对完整物理状态进行拒绝前后比较，`tests/amend_reservation.rs` 覆盖真实签名与 StopLimit 接续，`tests/amend_iceberg.rs` 和 `tests/amend_stop.rs` 固定优先级与触发执行矩阵。无分支 getter、重导出和透明转发由这些消费者覆盖，不以逐方法镜像测试替代真实状态验证。

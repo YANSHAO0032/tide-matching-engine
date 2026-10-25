@@ -128,6 +128,11 @@ impl MarketMath {
         self.tick_size
     }
 
+    /// 返回已验证的基础数量最小步长，供候选订单与显示峰值核对对齐。
+    pub const fn lot_size(&self) -> u64 {
+        self.lot_size
+    }
+
     /// 读取最小合法价格步长×数量步长成交对应的精确报价资产本金 K。
     pub const fn min_trade_notional(&self) -> u128 {
         self.min_trade_notional

@@ -8,7 +8,9 @@ workspace = true
 
 [dependencies]
 matching-domain = { path = "../matching-domain" }
+matching-risk = { path = "../matching-risk" }
 
 
 [dev-dependencies]
 proptest = "1.11.0"
+ed25519-dalek = { version = "3.0.0", default-features = false }

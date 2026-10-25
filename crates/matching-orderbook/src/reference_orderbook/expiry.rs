@@ -6,8 +6,25 @@ use matching_domain::{
     EngineEvent, ExpireReason, ExpiredOrder, LimitGtcOrder, LogicalTime, QueuePriority,
     RejectReason, TimeInForce, TradeId, TriggerExpiry,
 };
+use matching_risk::ReservationState;
 
 impl ReferenceOrderBook {
+    /// 将时效挂单和调用方预留快照作为一次独占操作提交。
+    pub fn rest_timed_with_reservation(
+        &mut self,
+        order: LimitGtcOrder,
+        tif: TimeInForce,
+        now: LogicalTime,
+        current_session_id: u64,
+        state: ReservationState,
+    ) -> Result<(), RejectReason> {
+        self.validate_new_reservation(order.order_id, order.user_id, &state)?;
+        let order_id = order.order_id;
+        self.rest_timed(order, tif, now, current_session_id)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(())
+    }
+
     /// 独立执行带 DAY/GTD/GTC 存活期的普通限价单，并仅标记实际挂单余量。
     pub fn place_limit_timed_with_events(
         &mut self,

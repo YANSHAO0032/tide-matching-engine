@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use matching_domain::{
-    LogicalTime, OrderId, Price, RejectReason, Side, StopMarketQuantity, StopOrder, StopPriority,
-    TimeInForce, TriggerExpiry,
+    LogicalTime, OrderId, Price, PriceReferenceKind, RejectReason, Side, StopMarketQuantity,
+    StopOrder, StopPriority, TimeInForce, TriggerExpiry,
 };
 
 use crate::StopPriorityAllocator;
@@ -10,6 +10,8 @@ use crate::StopPriorityAllocator;
 /// 止损订单在一侧 StopBook 中的价位位置。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StopLocation {
+    /// 本订单所属的触发来源索引。
+    reference: PriceReferenceKind,
     /// 未触发订单所属的买卖方向。
     side: Side,
     /// 未触发订单所属的触发价格档位。
@@ -111,13 +113,13 @@ impl StopExpiryIndex {
 /// 以触发价位保存未触发订单的 StopBook。
 ///
 /// 买方遍历为低触发价到高触发价，卖方遍历为高触发价到低触发价。同一价位按
-/// StopPriority 严格递增；未触发订单不拥有 QueuePriority。
+/// 同一来源的 StopPriority 严格递增；未触发订单不拥有 QueuePriority。
 #[derive(Clone, Debug, Default)]
 pub struct StopBook {
     /// 买方向止损价位表。
-    buy_stops: BTreeMap<Price, Vec<StopEntry>>,
+    buy_stops: BTreeMap<(Price, PriceReferenceKind), Vec<StopEntry>>,
     /// 卖方向止损价位表。
-    sell_stops: BTreeMap<Price, Vec<StopEntry>>,
+    sell_stops: BTreeMap<(Price, PriceReferenceKind), Vec<StopEntry>>,
     /// 订单标识到止损方向及价位的定位索引。
     locations: HashMap<OrderId, StopLocation>,
     /// 未触发订单的统一触发前到期索引。
@@ -125,6 +127,190 @@ pub struct StopBook {
 }
 
 impl StopBook {
+    /// 测试读取真实到期桶引用及来源位置；业务队列与到期事件不经此排序。
+    #[cfg(test)]
+    pub(crate) fn test_expiry_entries(
+        &self,
+    ) -> Vec<(OrderId, TriggerExpiry, PriceReferenceKind, Side, Price)> {
+        let mut entries = self
+            .expiry_index
+            .gtd
+            .iter()
+            .flat_map(|(at, refs)| {
+                refs.iter().map(move |r| {
+                    (
+                        r.order_id,
+                        TriggerExpiry::Gtd { expire_at: *at },
+                        r.location.reference,
+                        r.location.side,
+                        r.location.stop_price,
+                    )
+                })
+            })
+            .chain(self.expiry_index.day.iter().flat_map(|(session, refs)| {
+                refs.iter().map(move |r| {
+                    (
+                        r.order_id,
+                        TriggerExpiry::Day {
+                            session_id: *session,
+                        },
+                        r.location.reference,
+                        r.location.side,
+                        r.location.stop_price,
+                    )
+                })
+            }))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(id, ..)| *id);
+        entries
+    }
+
+    /// 测试相等投影显式排序身份索引，保留实际触发队列与到期引用原序。
+    #[cfg(test)]
+    pub(crate) fn test_deterministic_state(&self) -> String {
+        let mut locations = self.locations.iter().collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(id, _)| **id);
+        format!(
+            "{:?}",
+            (
+                &self.buy_stops,
+                &self.sell_stops,
+                locations,
+                &self.expiry_index
+            )
+        )
+    }
+}
+
+/// 已完成时效和优先级校验的止损替换计划，只供独占提交使用。
+pub(crate) struct StopReplacementPlan {
+    /// 保持同一身份的候选 child 模板及触发条件。
+    order: StopOrder,
+    /// 原位置的优先级，用于检测计划与提交之间的状态漂移。
+    old_priority: StopPriority,
+    /// 新优先级，仅触发价改变时分配。
+    priority: StopPriority,
+    /// 是否迁移到另一触发来源或触发价档位。
+    requeue: bool,
+}
+
+impl StopBook {
+    /// 构造替换计划，不修改容器、到期索引或优先级分配器。
+    pub(crate) fn plan_replacement(
+        &self,
+        order: StopOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        priorities: &StopPriorityAllocator,
+    ) -> Result<StopReplacementPlan, RejectReason> {
+        let (old, old_priority) = self
+            .get(order.order_id())
+            .ok_or(RejectReason::OrderNotFound)?;
+        if old.side() != order.side() {
+            return Err(RejectReason::InvalidOrderCombination);
+        }
+        if order.trigger_reference() == PriceReferenceKind::StaticOpening {
+            return Err(RejectReason::InvalidReferencePriceSource);
+        }
+        if order
+            .market_protection()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
+        }
+        Self::validate_child_tif(&order)?;
+        if let StopOrder::Limit(child) = &order {
+            match child.child_tif {
+                TimeInForce::Gtd { expire_at } if expire_at <= now => {
+                    return Err(RejectReason::InvalidExpireTime);
+                }
+                TimeInForce::Day { session_id } if session_id != current_session_id => {
+                    return Err(RejectReason::InvalidSession);
+                }
+                _ => {}
+            }
+        }
+        Self::validate_expiry(order.trigger_expiry(), now, current_session_id)?;
+        let requeue = order.stop_price() != old.stop_price()
+            || order.trigger_reference() != old.trigger_reference();
+        let priority = if requeue {
+            priorities.preflight_allocate()?;
+            StopPriority::new(priorities.next())
+        } else {
+            old_priority
+        };
+        Ok(StopReplacementPlan {
+            order,
+            old_priority,
+            priority,
+            requeue,
+        })
+    }
+
+    /// 提交已校验的替换；写屏障之后仅允许不变量断言失败，不再返回业务拒绝。
+    pub(crate) fn commit_replacement(
+        &mut self,
+        plan: StopReplacementPlan,
+        priorities: &mut StopPriorityAllocator,
+    ) {
+        let id = plan.order.order_id();
+        let (old, priority) = self.get(id).expect("preflighted Stop replacement exists");
+        assert_eq!(priority, plan.old_priority);
+        let old_expiry = old.trigger_expiry();
+        let old_location = *self.locations.get(&id).expect("preflighted Stop location");
+        let new_expiry = plan.order.trigger_expiry();
+        if plan.requeue {
+            assert_eq!(
+                priorities.allocate().expect("preflighted Stop priority"),
+                plan.priority
+            );
+            self.remove_inner(id).expect("preflighted Stop removal");
+            self.expiry_index.remove(old_expiry, id);
+            let location = StopLocation {
+                side: plan.order.side(),
+                reference: plan.order.trigger_reference(),
+                stop_price: plan.order.stop_price(),
+            };
+            self.levels_mut(location.side)
+                .entry((location.stop_price, location.reference))
+                .or_default()
+                .push(StopEntry {
+                    order: plan.order,
+                    priority: plan.priority,
+                });
+            assert!(self.locations.insert(id, location).is_none());
+            self.expiry_index.insert(
+                new_expiry,
+                ExpiryRef {
+                    order_id: id,
+                    location,
+                },
+            );
+        } else {
+            let entries = self
+                .levels_mut(old_location.side)
+                .get_mut(&(old_location.stop_price, old_location.reference))
+                .expect("preflighted Stop level");
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.order.order_id() == id)
+                .expect("preflighted Stop entry");
+            entry.order = plan.order;
+            if old_expiry != new_expiry {
+                self.expiry_index.remove(old_expiry, id);
+                self.expiry_index.insert(
+                    new_expiry,
+                    ExpiryRef {
+                        order_id: id,
+                        location: old_location,
+                    },
+                );
+            }
+        }
+        debug_assert!(self.validate().is_ok());
+    }
+
     /// 创建空的 StopBook。
     pub fn new() -> Self {
         Self::default()
@@ -147,18 +333,29 @@ impl StopBook {
         if self.contains(order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
+        if order.trigger_reference() == PriceReferenceKind::StaticOpening {
+            return Err(RejectReason::InvalidReferencePriceSource);
+        }
+        if order
+            .market_protection()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
+        }
         Self::validate_child_tif(&order)?;
         Self::validate_expiry(order.trigger_expiry(), now, current_session_id)?;
         priorities.preflight_allocate()?;
 
         let location = StopLocation {
             side: order.side(),
+            reference: order.trigger_reference(),
             stop_price: order.stop_price(),
         };
         let expiry = order.trigger_expiry();
         let priority = priorities.allocate()?;
         self.levels_mut(location.side)
-            .entry(location.stop_price)
+            .entry((location.stop_price, location.reference))
             .or_default()
             .push(StopEntry { order, priority });
         self.locations.insert(order_id, location);
@@ -195,6 +392,7 @@ impl StopBook {
     /// 和到期索引删除，调用方才能执行 child。
     pub fn take_triggered_crossing(
         &mut self,
+        source: PriceReferenceKind,
         side: Side,
         previous: Price,
         current: Price,
@@ -209,6 +407,7 @@ impl StopBook {
         let order_ids = self
             .ordered(side)
             .into_iter()
+            .filter(|(order, _)| order.trigger_reference() == source)
             .filter(|(order, _)| match side {
                 Side::Buy => previous < order.stop_price() && order.stop_price() <= current,
                 Side::Sell => current <= order.stop_price() && order.stop_price() < previous,
@@ -301,9 +500,8 @@ impl StopBook {
     /// 校验止损触发后 child 的可实现时效组合。
     ///
     /// 接收阶段允许 StopLimit 携带 GTC、DAY 或 GTD child，StopMarket 只接受
-    /// 不挂单的 IOC child。触发阶段会再次校验当前实际可执行的组合；尚未实现
-    /// 的 DAY/GTD 常规生命周期会在 Trigger-R1 前被拒绝。FOK child 留待具备
-    /// 完整触发预检时再开放。
+    /// 不挂单的 IOC child。触发阶段以显式逻辑时间及当前时段重校验 DAY/GTD，
+    /// 实际余量通过常规时效入口登记到期引用；FOK child 仍不开放。
     fn validate_child_tif(order: &StopOrder) -> Result<(), RejectReason> {
         match order {
             StopOrder::Limit(order)
@@ -336,7 +534,7 @@ impl StopBook {
         let location = self.locations.remove(&order_id)?;
         let entries = self
             .levels_mut(location.side)
-            .get_mut(&location.stop_price)
+            .get_mut(&(location.stop_price, location.reference))
             .expect("StopBook 位置索引必须指向存在的止损价位");
         let position = entries
             .iter()
@@ -344,7 +542,8 @@ impl StopBook {
             .expect("StopBook 位置索引必须指向价位中的订单");
         let entry = entries.remove(position);
         if entries.is_empty() {
-            self.levels_mut(location.side).remove(&location.stop_price);
+            self.levels_mut(location.side)
+                .remove(&(location.stop_price, location.reference));
         }
         Some((entry.order, entry.priority))
     }
@@ -367,13 +566,13 @@ impl StopBook {
     fn entry(&self, order_id: OrderId) -> Option<&StopEntry> {
         let location = self.locations.get(&order_id)?;
         self.levels(location.side)
-            .get(&location.stop_price)?
+            .get(&(location.stop_price, location.reference))?
             .iter()
             .find(|entry| entry.order.order_id() == order_id)
     }
 
     /// 选择一侧价位表。
-    fn levels(&self, side: Side) -> &BTreeMap<Price, Vec<StopEntry>> {
+    fn levels(&self, side: Side) -> &BTreeMap<(Price, PriceReferenceKind), Vec<StopEntry>> {
         match side {
             Side::Buy => &self.buy_stops,
             Side::Sell => &self.sell_stops,
@@ -381,7 +580,10 @@ impl StopBook {
     }
 
     /// 可变地选择一侧价位表。
-    fn levels_mut(&mut self, side: Side) -> &mut BTreeMap<Price, Vec<StopEntry>> {
+    fn levels_mut(
+        &mut self,
+        side: Side,
+    ) -> &mut BTreeMap<(Price, PriceReferenceKind), Vec<StopEntry>> {
         match side {
             Side::Buy => &mut self.buy_stops,
             Side::Sell => &mut self.sell_stops,
@@ -392,17 +594,19 @@ impl StopBook {
     fn validate_side(
         &self,
         side: Side,
-        levels: &BTreeMap<Price, Vec<StopEntry>>,
+        levels: &BTreeMap<(Price, PriceReferenceKind), Vec<StopEntry>>,
         seen: &mut HashMap<OrderId, StopLocation>,
     ) -> Result<(), &'static str> {
-        for (stop_price, entries) in levels {
+        for ((stop_price, reference), entries) in levels {
             let mut previous = None;
             for entry in entries {
                 let location = StopLocation {
                     side,
+                    reference: *reference,
                     stop_price: *stop_price,
                 };
                 if entry.order.side() != side
+                    || entry.order.trigger_reference() != *reference
                     || entry.order.stop_price() != *stop_price
                     || self.locations.get(&entry.order.order_id()) != Some(&location)
                 {
@@ -459,6 +663,7 @@ mod tests {
 
     fn limit(id: u64, side: Side, stop: u64, expiry: TriggerExpiry) -> StopOrder {
         StopOrder::Limit(StopLimitOrder {
+            trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
             order_id: OrderId::new(u128::from(id)),
             user_id: UserId::new(1),
             reservation_id: ReservationId::new(u128::from(id)),
@@ -474,6 +679,8 @@ mod tests {
 
     fn market(id: u64, side: Side, stop: u64, expiry: TriggerExpiry) -> StopOrder {
         StopOrder::Market(StopMarketOrder {
+            trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+            market_protection: None,
             order_id: OrderId::new(u128::from(id)),
             user_id: UserId::new(2),
             reservation_id: ReservationId::new(u128::from(id)),

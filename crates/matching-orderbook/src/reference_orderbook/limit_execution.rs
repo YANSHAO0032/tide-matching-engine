@@ -219,6 +219,7 @@ impl ReferenceOrderBook {
                 .expect("preflighted limit maker deduction must succeed");
         }
         self.orders.retain(|maker| maker.remaining() != 0);
+        self.retain_active_reservations();
         LimitImmediateExecution::new(order.order_id, trades, canceled_remaining)
     }
 }

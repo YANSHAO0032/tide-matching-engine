@@ -5,9 +5,39 @@ use crate::{OrderArena, OrderIndex, OrderNode, PriceLevel};
 use matching_domain::{
     LimitGtcOrder, LogicalTime, OrderId, Price, QueuePriority, RejectReason, Side, TimeInForce,
 };
+use matching_risk::ReservationState;
 use std::collections::BTreeMap;
 
 impl ProductionOrderBook {
+    /// 在一次独占提交中挂入普通订单并登记预留状态。
+    pub fn rest_with_reservation(
+        &mut self,
+        order: LimitGtcOrder,
+        state: ReservationState,
+    ) -> Result<(), RejectReason> {
+        self.validate_new_reservation(order.order_id, order.user_id, &state)?;
+        let order_id = order.order_id;
+        self.rest(order)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(())
+    }
+
+    /// 完成时效预检后，原子挂单并保存调用方预留状态。
+    pub fn rest_timed_with_reservation(
+        &mut self,
+        order: LimitGtcOrder,
+        tif: TimeInForce,
+        now: LogicalTime,
+        current_session_id: u64,
+        state: ReservationState,
+    ) -> Result<(), RejectReason> {
+        self.validate_new_reservation(order.order_id, order.user_id, &state)?;
+        let order_id = order.order_id;
+        self.rest_timed(order, tif, now, current_session_id)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(())
+    }
+
     /// 将已确认不可成交的限价单 GTC 余量挂入对应价格档尾。
     ///
     /// 此窄接口不执行撮合或生成事件；调用方必须先保证其不会价格交叉/价格相等。
@@ -335,6 +365,7 @@ impl ProductionOrderBook {
 
         self.regular_expiry
             .remove(order_id, removed.time_in_force());
+        self.reservations.remove(&order_id);
 
         Ok(removed)
     }

@@ -174,6 +174,7 @@ impl ReferenceOrderBook {
             // 5. 耗尽挂单直接删除，部分挂单保留。
             if self.orders[maker_index].remaining() == 0 {
                 self.orders.remove(maker_index);
+                self.reservations.remove(&maker_order_id);
             }
 
             // 6. TradeEvent 必须使用真实挂单成交价格。
@@ -256,6 +257,7 @@ impl ReferenceOrderBook {
 
             if exhausted {
                 self.orders.remove(maker_index);
+                self.reservations.remove(&maker_order_id);
             }
 
             events.push(EngineEvent::Trade(TradeEvent {

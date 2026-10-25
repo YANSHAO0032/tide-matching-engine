@@ -110,6 +110,7 @@ impl ReferenceOrderBook {
 
         if self.orders[maker_index].remaining() == 0 {
             self.orders.remove(maker_index);
+            self.reservations.remove(&maker_id);
         }
 
         Ok(Some((maker_id, maker_price, fill_qty)))

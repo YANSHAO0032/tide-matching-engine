@@ -26,6 +26,8 @@ pub enum StopMarketQuantity {
 /// 未触发的 StopLimit 订单载荷。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopLimitOrder {
+    /// 决定本单触发集合的持久价格来源。
+    pub trigger_reference: crate::PriceReferenceKind,
     /// 订单唯一标识符。
     pub order_id: OrderId,
     /// 订单所属用户标识符。
@@ -51,6 +53,10 @@ pub struct StopLimitOrder {
 /// 未触发的 StopMarket 订单载荷。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopMarketOrder {
+    /// 决定本单触发集合的持久价格来源。
+    pub trigger_reference: crate::PriceReferenceKind,
+    /// 触发时以该来源价格冻结并执行的市价保护。
+    pub market_protection: Option<crate::MarketProtection>,
     /// 订单唯一标识符。
     pub order_id: OrderId,
     /// 订单所属用户标识符。
@@ -81,6 +87,21 @@ pub enum StopOrder {
 }
 
 impl StopOrder {
+    /// 返回本单所属的触发来源。
+    pub fn trigger_reference(&self) -> crate::PriceReferenceKind {
+        match self {
+            Self::Limit(order) => order.trigger_reference,
+            Self::Market(order) => order.trigger_reference,
+        }
+    }
+
+    /// 返回市价 child 的实际保护模板，限价 child 没有市价保护。
+    pub fn market_protection(&self) -> Option<&crate::MarketProtection> {
+        match self {
+            Self::Limit(_) => None,
+            Self::Market(order) => order.market_protection.as_ref(),
+        }
+    }
     /// 返回不依赖容器位置的订单标识符。
     pub fn order_id(&self) -> OrderId {
         match self {
@@ -143,6 +164,8 @@ mod tests {
     #[test]
     fn stop_order_exposes_location_fields_without_child_lifetime_confusion() {
         let order = StopOrder::Market(StopMarketOrder {
+            trigger_reference: crate::PriceReferenceKind::LastTrade,
+            market_protection: None,
             order_id: OrderId::new(7),
             user_id: UserId::new(8),
             reservation_id: ReservationId::new(9),

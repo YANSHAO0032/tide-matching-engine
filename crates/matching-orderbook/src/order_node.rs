@@ -7,7 +7,7 @@ use matching_domain::{IcebergOrder, LimitGtcOrder, Qty, QueuePriority, TimeInFor
 /// 链接使用 `Option<OrderIndex>`，不保留特殊空值。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderNode {
-    /// 创建时的不可变订单请求；运行态链接和剩余量不回写该值。
+    /// 最近一次已接受的绝对总量载荷；成交和运行态链接不回写该值。
     order: LimitGtcOrder,
     /// 当前仍显示在本档位的正数量；冰山挂单只显示当前可见片。
     remaining: u64,
@@ -76,7 +76,7 @@ impl OrderNode {
         }
     }
 
-    /// 借用创建此节点的不可变订单数据。
+    /// 借用最近一次已接受的订单载荷，数量包含已经成交的部分。
     pub fn original_order(&self) -> &LimitGtcOrder {
         &self.order
     }
@@ -165,6 +165,35 @@ impl OrderNode {
         self.tif = tif;
     }
 
+    /// 在同价减量的已验证提交点原位替换普通订单载荷。
+    ///
+    /// 调用方必须先完成价格档聚合、到期索引和绝对总量的全部预检；
+    /// 本方法不触碰链接或优先级，因而保留原有先进先出位置。
+    pub(crate) fn amend_regular_in_place(
+        &mut self,
+        order: LimitGtcOrder,
+        remaining: Qty,
+        tif: TimeInForce,
+    ) {
+        assert!(
+            self.peak_size.is_none(),
+            "iceberg must not use regular amend"
+        );
+        assert_eq!(order.order_id, self.order.order_id, "amend changed OrderId");
+        assert_eq!(order.side, self.order.side, "amend changed side");
+        assert_eq!(
+            order.price, self.order.price,
+            "in-place amend changed price"
+        );
+        assert!(
+            remaining.get() <= self.remaining,
+            "in-place amend increased remaining"
+        );
+        self.order = order;
+        self.remaining = remaining.get();
+        self.tif = tif;
+    }
+
     /// 返回本档位前驱槽位；不能据此推断槽位仍在 Arena 中存活。
     pub fn prev(&self) -> Option<OrderIndex> {
         self.prev
@@ -173,6 +202,29 @@ impl OrderNode {
     /// 返回本档位后继槽位；不能据此验证整条链或成员归属。
     pub fn next(&self) -> Option<OrderIndex> {
         self.next
+    }
+
+    /// 冰山同价非增暴露改单只写入已校验的显示片与隐藏片，保留链接及优先级。
+    pub(crate) fn amend_iceberg_in_place(
+        &mut self,
+        order: LimitGtcOrder,
+        total: Qty,
+        visible: Qty,
+        peak: Qty,
+        tif: TimeInForce,
+    ) {
+        assert!(self.peak_size.is_some());
+        assert_eq!(order.order_id, self.order.order_id);
+        assert_eq!(order.price, self.order.price);
+        assert!(visible.get() <= self.remaining && total.get() <= self.total_remaining());
+        self.order = order;
+        self.remaining = visible.get();
+        self.hidden_remaining = total
+            .get()
+            .checked_sub(visible.get())
+            .expect("planned visible bounded by total");
+        self.peak_size = Some(peak);
+        self.tif = tif;
     }
 
     /// 仅由完成局部链表预检的库内维护路径设置前驱。

@@ -1,6 +1,6 @@
 use crate::{
-    CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason, ReservationId, TradeEvent,
-    TriggeredOrderKind,
+    AmendedQuantity, CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason,
+    ReservationId, TradeEvent, TriggeredOrderKind,
 };
 
 /// 订单终结时释放本地预留的稳定原因。
@@ -32,6 +32,21 @@ pub enum EngineEvent {
     OrderOpened {
         /// 已成为挂单流动性的订单标识符。
         order_id: OrderId,
+    },
+    /// 改单已提交；新值是再次撮合前的候选值，应先于该次撮合的成交及订单事件。
+    OrderAmended {
+        /// 保持不变的订单身份。
+        order_id: OrderId,
+        /// 改单前价格；无价格订单使用 `None`。
+        old_price: Option<Price>,
+        /// 改单后的候选价格；无价格订单使用 `None`。
+        new_price: Option<Price>,
+        /// 改单前的基础余量或报价预算。
+        old_quantity: AmendedQuantity,
+        /// 再次撮合前的候选基础余量或报价预算。
+        new_quantity: AmendedQuantity,
+        /// 是否保留原有队列优先级。
+        priority_retained: bool,
     },
     /// 订单成交后仍有严格正的总剩余量；冰山包含可见量 + 隐藏量。
     OrderPartiallyFilled {

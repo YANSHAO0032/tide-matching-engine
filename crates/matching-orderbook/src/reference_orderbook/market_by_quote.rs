@@ -352,6 +352,7 @@ impl ReferenceOrderBook {
             // 完全成交挂单从参考簿 Vec 中物理移除。
             if maker_after == 0 {
                 let removed = self.orders.remove(maker_index);
+                self.reservations.remove(&fill.maker_order_id);
 
                 assert_eq!(removed.original_order().order_id, fill.maker_order_id,);
                 assert_eq!(removed.remaining(), 0);
@@ -517,6 +518,7 @@ impl ReferenceOrderBook {
             if maker_after == 0 {
                 // 完全成交：物理移除挂单。
                 let removed = self.orders.remove(maker_index);
+                self.reservations.remove(&fill.maker_order_id);
 
                 assert_eq!(removed.original_order().order_id, fill.maker_order_id);
                 assert_eq!(removed.remaining(), 0);

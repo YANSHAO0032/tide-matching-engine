@@ -256,6 +256,7 @@ impl ProductionOrderBook {
             );
 
             self.regular_expiry.remove(maker_order_id, maker_tif);
+            self.reservations.remove(&maker_order_id);
 
             if level_became_empty {
                 let removed_level = match maker_side {

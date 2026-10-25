@@ -18,6 +18,31 @@ pub(super) struct RegularExpiryIndex {
 }
 
 impl RegularExpiryIndex {
+    /// 差分测试读取真实二级索引；按身份排序只统一两模型不同存储形式。
+    #[cfg(test)]
+    pub(super) fn test_entries(&self) -> Vec<(OrderId, TimeInForce)> {
+        let mut entries = self
+            .gtd
+            .iter()
+            .flat_map(|(at, ids)| {
+                ids.iter()
+                    .map(move |id| (*id, TimeInForce::Gtd { expire_at: *at }))
+            })
+            .chain(self.day.iter().flat_map(|(session, ids)| {
+                ids.iter().map(move |id| {
+                    (
+                        *id,
+                        TimeInForce::Day {
+                            session_id: *session,
+                        },
+                    )
+                })
+            }))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        entries
+    }
+
     pub(super) fn insert(&mut self, order_id: OrderId, tif: TimeInForce) {
         match tif {
             TimeInForce::Gtc => {}
@@ -182,7 +207,7 @@ impl ProductionOrderBook {
                 )
             })
             .collect::<Vec<_>>();
-        expired.extend(self.stop_book.expire_gtd_through(now).into_iter().map(
+        expired.extend(self.expire_stop_gtd_through(now).into_iter().map(
             |(order, _)| match order.trigger_expiry() {
                 TriggerExpiry::Gtd { expire_at } => (
                     expire_at,
@@ -224,8 +249,7 @@ impl ProductionOrderBook {
             })
             .collect::<Vec<_>>();
         expired.extend(
-            self.stop_book
-                .expire_day_session(session_id)
+            self.expire_stop_day_session(session_id)
                 .into_iter()
                 .map(|(order, _)| ExpiredOrder {
                     order_id: order.order_id(),

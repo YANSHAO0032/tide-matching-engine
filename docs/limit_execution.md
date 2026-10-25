@@ -32,7 +32,7 @@ IOC/FOK 返回 `LimitImmediateExecution`。`events()` 按真实成交顺序保�
 
 ## 合法组合边界
 
-`validate_basic_order_combination` 可供输入适配层检查当前支持的类型、TIF 和标志：Limit GTC/IOC/FOK、Iceberg GTC、Market IOC；PostOnly 允许 Limit/Iceberg GTC。当前不支持 Market FOK；因此按 base 和按 quote 的 Market FOK 都会被拒绝。Stop、DAY/GTD 与 ReduceOnly 不在当前执行支持范围。拒绝使用稳定码 `InvalidOrderCombination = 2001`。
+`validate_basic_order_combination` 可供输入适配层检查该基础 schema 支持的类型、TIF 和标志：Limit GTC/IOC/FOK、Iceberg GTC、Market IOC；PostOnly 允许 Limit/Iceberg GTC。当前不支持 Market FOK；因此按 base 和按 quote 的 Market FOK 都会被拒绝。该基础 helper 不承担 Stop、DAY/GTD 与 ReduceOnly 的完整组合校验，非法基础组合使用稳定码 `InvalidOrderCombination = 2001`。普通 DAY/GTD 由显式 timed 入口处理，Stop 由独立入口处理；活动订单修改见[挂单修改与本地预留授权](amend.md)。
 
 订单簿的显式限价入口不接受 Market 输入或额外 flags，因而不能构造 PostOnly + IOC/FOK 的调用组合。上述 schema 校验不代替簿状态、数值和资金校验，也不构成完整 PlaceOrder 协议。
 

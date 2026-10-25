@@ -12,7 +12,7 @@
 | `place_iceberg_post_only(order, math)` | 在改簿前拒绝含等价的交叉，通过全部校验才挂单 |
 | `place_limit_gtc_with_events(order, trade_ids)` | 普通限价成交及余量挂单，并返回冰山 maker 的生命周期事件 |
 
-当前支持 Iceberg GTC 及其 PostOnly 形式；IOC/FOK 与 Iceberg 输入组合非法。普通 IOC/FOK 可以与冰山 maker 成交。DAY/GTD、Stop、Amend 和资金预留仍属于后续功能。
+初始冰山下单支持 GTC 及其 PostOnly 形式；IOC/FOK 与 Iceberg 输入组合非法。普通 IOC/FOK 可以与冰山 maker 成交。活动冰山支持绝对总量、显示峰值、价格与合法 GTC/DAY/GTD 修改，完整数值/资金入口及边界见[挂单修改与本地预留授权](amend.md)。
 
 运行态的 `remaining()` 沿用可见量口径，与 `visible_remaining()` 相同。`hidden_remaining()` 是隐藏量，`total_remaining()` 是两者之和；`peak_size()` 对冰山返回 `Some(Qty)`，普通订单为 `None`。查询方须按用途选择字段：公开价档深度累计可见量，订单余量与取消数量使用总量。Cancel 返回被移除的运行态，包含尚未成交的可见和隐藏量。
 

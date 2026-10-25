@@ -5,6 +5,7 @@ use matching_domain::{
     LogicalTime, OrderId, RejectReason, Side, StopMarketQuantity, StopOrder, StopPriority,
     TimeInForce, TriggerExpiry,
 };
+use matching_risk::ReservationState;
 
 /// 参考模型中未触发止损订单的最小运行态。
 #[derive(Clone, Debug)]
@@ -16,6 +17,28 @@ pub(super) struct ReferenceStopOrder {
 }
 
 impl ReferenceOrderBook {
+    /// 在一次参考模型提交中登记未触发 Stop 与其本地预留快照。
+    pub fn place_stop_with_reservation(
+        &mut self,
+        order: StopOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        state: ReservationState,
+    ) -> Result<StopPriority, RejectReason> {
+        let order_id = order.order_id();
+        let user_id = match &order {
+            StopOrder::Limit(stop) => stop.user_id,
+            StopOrder::Market(stop) => stop.user_id,
+        };
+        self.validate_new_reservation(order_id, user_id, &state)?;
+        if order.reservation_id() != state.reservation_id {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let priority = self.place_stop(order, now, current_session_id)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(priority)
+    }
+
     /// 判断标识是否被常规订单或未触发止损订单占用。
     pub(crate) fn contains_active_order(&self, order_id: OrderId) -> bool {
         self.orders
@@ -41,6 +64,16 @@ impl ReferenceOrderBook {
     ) -> Result<StopPriority, RejectReason> {
         if self.contains_active_order(order.order_id()) {
             return Err(RejectReason::DuplicateOrderId);
+        }
+        if order.trigger_reference() == matching_domain::PriceReferenceKind::StaticOpening {
+            return Err(RejectReason::InvalidReferencePriceSource);
+        }
+        if order
+            .market_protection()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
         }
         match &order {
             StopOrder::Limit(order)
@@ -101,7 +134,19 @@ impl ReferenceOrderBook {
                 Side::Buy => left.order.stop_price().cmp(&right.order.stop_price()),
                 Side::Sell => right.order.stop_price().cmp(&left.order.stop_price()),
             };
-            price_order.then(left.priority.cmp(&right.priority))
+            let source_order = match side {
+                Side::Buy => left
+                    .order
+                    .trigger_reference()
+                    .cmp(&right.order.trigger_reference()),
+                Side::Sell => right
+                    .order
+                    .trigger_reference()
+                    .cmp(&left.order.trigger_reference()),
+            };
+            price_order
+                .then(source_order)
+                .then(left.priority.cmp(&right.priority))
         });
         entries
             .into_iter()
@@ -116,6 +161,7 @@ impl ReferenceOrderBook {
             .iter()
             .position(|entry| entry.order.order_id() == order_id)?;
         let entry = self.stop_orders.remove(index);
+        self.reservations.remove(&order_id);
         Some((entry.order, entry.priority))
     }
 
@@ -140,6 +186,7 @@ impl ReferenceOrderBook {
         let mut retained = Vec::with_capacity(self.stop_orders.len());
         for entry in self.stop_orders.drain(..) {
             if predicate(entry.order.trigger_expiry()) {
+                self.reservations.remove(&entry.order.order_id());
                 expired.push((entry.order, entry.priority));
             } else {
                 retained.push(entry);

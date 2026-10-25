@@ -7,6 +7,8 @@ use matching_domain::{
     EngineEvent, LimitGtcOrder, MarketByQuote, MarketMath, OrderId, Price, ProtectionSource, Qty,
     QueuePriority, QuoteAmount, RejectReason, Side, TradeEvent, TradeId,
 };
+mod amend_candidate;
+mod amend_regular;
 mod basic;
 mod expiry;
 mod iceberg;
@@ -22,3 +24,4 @@ mod property;
 mod protected_market_by_base;
 mod protected_market_by_quote_execution;
 mod protected_market_by_quote_preflight;
+mod reservation;

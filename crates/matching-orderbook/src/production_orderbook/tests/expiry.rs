@@ -8,6 +8,7 @@ use matching_domain::{
 
 fn stop_limit(id: u128, expiry: TriggerExpiry) -> StopOrder {
     StopOrder::Limit(StopLimitOrder {
+        trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         reservation_id: ReservationId::new(id + 1_000),

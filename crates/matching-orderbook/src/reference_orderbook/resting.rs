@@ -3,8 +3,22 @@
 use super::{PRIORITY_GUARD, ReferenceOrderBook};
 use crate::ReferenceOrder;
 use matching_domain::{LimitGtcOrder, OrderId, QueuePriority, RejectReason};
+use matching_risk::ReservationState;
 
 impl ReferenceOrderBook {
+    /// 独立校验并在一次独占提交中挂单、登记预留状态。
+    pub fn rest_with_reservation(
+        &mut self,
+        order: LimitGtcOrder,
+        state: ReservationState,
+    ) -> Result<(), RejectReason> {
+        self.validate_new_reservation(order.order_id, order.user_id, &state)?;
+        let order_id = order.order_id;
+        self.rest(order)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(())
+    }
+
     /// 将订单加入当前市场的参考订单簿。
     ///
     /// 校验顺序：
@@ -49,6 +63,8 @@ impl ReferenceOrderBook {
             .iter()
             .position(|order| order.original_order().order_id == order_id)
             .ok_or(RejectReason::OrderNotFound)?;
-        Ok(self.orders.remove(index))
+        let removed = self.orders.remove(index);
+        self.reservations.remove(&order_id);
+        Ok(removed)
     }
 }

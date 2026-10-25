@@ -1,5 +1,5 @@
 use crate::{OrderArena, OrderIndex, OrderNode};
-use matching_domain::{Qty, RejectReason};
+use matching_domain::{LimitGtcOrder, Qty, RejectReason, TimeInForce};
 
 /// 单个价格档位的运行态。
 ///
@@ -335,6 +335,80 @@ impl PriceLevel {
 
         // 6. 提交档位聚合量。
         self.total_visible_qty = new_total;
+    }
+
+    /// 在不解除链接的前提下提交同价普通改单的数量变化。
+    ///
+    /// 该路径只允许减量或不变；调用方负责订单载荷和到期索引的其余提交，
+    /// 本方法只维护节点余量及本价档可见聚合。
+    pub(crate) fn amend_regular_in_place(
+        &mut self,
+        arena: &mut OrderArena,
+        index: OrderIndex,
+        order: LimitGtcOrder,
+        remaining: Qty,
+        tif: TimeInForce,
+    ) {
+        let node = arena
+            .get(index)
+            .expect("PriceLevel invariant violation: amend target missing");
+        assert_eq!(node.original_order().order_id, order.order_id);
+        assert_eq!(node.original_order().price, order.price);
+        assert_eq!(node.original_order().side, order.side);
+        assert!(
+            node.peak_size().is_none(),
+            "iceberg must not use regular amend"
+        );
+        let old_remaining = node.remaining();
+        assert!(
+            remaining.get() <= old_remaining,
+            "in-place amend increased remaining"
+        );
+        let reduction = old_remaining
+            .checked_sub(remaining.get())
+            .expect("in-place amend remaining underflow");
+        let total = self
+            .total_visible_qty
+            .checked_sub(reduction)
+            .expect("in-place amend aggregate underflow");
+        assert!(total > 0, "in-place amend produced empty nonempty level");
+        arena
+            .get_mut(index)
+            .expect("prechecked amend target missing")
+            .amend_regular_in_place(order, remaining, tif);
+        self.total_visible_qty = total;
+    }
+
+    /// 不解链的冰山减量只扣减公开深度；候选已确保不会增加公开暴露。
+    pub(crate) fn amend_iceberg_in_place(
+        &mut self,
+        arena: &mut OrderArena,
+        index: OrderIndex,
+        replacement: OrderNode,
+    ) {
+        let node = arena.get(index).expect("iceberg amend target");
+        assert_eq!(
+            node.original_order().order_id,
+            replacement.original_order().order_id
+        );
+        let reduction = node
+            .visible_remaining()
+            .checked_sub(replacement.visible_remaining())
+            .expect("iceberg reduce exposure");
+        self.total_visible_qty = self
+            .total_visible_qty
+            .checked_sub(reduction)
+            .expect("iceberg aggregate");
+        arena
+            .get_mut(index)
+            .expect("iceberg amend target")
+            .amend_iceberg_in_place(
+                replacement.original_order().clone(),
+                Qty::try_new(replacement.total_remaining()).expect("planned total"),
+                Qty::try_new(replacement.visible_remaining()).expect("planned visible"),
+                replacement.peak_size().expect("iceberg peak"),
+                replacement.time_in_force(),
+            );
     }
 
     /// 移除并返回当前档位的先进先出头节点。

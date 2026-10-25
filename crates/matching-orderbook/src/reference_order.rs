@@ -46,6 +46,30 @@ impl ReferenceOrder {
         }
     }
 
+    /// 用已通过改单预检的总目标与剩余量重建普通挂单运行态。
+    ///
+    /// 该构造器只服务于失去优先级的普通改单路径；调用方必须已确认
+    /// `remaining` 严格为正且不超过新的绝对总量。
+    pub(crate) fn amended_regular(
+        original: LimitGtcOrder,
+        remaining: Qty,
+        priority: QueuePriority,
+        tif: TimeInForce,
+    ) -> Self {
+        assert!(
+            remaining <= original.qty,
+            "ReferenceOrder invariant violation: amended remaining exceeds target total"
+        );
+        Self {
+            original,
+            remaining: remaining.get(),
+            hidden_remaining: 0,
+            peak_size: None,
+            priority,
+            tif,
+        }
+    }
+
     /// 根据已验证的冰山余量构造运行态，同时保留原始输入。
     pub(crate) fn iceberg(
         original: LimitGtcOrder,
@@ -63,6 +87,27 @@ impl ReferenceOrder {
             peak_size: Some(peak),
             priority,
             tif: TimeInForce::Gtc,
+        }
+    }
+    /// 从只读计划重建冰山运行态，同时保存独立的可见片和时效。
+    pub(crate) fn amended_iceberg(
+        original: LimitGtcOrder,
+        total: Qty,
+        visible: Qty,
+        peak: Qty,
+        priority: QueuePriority,
+        tif: TimeInForce,
+    ) -> Self {
+        Self {
+            original,
+            remaining: visible.get(),
+            hidden_remaining: total
+                .get()
+                .checked_sub(visible.get())
+                .expect("planned visible bounded by total"),
+            peak_size: Some(peak),
+            priority,
+            tif,
         }
     }
     /// 公开深度只统计当前可见片的数量。
@@ -124,6 +169,34 @@ impl ReferenceOrder {
             TimeInForce::Gtc,
             "ReferenceOrder invariant violation: only initial GTC metadata may be replaced"
         );
+        self.tif = tif;
+    }
+
+    /// 同价减量在不改变队列位置时写入新的绝对目标和严格正余量。
+    pub(crate) fn amend_regular_in_place(
+        &mut self,
+        original: LimitGtcOrder,
+        remaining: Qty,
+        tif: TimeInForce,
+    ) {
+        assert!(
+            self.peak_size.is_none(),
+            "ReferenceOrder invariant violation: iceberg cannot use regular reduce"
+        );
+        assert!(
+            remaining.get() <= self.remaining,
+            "ReferenceOrder invariant violation: in-place reduce increased remaining"
+        );
+        assert_eq!(
+            self.original.order_id, original.order_id,
+            "ReferenceOrder invariant violation: in-place Amend changed order identity"
+        );
+        assert_eq!(
+            self.original.price, original.price,
+            "ReferenceOrder invariant violation: in-place Amend changed price"
+        );
+        self.original = original;
+        self.remaining = remaining.get();
         self.tif = tif;
     }
 

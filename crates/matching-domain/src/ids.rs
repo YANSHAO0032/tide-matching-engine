@@ -8,6 +8,11 @@ pub struct ClusterId(pub u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MarketId(pub u32);
 
+/// 资产身份；签名载荷使用四字节大端编码。
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AssetId(pub u32);
+
 /// 用户身份；它不是资金账户、订单或命令的替代标识。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -70,6 +75,7 @@ macro_rules! impl_id {
 
 impl_id!(ClusterId, u16);
 impl_id!(MarketId, u32);
+impl_id!(AssetId, u32);
 impl_id!(UserId, u64);
 impl_id!(OrderId, u128);
 impl_id!(CommandId, u128);
@@ -123,6 +129,7 @@ mod tests {
 
     test_id!(cluster_id_behavior, ClusterId, u16);
     test_id!(market_id_behavior, MarketId, u32);
+    test_id!(asset_id_behavior, AssetId, u32);
     test_id!(user_id_behavior, UserId, u64);
     test_id!(order_id_behavior, OrderId, u128);
     test_id!(command_id_behavior, CommandId, u128);

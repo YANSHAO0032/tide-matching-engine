@@ -20,6 +20,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> ReferenceOrder {
 fn book(orders: Vec<ReferenceOrder>) -> ReferenceOrderBook {
     ReferenceOrderBook {
         orders,
+        reservations: Default::default(),
         next_priority: 0,
         stop_orders: Vec::new(),
         next_stop_priority: 0,
@@ -313,6 +314,7 @@ fn priority_guard_allows_last_safe_rest_then_rejects() {
     // 只在测试模块中初始化高水位计数器。
     let mut book = ReferenceOrderBook {
         orders: Vec::new(),
+        reservations: Default::default(),
         next_priority: threshold - 1,
         stop_orders: Vec::new(),
         next_stop_priority: 0,
@@ -343,6 +345,7 @@ fn duplicate_id_takes_precedence_over_priority_exhaustion() {
 
     let mut book = ReferenceOrderBook {
         orders: Vec::new(),
+        reservations: Default::default(),
         next_priority: threshold - 1,
         stop_orders: Vec::new(),
         next_stop_priority: 0,

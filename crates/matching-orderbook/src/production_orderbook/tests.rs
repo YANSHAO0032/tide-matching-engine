@@ -17,6 +17,13 @@ use support::*;
 
 mod support;
 
+mod amend_atomicity;
+mod amend_candidate;
+mod amend_iceberg;
+mod amend_regular;
+mod amend_reservation;
+mod amend_stop;
+mod broad_review;
 mod cancel;
 mod differential;
 mod expiry;
@@ -28,6 +35,7 @@ mod market_by_base;
 mod market_by_quote;
 mod matching;
 mod query;
+mod reservation;
 mod resting;
 mod stop_trigger;
 

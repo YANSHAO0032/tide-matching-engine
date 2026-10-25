@@ -13,6 +13,7 @@ use matching_domain::{
     MarketMath, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason,
     Side, TradeEvent, TradeId,
 };
+use matching_risk::ReservationState;
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy)]
@@ -28,7 +29,7 @@ struct VirtualMaker {
 }
 
 #[derive(Clone, Copy)]
-struct SliceFill {
+pub(super) struct SliceFill {
     /// 被成交冰山挂单的订单标识符。
     id: OrderId,
     /// 本片成交的挂单价格。
@@ -41,11 +42,11 @@ struct SliceFill {
     refresh: Option<(Qty, QueuePriority)>,
 }
 
-struct IcebergPlan {
+pub(super) struct IcebergPlan {
     /// 按撮合顺序排列的冰山片成交计划。
-    fills: Vec<SliceFill>,
+    pub(super) fills: Vec<SliceFill>,
     /// 按基础数量预算执行时的剩余基础数量。
-    base_remaining: u64,
+    pub(super) base_remaining: u64,
     /// 按报价预算执行时的剩余报价资产金额。
     quote_remaining: QuoteAmount,
     /// 计划使用的报价资产本金。
@@ -53,15 +54,56 @@ struct IcebergPlan {
     /// 因保护边界停止时首个不可成交的价格信息。
     stop: Option<ProtectionBoundaryStop>,
     /// 全部补量提交后预期的下一队列优先级数值。
-    next_priority: u128,
+    pub(super) next_priority: u128,
 }
 
-enum Budget {
+pub(super) enum Budget {
     Base(u64),
     Quote(QuoteAmount),
 }
 
 impl ProductionOrderBook {
+    /// 在同一次独占调用中执行普通限价单并关联实际挂单余量。
+    pub fn place_limit_gtc_with_reservation(
+        &mut self,
+        order: LimitGtcOrder,
+        state: ReservationState,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        self.validate_new_reservation(order.order_id, order.user_id, &state)?;
+        let order_id = order.order_id;
+        let accepted = order.clone();
+        let events = self.place_limit_gtc_with_events(order, trade_ids)?;
+        if let Some(index) = self.orders.get(&order_id).copied() {
+            let node = self
+                .arena
+                .get_mut(index)
+                .expect("resting reservation order");
+            // 基础挂单路径仅保存余量；接收总量必须包含入簿前的真实成交。
+            node.amend_regular_in_place(
+                accepted,
+                Qty::try_new(node.total_remaining()).expect("positive placement residual"),
+                node.time_in_force(),
+            );
+            assert!(self.reservations.insert(order_id, state).is_none());
+        }
+        Ok(events)
+    }
+
+    /// 将冰山挂单及预留状态一并提交；失败保持两者不变。
+    pub fn place_iceberg_post_only_with_reservation(
+        &mut self,
+        iceberg: IcebergOrder,
+        math: &MarketMath,
+        state: ReservationState,
+    ) -> Result<(), RejectReason> {
+        let order_id = iceberg.order().order_id;
+        self.validate_new_reservation(order_id, iceberg.order().user_id, &state)?;
+        self.place_iceberg_post_only(iceberg, math)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(())
+    }
+
     pub(super) fn has_iceberg_maker(&self, incoming_side: Side) -> bool {
         let levels = match incoming_side {
             Side::Buy => &self.asks,
@@ -98,7 +140,7 @@ impl ProductionOrderBook {
         })
     }
 
-    fn preflight_iceberg_plan(
+    pub(super) fn preflight_iceberg_plan(
         &self,
         side: Side,
         limit: Option<Price>,
@@ -285,7 +327,7 @@ impl ProductionOrderBook {
         })
     }
 
-    fn commit_iceberg_plan(
+    pub(super) fn commit_iceberg_plan(
         &mut self,
         plan: &IcebergPlan,
         side: Side,
@@ -345,6 +387,7 @@ impl ProductionOrderBook {
                     .expect("planned full maker missing");
                 assert_eq!(removed.original_order().order_id, fill.id);
                 assert_eq!(self.orders.remove(&fill.id), Some(index));
+                self.reservations.remove(&fill.id);
                 self.regular_expiry.remove(fill.id, removed.time_in_force());
                 if level.is_empty() {
                     let removed_level = match maker_side {

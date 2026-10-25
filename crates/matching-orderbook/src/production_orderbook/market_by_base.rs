@@ -297,6 +297,7 @@ impl ProductionOrderBook {
 
             // 不要重复调用 `arena.remove`。
             assert_eq!(self.orders.remove(&maker_order_id), Some(head_index),);
+            self.reservations.remove(&maker_order_id);
             self.regular_expiry.remove(maker_order_id, maker_tif);
 
             if level_became_empty {

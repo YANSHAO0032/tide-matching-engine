@@ -442,6 +442,14 @@ pub(super) fn validate_book(book: &ProductionOrderBook) -> Result<(), String> {
     book.validate_regular_expiry()
         .map_err(|reason| format!("expiry-index/{reason}"))?;
 
+    for (order_id, state) in &book.reservations {
+        if state.order_id != *order_id || !book.contains_active_order(*order_id) {
+            return Err(format!(
+                "reservation/invalid-identity: order_id={order_id:?}"
+            ));
+        }
+    }
+
     Ok(())
 }
 

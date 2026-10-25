@@ -14,6 +14,8 @@ fn math() -> MarketMath {
 
 fn stop_market(id: u128, side: Side, stop_price: i64) -> StopOrder {
     StopOrder::Market(StopMarketOrder {
+        trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+        market_protection: None,
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         reservation_id: ReservationId::new(id + 1_000),
@@ -28,6 +30,7 @@ fn stop_market(id: u128, side: Side, stop_price: i64) -> StopOrder {
 
 fn stop_limit(id: u128, side: Side, stop_price: i64, price: i64) -> StopOrder {
     StopOrder::Limit(StopLimitOrder {
+        trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         reservation_id: ReservationId::new(id + 1_000),
@@ -62,9 +65,14 @@ fn trigger_r1_insufficient_reservation_has_zero_trades_and_removes_stop_first() 
     let priority_before = book.next_queue_priority();
 
     let events = book
-        .trigger_stops(last_trade(2, 105), &math(), &[], |_| {
-            Err(RejectReason::InsufficientReservation)
-        })
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Err(RejectReason::InsufficientReservation),
+        )
         .unwrap();
 
     assert_eq!(
@@ -94,7 +102,14 @@ fn trigger_r1_insufficient_reservation_has_zero_trades_and_removes_stop_first() 
             .any(|event| matches!(event, EngineEvent::Trade(_)))
     );
     assert_eq!(
-        book.trigger_stops(last_trade(3, 106), &math(), &[], |_| Ok(())),
+        book.trigger_stops(
+            last_trade(3, 106),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(())
+        ),
         Ok(Vec::new())
     );
 }
@@ -110,9 +125,14 @@ fn trigger_r1_fee_schedule_mismatch_has_zero_trades_and_releases_reservation() {
     );
 
     let events = book
-        .trigger_stops(last_trade(2, 105), &math(), &[], |_| {
-            Err(RejectReason::FeeScheduleMismatch)
-        })
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Err(RejectReason::FeeScheduleMismatch),
+        )
         .unwrap();
 
     assert!(matches!(
@@ -198,7 +218,14 @@ fn limit_child_allocates_queue_priority_only_when_it_rests() {
     assert_eq!(book.next_queue_priority(), 0);
 
     let events = book
-        .trigger_stops(last_trade(2, 105), &math(), &[], |_| Ok(()))
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
         .unwrap();
     assert!(matches!(
         events.as_slice(),
@@ -241,10 +268,24 @@ fn run_cascade() -> (Vec<EngineEvent>, Vec<EngineEvent>) {
 
     let trade_ids = [TradeId::new(1), TradeId::new(2), TradeId::new(3)];
     let production_events = production
-        .trigger_stops(last_trade(2, 105), &math(), &trade_ids, |_| Ok(()))
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &trade_ids,
+            |_| Ok(()),
+        )
         .unwrap();
     let reference_events = reference
-        .trigger_stops(last_trade(2, 105), &math(), &trade_ids, |_| Ok(()))
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &trade_ids,
+            |_| Ok(()),
+        )
         .unwrap();
     assert!(production.stop_order(OrderId::new(1)).is_none());
     assert!(production.stop_order(OrderId::new(2)).is_none());

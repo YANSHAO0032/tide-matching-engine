@@ -2,6 +2,8 @@
 //!
 //! 当前提供撮合所需的领域子集，不包含完整命令封装、资金账本或持久化协议。
 
+/// 改单绝对目标、显式补丁与纯候选计算。
+pub mod amend_order;
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
 /// 订单到期的稳定业务原因。
@@ -35,6 +37,8 @@ pub mod price_reference;
 pub mod queue_priority;
 /// 稳定编号的拒绝原因。
 pub mod reject_reason;
+/// 资金预留调整令牌与规范签名载荷。
+pub mod reservation_adjustment;
 /// 买卖方向。
 pub mod side;
 /// 未触发 Stop 的输入载荷和触发后 child 的数量模式。
@@ -49,8 +53,14 @@ pub mod trade_event;
 pub mod trigger_expiry;
 
 /// 对外公开的集群、市场、用户、订单、命令、成交和预留身份。
-pub use ids::{ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, UserId};
+pub use ids::{AssetId, ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, UserId};
 
+/// 改单载荷、数量模式及纯候选计算。
+pub use amend_order::{
+    AmendOrder, AmendQuantityMode, AmendedQuantity, MarketProtectionPatch, RegularAmendKind,
+    TriggerExpiryPatch, classify_regular_amend, remaining_after_target_total,
+    validate_amend_quantity_mode,
+};
 /// 最小订单生命周期事件。
 pub use engine_event::EngineEvent;
 /// 订单终结时释放本地预留的稳定原因。
@@ -82,6 +92,8 @@ pub use price_reference::{PriceReference, PriceReferenceKind, PriceReferenceStat
 pub use queue_priority::QueuePriority;
 /// 稳定编号的业务拒绝原因。
 pub use reject_reason::RejectReason;
+/// 按资产排序的目标预留与签名授权令牌。
+pub use reservation_adjustment::{AssetReserve, ReservationAdjustmentToken};
 /// 买卖方向。
 pub use side::Side;
 /// 未触发 Stop 的领域订单和数量模式。

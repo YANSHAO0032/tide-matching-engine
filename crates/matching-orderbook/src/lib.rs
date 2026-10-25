@@ -7,8 +7,10 @@
 //! PostOnly 只在成功挂单时分配；冰山每次补量移动到同价队尾。
 //! 本库不包含完整命令生命周期、资金闭环、持久化或市场管理。
 
+mod amend_execution_context;
 /// 进入撮合流程但尚未挂单的最小运行态。
 pub mod incoming_order;
+pub use amend_execution_context::AmendExecutionContext;
 /// 参考簿与生产簿共享的只读市价计划数据；不含撮合算法。
 mod market_plan;
 /// 保存稳定槽位与后进先出空闲链表的 Arena 容器。

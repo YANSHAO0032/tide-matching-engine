@@ -12,6 +12,7 @@ use matching_domain::{
     MarketMath, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason,
     Side, TradeEvent, TradeId,
 };
+use matching_risk::ReservationState;
 
 pub(super) struct SliceRequest<'a> {
     /// 正在执行的订单标识符。
@@ -34,11 +35,11 @@ pub(super) struct SliceRequest<'a> {
 
 pub(super) struct SlicePlan {
     /// 提交后按参考模型顺序保存的全部挂单。
-    orders: Vec<ReferenceOrder>,
+    pub(super) orders: Vec<ReferenceOrder>,
     /// 提交后预期分配器的下一队列优先级数值。
-    next_priority: u128,
+    pub(super) next_priority: u128,
     /// 按撮合顺序产生的生命周期事件。
-    events: Vec<EngineEvent>,
+    pub(super) events: Vec<EngineEvent>,
     /// 计划结束后尚待执行的基础资产数量。
     pub remaining: u64,
     /// 计划使用的报价资产本金。
@@ -48,6 +49,47 @@ pub(super) struct SlicePlan {
 }
 
 impl ReferenceOrderBook {
+    /// 独立规划限价单成交，并仅为实际入簿余量保存预留状态。
+    pub fn place_limit_gtc_with_reservation(
+        &mut self,
+        order: LimitGtcOrder,
+        state: ReservationState,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        self.validate_new_reservation(order.order_id, order.user_id, &state)?;
+        let order_id = order.order_id;
+        let accepted = order.clone();
+        let events = self.place_limit_gtc_with_events(order, trade_ids)?;
+        if let Some(maker) = self
+            .orders
+            .iter_mut()
+            .find(|maker| maker.original_order().order_id == order_id)
+        {
+            // 独立保留接收绝对总量，入簿前成交仍计入后续改单的已成交量。
+            maker.amend_regular_in_place(
+                accepted,
+                Qty::try_new(maker.total_remaining()).expect("positive reference residual"),
+                maker.time_in_force(),
+            );
+            assert!(self.reservations.insert(order_id, state).is_none());
+        }
+        Ok(events)
+    }
+
+    /// 在一次参考模型提交中挂入冰山订单并保存预留状态。
+    pub fn place_iceberg_post_only_with_reservation(
+        &mut self,
+        iceberg: IcebergOrder,
+        math: &MarketMath,
+        state: ReservationState,
+    ) -> Result<(), RejectReason> {
+        let order_id = iceberg.order().order_id;
+        self.validate_new_reservation(order_id, iceberg.order().user_id, &state)?;
+        self.place_iceberg_post_only(iceberg, math)?;
+        assert!(self.reservations.insert(order_id, state).is_none());
+        Ok(())
+    }
+
     pub(super) fn has_iceberg_maker(&self, incoming_side: Side) -> bool {
         self.orders.iter().any(|maker| {
             maker.original_order().side != incoming_side && maker.peak_size().is_some()
@@ -67,6 +109,7 @@ impl ReferenceOrderBook {
     pub(super) fn plan_slices(&self, request: SliceRequest<'_>) -> Result<SlicePlan, RejectReason> {
         let mut virtual_book = Self {
             orders: self.orders.clone(),
+            reservations: self.reservations.clone(),
             next_priority: self.next_priority,
             stop_orders: self.stop_orders.clone(),
             next_stop_priority: self.next_stop_priority,
@@ -249,6 +292,7 @@ impl ReferenceOrderBook {
             }
         }
         self.orders = plan.orders;
+        self.retain_active_reservations();
         self.next_priority = plan.next_priority;
         plan.events
     }
@@ -345,6 +389,7 @@ impl ReferenceOrderBook {
         let mut plan = self.plan_limit_slices(&order, math, order.qty.get(), false)?;
         let mut virtual_book = Self {
             orders: plan.orders,
+            reservations: self.reservations.clone(),
             next_priority: plan.next_priority,
             stop_orders: self.stop_orders.clone(),
             next_stop_priority: self.next_stop_priority,
