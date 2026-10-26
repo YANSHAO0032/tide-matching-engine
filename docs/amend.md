@@ -50,6 +50,8 @@ Stop 按 LastTrade、MarkPrice、IndexPrice 分区；StaticOpening 不可触发�
 
 数量、时间、保护、资金、算术、档位聚合与 priority 的普通拒绝都发生在写屏障之前；拒绝保持载荷、FIFO、深度、Arena/free-list、身份与到期索引、两种 priority 及 allocator、来源参考和完整预留/version。TradeId 不足遵循既有调用方容量契约，在首个写入前 fail-stop；不是客户业务 Reject。提交阶段消费已冻结计划，不返回新的普通业务错误。
 
+完整入口先在普通簿、冰山或未触发 Stop 容器中定位活动 `OrderId`；三个容器均不存在时稳定返回 `OrderNotFound (2010)`，不读取已随 Cancel、Fill 或 Expire 清理的 shadow reservation。只有订单仍活动而 shadow 缺失、身份不匹配或版本/令牌验证失败时，才返回 `InvalidReservation (4002)`。两种拒绝均不改变任何订单簿或预留状态。
+
 参考更新触发级联前，先在独立参考价快照中应用 root 输入，再检查后代成交所需的 LastTrade 序号容量。root 自身提高来源序号后的溢出也必须在移除 Stop、撮合和推进真实参考前拒绝；恰好使用到最大合法序号仍可成功。
 
 固定边界、生成式失败性质和完整混合差分逐命令比较原序结果/事件、所有普通与 Stop 载荷、真实 FIFO、深度、到期引用、两个 allocator、来源价格/序号和完整预留。固定 seed 100k 及两组各双次 10k 比较完整逐步 transcript；状态投影用于本地测试，不是 durable digest。实现入口见[模块说明](orderbook_modules.md)，执行顺序见[逻辑流程](logic_flows.md)。

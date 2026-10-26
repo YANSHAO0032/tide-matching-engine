@@ -21,7 +21,7 @@
 | 按基础数量执行市价单 | [market_by_base.rs](../crates/matching-orderbook/src/production_orderbook/market_by_base.rs) | [market_by_base.rs](../crates/matching-orderbook/src/reference_orderbook/market_by_base.rs) |
 | 按报价预算执行市价单 | [market_by_quote.rs](../crates/matching-orderbook/src/production_orderbook/market_by_quote.rs) | [market_by_quote.rs](../crates/matching-orderbook/src/reference_orderbook/market_by_quote.rs) |
 | 冰山可见片与补量 | [iceberg.rs](../crates/matching-orderbook/src/production_orderbook/iceberg.rs) | [iceberg.rs](../crates/matching-orderbook/src/reference_orderbook/iceberg.rs) |
-| 普通订单定时挂单与到期 | [expiry.rs](../crates/matching-orderbook/src/production_orderbook/expiry.rs) | [expiry.rs](../crates/matching-orderbook/src/reference_orderbook/expiry.rs) |
+| 普通订单 DAY/GTD 定时挂单、到期与 EndSession | [expiry.rs](../crates/matching-orderbook/src/production_orderbook/expiry.rs) | [expiry.rs](../crates/matching-orderbook/src/reference_orderbook/expiry.rs) |
 | 未触发止损、触发前到期 | [stop_orders.rs](../crates/matching-orderbook/src/production_orderbook/stop_orders.rs) 与 [stop_book.rs](../crates/matching-orderbook/src/stop_book.rs) | [stop_orders.rs](../crates/matching-orderbook/src/reference_orderbook/stop_orders.rs) |
 | 止损触发与级联 | [stop_trigger.rs](../crates/matching-orderbook/src/production_orderbook/stop_trigger.rs) | [stop_trigger.rs](../crates/matching-orderbook/src/reference_orderbook/stop_trigger.rs) |
 | 改单候选、普通改单与完整上下文入口 | [amend_candidate.rs](../crates/matching-orderbook/src/production_orderbook/amend_candidate.rs) | [amend_candidate.rs](../crates/matching-orderbook/src/reference_orderbook/amend_candidate.rs) |
@@ -67,11 +67,13 @@
 | [protected_quote_scenarios.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/protected_quote_scenarios.rs) | 受保护报价市价单的专项固定场景与失败原子性 |
 | [execution_constraints.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/execution_constraints.rs) | IOC、FOK、PostOnly 命令序列与语义性质 |
 | [iceberg.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/iceberg.rs) | 冰山混合命令序列、补量和数量守恒性质 |
-| [expiry.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/expiry.rs) | 逻辑时间、会话与普通/止损到期比较 |
+| [expiry.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/expiry.rs) | LogicalClock、GTD、DAY、EndSession 与普通/止损到期的差分 tape、生成式场景 |
 | [amend_regular.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_regular.rs) | 常规改单、绝对数量、事件原序与完整 TIF 迁移 |
 | [amend_full.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_full.rs) 及其 [scenarios.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_full/scenarios.rs)、[tapes.rs](../crates/matching-orderbook/src/production_orderbook/tests/differential/amend_full/tapes.rs) | 全容器改单、真实签名、触发/到期、100k 与两组双次 10k 完整 transcript |
 
 公共工具只统一测试观察和执行驱动；两本订单簿分别执行自己的撮合算法，比较时保留原始事件顺序。测试数据类型的字段保持私有，跨分组辅助函数只在差分测试范围内开放。
+
+`proptest-regressions/` 保存性质测试曾发现并缩减的失败输入。测试运行时会先重放这些种子，再生成新样本；例如 `market_by_quote.txt` 固定了“较优价档不可支付、较差价档仍可支付”的报价预算边界。该目录是测试回归证据，应随源码保留，不参与生产运行。
 
 阅读时先查看两种订单簿的字段和查询方法，再沿所需公开入口进入对应功能文件，最后查看该功能的单元测试与差分案例。基础参考撮合仍不自动挂入 incoming 余量，完整生命周期入口负责相应挂单；不能仅因两侧方法同名就忽略接口契约差异。
 
@@ -93,4 +95,8 @@ StopBook 同时保存订单位置索引与触发前到期索引。GTD 按 Logica
 
 [领域改单协议](../crates/matching-domain/src/amend_order.rs) 定义绝对目标、patch 和 typed quantity；[预留令牌](../crates/matching-domain/src/reservation_adjustment.rs) 固定签名字节；[本地风控验证器](../crates/matching-risk/src/reservation_adjustment.rs) 负责已加载 Ed25519 公钥验签和 checked 版本应用。两本簿分别按 OrderId 保存 shadow reservation，身份 map 不决定业务顺序。完整核验使用 `amend_with_context`，低层改单入口要求调用者已完成数值与资金校验。
 
-`tests/amend_atomicity.rs` 对完整物理状态进行拒绝前后比较，`tests/amend_reservation.rs` 覆盖真实签名与 StopLimit 接续，`tests/amend_iceberg.rs` 和 `tests/amend_stop.rs` 固定优先级与触发执行矩阵。无分支 getter、重导出和透明转发由这些消费者覆盖，不以逐方法镜像测试替代真实状态验证。
+`tests/amend_atomicity.rs` 对完整物理状态进行拒绝前后比较，`tests/amend_reservation.rs` 覆盖真实签名与 StopLimit 接续，`tests/amend_iceberg.rs` 和 `tests/amend_stop.rs` 固定优先级与触发执行矩阵。两个 `amend_candidate.rs` 的终结路径回归固定空簿、取消、全成与到期后的 `OrderNotFound (2010)`，并与活动订单缺失 shadow 的 `InvalidReservation (4002)` 对照。无分支 getter、重导出和透明转发由这些消费者覆盖，不以逐方法镜像测试替代真实状态验证。
+
+## 常规订单的逻辑时间与会话到期
+
+常规订单的 TIF 存在订单运行态中。生产簿以 `BTreeMap<LogicalTime, BTreeSet<OrderId>>` 和 session 索引维护二级引用；参考簿独立扫描 Vec，并显式排序。两侧的 GTD 输出固定为 `(expire_at, order_id)` 顺序，DAY/EndSession 输出固定为 `order_id` 顺序。取消、完全成交和到期均同步删除二级引用，避免遗留到期记录；到期不会重排或消耗 QueuePriority。

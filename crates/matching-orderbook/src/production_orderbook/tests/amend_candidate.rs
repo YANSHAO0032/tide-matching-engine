@@ -200,3 +200,61 @@ fn missing_or_wrong_quantity_mode_rejects_without_production_state_drift() {
     assert_eq!(book.validate_stop_book(), Ok(()));
     assert_eq!(book.validate_regular_expiry(), Ok(()));
 }
+
+#[test]
+fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lookup() {
+    let mut book = ProductionOrderBook::new(policy());
+
+    let assert_missing = |book: &ProductionOrderBook, order_id: OrderId| {
+        let before = snapshot(book, &[]);
+        assert_eq!(
+            book.build_amend_plan(
+                &amend(
+                    order_id,
+                    UserId::new(order_id.get() as u64),
+                    Qty::try_new(1).unwrap()
+                ),
+                LogicalTime::new(20),
+                1,
+            ),
+            Err(RejectReason::OrderNotFound),
+        );
+        assert_eq!(snapshot(book, &[]), before);
+    };
+
+    assert_missing(&book, OrderId::new(1));
+
+    let canceled = order(2, Side::Buy, 90, 1);
+    book.rest_with_reservation(
+        canceled.clone(),
+        reservation(canceled.order_id, canceled.user_id),
+    )
+    .unwrap();
+    book.cancel(canceled.order_id).unwrap();
+    assert_missing(&book, canceled.order_id);
+
+    let filled = order(3, Side::Sell, 100, 1);
+    book.rest_with_reservation(filled.clone(), reservation(filled.order_id, filled.user_id))
+        .unwrap();
+    let mut incoming = IncomingOrder::new(order(4, Side::Buy, 100, 1));
+    book.execute_next_fill_trade(&mut incoming, TradeId::new(1))
+        .unwrap();
+    assert_missing(&book, filled.order_id);
+
+    let expired = order(5, Side::Buy, 90, 1);
+    book.rest_timed_with_reservation(
+        expired.clone(),
+        TimeInForce::Gtd {
+            expire_at: LogicalTime::new(20),
+        },
+        LogicalTime::new(10),
+        1,
+        reservation(expired.order_id, expired.user_id),
+    )
+    .unwrap();
+    book.expire_gtd_through(LogicalTime::new(20));
+    assert_missing(&book, expired.order_id);
+    assert_eq!(validate_book(&book), Ok(()));
+    assert_eq!(book.validate_stop_book(), Ok(()));
+    assert_eq!(book.validate_regular_expiry(), Ok(()));
+}

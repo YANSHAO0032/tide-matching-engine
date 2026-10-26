@@ -466,12 +466,12 @@ impl ReferenceOrderBook {
         now: LogicalTime,
         current_session_id: u64,
     ) -> Result<ReferenceAmendPlan, RejectReason> {
-        let reservation = self.reservation_snapshot(amend)?;
         if let Some(order) = self
             .orders
             .iter()
             .find(|entry| entry.original_order().order_id == amend.order_id)
         {
+            let reservation = self.reservation_snapshot(amend)?;
             return Self::build_regular_plan(order, amend, now, current_session_id, reservation);
         }
         if let Some(stop) = self
@@ -479,6 +479,7 @@ impl ReferenceOrderBook {
             .iter()
             .find(|entry| entry.order.order_id() == amend.order_id)
         {
+            let reservation = self.reservation_snapshot(amend)?;
             return Self::build_stop_plan(stop, amend, reservation);
         }
         Err(RejectReason::OrderNotFound)

@@ -221,3 +221,81 @@ fn missing_or_wrong_quantity_mode_rejects_without_reference_state_drift() {
     );
     assert_eq!(snapshot(&book), before);
 }
+
+#[test]
+fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lookup() {
+    let mut book = ReferenceOrderBook::new();
+
+    let assert_missing = |book: &ReferenceOrderBook, order_id: OrderId| {
+        let before = snapshot(book);
+        assert_eq!(
+            book.build_amend_plan(
+                &amend(
+                    order_id,
+                    UserId::new(order_id.get() as u64),
+                    Qty::try_new(1).unwrap()
+                ),
+                LogicalTime::new(20),
+                1,
+            ),
+            Err(RejectReason::OrderNotFound),
+        );
+        assert_eq!(snapshot(book), before);
+    };
+
+    assert_missing(&book, OrderId::new(1));
+
+    let canceled = LimitGtcOrder {
+        order_id: OrderId::new(2),
+        user_id: UserId::new(2),
+        side: Side::Buy,
+        price: Price::try_new(90).unwrap(),
+        qty: Qty::try_new(1).unwrap(),
+    };
+    book.rest_with_reservation(
+        canceled.clone(),
+        reservation(canceled.order_id, canceled.user_id),
+    )
+    .unwrap();
+    book.cancel(canceled.order_id).unwrap();
+    assert_missing(&book, canceled.order_id);
+
+    let filled = LimitGtcOrder {
+        order_id: OrderId::new(3),
+        user_id: UserId::new(3),
+        side: Side::Sell,
+        price: Price::try_new(100).unwrap(),
+        qty: Qty::try_new(1).unwrap(),
+    };
+    book.rest_with_reservation(filled.clone(), reservation(filled.order_id, filled.user_id))
+        .unwrap();
+    let mut incoming = IncomingOrder::new(LimitGtcOrder {
+        order_id: OrderId::new(4),
+        user_id: UserId::new(4),
+        side: Side::Buy,
+        price: Price::try_new(100).unwrap(),
+        qty: Qty::try_new(1).unwrap(),
+    });
+    book.execute_next_fill(&mut incoming).unwrap();
+    assert_missing(&book, filled.order_id);
+
+    let expired = LimitGtcOrder {
+        order_id: OrderId::new(5),
+        user_id: UserId::new(5),
+        side: Side::Buy,
+        price: Price::try_new(90).unwrap(),
+        qty: Qty::try_new(1).unwrap(),
+    };
+    book.rest_timed_with_reservation(
+        expired.clone(),
+        TimeInForce::Gtd {
+            expire_at: LogicalTime::new(20),
+        },
+        LogicalTime::new(10),
+        1,
+        reservation(expired.order_id, expired.user_id),
+    )
+    .unwrap();
+    book.expire_gtd_through(LogicalTime::new(20));
+    assert_missing(&book, expired.order_id);
+}

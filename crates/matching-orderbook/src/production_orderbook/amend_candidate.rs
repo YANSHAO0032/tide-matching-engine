@@ -520,11 +520,12 @@ impl ProductionOrderBook {
         now: LogicalTime,
         current_session_id: u64,
     ) -> Result<ProductionAmendPlan, RejectReason> {
-        let reservation = self.reservation_snapshot(amend)?;
         if let Some(node) = self.order(amend.order_id) {
+            let reservation = self.reservation_snapshot(amend)?;
             return Self::build_regular_plan(node, amend, now, current_session_id, reservation);
         }
         if let Some((stop, priority)) = self.stop_book.get(amend.order_id) {
+            let reservation = self.reservation_snapshot(amend)?;
             return Self::build_stop_plan(stop, priority, amend, reservation);
         }
         Err(RejectReason::OrderNotFound)

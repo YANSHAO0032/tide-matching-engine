@@ -756,7 +756,7 @@ fn amend_regular_differential_rejections_leave_both_full_states_unchanged() {
     assert_eq!(harness.production.reservation_state(input.order_id), None);
     assert_eq!(
         harness.run(Command::Amend(amend(&input).into())).outcome,
-        Outcome::Events(Err(RejectReason::InvalidReservation))
+        Outcome::Events(Err(RejectReason::OrderNotFound))
     );
 }
 

@@ -267,7 +267,7 @@ fn reject_case(kind: u8, side: Side, noise: u16, failure: u8) {
         }
         2 => {
             cmd.order_id = OrderId::new(99);
-            RejectReason::InvalidReservation
+            RejectReason::OrderNotFound
         }
         3 => {
             cmd.new_qty = Some(Qty::try_new(12).unwrap());

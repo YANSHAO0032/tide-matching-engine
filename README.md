@@ -4,13 +4,17 @@
 
 ## 当前状态
 
-订单簿模块已按职责整理：两个模块入口分别保留类型、状态、构造与查询，挂单取消、基础撮合、限价策略、两类市价和冰山实现位于子模块，原有测试迁至对应测试目录。公开 API 与两套独立撮合算法保持不变。2026-10-22 本地回归通过：完整 52 项差分、395 项订单簿测试、workspace 538 项单元测试及 2 项 doctest，另有 fmt、严格 Clippy 和无警告 Rustdoc。文件入口见 [订单簿模块与代码入口](docs/orderbook_modules.md)。
+截至 2026-10-25，T00–T11 已交付；含 P2 修复的 T12 Amend 未提交工作树已完成 scoped re-review 与本地完整验证，等待用户决定是否提交。本地 `main` 的已提交 HEAD `d694974` 尚不包含该修复；远端 `origin/main` 仍为 `550fda02816c73a5704b4ffe836fcfb31ffff08f`，未推送且远端 CI/GitHub 页面未核验。当前能力还包含订单簿模块整理、StopBook/确定性止损级联、LogicalClock 驱动的常规与未触发 Stop 的 DAY/GTD 到期，以及 EndSession。文件职责和测试入口见 [订单簿模块与代码入口](docs/orderbook_modules.md)。
 
-**T08_P3_iceberg 已完成本地验收**，分支 `codex/t08-iceberg`，基线为已合并 T07 的 `7048296`。2026-10-22 本地验收通过：workspace 538 项单元测试（domain 143、orderbook 395）及 2 项 doctest；完整 differential 52 项、fmt、严格 workspace Clippy 均通过。包含冰山固定 seed 100k 混合命令与两组双次 10k 重复 tape。 已实现可见/隐藏量守恒、补量取得新优先级并移到队尾、total remaining 事件、完整取消与既有成交入口兼容。API 见 [冰山订单](docs/iceberg.md)。交付分支为 `codex/t08-iceberg`，本次包含 T00–T08 中文注释规范修订；上述结果为本地验收，远端 CI 状态单独核验。以下旧测试数字保留为历史证据。
+**T12 Amend 的未提交修复已完成本地验证。**两个独立订单簿已具备普通、冰山和未触发 Stop 的 Amend 候选/提交路径、typed `OrderAmended` 事件和本地版本化预留令牌验证；用户冻结的数量规则为绝对总目标必须严格大于已成交量，零余量改用 Cancel。P2 已将 terminal OrderId 的稳定原因恢复为 `OrderNotFound (2010)`，并保留活动订单缺失 shadow 时的 `InvalidReservation (4002)`；该修复已通过 scoped re-review 与完整本地 gate，但尚未提交，不代表远端 CI、完整账户/结算或持久化协议已经完成。
 
-**T07_P3_ioc_fok_postonly 已完成（2026-10-21）**。2026-10-21 用户已解除导师模式，授权 Codex 直接完成实现和验收；已在 `codex/t07-ioc-fok-postonly` 分支完成本地验收：495 项单元测试、2 项 doctest，以及 fmt、严格 Clippy 全部通过；包含固定 seed 100k 混合命令和重复 tape 验证。交付分支为 `codex/t07-ioc-fok-postonly`；上述结果为本地验证，远端 CI 未核验。API 与事件契约见 [限价订单执行约束](docs/limit_execution.md)。
+**T11 LogicalClock / DAY / GTD / EndSession 已交付。**实现提交 `36d4a4d` 已快进合入 `main`；随后 `ReservationReleaseReason` 的文件组织整理由 PR #3 合入 `550fda0`，保持 crate-root 公开导入路径不变。逻辑时间只接受显式单调推进；GTD 必须严格晚于当前 LogicalTime，DAY 必须绑定当前 session。生产簿使用有序到期索引，参考簿以独立 Vec 扫描与显式排序实现相同顺序；EndSession 会终结对应的常规 DAY 与未触发 Stop-DAY 订单。最终本地 gate：domain 152、orderbook 419、2 项 doctest，fmt、严格 Clippy 与测试均通过；远端 CI 未在本记录中重新核验。
 
-当前已验收 **T00–T08**。已完成 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel 行为，以及 Reference/Production differential/invariant gate；T03 提交为 `f96e81b`，T04 为 `c860543`，T05 提交及 T06 启动基线为 `e752fdb`。T05 本地最终证据为 21 项 differential（含固定 seed 单条 100k 与两组固定 seed 双次 10k 流式回放）、229 项 orderbook 单测、workspace 299 项单测与 2 项 doctest，以及 fmt、严格 Clippy、两类 diff 检查全部通过；未查询新的远端 CI。T06 已本地验收严格正 QuoteBudget、MarketMath 的配置/精确本金/预算反推边界、两种无价格市价输入、Reference/Production 的 MarketByBase 与 MarketByQuote 立即成交、预算守恒/dust、固定差分与属性测试，以及命令开始固定保护 reference、bps/显式价格/market-band 边界、保护事件和跨模型差分。最终 T06 本地证据为固定 seed 100k 流式差分、workspace 139 个 domain 测试、316 个 orderbook 测试、2 个 doctest 与 fmt、严格 Clippy、两类 diff 检查全部通过。reservation/fee/settlement 资金闭环仍未实现。数值规格已明确独立 quote_scale、配置验证与本金精确不取整，详见 v6 §6.5/§13/§46.1；小步进度以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
+**历史本地验收 — T08_P3_iceberg**：分支 `codex/t08-iceberg`，基线为已合并 T07 的 `7048296`。2026-10-22 本地验收通过：workspace 538 项单元测试（domain 143、orderbook 395）及 2 项 doctest；完整 differential 52 项、fmt、严格 workspace Clippy 均通过。包含冰山固定 seed 100k 混合命令与两组双次 10k 重复 tape。 已实现可见/隐藏量守恒、补量取得新优先级并移到队尾、total remaining 事件、完整取消与既有成交入口兼容。API 见 [冰山订单](docs/iceberg.md)。交付分支为 `codex/t08-iceberg`，本次包含 T00–T08 中文注释规范修订；上述结果为历史本地验收，远端 CI 状态单独核验。以下旧测试数字保留为历史证据。
+
+**历史本地验收 — T07_P3_ioc_fok_postonly（2026-10-21）**。2026-10-21 用户已解除导师模式，授权 Codex 直接完成实现和验收；已在 `codex/t07-ioc-fok-postonly` 分支完成本地验收：495 项单元测试、2 项 doctest，以及 fmt、严格 Clippy 全部通过；包含固定 seed 100k 混合命令和重复 tape 验证。交付分支为 `codex/t07-ioc-fok-postonly`；上述结果为历史本地验证，远端 CI 未核验。API 与事件契约见 [限价订单执行约束](docs/limit_execution.md)。
+
+当前已验收 **T00–T11**；含 P2 修复的 T12 Amend 未提交工作树已完成本地完整验证，等待用户决定是否提交。已完成 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel、Market、IOC/FOK/PostOnly、Iceberg、StopBook、止损触发级联和逻辑时间到期行为；Reference 与 Production 保持独立实现，并由差分、不变量、固定 tape 与性质测试共同验证。T12 本地实现加入了与预留 shadow 绑定的 Amend，但资金 reservation/fee/settlement 的完整账户闭环、CancelReplace、runtime、持久化、HA 与 market data 尚未实现。数值规格已明确独立 quote_scale、配置验证与本金精确不取整，详见 v6 §6.5/§13/§46.1；当前事实和验证边界以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
 
 当前已建立包含六个 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。matching-domain 已有领域类型、QueuePriority 与基础错误模型；matching-orderbook 已有 ReferenceOrder、IncomingOrder、ReferenceOrderBook 的挂单、双向成交、Cancel 和 TradeEvent，T02 提交为 `161abf7`；其余四库仍为职责注释骨架。orderbook 的运行依赖只有本地 domain，测试依赖为 proptest 1.11.0。CI 的 T00 提交已有远端成功证据，最近验收已核验本地 gate；T07 启动轮复用该历史证据，未查询新的远端 CI。
 
@@ -26,7 +30,7 @@
 
 账户中心、充值提现、KYC、财务总账、清结算数据库和 Web 前端不属于撮合核心。核心与外围资金、订单、行情和清算系统的集成协议，以及参考风控/资金实现，按规格对应阶段推进。
 
-T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。该 API 不自动 rest incoming 余量，尚无完整生命周期事件/命令协议。T03 已完成 OrderIndex、OrderArena slot/free-list、PriceLevel 双向 FIFO 与 QueuePriority/high-water 不变量。T04 已组合生产簿的双侧价格索引和订单 ID 索引，完成 Limit GTC/Cancel、余量挂单及 mutation 后不变量；T05 已用独立 Reference 适配、逐命令差分和固定 seed 100k 流式回放验收这一行为等价门。T06 已完成 MarketByBase/MarketByQuote 的不挂单语义、checked 金额换算、quote dust 终止、固定保护 reference 与保护终结事件；预算不含手续费，reservation 只预留接口边界。T07 已完成 Limit IOC/FOK、Limit GTC + PostOnly 及其独立差分/属性测试；MarketByBase + FOK 采用规格允许的 P3 暂禁选项，MarketByQuote + FOK 非法。T08 已完成 Iceberg 生命周期与补量预检。Stop、DAY/GTD 到期执行、runtime、Gateway、HA 和 MarketData 仍属于后续范围。
+T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。T03–T08 分别完成生产簿、差分验证、市价、执行约束和冰山生命周期。T09 建立独立 StopBook 与触发前到期索引；T10 实现确定性止损触发级联和本地 Trigger-R1 边界；T11 将常规 DAY/GTD 到期和 EndSession 纳入 LogicalClock/session 驱动；含 P2 修复的 T12 Amend 未提交工作树已完成本地完整验证，等待用户决定是否提交。runtime、Gateway、HA、MarketData、CancelReplace 和完整资金闭环仍属于后续范围。
 
 ## Crate 边界
 
@@ -72,13 +76,13 @@ cargo test --workspace
 
 用户已授权 Codex 直接完成当前任务的实现、代码审查、验证和交接。详细协作与工程约束见 [AGENTS.md](AGENTS.md)。
 
-[关键逻辑流程图](docs/logic_flows.md) 是长期维护的流程图入口；当前使用 ASCII 图说明工程门、数值校验、参考撮合、Arena/FIFO 生命周期、取消、生产 Limit GTC、市价保护、IOC/FOK/PostOnly、冰山补量与独立差分验证。
+[关键逻辑流程图](docs/logic_flows.md) 是长期维护的流程图入口；当前说明工程门、数值校验、参考撮合、Arena/FIFO 生命周期、取消、生产 Limit GTC、市价保护、IOC/FOK/PostOnly、冰山、止损级联、LogicalClock 到期与独立差分验证。
 
 - [工作规则](assignment/CODEX_GUIDANCE_RULES.md)
 - [当前交接记录](assignment/SESSION_HANDOFF.md)
 - [Rust 撮合系统 v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md)
 - [任务索引](assignment/README.md)
-- [当前已验收 T08 任务书](assignment/tasks/T08_P3_iceberg.md)
+- [当前 T12 Amend 任务书](assignment/tasks/T12_P4_amend.md)
 - [已验收的 T07 任务书](assignment/tasks/T07_P3_ioc_fok_postonly.md)
 - [已验收的 T06 任务书](assignment/tasks/T06_P3_market_orders.md)
 - [已验收的 T05 任务书](assignment/tasks/T05_P2_differential_invariants.md)
