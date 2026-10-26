@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-截至 2026-10-25，T00–T11 已交付；含 P2 修复的 T12 Amend 未提交工作树已完成 scoped re-review 与本地完整验证，等待用户决定是否提交。本地 `main` 的已提交 HEAD `d694974` 尚不包含该修复；远端 `origin/main` 仍为 `550fda02816c73a5704b4ffe836fcfb31ffff08f`，未推送且远端 CI/GitHub 页面未核验。当前能力还包含订单簿模块整理、StopBook/确定性止损级联、LogicalClock 驱动的常规与未触发 Stop 的 DAY/GTD 到期，以及 EndSession。文件职责和测试入口见 [订单簿模块与代码入口](docs/orderbook_modules.md)。
+截至 2026-10-26，T00–T12 已交付；T12 Amend 由 `d694974` 与 P2 收尾提交 `b763984` 合入并推送至 `origin/main`。本地完整验证已经通过；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染尚未在本轮核验。当前能力还包含订单簿模块整理、StopBook/确定性止损级联、LogicalClock 驱动的常规与未触发 Stop 的 DAY/GTD 到期，以及 EndSession。文件职责和测试入口见 [订单簿模块与代码入口](docs/orderbook_modules.md)。
 
-**T12 Amend 的未提交修复已完成本地验证。**两个独立订单簿已具备普通、冰山和未触发 Stop 的 Amend 候选/提交路径、typed `OrderAmended` 事件和本地版本化预留令牌验证；用户冻结的数量规则为绝对总目标必须严格大于已成交量，零余量改用 Cancel。P2 已将 terminal OrderId 的稳定原因恢复为 `OrderNotFound (2010)`，并保留活动订单缺失 shadow 时的 `InvalidReservation (4002)`；该修复已通过 scoped re-review 与完整本地 gate，但尚未提交，不代表远端 CI、完整账户/结算或持久化协议已经完成。
+**T12 Amend 已交付。**两个独立订单簿已具备普通、冰山和未触发 Stop 的 Amend 候选/提交路径、typed `OrderAmended` 事件和本地版本化预留令牌验证；用户冻结的数量规则为绝对总目标必须严格大于已成交量，零余量改用 Cancel。P2 已将 terminal OrderId 的稳定原因恢复为 `OrderNotFound (2010)`，并保留活动订单缺失 shadow 时的 `InvalidReservation (4002)`；该修复已通过 scoped re-review、完整本地 gate，并随 `b763984` 推送，不代表远端 CI、完整账户/结算或持久化协议已经完成。
 
 **T11 LogicalClock / DAY / GTD / EndSession 已交付。**实现提交 `36d4a4d` 已快进合入 `main`；随后 `ReservationReleaseReason` 的文件组织整理由 PR #3 合入 `550fda0`，保持 crate-root 公开导入路径不变。逻辑时间只接受显式单调推进；GTD 必须严格晚于当前 LogicalTime，DAY 必须绑定当前 session。生产簿使用有序到期索引，参考簿以独立 Vec 扫描与显式排序实现相同顺序；EndSession 会终结对应的常规 DAY 与未触发 Stop-DAY 订单。最终本地 gate：domain 152、orderbook 419、2 项 doctest，fmt、严格 Clippy 与测试均通过；远端 CI 未在本记录中重新核验。
 
@@ -14,7 +14,7 @@
 
 **历史本地验收 — T07_P3_ioc_fok_postonly（2026-10-21）**。2026-10-21 用户已解除导师模式，授权 Codex 直接完成实现和验收；已在 `codex/t07-ioc-fok-postonly` 分支完成本地验收：495 项单元测试、2 项 doctest，以及 fmt、严格 Clippy 全部通过；包含固定 seed 100k 混合命令和重复 tape 验证。交付分支为 `codex/t07-ioc-fok-postonly`；上述结果为历史本地验证，远端 CI 未核验。API 与事件契约见 [限价订单执行约束](docs/limit_execution.md)。
 
-当前已验收 **T00–T11**；含 P2 修复的 T12 Amend 未提交工作树已完成本地完整验证，等待用户决定是否提交。已完成 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel、Market、IOC/FOK/PostOnly、Iceberg、StopBook、止损触发级联和逻辑时间到期行为；Reference 与 Production 保持独立实现，并由差分、不变量、固定 tape 与性质测试共同验证。T12 本地实现加入了与预留 shadow 绑定的 Amend，但资金 reservation/fee/settlement 的完整账户闭环、CancelReplace、runtime、持久化、HA 与 market data 尚未实现。数值规格已明确独立 quote_scale、配置验证与本金精确不取整，详见 v6 §6.5/§13/§46.1；当前事实和验证边界以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
+当前已验收 **T00–T12**。已完成 ReferenceOrderBook、Arena / PriceLevel / intrusive FIFO、ProductionOrderBook 的 Limit GTC / Cancel、Market、IOC/FOK/PostOnly、Iceberg、StopBook、止损触发级联、逻辑时间到期和与预留 shadow 绑定的 Amend；Reference 与 Production 保持独立实现，并由差分、不变量、固定 tape 与性质测试共同验证。资金 reservation/fee/settlement 的完整账户闭环、CancelReplace、runtime、持久化、HA 与 market data 尚未实现。数值规格已明确独立 quote_scale、配置验证与本金精确不取整，详见 v6 §6.5/§13/§46.1；当前事实和验证边界以 [唯一交接摘要](assignment/SESSION_HANDOFF.md) 为准。
 
 当前已建立包含六个 library crate 的 virtual workspace（edition 2024），项目工具链固定为 Rust 1.98.0。matching-domain 已有领域类型、QueuePriority 与基础错误模型；matching-orderbook 已有 ReferenceOrder、IncomingOrder、ReferenceOrderBook 的挂单、双向成交、Cancel 和 TradeEvent，T02 提交为 `161abf7`；其余四库仍为职责注释骨架。orderbook 的运行依赖只有本地 domain，测试依赖为 proptest 1.11.0。CI 的 T00 提交已有远端成功证据，最近验收已核验本地 gate；T07 启动轮复用该历史证据，未查询新的远端 CI。
 
@@ -30,7 +30,7 @@
 
 账户中心、充值提现、KYC、财务总账、清结算数据库和 Web 前端不属于撮合核心。核心与外围资金、订单、行情和清算系统的集成协议，以及参考风控/资金实现，按规格对应阶段推进。
 
-T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。T03–T08 分别完成生产簿、差分验证、市价、执行约束和冰山生命周期。T09 建立独立 StopBook 与触发前到期索引；T10 实现确定性止损触发级联和本地 Trigger-R1 边界；T11 将常规 DAY/GTD 到期和 EndSession 纳入 LogicalClock/session 驱动；含 P2 修复的 T12 Amend 未提交工作树已完成本地完整验证，等待用户决定是否提交。runtime、Gateway、HA、MarketData、CancelReplace 和完整资金闭环仍属于后续范围。
+T02 已用 `Vec + sort` 建立易审计的参考模型，并验证价格/FIFO、maker-price、相同 command tape 的事件与终态、数量守恒和取消性质。T03–T08 分别完成生产簿、差分验证、市价、执行约束和冰山生命周期。T09 建立独立 StopBook 与触发前到期索引；T10 实现确定性止损触发级联和本地 Trigger-R1 边界；T11 将常规 DAY/GTD 到期和 EndSession 纳入 LogicalClock/session 驱动；T12 Amend 已通过本地完整验证并推送至 `origin/main`。runtime、Gateway、HA、MarketData、CancelReplace 和完整资金闭环仍属于后续范围。
 
 ## Crate 边界
 

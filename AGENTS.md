@@ -1,6 +1,6 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-10-25 当前事实：含 P2 修复的 T12 Amend 未提交工作树已完成本地完整验证，等待用户决定是否提交；本地 `main` 的已提交 HEAD 仍为不含该修复的 `d694974`，远端 `origin/main` 仍为 `550fda02816c73a5704b4ffe836fcfb31ffff08f`，未推送且远端 CI/GitHub 页面未核验。`codex/t12-amend` 已删除。
+> 2026-10-26 当前事实：T12 Amend 已由 `d694974` 与 P2 收尾提交 `b763984` 合入并推送至 `origin/main`；本地完整验证已经通过。远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染尚未在本轮核验。`codex/t12-amend` 已删除。
 
 > 2026-10-23 交付事实：用户已授权将已验证的订单簿模块整理提交、合并到 `main`、删除开发分支并推送。实现提交为 `91d13bc71488db346fe1f9d6afbd61404fa367ac`，已快进合入并推送至 `origin/main`；`codex/orderbook-module-layout` 已在本地删除，且从未存在远端同名分支。随后 T09 已由 `77761e010cc10179dfc566181f0a3b1397929f78` 合入并推送至 `origin/main`，开发分支已删除。
 
@@ -10,7 +10,7 @@
 
 ## 角色与授权边界
 
-当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T11 均已交付；用户已授权 T12 Amend 的实现与审查。P2 scoped re-review 与完整本地验证均已通过；当前等待用户决定是否提交该未提交工作树，不扩展后续业务任务，也不将本地验证误述为远端交付。
+当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T12 均已交付；T12 P2 scoped re-review 与完整本地验证均已通过并随 `b763984` 推送。远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染仍未在本轮核验；不扩展 T13 或其他后续业务任务。
 
 - 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
 - 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
@@ -19,7 +19,7 @@
 
 ## 当前范围与文档入口
 
-**订单簿模块整理已交付**；实现提交 `91d13bc` 已在 main 上，实施计划见 [模块整理计划](assignment/ORDERBOOK_MODULE_LAYOUT_PLAN.md)。T09、T10 与 T11 已分别由 `77761e0`、`9e23e45`、`36d4a4d` 交付；当前远端 main 为 `550fda0`。当前 T12 读取 [T12 任务书](assignment/tasks/T12_P4_amend.md)、v6 §7.4、§19–§20、§24、§54、§58、§65 与 §77，保留 T11 的 LogicalClock/DAY/GTD/EndSession、此前数值、保护、失败原子性和 differential gate；P2 修复已经通过 scoped re-review 与本地完整 gate，但尚在未提交工作树，等待用户决定是否提交。
+**订单簿模块整理已交付**；实现提交 `91d13bc` 已在 main 上，实施计划见 [模块整理计划](assignment/ORDERBOOK_MODULE_LAYOUT_PLAN.md)。T09、T10、T11 与 T12 已分别由 `77761e0`、`9e23e45`、`36d4a4d`、`d694974`/`b763984` 交付并推送至 `origin/main`。T12 保留 T11 的 LogicalClock/DAY/GTD/EndSession、此前数值、保护、失败原子性和 differential gate；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染仍未在本轮核验。
 
 **T08 已完成本地验收（2026-10-22）**。2026-10-22 本地验收通过：workspace 538 项单元测试（domain 143、orderbook 395）及 2 项 doctest；完整 differential 52 项、fmt、严格 workspace Clippy 均通过。包含冰山固定 seed 100k 混合命令与两组双次 10k 重复 tape。 注释、12 张流程图与 116 项公式已审查；公式通过 GitHub 实际渲染组件验证；提交后的页面与远端 CI 状态须另行核验。中文注释专项修订覆盖 43 个 Rust 文件、3,200 处注释，非注释代码保持一致。交付分支为 `codex/t08-iceberg`，提交与推送事实见唯一交接。
 
@@ -43,7 +43,7 @@ T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/coun
 
 T05 已以独立流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，验收可复现 100k command tape 与当前适用不变量。T06 已验收的 Market incoming 不 rest、不分配 QueuePriority；当前冰山 maker 补量会取得新 priority；quote budget 严格正且不含手续费，spent<=budget，unused_quote 不是成交。所有 notional/quote→qty 换算走统一 checked MarketMath；向下取整到合法 lot，本档不能成交一个 lot 时立即终止，不构造 Qty(0) 或零量 Trade。保护参考在命令开始捕获并固定；bps 只允许 0..=9_999，Buy 对 reference×(10_000+bps)/10_000 双重向下取整，Sell 对 reference×(10_000-bps)/10_000 双重向上取整，最终边界按方向与显式 worst price/market band 取更严格者。边界比较包含等号；首个越界 maker 不成交并终结命令。reservation/fee release 只保留后续接口契约，不伪造已实现的资金闭环。
 
-T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Iceberg、StopBook/确定性触发级联及 DAY/GTD/EndSession 已交付；T12 Amend 的 P2 修复已在未提交工作树通过 scoped re-review 与完整本地 gate；CancelReplace、HA、完整后续命令协议及 runtime/persistence/risk/protocol 业务仍在后续任务；不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Iceberg、StopBook/确定性触发级联、DAY/GTD/EndSession 及 T12 Amend 已交付；CancelReplace、HA、完整后续命令协议及 runtime/persistence/risk/protocol 业务仍在后续任务；不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
