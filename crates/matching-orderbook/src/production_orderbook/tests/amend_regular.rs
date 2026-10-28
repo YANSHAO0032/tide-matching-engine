@@ -15,6 +15,9 @@ fn shadow(input: &LimitGtcOrder) -> ReservationState {
         user_id: input.user_id,
         market_id: MarketId::new(7),
         version: 11,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 0,
         reserves: vec![AssetReserve {
             asset: AssetId::new(3),
             atoms: 17,
@@ -53,15 +56,25 @@ fn valid(book: &ProductionOrderBook) {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
+    /// 买方价格档与其队列顺序快照。
     bids: Vec<LevelSnapshotEntry>,
+    /// 卖方价格档与其队列顺序快照。
     asks: Vec<LevelSnapshotEntry>,
+    /// Arena 槽位与空闲链的完整快照。
     arena: (Vec<Option<OrderNode>>, Vec<OrderIndex>),
+    /// 订单身份到 Arena 槽位的有序索引快照。
     index: Vec<(OrderId, OrderIndex)>,
+    /// 活动订单到金融预留影子的有序快照。
     reservations: Vec<(OrderId, ReservationState)>,
+    /// 未触发止损订单及其优先级的有序快照。
     stops: Vec<(StopOrder, StopPriority)>,
+    /// 普通订单到期二级索引的稳定文本表示。
     expiry: String,
+    /// 下一普通队列优先级计数。
     next: u128,
+    /// 下一止损优先级计数。
     next_stop: u128,
+    /// 触发和保护计算使用的参考价状态。
     references: PriceReferenceState,
 }
 

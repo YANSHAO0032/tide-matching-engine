@@ -39,7 +39,7 @@ struct StopEntry {
 /// 未触发止损订单的统一到期索引。
 ///
 /// GTD 按逻辑时间、DAY 按交易时段登记；两种索引使用相同的订单引用形式。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StopExpiryIndex {
     /// 按逻辑时间升序保存的 GTD 到期引用。
     gtd: BTreeMap<LogicalTime, Vec<ExpiryRef>>,
@@ -114,7 +114,7 @@ impl StopExpiryIndex {
 ///
 /// 买方遍历为低触发价到高触发价，卖方遍历为高触发价到低触发价。同一价位按
 /// 同一来源的 StopPriority 严格递增；未触发订单不拥有 QueuePriority。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StopBook {
     /// 买方向止损价位表。
     buy_stops: BTreeMap<(Price, PriceReferenceKind), Vec<StopEntry>>,
@@ -124,62 +124,6 @@ pub struct StopBook {
     locations: HashMap<OrderId, StopLocation>,
     /// 未触发订单的统一触发前到期索引。
     expiry_index: StopExpiryIndex,
-}
-
-impl StopBook {
-    /// 测试读取真实到期桶引用及来源位置；业务队列与到期事件不经此排序。
-    #[cfg(test)]
-    pub(crate) fn test_expiry_entries(
-        &self,
-    ) -> Vec<(OrderId, TriggerExpiry, PriceReferenceKind, Side, Price)> {
-        let mut entries = self
-            .expiry_index
-            .gtd
-            .iter()
-            .flat_map(|(at, refs)| {
-                refs.iter().map(move |r| {
-                    (
-                        r.order_id,
-                        TriggerExpiry::Gtd { expire_at: *at },
-                        r.location.reference,
-                        r.location.side,
-                        r.location.stop_price,
-                    )
-                })
-            })
-            .chain(self.expiry_index.day.iter().flat_map(|(session, refs)| {
-                refs.iter().map(move |r| {
-                    (
-                        r.order_id,
-                        TriggerExpiry::Day {
-                            session_id: *session,
-                        },
-                        r.location.reference,
-                        r.location.side,
-                        r.location.stop_price,
-                    )
-                })
-            }))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(id, ..)| *id);
-        entries
-    }
-
-    /// 测试相等投影显式排序身份索引，保留实际触发队列与到期引用原序。
-    #[cfg(test)]
-    pub(crate) fn test_deterministic_state(&self) -> String {
-        let mut locations = self.locations.iter().collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(id, _)| **id);
-        format!(
-            "{:?}",
-            (
-                &self.buy_stops,
-                &self.sell_stops,
-                locations,
-                &self.expiry_index
-            )
-        )
-    }
 }
 
 /// 已完成时效和优先级校验的止损替换计划，只供独占提交使用。
@@ -645,6 +589,10 @@ impl StopBook {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "stop_book/test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {

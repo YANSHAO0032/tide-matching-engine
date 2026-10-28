@@ -30,11 +30,62 @@ pub(super) fn state(input: &LimitGtcOrder) -> ReservationState {
         user_id: input.user_id,
         market_id: MarketId::new(7),
         version: 11,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 5,
+        fee_tier_id: 1,
         reserves: vec![AssetReserve {
             asset: AssetId::new(3),
             atoms: 1000,
         }],
     }
+}
+
+fn reject_unusable_shadow_without_adjustment(case: u8) {
+    let keys = RiskKeySet::new(2, []).unwrap();
+    for side in [Side::Buy, Side::Sell] {
+        let mut book = ProductionOrderBook::new(policy());
+        let input = order(1, side, 100, 10);
+        book.rest_with_reservation(input.clone(), state(&input))
+            .unwrap();
+        let shadow = book.reservations.get_mut(&input.order_id).unwrap();
+        match case {
+            0 => shadow.status = matching_risk::ReservationStatus::Released,
+            1 => shadow.fee_schedule_version = 6,
+            2 => shadow.fee_tier_id = 2,
+            _ => unreachable!(),
+        }
+        let mut cmd = command(&input);
+        cmd.new_qty = Some(Qty::try_new(8).unwrap());
+        assert!(cmd.reservation_adjustment.is_none());
+        let context = AmendExecutionContext {
+            required_reserves: vec![AssetReserve {
+                asset: AssetId::new(3),
+                atoms: 800,
+            }],
+            ..context(&keys)
+        };
+        let before = production_snapshot(&book);
+        assert_eq!(
+            book.amend_with_context(&cmd, LogicalTime::new(1), 9, &[], &context),
+            Err(RejectReason::InvalidReservation)
+        );
+        assert_eq!(production_snapshot(&book), before);
+    }
+}
+
+#[test]
+fn amend_no_adjustment_rejects_released_shadow_atomically() {
+    reject_unusable_shadow_without_adjustment(0);
+}
+
+#[test]
+fn amend_no_adjustment_rejects_pinned_fee_version_mismatch_atomically() {
+    reject_unusable_shadow_without_adjustment(1);
+}
+
+#[test]
+fn amend_no_adjustment_rejects_pinned_fee_tier_mismatch_atomically() {
+    reject_unusable_shadow_without_adjustment(2);
 }
 
 #[test]
@@ -364,12 +415,12 @@ fn amend_reservation_valid_signature_later_priority_failure_never_applies() {
             p.queue_priority_allocator =
                 crate::QueuePriorityAllocator::try_restore(policy(), u128::MAX - 1024).unwrap();
             // 参考模型通过自身失败测试入口覆盖真实高水位，不改变生产策略。
-            crate::reference_orderbook::amend_candidate::test_exhaust_priority(&mut r, false);
+            crate::reference_orderbook::test_support::test_exhaust_priority(&mut r, false);
         } else {
             cmd.new_stop_price = Some(Price::try_new(115).unwrap());
             p.stop_priority_allocator =
                 crate::StopPriorityAllocator::try_restore(policy(), u128::MAX - 1024).unwrap();
-            crate::reference_orderbook::amend_candidate::test_exhaust_priority(&mut r, true);
+            crate::reference_orderbook::test_support::test_exhaust_priority(&mut r, true);
         }
         let ps = production_snapshot(&p);
         let rs = r.test_deterministic_state();

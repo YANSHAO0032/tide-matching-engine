@@ -10,15 +10,22 @@ use std::collections::HashMap;
 pub(crate) mod amend_candidate;
 mod amend_iceberg;
 mod amend_stop;
+mod cancel_replace;
+mod cancel_replace_view;
 mod expiry;
 mod iceberg;
 mod limit_execution;
 mod market_by_base;
 mod market_by_quote;
 mod matching;
+mod reservation_place;
 mod resting;
 mod stop_orders;
 mod stop_trigger;
+
+pub use cancel_replace::ReferenceCancelReplacePlan;
+pub use cancel_replace_view::ReferenceBookWithout;
+pub use reservation_place::{ReferencePlaceContext, ReferencePlaceOrder, ReferencePlacePlan};
 
 /// 为优先级计数器保留不可分配的高位保护空间。
 ///
@@ -28,7 +35,7 @@ const PRIORITY_GUARD: u128 = 1_024;
 /// 单市场参考订单簿
 ///
 /// 订单集合的原始顺序表示已知挂单先后。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceOrderBook {
     /// 挂单的权威存储顺序；同价先进先出的参考基线由该顺序加稳定排序得出。
     orders: Vec<ReferenceOrder>,
@@ -45,51 +52,6 @@ pub struct ReferenceOrderBook {
 }
 
 impl ReferenceOrderBook {
-    /// 完整差分投影直接读取计数器，避免为读取数值重复格式化源订单。
-    #[cfg(test)]
-    pub(crate) fn test_next_queue_priority(&self) -> u128 {
-        self.next_priority
-    }
-
-    /// 仅身份映射按标识排序；源 Vec 与所有业务队列顺序不变。
-    #[cfg(test)]
-    pub(crate) fn test_reservations(&self) -> Vec<(OrderId, ReservationState)> {
-        let mut states = self
-            .reservations
-            .iter()
-            .map(|(id, state)| (*id, state.clone()))
-            .collect::<Vec<_>>();
-        states.sort_unstable_by_key(|(id, _)| *id);
-        states
-    }
-
-    /// 供差分测试检查全部来源状态，验证触发检测仍更新而 root 保护参考保持冻结。
-    #[cfg(test)]
-    pub(crate) fn test_reference_state(&self) -> &PriceReferenceState {
-        &self.reference_prices
-    }
-
-    /// 测试快照保留源 Vec、完整影子状态、参考价及两个分配器，不改变业务可见性。
-    #[cfg(test)]
-    pub(crate) fn test_deterministic_state(&self) -> (String, u128) {
-        let mut reservations = self.reservations.iter().collect::<Vec<_>>();
-        reservations.sort_unstable_by_key(|(id, _)| **id);
-        (
-            format!(
-                "{:?}",
-                (
-                    &self.orders,
-                    reservations,
-                    self.next_priority,
-                    &self.stop_orders,
-                    self.next_stop_priority,
-                    &self.reference_prices
-                )
-            ),
-            self.next_priority,
-        )
-    }
-
     /// 创建不含挂单且优先级从零开始的单市场参考订单簿。
     pub fn new() -> Self {
         Self::default()
@@ -105,7 +67,8 @@ impl ReferenceOrderBook {
         if self.contains_active_order(order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
-        if state.order_id != order_id
+        if state.status != matching_risk::ReservationStatus::Active
+            || state.order_id != order_id
             || state.user_id != user_id
             || self.reservations.contains_key(&order_id)
         {
@@ -172,6 +135,10 @@ impl ReferenceOrderBook {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "reference_orderbook/test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests;

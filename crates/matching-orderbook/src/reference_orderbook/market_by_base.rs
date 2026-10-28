@@ -10,12 +10,16 @@ use matching_domain::{
     EngineEvent, MarketByBase, MarketMath, OrderId, Qty, RejectReason, Side, TradeEvent, TradeId,
 };
 
+#[cfg(test)]
+#[path = "market_by_base/test_support.rs"]
+pub(crate) mod test_support;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProtectedMarketByBasePlan {
-    // 保留此前已验收的挂单标识符 + Qty 成交计划。
+    /// 保留此前已验收的挂单标识符与 `Qty` 成交计划。
     fills: Vec<(OrderId, Qty)>,
 
-    // 至多一个终止点，即价格优先顺序中的首个越界挂单。
+    /// 至多一个终止点，即价格优先顺序中的首个越界挂单。
     stop: Option<ProtectionBoundaryStop>,
 }
 
@@ -67,24 +71,6 @@ impl ReferenceOrderBook {
         }
 
         Ok(required_trade_ids)
-    }
-
-    /// 只读规划带保护的 MarketByBase。
-    ///
-    /// 返回按价格优先、同价先进先出排列的挂单标识符与计划数量。
-    /// 遇到首个保护价之外的挂单立即停止。
-    ///
-    /// 不修改盘口、不消耗 TradeId、不分配 QueuePriority。
-    #[cfg(test)]
-    pub(super) fn preflight_market_by_base_with_protection(
-        &self,
-        incoming: &MarketByBase,
-        context: &CommandStartProtectionContext,
-        math: &MarketMath,
-    ) -> Result<Vec<(OrderId, Qty)>, RejectReason> {
-        Ok(self
-            .preflight_protected_market_by_base_plan(incoming, context, math)?
-            .fills)
     }
 
     /// 市价按基础币数量立即成交。

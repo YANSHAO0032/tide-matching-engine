@@ -7,42 +7,23 @@ use matching_domain::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "expiry/test_support.rs"]
+pub(crate) mod test_support;
+
 /// 普通挂单的二级到期索引。
 ///
 /// 两个 `BTreeMap` 的键顺序和每个 `BTreeSet` 的标识顺序共同冻结到期输出，
 /// 业务结果不依赖 Arena 槽位、先进先出链接或 HashMap 迭代顺序。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct RegularExpiryIndex {
+    /// 按到期逻辑时间索引的 GTD 普通订单身份集合。
     gtd: BTreeMap<LogicalTime, BTreeSet<OrderId>>,
+    /// 按交易时段索引的 DAY 普通订单身份集合。
     day: BTreeMap<u64, BTreeSet<OrderId>>,
 }
 
 impl RegularExpiryIndex {
-    /// 差分测试读取真实二级索引；按身份排序只统一两模型不同存储形式。
-    #[cfg(test)]
-    pub(super) fn test_entries(&self) -> Vec<(OrderId, TimeInForce)> {
-        let mut entries = self
-            .gtd
-            .iter()
-            .flat_map(|(at, ids)| {
-                ids.iter()
-                    .map(move |id| (*id, TimeInForce::Gtd { expire_at: *at }))
-            })
-            .chain(self.day.iter().flat_map(|(session, ids)| {
-                ids.iter().map(move |id| {
-                    (
-                        *id,
-                        TimeInForce::Day {
-                            session_id: *session,
-                        },
-                    )
-                })
-            }))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(id, _)| *id);
-        entries
-    }
-
     pub(super) fn insert(&mut self, order_id: OrderId, tif: TimeInForce) {
         match tif {
             TimeInForce::Gtc => {}
@@ -129,63 +110,6 @@ impl ProductionOrderBook {
             self.regular_expiry.insert(order_id, tif);
         }
         Ok(events)
-    }
-
-    /// 只读校验普通挂单到期索引与活动订单的一一对应关系。
-    #[cfg(test)]
-    pub(crate) fn validate_regular_expiry(&self) -> Result<(), &'static str> {
-        let mut seen = BTreeSet::new();
-        for (expire_at, order_ids) in &self.regular_expiry.gtd {
-            for order_id in order_ids {
-                let index = self.orders.get(order_id).ok_or("GTD 索引引用不存在订单")?;
-                let node = self.arena.get(*index).ok_or("GTD 索引引用不存在槽位")?;
-                if node.time_in_force()
-                    != (TimeInForce::Gtd {
-                        expire_at: *expire_at,
-                    })
-                {
-                    return Err("GTD 索引时间与订单有效期不一致");
-                }
-                if !seen.insert(*order_id) {
-                    return Err("普通到期索引存在重复订单引用");
-                }
-            }
-        }
-        for (session_id, order_ids) in &self.regular_expiry.day {
-            for order_id in order_ids {
-                let index = self.orders.get(order_id).ok_or("DAY 索引引用不存在订单")?;
-                let node = self.arena.get(*index).ok_or("DAY 索引引用不存在槽位")?;
-                if node.time_in_force()
-                    != (TimeInForce::Day {
-                        session_id: *session_id,
-                    })
-                {
-                    return Err("DAY 索引会话与订单有效期不一致");
-                }
-                if !seen.insert(*order_id) {
-                    return Err("普通到期索引存在重复订单引用");
-                }
-            }
-        }
-        for (order_id, index) in &self.orders {
-            let node = self.arena.get(*index).ok_or("订单索引引用不存在槽位")?;
-            match node.time_in_force() {
-                TimeInForce::Gtc => {
-                    if seen.contains(order_id) {
-                        return Err("GTC 订单错误出现在到期索引");
-                    }
-                }
-                TimeInForce::Gtd { .. } | TimeInForce::Day { .. } => {
-                    if !seen.contains(order_id) {
-                        return Err("活动定时订单缺少到期索引引用");
-                    }
-                }
-                TimeInForce::Ioc | TimeInForce::Fok => {
-                    return Err("立即有效期订单错误留在常规订单簿");
-                }
-            }
-        }
-        Ok(())
     }
 
     /// 使普通 GTD 挂单在到达给定逻辑时间后确定性到期。

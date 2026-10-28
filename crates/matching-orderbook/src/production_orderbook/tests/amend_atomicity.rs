@@ -17,8 +17,11 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
 struct Pair {
+    /// 待差分比较的生产订单簿。
     p: ProductionOrderBook,
+    /// 独立参考订单簿。
     r: ReferenceOrderBook,
+    /// 本轮生成的改单输入。
     input: LimitGtcOrder,
 }
 
@@ -368,10 +371,7 @@ fn reject_case(kind: u8, side: Side, noise: u16, failure: u8) {
                 pair.p.stop_priority_allocator =
                     crate::StopPriorityAllocator::try_restore(policy(), u128::MAX - 1024).unwrap();
             }
-            crate::reference_orderbook::amend_candidate::test_exhaust_priority(
-                &mut pair.r,
-                kind >= 2,
-            );
+            crate::reference_orderbook::test_support::test_exhaust_priority(&mut pair.r, kind >= 2);
             RejectReason::PrioritySpaceExhaustion
         }
         16..=26 | 32 => {
@@ -640,7 +640,7 @@ fn amend_atomicity_maker_replenishment_priority_failure_preserves_every_containe
             cmd.reservation_adjustment = Some(token(&pair.input, &signing));
             pair.p.queue_priority_allocator =
                 crate::QueuePriorityAllocator::try_restore(policy(), u128::MAX - 1024).unwrap();
-            crate::reference_orderbook::amend_candidate::test_exhaust_priority(&mut pair.r, false);
+            crate::reference_orderbook::test_support::test_exhaust_priority(&mut pair.r, false);
             pair.reject(&cmd, &context(&keys), RejectReason::PrioritySpaceExhaustion);
         }
     }

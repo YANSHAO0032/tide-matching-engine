@@ -13,12 +13,17 @@ pub struct OrderArena {
     slots: Vec<Option<OrderNode>>,
     /// 已释放空槽的后进先出栈；每个元素必须有效且恰好对应一个 `None` 槽位。
     free: Vec<OrderIndex>,
-    /// 仅测试中的实际槽位访问计数，不是业务状态，也不参与重放。
     #[cfg(test)]
+    /// 仅测试中的实际槽位访问计数，不是业务状态，也不参与重放。
     slot_accesses: Cell<usize>,
 }
 
 impl OrderArena {
+    /// 冻结提交屏障需要的全部槽位与空闲栈；测试访问计数不属于业务状态。
+    pub(crate) fn state_snapshot(&self) -> (Vec<Option<OrderNode>>, Vec<OrderIndex>) {
+        (self.slots.clone(), self.free.clone())
+    }
+
     /// 创建没有槽位和空闲链表条目的空 Arena。
     pub fn new() -> Self {
         Self::default()
@@ -119,18 +124,6 @@ impl OrderArena {
         self.slot_accesses.set(next);
     }
 
-    /// 将测试访问计数归零；不会触碰槽位或空闲链表。
-    #[cfg(test)]
-    pub(crate) fn reset_slot_accesses(&self) {
-        self.slot_accesses.set(0);
-    }
-
-    /// 读取测试访问计数；它不是运行时指标或持久化数据。
-    #[cfg(test)]
-    pub(crate) fn slot_accesses(&self) -> usize {
-        self.slot_accesses.get()
-    }
-
     /// 只读验证下一次 `insert` 是否可执行。
     ///
     /// 不弹出空闲链表，不扩展槽位，不修改任何 Arena 状态。
@@ -162,16 +155,6 @@ impl OrderArena {
         OrderIndex::try_from_usize(self.slots.len())?;
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-impl OrderArena {
-    /// 复制完整 Arena 内存态，用于测试失败原子性。
-    ///
-    /// 此辅助函数不模拟快照、WAL 或重放，也不会暴露给生产调用方。
-    pub(crate) fn test_snapshot(&self) -> (Vec<Option<OrderNode>>, Vec<OrderIndex>) {
-        (self.slots.clone(), self.free.clone())
     }
 }
 

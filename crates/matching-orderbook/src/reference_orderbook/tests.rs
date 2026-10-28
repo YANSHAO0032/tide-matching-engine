@@ -10,6 +10,8 @@ use matching_domain::{
 mod amend_candidate;
 mod amend_regular;
 mod basic;
+mod cancel_replace;
+mod cancel_replace_view;
 mod expiry;
 mod iceberg;
 mod limit_execution;
@@ -25,3 +27,4 @@ mod protected_market_by_base;
 mod protected_market_by_quote_execution;
 mod protected_market_by_quote_preflight;
 mod reservation;
+mod reservation_place;

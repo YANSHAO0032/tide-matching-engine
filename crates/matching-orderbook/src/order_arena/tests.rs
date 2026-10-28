@@ -8,6 +8,25 @@ use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+impl OrderArena {
+    /// 将测试访问计数归零；不会触碰槽位或空闲链表。
+    pub(crate) fn reset_slot_accesses(&self) {
+        self.slot_accesses.set(0);
+    }
+
+    /// 读取测试访问计数；它不是运行时指标或持久化数据。
+    pub(crate) fn slot_accesses(&self) -> usize {
+        self.slot_accesses.get()
+    }
+
+    /// 复制完整 Arena 内存态，用于测试失败原子性。
+    ///
+    /// 此辅助函数不模拟快照、WAL 或重放，也不会暴露给生产调用方。
+    pub(crate) fn test_snapshot(&self) -> (Vec<Option<OrderNode>>, Vec<OrderIndex>) {
+        (self.slots.clone(), self.free.clone())
+    }
+}
+
 /// 构造具有固定有效价格的最小测试订单。
 fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
     LimitGtcOrder {

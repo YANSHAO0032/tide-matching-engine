@@ -27,6 +27,9 @@
 | 改单候选、普通改单与完整上下文入口 | [amend_candidate.rs](../crates/matching-orderbook/src/production_orderbook/amend_candidate.rs) | [amend_candidate.rs](../crates/matching-orderbook/src/reference_orderbook/amend_candidate.rs) |
 | 冰山改单 | [amend_iceberg.rs](../crates/matching-orderbook/src/production_orderbook/amend_iceberg.rs) | [amend_iceberg.rs](../crates/matching-orderbook/src/reference_orderbook/amend_iceberg.rs) |
 | 未触发止损改单 | [amend_stop.rs](../crates/matching-orderbook/src/production_orderbook/amend_stop.rs) | [amend_stop.rs](../crates/matching-orderbook/src/reference_orderbook/amend_stop.rs) |
+| 撤单替换只读过滤视图 | [cancel_replace_view.rs](../crates/matching-orderbook/src/production_orderbook/cancel_replace_view.rs) | [cancel_replace_view.rs](../crates/matching-orderbook/src/reference_orderbook/cancel_replace_view.rs) |
+| 撤单替换独立计划与原子提交 | [cancel_replace.rs](../crates/matching-orderbook/src/production_orderbook/cancel_replace.rs) | [cancel_replace.rs](../crates/matching-orderbook/src/reference_orderbook/cancel_replace.rs) |
+| 接收登记表的正常下单预演与归属提交 | 由撤单替换计划内部完成，未新增通用生产 Place API | [reservation_place.rs](../crates/matching-orderbook/src/reference_orderbook/reservation_place.rs) |
 
 文件按业务职责组织。预检与提交尽量保留在同一功能模块，便于核对拒绝是否发生在真实改簿之前；共享的结构预检仍由负责该结构的模块维护。限价和市价入口遇到冰山 maker 时，通过本模型的冰山计划完成相应执行。
 
@@ -77,7 +80,9 @@
 
 阅读时先查看两种订单簿的字段和查询方法，再沿所需公开入口进入对应功能文件，最后查看该功能的单元测试与差分案例。基础参考撮合仍不自动挂入 incoming 余量，完整生命周期入口负责相应挂单；不能仅因两侧方法同名就忽略接口契约差异。
 
-业务说明见 [限价订单执行约束](limit_execution.md)、[冰山订单](iceberg.md)、[挂单修改与本地预留授权](amend.md)、[数值计算公式](numerical_formulas.md) 与 [关键逻辑流程](logic_flows.md)。
+业务说明见 [限价订单执行约束](limit_execution.md)、[冰山订单](iceberg.md)、[挂单修改与本地预留授权](amend.md)、[原子撤单替换与预留归属](cancel_replace.md)、[数值计算公式](numerical_formulas.md) 与 [关键逻辑流程](logic_flows.md)。
+
+撤单替换领域输入位于 `matching-domain/src/cancel_replace.rs`，新预留的规范签名字节位于 `reservation_token.rs`。`matching-risk/src/reservation_transition.rs` 持有真实登记表及不可伪造的金融/归属计划，区分 ActiveOrder 与 PendingR2；订单终结不伪装成金融释放。两套簿各自规划、核对完整前态后提交，不共享过滤、撮合或提交算法。`tests/cancel_replace/` 固定约束和原子性；`tests/differential/cancel_replace/` 保存持续历史的完整混合磁带和独立性质断言。
 
 ## 未触发止损订单
 

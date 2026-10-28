@@ -28,6 +28,9 @@ fn shadow(input: &LimitGtcOrder) -> ReservationState {
         user_id: input.user_id,
         market_id: MarketId::new(7),
         version: 11,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 0,
         reserves: vec![],
     }
 }

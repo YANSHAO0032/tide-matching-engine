@@ -12,6 +12,10 @@ use matching_domain::{
     TradeId,
 };
 
+#[cfg(test)]
+#[path = "market_by_base/test_support.rs"]
+pub(crate) mod test_support;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProtectedBaseFill {
     /// 将被成交的挂单订单标识符。
@@ -553,21 +557,5 @@ impl ProductionOrderBook {
             stop,
             remaining,
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn preflight_market_by_base_with_protection(
-        &self,
-        incoming: &MarketByBase,
-        context: &CommandStartProtectionContext,
-        math: &MarketMath,
-    ) -> Result<Vec<(OrderId, Qty)>, RejectReason> {
-        let plan = self.preflight_protected_market_by_base_plan(incoming, context, math)?;
-
-        Ok(plan
-            .fills
-            .into_iter()
-            .map(|fill| (fill.maker_order_id, fill.qty))
-            .collect())
     }
 }

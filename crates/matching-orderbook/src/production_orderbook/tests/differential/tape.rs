@@ -17,7 +17,7 @@ pub(super) fn validate_tape_domain(commands: &[Command]) -> Result<(), String> {
     }
 
     for (index, command) in commands.iter().enumerate() {
-        // T05.2a 诊断优先级：OrderId 必须先于下单价格/数量。
+        // 诊断优先级：OrderId 必须先于下单价格或数量。
         let id = match command {
             Command::Place(order) => order.order_id.get(),
             Command::Cancel(order_id) => order_id.get(),
@@ -73,7 +73,7 @@ pub(super) fn validate_tape_domain(commands: &[Command]) -> Result<(), String> {
     Ok(())
 }
 
-/// T05.2b 固定种子随机命令生成器。测试输入独立于订单簿状态。
+/// 固定种子随机命令生成器；测试输入独立于订单簿状态。
 pub(super) const TAPE_GENERATOR_VERSION: &str = "T05.2b-v1";
 
 pub(super) fn generate_tape(seed: [u8; 32], length: usize) -> Vec<Command> {
@@ -236,7 +236,7 @@ pub(super) fn run_tape(commands: &[Command]) -> Vec<StepRecord> {
     transcript
 }
 
-/// T05.3: 不存储完整执行记录；每步验证完成后仅增加计数。
+/// 不存储完整执行记录；每步验证完成后仅增加计数。
 pub(super) fn run_tape_streaming(commands: &[Command]) -> usize {
     let mut processed = 0usize;
     execute_tape(commands, |_record| {

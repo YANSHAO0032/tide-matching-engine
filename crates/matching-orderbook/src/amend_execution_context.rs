@@ -48,7 +48,10 @@ impl AmendExecutionContext<'_> {
         amend: &AmendOrder,
         state: &ReservationState,
     ) -> Result<ReservationState, RejectReason> {
-        if state.order_id != amend.order_id
+        if state.status != matching_risk::ReservationStatus::Active
+            || state.fee_schedule_version != self.fee_schedule_version
+            || state.fee_tier_id != self.fee_tier_id
+            || state.order_id != amend.order_id
             || state.user_id != amend.user_id
             || state.market_id != amend.market_id
             || self.required_reserves.is_empty()

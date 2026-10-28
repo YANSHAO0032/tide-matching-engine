@@ -4,7 +4,7 @@ use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason, TimeInFor
 ///
 /// 此对象保存剩余量与市场内优先级。它不维护生产簿的侵入式先进先出链接；
 /// 参考模型的同价先进先出由源 `Vec` 的稳定顺序表达。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceOrder {
     /// 不随成交扣减改变的原始订单载荷。
     original: LimitGtcOrder,

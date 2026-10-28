@@ -230,6 +230,9 @@ mod tests {
                 user_id: UserId::new(4),
                 market_id: MarketId::new(7),
                 version: 11,
+                status: matching_risk::ReservationStatus::Active,
+                fee_schedule_version: 2,
+                fee_tier_id: 0,
                 reserves: Vec::new(),
             },
         )

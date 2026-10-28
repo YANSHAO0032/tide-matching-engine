@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) mod amend_candidate;
 mod amend_iceberg;
 mod amend_stop;
+mod cancel_replace;
+mod cancel_replace_view;
 mod expiry;
 mod iceberg;
 mod limit_execution;
@@ -21,6 +23,8 @@ mod resting;
 mod stop_orders;
 mod stop_trigger;
 
+pub use cancel_replace::{ProductionCancelReplaceContext, ProductionCancelReplacePlan};
+pub use cancel_replace_view::ProductionBookWithout;
 use expiry::RegularExpiryIndex;
 
 /// 指明已预检的余量将追加到既有档位还是新建档位。
@@ -28,7 +32,7 @@ use expiry::RegularExpiryIndex;
 /// 该枚举只保存提交前后必须保持一致的值，不保留对容器的借用；
 /// 因而预检完成后仍可执行挂单状态变更，再通过失败即停止的断言检查
 /// 提交时的所有者状态没有发生意外漂移。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestTargetPlan {
     Existing {
         /// 提交前既有价档的先进先出尾节点。
@@ -55,7 +59,7 @@ enum RestTargetPlan {
 /// 它记录身份、计划分配的优先级及目标档位的聚合快照。
 /// 公开 `rest` 另行施加严格不交叉；完整限价单 GTC 则在
 /// 挂单已被预检后复用本计划，保证余量的可预期拒绝发生在首笔成交前。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RestPlan {
     /// 即将挂入订单簿的订单标识符。
     order_id: OrderId,
@@ -176,7 +180,8 @@ impl ProductionOrderBook {
         if self.contains_active_order(order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
-        if state.order_id != order_id
+        if state.status != matching_risk::ReservationStatus::Active
+            || state.order_id != order_id
             || state.user_id != user_id
             || self.reservations.contains_key(&order_id)
         {

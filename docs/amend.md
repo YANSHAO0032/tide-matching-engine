@@ -56,4 +56,4 @@ Stop 按 LastTrade、MarkPrice、IndexPrice 分区；StaticOpening 不可触发�
 
 固定边界、生成式失败性质和完整混合差分逐命令比较原序结果/事件、所有普通与 Stop 载荷、真实 FIFO、深度、到期引用、两个 allocator、来源价格/序号和完整预留。固定 seed 100k 及两组各双次 10k 比较完整逐步 transcript；状态投影用于本地测试，不是 durable digest。实现入口见[模块说明](orderbook_modules.md)，执行顺序见[逻辑流程](logic_flows.md)。
 
-当前不包含 MarketState/KillSwitch/路由 fencing、完整 PriceBand/STP/PreOpen、账户与 Settlement、WAL/快照/HA、durable envelope、完整命令去重或 CancelReplace。止损 root reference update 一次冻结更新后参考作为全级联用户保护上下文，后代成交只更新触发检测状态；完整市场价格带配置仍由后续接入。
+当前不包含 MarketState/KillSwitch/路由 fencing、完整 PriceBand/STP/PreOpen、账户与 Settlement、WAL/快照/HA、durable envelope 或完整命令去重。独立新身份替换见[原子撤单替换与预留归属](cancel_replace.md)；该入口使用真实登记表，不能将旧窄 Amend/Cancel/expiry API 的 shadow 清理解释成已完成 R2。完整 Amend 上下文同时拒绝 Released 或固定费率漂移的 shadow，包括无调整令牌分支。止损 root reference update 一次冻结更新后参考作为全级联用户保护上下文，后代成交只更新触发检测状态；完整市场价格带配置仍由后续接入。

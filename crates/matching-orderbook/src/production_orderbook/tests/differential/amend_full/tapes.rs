@@ -261,14 +261,23 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Coverage {
+    /// 已执行的总命令数。
     commands: usize,
+    /// 成功提交的改单次数。
     successful_amend: usize,
+    /// 被拒绝且保持原子性的改单次数。
     rejected_amend: usize,
+    /// 成功应用签名预留调整的次数。
     signed_success: usize,
+    /// 成功修改止损订单的次数。
     stop_amend: usize,
+    /// 成功修改冰山订单的次数。
     iceberg_amend: usize,
+    /// 全部命令累计产生的成交数量。
     trades: usize,
+    /// 全部命令累计触发的止损子订单数量。
     triggered: usize,
+    /// 全部命令累计到期的订单数量。
     expired: usize,
 }
 

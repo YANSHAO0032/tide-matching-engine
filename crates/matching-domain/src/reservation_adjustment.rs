@@ -7,24 +7,38 @@ use crate::{AssetId, CommandId, MarketId, OrderId, RejectReason, ReservationId, 
 /// 单一资产的目标预留原子数。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssetReserve {
+    /// 被锁定资产的稳定身份。
     pub asset: AssetId,
+    /// 该资产锁定的严格正原子数量。
     pub atoms: u128,
 }
 
 /// 账户风控在命令身份确定后签发的绝对目标预留授权。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReservationAdjustmentToken {
+    /// 账户风控签发的稳定令牌身份。
     pub token_id: u128,
+    /// 授权调整预先绑定的最终命令身份。
     pub command_id: CommandId,
+    /// 待调整预留的身份。
     pub reservation_id: ReservationId,
+    /// 待调整活动订单的身份。
     pub order_id: OrderId,
+    /// 授权所绑定的用户身份。
     pub user_id: UserId,
+    /// 授权所绑定的市场身份。
     pub market_id: MarketId,
+    /// 签发时读取的预留版本，用于拒绝陈旧授权。
     pub expected_reservation_version: u64,
+    /// 调整后每种资产的目标锁定数量，按资产严格升序。
     pub target_reserves: SmallVec<[AssetReserve; 3]>,
+    /// 签发时锁定的费率表版本。
     pub fee_schedule_version: u64,
+    /// 签发时锁定的费率层级。
     pub fee_tier_id: u32,
+    /// 签发该令牌的已加载风控公钥标识符。
     pub risk_key_id: u32,
+    /// 对规范载荷的 Ed25519 签名。
     pub signature: [u8; 64],
 }
 

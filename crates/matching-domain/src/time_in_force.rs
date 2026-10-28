@@ -1,8 +1,8 @@
 use crate::logical_time::LogicalTime;
 /// 订单有效期策略声明。
 ///
-/// 该枚举保存策略参数；限价 IOC/FOK/PostOnly 已有独立订单簿入口，
-/// 完整命令分派和 DAY/GTD 到期执行仍由后续层承担。
+/// 该枚举保存策略参数；限价 IOC/FOK/PostOnly 与 DAY/GTD 到期均有独立订单簿入口。
+/// 完整命令分派仍由后续协议层承担。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeInForce {
     /// 除非被取消或按其他规则终止，否则持续有效。

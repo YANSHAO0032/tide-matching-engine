@@ -22,6 +22,9 @@ fn fixture() -> (
         user_id: UserId(5),
         market_id: MarketId(6),
         version: 7,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 9,
+        fee_tier_id: 10,
         reserves: vec![AssetReserve {
             asset: AssetId(1),
             atoms: 10,
@@ -290,4 +293,45 @@ fn version_overflow_does_not_partially_apply() {
         Err(RejectReason::ArithmeticOverflow)
     );
     assert_eq!(state, before);
+}
+
+#[test]
+fn released_or_repriced_state_cannot_verify_adjustment() {
+    let (_, keys, state, expected, token) = fixture();
+    for case in 0..3 {
+        let mut changed = state.clone();
+        match case {
+            0 => changed.status = matching_risk::ReservationStatus::Released,
+            1 => changed.fee_schedule_version += 1,
+            2 => changed.fee_tier_id += 1,
+            _ => unreachable!(),
+        }
+        let before = changed.clone();
+        assert_eq!(
+            verify_amend_reservation(&keys, &changed, &expected, &token),
+            Err(RejectReason::InvalidReservation)
+        );
+        assert_eq!(changed, before);
+    }
+}
+
+#[test]
+fn released_or_repriced_state_cannot_apply_previously_verified_adjustment() {
+    let (_, keys, state, expected, token) = fixture();
+    let verified = verify_amend_reservation(&keys, &state, &expected, &token).unwrap();
+    for case in 0..3 {
+        let mut changed = state.clone();
+        match case {
+            0 => changed.status = matching_risk::ReservationStatus::Released,
+            1 => changed.fee_schedule_version += 1,
+            2 => changed.fee_tier_id += 1,
+            _ => unreachable!(),
+        }
+        let before = changed.clone();
+        assert_eq!(
+            changed.apply_verified_adjustment(&verified),
+            Err(RejectReason::InvalidReservation)
+        );
+        assert_eq!(changed, before);
+    }
 }

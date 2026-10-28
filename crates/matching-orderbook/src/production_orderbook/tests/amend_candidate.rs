@@ -14,6 +14,9 @@ fn reservation(order_id: OrderId, user_id: UserId) -> ReservationState {
         user_id,
         market_id: MarketId::new(7),
         version: 3,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 0,
         reserves: Vec::new(),
     }
 }
@@ -38,12 +41,19 @@ fn amend(order_id: OrderId, user_id: UserId, new_qty: Qty) -> AmendOrder {
 
 #[derive(Debug, PartialEq, Eq)]
 struct BookSnapshot {
+    /// 买方价格档与其队列顺序快照。
     bids: Vec<LevelSnapshotEntry>,
+    /// 卖方价格档与其队列顺序快照。
     asks: Vec<LevelSnapshotEntry>,
+    /// 指定订单身份对应的节点快照。
     nodes: Vec<NodeSnapshotEntry>,
+    /// 活动订单到金融预留影子的有序快照。
     reservations: Vec<(OrderId, ReservationState)>,
+    /// 未触发止损订单及其优先级的有序快照。
     stops: Vec<(StopOrder, StopPriority)>,
+    /// 下一普通队列优先级计数。
     next_priority: u128,
+    /// 下一止损优先级计数。
     next_stop_priority: u128,
 }
 
