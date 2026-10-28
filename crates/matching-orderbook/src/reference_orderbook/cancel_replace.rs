@@ -5,7 +5,7 @@
 use super::{ReferenceOrderBook, ReferencePlaceContext, ReferencePlaceOrder};
 use matching_domain::{
     CancelReason, CancelReplaceOrder, CancelReplaceRejection, EngineEvent, IcebergOrder,
-    LimitGtcOrder, Qty, RejectReason, ReplacementOrderKind, StopOrder,
+    LimitOrder, Qty, RejectReason, ReplacementOrderKind, StopOrder,
 };
 use matching_risk::{
     ExpectedReplacementReservation, ReservationApplyError, ReservationRegistry, ReservationStatus,
@@ -108,7 +108,7 @@ impl ReferenceOrderBook {
             .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
 
         let replacement = &request.replacement;
-        let order = LimitGtcOrder {
+        let order = LimitOrder {
             order_id: replacement.order_id,
             user_id: replacement.user_id,
             side: replacement.side,

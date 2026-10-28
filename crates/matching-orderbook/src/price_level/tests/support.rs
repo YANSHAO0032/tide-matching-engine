@@ -14,7 +14,7 @@ fn empty_price_level_initializes_all_fields() {
         assert_eq!(validate_level(&level, &arena), Ok(()));
     }
 }
-use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
+use matching_domain::{LimitOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
 
 /// 将受控测试位置转换为已知可表示的 Arena 槽位。
 pub(super) fn index(position: usize) -> OrderIndex {
@@ -22,8 +22,8 @@ pub(super) fn index(position: usize) -> OrderIndex {
 }
 
 /// 构造具有显式方向、价格和正数量的最小测试订单。
-pub(super) fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+pub(super) fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -48,7 +48,7 @@ pub(super) fn level_state(
 pub(super) fn node_state(
     node: &OrderNode,
 ) -> (
-    LimitGtcOrder,
+    LimitOrder,
     u64,
     QueuePriority,
     Option<OrderIndex>,
@@ -103,7 +103,7 @@ pub(super) enum LevelOp {
 #[derive(Debug, Clone)]
 pub(super) struct ModelEntry {
     /// 原始订单载荷，用于验证复用槽位没有改变逻辑成员。
-    pub(super) original: LimitGtcOrder,
+    pub(super) original: LimitOrder,
     /// 该成员当前应计入档位聚合的数量。
     pub(super) remaining: u64,
     /// 模型分配的严格递增优先级。

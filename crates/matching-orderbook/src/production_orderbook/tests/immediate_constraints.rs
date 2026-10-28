@@ -26,7 +26,7 @@ fn assert_atomic(book: &mut ProductionOrderBook, action: impl FnOnce(&mut Produc
 fn execute(
     book: &mut ProductionOrderBook,
     fok: bool,
-    order: LimitGtcOrder,
+    order: LimitOrder,
     math: &MarketMath,
     ids: &[TradeId],
 ) -> Result<LimitImmediateExecution, RejectReason> {

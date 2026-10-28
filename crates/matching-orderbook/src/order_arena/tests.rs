@@ -3,7 +3,7 @@
 //! 此模块的模型与快照只用于验证实现，不参与生产状态或重放。
 
 use super::*;
-use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
+use matching_domain::{LimitOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -28,8 +28,8 @@ impl OrderArena {
 }
 
 /// 构造具有固定有效价格的最小测试订单。
-fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -47,7 +47,7 @@ fn index(position: usize) -> OrderIndex {
 fn assert_node(
     arena: &OrderArena,
     index: OrderIndex,
-    expected: &LimitGtcOrder,
+    expected: &LimitOrder,
     priority: QueuePriority,
 ) {
     let node = arena.get(index).expect("node must exist");
@@ -61,7 +61,7 @@ fn assert_node(
 
 /// 用于比较槽位内容的完整节点投影，包含所有运行态字段。
 type NodeState = (
-    LimitGtcOrder,
+    LimitOrder,
     u64,
     QueuePriority,
     Option<OrderIndex>,

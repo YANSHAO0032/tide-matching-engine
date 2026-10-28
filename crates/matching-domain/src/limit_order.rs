@@ -1,11 +1,11 @@
 use crate::{OrderId, Price, Qty, Side, UserId};
 
-/// 限价订单的最小身份、价格与数量载荷（保留既有类型名）。
+/// 限价订单的最小身份、价格与数量载荷。
 ///
 /// 它不含市场、有效期、标志、状态或资金预留；GTC/IOC/FOK/PostOnly 由所调用的
-/// 显式订单簿入口选择，不应根据本载荷的历史类型名推断执行策略。
+/// 显式订单簿入口选择，本载荷本身不携带执行策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LimitGtcOrder {
+pub struct LimitOrder {
     /// 在订单簿内唯一定位该订单的业务身份。
     pub order_id: OrderId,
     /// 提交订单的用户身份。
@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn identical_orders_are_equal() {
-        let a = LimitGtcOrder {
+        let a = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
             side: Side::Buy,
@@ -34,7 +34,7 @@ mod tests {
             qty: Qty::try_new(10).unwrap(),
         };
 
-        let b = LimitGtcOrder {
+        let b = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
             side: Side::Buy,
@@ -46,8 +46,8 @@ mod tests {
     }
 
     /// 构造可复用的合法订单测试数据。
-    fn sample_order() -> LimitGtcOrder {
-        LimitGtcOrder {
+    fn sample_order() -> LimitOrder {
+        LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
             side: Side::Buy,
@@ -61,23 +61,23 @@ mod tests {
         let original = sample_order();
 
         let changed_orders = [
-            LimitGtcOrder {
+            LimitOrder {
                 order_id: OrderId::new(3),
                 ..sample_order()
             },
-            LimitGtcOrder {
+            LimitOrder {
                 user_id: UserId::new(4),
                 ..sample_order()
             },
-            LimitGtcOrder {
+            LimitOrder {
                 side: Side::Sell,
                 ..sample_order()
             },
-            LimitGtcOrder {
+            LimitOrder {
                 price: Price::try_new(101).unwrap(),
                 ..sample_order()
             },
-            LimitGtcOrder {
+            LimitOrder {
                 qty: Qty::try_new(11).unwrap(),
                 ..sample_order()
             },
@@ -101,7 +101,7 @@ mod tests {
         let order = sample_order();
         let debug = format!("{order:?}");
 
-        assert!(debug.contains("LimitGtcOrder"));
+        assert!(debug.contains("LimitOrder"));
         assert!(debug.contains("OrderId(1)"));
         assert!(debug.contains("UserId(2)"));
         assert!(debug.contains("Buy"));

@@ -220,7 +220,7 @@ impl ReferenceOrderBook {
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         match order {
             StopOrder::Limit(stop) => self.place_limit_timed_with_events(
-                matching_domain::LimitGtcOrder {
+                matching_domain::LimitOrder {
                     order_id: stop.order_id,
                     user_id: stop.user_id,
                     side: stop.side,

@@ -7,7 +7,7 @@ use matching_domain::{
 };
 use matching_risk::ReservationState;
 
-fn shadow(input: &LimitGtcOrder) -> ReservationState {
+fn shadow(input: &LimitOrder) -> ReservationState {
     ReservationState {
         reservation_id: ReservationId::new(input.order_id.get()),
         order_id: input.order_id,
@@ -24,7 +24,7 @@ fn shadow(input: &LimitGtcOrder) -> ReservationState {
     }
 }
 
-fn amend(input: &LimitGtcOrder) -> AmendOrder {
+fn amend(input: &LimitOrder) -> AmendOrder {
     AmendOrder {
         market_id: MarketId::new(7),
         user_id: input.user_id,
@@ -45,8 +45,8 @@ fn amend(input: &LimitGtcOrder) -> AmendOrder {
 /// 常规改单专用命令域；历史 GTC 随机生成器继续保持原来的可复现输入。
 #[derive(Clone, Debug)]
 enum Command {
-    Rest(LimitGtcOrder, TimeInForce, bool),
-    Place(LimitGtcOrder, TimeInForce),
+    Rest(LimitOrder, TimeInForce, bool),
+    Place(LimitOrder, TimeInForce),
     Amend(Box<AmendOrder>),
     Cancel(OrderId),
     AdvanceTime(LogicalTime),
@@ -320,7 +320,7 @@ impl Harness {
         }
     }
 
-    fn rest(&mut self, input: LimitGtcOrder, tif: TimeInForce) {
+    fn rest(&mut self, input: LimitOrder, tif: TimeInForce) {
         assert_eq!(
             self.run(Command::Rest(input, tif, true)).outcome,
             Outcome::Unit(Ok(()))
@@ -342,7 +342,7 @@ fn gtd(at: u64) -> TimeInForce {
 }
 
 fn expected_amended(
-    input: &LimitGtcOrder,
+    input: &LimitOrder,
     price: i64,
     old: u64,
     new: u64,

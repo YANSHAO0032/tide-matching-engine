@@ -19,7 +19,7 @@ pub mod ids;
 /// IOC/FOK 的终结结果与当前基础订单组合校验。
 pub mod limit_execution;
 /// 限价身份、价格和数量载荷，执行策略由订单簿入口选择。
-pub mod limit_gtc_order;
+pub mod limit_order;
 /// 不依赖系统时钟的逻辑时间值。
 pub mod logical_time;
 /// 市场整数金额换算的已验证配置与内部错误分类。
@@ -85,8 +85,8 @@ pub use iceberg_order::IcebergOrder;
 pub use limit_execution::{
     CancelReason, LimitImmediateExecution, validate_basic_order_combination,
 };
-/// 保留历史类型名的最小限价订单载荷。
-pub use limit_gtc_order::LimitGtcOrder;
+/// 不携带执行策略的最小限价订单载荷。
+pub use limit_order::LimitOrder;
 /// 确定性逻辑时间值。
 pub use logical_time::{LogicalClock, LogicalTime};
 /// 整数价格、数量和金额值对象。

@@ -9,7 +9,7 @@ use matching_domain::market_order::{
     effective_protection_at_command_start_with_source, maker_price_within_protection,
 };
 use matching_domain::{
-    EngineEvent, IcebergOrder, LimitGtcOrder, LimitImmediateExecution, MarketByBase, MarketByQuote,
+    EngineEvent, IcebergOrder, LimitImmediateExecution, LimitOrder, MarketByBase, MarketByQuote,
     MarketMath, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason,
     Side, TradeEvent, TradeId,
 };
@@ -82,7 +82,7 @@ impl ProductionOrderBook {
     /// 在同一次独占调用中执行普通限价单并关联实际挂单余量。
     pub fn place_limit_gtc_with_reservation(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         state: ReservationState,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
@@ -632,7 +632,7 @@ impl ProductionOrderBook {
     /// 普通挂单沿用仅报告成交事件的既有契约。
     pub fn place_limit_gtc_with_events(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         if self.contains_active_order(order.order_id) {
@@ -824,7 +824,7 @@ impl ProductionOrderBook {
 
     pub(super) fn place_immediate_iceberg(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
         fok: bool,

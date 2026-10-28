@@ -3,8 +3,8 @@
 use super::*;
 use matching_domain::{ExpireReason, ExpiredOrder, LogicalTime, TimeInForce, UserId};
 
-fn order(id: u128) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side: Side::Buy,

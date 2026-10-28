@@ -1,4 +1,4 @@
-use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason, TimeInForce};
+use matching_domain::{LimitOrder, Qty, QueuePriority, RejectReason, TimeInForce};
 
 /// 参考订单簿使用的最小挂单订单运行态。
 ///
@@ -7,7 +7,7 @@ use matching_domain::{LimitGtcOrder, Qty, QueuePriority, RejectReason, TimeInFor
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceOrder {
     /// 不随成交扣减改变的原始订单载荷。
-    original: LimitGtcOrder,
+    original: LimitOrder,
     /// 当前可见片的剩余量，可以在移除或补量前短暂为零。
     remaining: u64,
     /// 当前尚未展示的冰山隐藏基础数量。
@@ -25,13 +25,13 @@ impl ReferenceOrder {
     ///
     /// 该库内私有构造器供参考簿和测试数据使用；实际挂单必须经
     /// [`crate::ReferenceOrderBook::rest`] 完成重复标识符与高水位校验。
-    pub(crate) fn new(original: LimitGtcOrder, priority: QueuePriority) -> Self {
+    pub(crate) fn new(original: LimitOrder, priority: QueuePriority) -> Self {
         Self::new_timed(original, priority, TimeInForce::Gtc)
     }
 
     /// 使用已验证有效期构造普通参考挂单。
     pub(crate) fn new_timed(
-        original: LimitGtcOrder,
+        original: LimitOrder,
         priority: QueuePriority,
         tif: TimeInForce,
     ) -> Self {
@@ -51,7 +51,7 @@ impl ReferenceOrder {
     /// 该构造器只服务于失去优先级的普通改单路径；调用方必须已确认
     /// `remaining` 严格为正且不超过新的绝对总量。
     pub(crate) fn amended_regular(
-        original: LimitGtcOrder,
+        original: LimitOrder,
         remaining: Qty,
         priority: QueuePriority,
         tif: TimeInForce,
@@ -72,7 +72,7 @@ impl ReferenceOrder {
 
     /// 根据已验证的冰山余量构造运行态，同时保留原始输入。
     pub(crate) fn iceberg(
-        original: LimitGtcOrder,
+        original: LimitOrder,
         remaining: u64,
         peak: Qty,
         priority: QueuePriority,
@@ -91,7 +91,7 @@ impl ReferenceOrder {
     }
     /// 从只读计划重建冰山运行态，同时保存独立的可见片和时效。
     pub(crate) fn amended_iceberg(
-        original: LimitGtcOrder,
+        original: LimitOrder,
         total: Qty,
         visible: Qty,
         peak: Qty,
@@ -143,7 +143,7 @@ impl ReferenceOrder {
     }
 
     /// 借用不可变的原始订单载荷。
-    pub fn original_order(&self) -> &LimitGtcOrder {
+    pub fn original_order(&self) -> &LimitOrder {
         &self.original
     }
 
@@ -175,7 +175,7 @@ impl ReferenceOrder {
     /// 同价减量在不改变队列位置时写入新的绝对目标和严格正余量。
     pub(crate) fn amend_regular_in_place(
         &mut self,
-        original: LimitGtcOrder,
+        original: LimitOrder,
         remaining: Qty,
         tif: TimeInForce,
     ) {
@@ -219,14 +219,14 @@ impl ReferenceOrder {
 mod tests {
     //! 验证参考挂单订单的剩余量、优先级和失败原子性。
     use matching_domain::{
-        LimitGtcOrder, OrderId, Price, Qty, QueuePriority, RejectReason, Side, UserId,
+        LimitOrder, OrderId, Price, Qty, QueuePriority, RejectReason, Side, UserId,
     };
 
     use super::ReferenceOrder;
 
     /// 构造合法的买入订单测试数据。
-    fn make_order(qty: u64) -> LimitGtcOrder {
-        LimitGtcOrder {
+    fn make_order(qty: u64) -> LimitOrder {
+        LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
             side: Side::Buy,

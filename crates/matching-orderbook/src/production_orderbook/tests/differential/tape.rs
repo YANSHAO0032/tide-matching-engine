@@ -135,7 +135,7 @@ pub(super) fn generate_tape(seed: [u8; 32], length: usize) -> Vec<Command> {
 /// 不把这个测试适配器描述成通用失败原子事务。
 pub(super) fn place_reference(
     book: &mut ReferenceOrderBook,
-    order: LimitGtcOrder,
+    order: LimitOrder,
     trade_ids: &[TradeId],
 ) -> Result<ReferencePlaceResult, RejectReason> {
     // ------------------------------------------------------------

@@ -4,7 +4,7 @@ use super::iceberg::SliceRequest;
 use super::{ReferenceOrderBook, ReferenceStopOrder};
 use crate::ReferenceOrder;
 use matching_domain::{
-    AmendOrder, AmendQuantityMode, AmendedQuantity, EngineEvent, LimitGtcOrder, LogicalTime, Price,
+    AmendOrder, AmendQuantityMode, AmendedQuantity, EngineEvent, LimitOrder, LogicalTime, Price,
     Qty, QueuePriority, RegularAmendKind, RejectReason, StopMarketQuantity, StopPriority,
     TimeInForce, TradeId, TriggerExpiry, TriggerExpiryPatch, classify_regular_amend,
     remaining_after_target_total, validate_amend_quantity_mode,
@@ -310,9 +310,9 @@ impl ReferenceOrderBook {
 
     /// 构造新绝对总量的运行态订单载荷；已成交量继续由总量减当前余量推导。
     pub(super) fn amended_payload(
-        original: &LimitGtcOrder,
+        original: &LimitOrder,
         plan: RegularAmendPlan,
-    ) -> Result<LimitGtcOrder, RejectReason> {
+    ) -> Result<LimitOrder, RejectReason> {
         let target_total = plan
             .already_filled
             .checked_add(plan.new_remaining.get())
@@ -352,7 +352,7 @@ impl ReferenceOrderBook {
     fn commit_reprice_plan(
         &mut self,
         plan: RegularAmendPlan,
-        amended: LimitGtcOrder,
+        amended: LimitOrder,
         reservation: ReservationState,
         amended_event: EngineEvent,
         trade_ids: &[TradeId],

@@ -6,8 +6,8 @@ use matching_domain::{
     StopOrder, TimeInForce, TriggerExpiry,
 };
 
-fn timed_order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn timed_order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,

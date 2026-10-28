@@ -4,7 +4,7 @@
 
 ## 输入和查询
 
-`IcebergOrder::try_new(LimitGtcOrder, peak_size)` 验证总量与显示上限关系。字段保持私有，调用方通过 `order()` 和 `peak_size()` 读取输入。两本簿提供相同的入口：
+`IcebergOrder::try_new(LimitOrder, peak_size)` 验证总量与显示上限关系。字段保持私有，调用方通过 `order()` 和 `peak_size()` 读取输入。两本簿提供相同的入口：
 
 | 入口 | 职责 |
 |---|---|

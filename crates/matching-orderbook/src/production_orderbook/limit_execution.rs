@@ -3,7 +3,7 @@
 use super::{FillPlan, ProductionOrderBook};
 use crate::{IncomingOrder, PriceLevel};
 use matching_domain::{
-    LimitGtcOrder, LimitImmediateExecution, MarketMath, MathError, Price, Qty, RejectReason, Side,
+    LimitImmediateExecution, LimitOrder, MarketMath, MathError, Price, Qty, RejectReason, Side,
     TradeEvent, TradeId,
 };
 
@@ -24,7 +24,7 @@ impl ProductionOrderBook {
     /// 新到订单全部成交时不为其分配 QueuePriority；冰山挂单补量仍需新优先级。
     pub fn place_limit_gtc(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<TradeEvent>, RejectReason> {
         if self.has_iceberg_maker(order.side) {
@@ -176,7 +176,7 @@ impl ProductionOrderBook {
     /// 重复标识符优先于含等价的价格交叉拒绝；只有全部挂单预检成功后才
     /// 消耗 QueuePriority。正值由领域类型保证；市场价格步长/数量步长对齐须由调用方校验。
     /// 不接受市价单或 IOC/FOK 标志组合。
-    pub fn place_limit_post_only(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
+    pub fn place_limit_post_only(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -196,7 +196,7 @@ impl ProductionOrderBook {
 
     /// 按价格/先进先出立即成交限价单，正余量以 OrderCanceled 终结且永不入簿。
     ///
-    /// 此入口选择 IOC 策略；LimitGtcOrder 仅复用基础限价载荷。
+    /// 此入口选择 IOC 策略；LimitOrder 仅复用基础限价载荷。
     /// 整单及所有可执行成交的 MarketMath 本金和累计金额均在状态变更前校验。
     /// IOC 新到订单不分配优先级；冰山挂单补量取新优先级。
     /// 不预留/释放资金，也不实现完整命令生命周期。
@@ -207,7 +207,7 @@ impl ProductionOrderBook {
     /// TradeId 的全局唯一性由调用方保证，多余标识符不使用。
     pub fn place_limit_ioc(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
@@ -227,7 +227,7 @@ impl ProductionOrderBook {
     /// TradeId 的全局唯一性由调用方保证，多余标识符不使用。
     pub fn place_limit_fok(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
@@ -236,7 +236,7 @@ impl ProductionOrderBook {
 
     fn place_immediate_limit(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
         fill_or_kill: bool,

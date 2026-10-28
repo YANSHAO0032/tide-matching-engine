@@ -1,8 +1,8 @@
 use super::*;
 use matching_domain::UserId;
 
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -11,7 +11,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
     }
 }
 
-fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitGtcOrder, u64, QueuePriority)>, u128) {
+fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitOrder, u64, QueuePriority)>, u128) {
     (
         book.orders
             .iter()
@@ -29,7 +29,7 @@ fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitGtcOrder, u64, QueuePriorit
 
 fn assert_read_only(
     book: &ReferenceOrderBook,
-    candidate: LimitGtcOrder,
+    candidate: LimitOrder,
     expected: Result<(), RejectReason>,
 ) {
     let before = snapshot(book);

@@ -1,4 +1,4 @@
-use crate::{LimitGtcOrder, Qty, RejectReason};
+use crate::{LimitOrder, Qty, RejectReason};
 
 /// 冰山限价订单的总量载荷与显示上限。
 ///
@@ -8,14 +8,14 @@ use crate::{LimitGtcOrder, Qty, RejectReason};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcebergOrder {
     /// 冰山订单复用的基础限价订单载荷。
-    order: LimitGtcOrder,
+    order: LimitOrder,
     /// 每次展示在订单簿深度中的严格正峰值数量。
     peak_size: Qty,
 }
 
 impl IcebergOrder {
     /// 拒绝显示上限等于或大于总量的输入；严格正值已由 Qty 保证。
-    pub fn try_new(order: LimitGtcOrder, peak_size: Qty) -> Result<Self, RejectReason> {
+    pub fn try_new(order: LimitOrder, peak_size: Qty) -> Result<Self, RejectReason> {
         if peak_size >= order.qty {
             return Err(RejectReason::InvalidIceberg);
         }
@@ -23,7 +23,7 @@ impl IcebergOrder {
     }
 
     /// 原始订单身份、限价与总下单量；不会随补量或成交改变。
-    pub fn order(&self) -> &LimitGtcOrder {
+    pub fn order(&self) -> &LimitOrder {
         &self.order
     }
 
@@ -38,8 +38,8 @@ mod tests {
     use super::*;
     use crate::{OrderId, Price, Side, UserId};
 
-    fn order(total: u64) -> LimitGtcOrder {
-        LimitGtcOrder {
+    fn order(total: u64) -> LimitOrder {
+        LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
             side: Side::Sell,

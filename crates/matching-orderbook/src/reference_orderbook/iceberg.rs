@@ -8,7 +8,7 @@ use matching_domain::market_order::{
     maker_price_within_protection,
 };
 use matching_domain::{
-    EngineEvent, IcebergOrder, LimitGtcOrder, LimitImmediateExecution, MarketByBase, MarketByQuote,
+    EngineEvent, IcebergOrder, LimitImmediateExecution, LimitOrder, MarketByBase, MarketByQuote,
     MarketMath, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason,
     Side, TradeEvent, TradeId,
 };
@@ -52,7 +52,7 @@ impl ReferenceOrderBook {
     /// 独立规划限价单成交，并仅为实际入簿余量保存预留状态。
     pub fn place_limit_gtc_with_reservation(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         state: ReservationState,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
@@ -257,7 +257,7 @@ impl ReferenceOrderBook {
 
     fn check_visible_aggregate(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         visible: u64,
     ) -> Result<(), RejectReason> {
         self.orders
@@ -299,7 +299,7 @@ impl ReferenceOrderBook {
 
     fn plan_limit_slices(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         math: Option<&MarketMath>,
         remaining: u64,
         one_fill: bool,
@@ -318,7 +318,7 @@ impl ReferenceOrderBook {
 
     pub(super) fn iceberg_immediate(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         ids: &[TradeId],
         fok: bool,
@@ -346,7 +346,7 @@ impl ReferenceOrderBook {
     /// 撮合普通 GTC 并保留冰山挂单的完整生命周期事件，最后挂入余量。
     pub fn place_limit_gtc_with_events(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         self.place_sliced_gtc(order, None, None, trade_ids)
@@ -372,7 +372,7 @@ impl ReferenceOrderBook {
 
     fn place_sliced_gtc(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         peak: Option<Qty>,
         math: Option<&MarketMath>,
         trade_ids: &[TradeId],

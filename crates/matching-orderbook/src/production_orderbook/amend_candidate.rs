@@ -5,7 +5,7 @@ use super::resting::commit_rest_target;
 use super::{ProductionOrderBook, RestPlan, RestTargetPlan};
 use crate::{OrderIndex, OrderNode};
 use matching_domain::{
-    AmendOrder, AmendQuantityMode, AmendedQuantity, EngineEvent, LimitGtcOrder, LogicalTime, Price,
+    AmendOrder, AmendQuantityMode, AmendedQuantity, EngineEvent, LimitOrder, LogicalTime, Price,
     Qty, QueuePriority, RegularAmendKind, RejectReason, StopMarketQuantity, StopPriority,
     TimeInForce, TradeId, TriggerExpiry, TriggerExpiryPatch, classify_regular_amend,
     remaining_after_target_total, validate_amend_quantity_mode,
@@ -107,7 +107,7 @@ struct RegularRepriceCommitPlan {
     /// 不可变候选身份与时效。
     candidate: RegularAmendPlan,
     /// 保存目标绝对总量的订单载荷。
-    amended: LimitGtcOrder,
+    amended: LimitOrder,
     /// 生产价档和先进先出链生成的全部片成交。
     fills: IcebergPlan,
     /// 只有正余量才有挂单与新优先级计划。
@@ -297,7 +297,7 @@ impl ProductionOrderBook {
     fn commit_amend_reduce(
         &mut self,
         index: OrderIndex,
-        amended: LimitGtcOrder,
+        amended: LimitOrder,
         plan: RegularAmendPlan,
     ) {
         let levels = match plan.side {
@@ -401,7 +401,7 @@ impl ProductionOrderBook {
     /// 提交事先计算好的余量节点；不在写屏障后重新校验时效或构造正数量。
     fn commit_amend_rest(
         &mut self,
-        amended: LimitGtcOrder,
+        amended: LimitOrder,
         remaining: Qty,
         tif: TimeInForce,
         rest: RestPlan,
@@ -432,7 +432,7 @@ impl ProductionOrderBook {
     fn preflight_amend_reprice(
         &self,
         plan: RegularAmendPlan,
-        amended: LimitGtcOrder,
+        amended: LimitOrder,
         trade_ids: &[TradeId],
     ) -> Result<RegularRepriceCommitPlan, RejectReason> {
         let fills = self.preflight_iceberg_plan(

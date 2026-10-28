@@ -42,7 +42,7 @@ fn reserves(atoms: u128) -> Vec<AssetReserve> {
     ]
 }
 
-fn input(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
+fn input(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
     let mut o = order(id, side, price, qty);
     o.user_id = UserId::new(5);
     o
@@ -177,10 +177,10 @@ fn replacement(
 /// 所有命令均在回放之前生成，身份、签名及可信预留需求属于输入磁带。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
-    Rest(LimitGtcOrder, TimeInForce),
+    Rest(LimitOrder, TimeInForce),
     Iceberg(IcebergOrder),
     Stop(StopOrder),
-    Place(LimitGtcOrder),
+    Place(LimitOrder),
     CancelReplace {
         request: Box<CancelReplaceOrder>,
         expected: Box<ExpectedReplacementReservation>,

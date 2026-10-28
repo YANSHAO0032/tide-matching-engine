@@ -9,8 +9,8 @@ use matching_risk::{
     ReservationApplyError, ReservationRegistry, ReservationState, ReservationStatus,
 };
 
-fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,

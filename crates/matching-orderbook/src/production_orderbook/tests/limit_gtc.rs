@@ -292,7 +292,7 @@ fn place_limit_gtc_non_crossing_order_rests_directly() {
 
 fn assert_place_error_preserves_state(
     book: &mut ProductionOrderBook,
-    candidate: LimitGtcOrder,
+    candidate: LimitOrder,
     trade_ids: &[TradeId],
     expected: RejectReason,
 ) {

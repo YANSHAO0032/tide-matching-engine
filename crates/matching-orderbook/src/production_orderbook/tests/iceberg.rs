@@ -4,8 +4,8 @@ use matching_domain::{IcebergOrder, UserId};
 fn book() -> ProductionOrderBook {
     ProductionOrderBook::new(QueuePriorityPolicy::try_new(1).unwrap())
 }
-fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
         side,

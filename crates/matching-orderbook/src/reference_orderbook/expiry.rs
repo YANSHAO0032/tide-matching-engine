@@ -3,8 +3,8 @@
 use super::{PRIORITY_GUARD, ReferenceOrderBook};
 use crate::ReferenceOrder;
 use matching_domain::{
-    EngineEvent, ExpireReason, ExpiredOrder, LimitGtcOrder, LogicalTime, QueuePriority,
-    RejectReason, TimeInForce, TradeId, TriggerExpiry,
+    EngineEvent, ExpireReason, ExpiredOrder, LimitOrder, LogicalTime, QueuePriority, RejectReason,
+    TimeInForce, TradeId, TriggerExpiry,
 };
 use matching_risk::ReservationState;
 
@@ -12,7 +12,7 @@ impl ReferenceOrderBook {
     /// 将时效挂单和调用方预留快照作为一次独占操作提交。
     pub fn rest_timed_with_reservation(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         now: LogicalTime,
         current_session_id: u64,
@@ -28,7 +28,7 @@ impl ReferenceOrderBook {
     /// 独立执行带 DAY/GTD/GTC 存活期的普通限价单，并仅标记实际挂单余量。
     pub fn place_limit_timed_with_events(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         now: LogicalTime,
         current_session_id: u64,
@@ -62,7 +62,7 @@ impl ReferenceOrderBook {
     /// 以独立扫描方式挂入普通 DAY/GTD/GTC 订单。
     pub fn rest_timed(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         now: LogicalTime,
         current_session_id: u64,

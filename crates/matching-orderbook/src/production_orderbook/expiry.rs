@@ -2,7 +2,7 @@
 
 use super::ProductionOrderBook;
 use matching_domain::{
-    EngineEvent, ExpireReason, ExpiredOrder, LimitGtcOrder, LogicalTime, OrderId, RejectReason,
+    EngineEvent, ExpireReason, ExpiredOrder, LimitOrder, LogicalTime, OrderId, RejectReason,
     TimeInForce, TradeId, TriggerExpiry,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,7 +90,7 @@ impl ProductionOrderBook {
     /// 执行带 DAY/GTD/GTC 存活期的普通限价单，并仅为实际余量登记到期状态。
     pub fn place_limit_timed_with_events(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         now: LogicalTime,
         current_session_id: u64,

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::OrderNode;
 use matching_domain::{
-    LimitGtcOrder, MarketMath, OrderId, Price, QueuePriority, RejectReason, Side, StopOrder,
+    LimitOrder, MarketMath, OrderId, Price, QueuePriority, RejectReason, Side, StopOrder,
     StopPriority, TimeInForce, TriggerExpiry,
 };
 use matching_risk::ReservationState;
@@ -66,7 +66,7 @@ impl<'a> ProductionBookWithout<'a> {
     /// 固定排除身份并取得生产片成交计划，后续提交直接消费本计划而不重新扫描。
     pub(super) fn plan_limit_fills(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         math: &MarketMath,
         post_only: bool,
     ) -> Result<IcebergPlan, RejectReason> {
@@ -90,7 +90,7 @@ impl<'a> ProductionBookWithout<'a> {
     /// 冻结旧身份删除后的目标链尾、聚合值和未来分配器位置。
     pub(super) fn plan_rest(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         next_priority: u128,
         maker_releases_slot: bool,
     ) -> Result<RestPlan, RejectReason> {
@@ -268,7 +268,7 @@ impl<'a> ProductionBookWithout<'a> {
     }
 
     /// 只挂单交叉预检使用逻辑最优价，包含等价价格。
-    pub fn preflight_post_only(&self, order: &LimitGtcOrder) -> Result<(), RejectReason> {
+    pub fn preflight_post_only(&self, order: &LimitOrder) -> Result<(), RejectReason> {
         self.check_new_id(order.order_id)?;
         let crosses = match order.side {
             Side::Buy => self
@@ -286,7 +286,7 @@ impl<'a> ProductionBookWithout<'a> {
     /// 使用生产只读补量扫描验证全成条件；不调用提交或参考模型。
     pub fn preflight_limit_fok(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         math: &MarketMath,
     ) -> Result<(), RejectReason> {
         self.check_new_id(order.order_id)?;
@@ -315,7 +315,7 @@ impl<'a> ProductionBookWithout<'a> {
     /// `next_priority` 必须来自本视图的成交补量预演；本方法不验证完整替换命令。
     pub fn preflight_rest(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         next_priority: u128,
     ) -> Result<(), RejectReason> {
         self.preflight_rest_capacity(order, next_priority, false)
@@ -324,7 +324,7 @@ impl<'a> ProductionBookWithout<'a> {
     /// 完整成交计划可证明全成挂单将释放槽位；孤立视图预检不能假定这一点。
     fn preflight_rest_capacity(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         next_priority: u128,
         maker_releases_slot: bool,
     ) -> Result<(), RejectReason> {

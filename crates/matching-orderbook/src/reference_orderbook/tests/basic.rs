@@ -1,11 +1,11 @@
 //! 覆盖参考模型的排序、成交、取消和优先级边界。
 use super::*;
-use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, UserId};
+use matching_domain::{LimitOrder, OrderId, Price, Qty, UserId};
 
 /// 构造带指定业务字段的挂单订单测试数据。
 fn order(id: u128, side: Side, price: i64, qty: u64) -> ReferenceOrder {
     ReferenceOrder::new(
-        LimitGtcOrder {
+        LimitOrder {
             order_id: OrderId::new(id),
             user_id: UserId::new(id as u64),
             side,
@@ -187,8 +187,8 @@ fn repeated_queries_do_not_mutate_source_or_remaining() {
 }
 
 /// 构造经公开 `rest` 路径写入参考簿的合法订单测试数据。
-fn candidate(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn candidate(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -198,7 +198,7 @@ fn candidate(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
 }
 
 /// 保存完整可观察挂单状态，用于失败原子性断言。
-fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
+fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitOrder, u64, QueuePriority)> {
     book.orders
         .iter()
         .map(|order| {

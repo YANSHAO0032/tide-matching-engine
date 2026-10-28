@@ -22,7 +22,7 @@ struct Pair {
     /// 独立参考订单簿。
     r: ReferenceOrderBook,
     /// 本轮生成的改单输入。
-    input: LimitGtcOrder,
+    input: LimitOrder,
 }
 
 impl Pair {

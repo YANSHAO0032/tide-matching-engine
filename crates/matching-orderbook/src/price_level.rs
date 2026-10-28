@@ -1,5 +1,5 @@
 use crate::{OrderArena, OrderIndex, OrderNode};
-use matching_domain::{LimitGtcOrder, Qty, RejectReason, TimeInForce};
+use matching_domain::{LimitOrder, Qty, RejectReason, TimeInForce};
 
 /// 单个价格档位的运行态。
 ///
@@ -345,7 +345,7 @@ impl PriceLevel {
         &mut self,
         arena: &mut OrderArena,
         index: OrderIndex,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         remaining: Qty,
         tif: TimeInForce,
     ) {

@@ -1,11 +1,11 @@
 //! 验证只读 `next`-成交规划的挂单、数量和状态保持性质。
 use super::ReferenceOrderBook;
 use crate::IncomingOrder;
-use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
+use matching_domain::{LimitOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
 
 /// 构造指定方向、价格和数量的订单测试数据。
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -69,7 +69,7 @@ fn assert_plan(
 }
 
 /// 保存完整订单、运行态剩余量和先进先出优先级。
-fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
+fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitOrder, u64, QueuePriority)> {
     book.orders
         .iter()
         .map(|resting| {

@@ -15,8 +15,8 @@ fn market(id: u128, side: Side, budget: u128) -> MarketByQuote {
     }
 }
 
-fn limit(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn limit(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -25,7 +25,7 @@ fn limit(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
     }
 }
 
-fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitGtcOrder, u64, QueuePriority)>, u128) {
+fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitOrder, u64, QueuePriority)>, u128) {
     (
         book.orders
             .iter()

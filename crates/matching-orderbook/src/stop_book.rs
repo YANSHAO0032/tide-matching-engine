@@ -599,7 +599,7 @@ mod tests {
     use proptest::prelude::*;
 
     use matching_domain::{
-        LimitGtcOrder, LogicalTime, OrderId, Price, Qty, QuoteBudget, RejectReason, ReservationId,
+        LimitOrder, LogicalTime, OrderId, Price, Qty, QuoteBudget, RejectReason, ReservationId,
         Side, StopLimitOrder, StopMarketOrder, StopMarketQuantity, StopOrder, TimeInForce,
         TriggerExpiry, UserId,
     };
@@ -819,7 +819,7 @@ mod tests {
         );
         assert!(production.validate_stop_book().is_ok());
 
-        let regular = LimitGtcOrder {
+        let regular = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(3),
             side: Side::Buy,

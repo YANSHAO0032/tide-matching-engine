@@ -6,7 +6,7 @@ use matching_domain::{
 };
 use matching_risk::{ReservationState, RiskKeySet};
 
-pub(super) fn command(input: &LimitGtcOrder) -> AmendOrder {
+pub(super) fn command(input: &LimitOrder) -> AmendOrder {
     AmendOrder {
         market_id: MarketId::new(7),
         user_id: input.user_id,
@@ -23,7 +23,7 @@ pub(super) fn command(input: &LimitGtcOrder) -> AmendOrder {
         reservation_adjustment: None,
     }
 }
-pub(super) fn state(input: &LimitGtcOrder) -> ReservationState {
+pub(super) fn state(input: &LimitOrder) -> ReservationState {
     ReservationState {
         reservation_id: ReservationId::new(input.order_id.get()),
         order_id: input.order_id,
@@ -156,7 +156,7 @@ pub(super) fn setup(
 ) -> (
     ProductionOrderBook,
     ReferenceOrderBook,
-    LimitGtcOrder,
+    LimitOrder,
     AmendOrder,
 ) {
     setup_side(kind, Side::Buy)
@@ -168,7 +168,7 @@ pub(super) fn setup_side(
 ) -> (
     ProductionOrderBook,
     ReferenceOrderBook,
-    LimitGtcOrder,
+    LimitOrder,
     AmendOrder,
 ) {
     setup_version(kind, side, 11)
@@ -181,7 +181,7 @@ pub(super) fn setup_version(
 ) -> (
     ProductionOrderBook,
     ReferenceOrderBook,
-    LimitGtcOrder,
+    LimitOrder,
     AmendOrder,
 ) {
     let mut p = ProductionOrderBook::new(policy());
@@ -252,7 +252,7 @@ pub(super) fn setup_version(
     }
     (p, r, input, cmd)
 }
-pub(super) fn token(input: &LimitGtcOrder, signing: &SigningKey) -> ReservationAdjustmentToken {
+pub(super) fn token(input: &LimitOrder, signing: &SigningKey) -> ReservationAdjustmentToken {
     let mut token = ReservationAdjustmentToken {
         token_id: 91,
         command_id: CommandId::new(80),
