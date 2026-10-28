@@ -1,4 +1,4 @@
-//! 覆盖 T02 参考模型的排序、成交、取消和优先级边界。
+//! 覆盖参考模型的排序、成交、取消和优先级边界。
 use super::*;
 use matching_domain::{LimitGtcOrder, OrderId, Price, Qty, UserId};
 

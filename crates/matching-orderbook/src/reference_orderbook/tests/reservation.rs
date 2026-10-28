@@ -25,10 +25,81 @@ fn state(id: u128) -> ReservationState {
         user_id: UserId::new(id as u64),
         market_id: MarketId::new(7),
         version: 3,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 0,
         reserves: vec![AssetReserve {
             asset: AssetId::new(1),
             atoms: 500,
         }],
+    }
+}
+
+#[test]
+fn released_reservation_cannot_be_adopted_by_any_reservation_constructor() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    for path in 0..5 {
+        let mut book = ReferenceOrderBook::new();
+        book.rest_timed_with_reservation(
+            order(1, Side::Sell, 2),
+            TimeInForce::Gtd {
+                expire_at: LogicalTime::new(20),
+            },
+            LogicalTime::new(1),
+            7,
+            state(1),
+        )
+        .unwrap();
+        let mut released = state(9);
+        released.status = matching_risk::ReservationStatus::Released;
+        let before = book.test_deterministic_state();
+        let mut candidate = order(9, Side::Buy, 4);
+        if path == 2 {
+            candidate.price = Price::try_new(100).unwrap();
+        }
+        let result = match path {
+            0 => book.rest_with_reservation(candidate, released),
+            1 => book.rest_timed_with_reservation(
+                candidate,
+                TimeInForce::Day { session_id: 7 },
+                LogicalTime::new(1),
+                7,
+                released,
+            ),
+            2 => book
+                .place_limit_gtc_with_reservation(candidate, released, &[TradeId::new(1)])
+                .map(|_| ()),
+            3 => book.place_iceberg_post_only_with_reservation(
+                IcebergOrder::try_new(candidate, Qty::try_new(2).unwrap()).unwrap(),
+                &math,
+                released,
+            ),
+            4 => book
+                .place_stop_with_reservation(
+                    matching_domain::StopOrder::Limit(matching_domain::StopLimitOrder {
+                        order_id: candidate.order_id,
+                        user_id: candidate.user_id,
+                        reservation_id: released.reservation_id,
+                        fee_schedule_version: 1,
+                        side: candidate.side,
+                        stop_price: Price::try_new(110).unwrap(),
+                        price: candidate.price,
+                        qty: candidate.qty,
+                        child_tif: TimeInForce::Gtc,
+                        trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+                        trigger_expiry: matching_domain::TriggerExpiry::Gtd {
+                            expire_at: LogicalTime::new(30),
+                        },
+                    }),
+                    LogicalTime::new(1),
+                    7,
+                    released,
+                )
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert_eq!(result, Err(RejectReason::InvalidReservation), "path {path}");
+        assert_eq!(book.test_deterministic_state(), before, "path {path}");
     }
 }
 

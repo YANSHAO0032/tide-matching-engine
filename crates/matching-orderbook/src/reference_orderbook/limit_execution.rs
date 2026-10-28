@@ -7,11 +7,11 @@ use matching_domain::{
 };
 
 /// 全部计划挂单扣减完成前，原始 Vec 中的位置保持稳定。
-struct LimitFillPlan {
+pub(super) struct LimitFillPlan {
     /// 原始 Vec 中待扣减订单的位置及其成交数量。
     fills: Vec<(usize, Qty)>,
     /// 计划结束后吃单方的基础资产余量。
-    remaining: u64,
+    pub(super) remaining: u64,
 }
 
 fn reject_limit_math_error(error: MathError) -> RejectReason {
@@ -119,7 +119,7 @@ impl ReferenceOrderBook {
 
     /// 独立扫描按价格稳定排序的 Vec 位置，不使用生产簿的计划或
     /// 执行过程来生成参考结果。
-    fn preflight_limit_immediate(
+    pub(super) fn preflight_limit_immediate(
         &self,
         order: &LimitGtcOrder,
         math: &MarketMath,

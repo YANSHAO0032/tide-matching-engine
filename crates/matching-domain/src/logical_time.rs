@@ -22,6 +22,7 @@ impl LogicalTime {
 /// 该状态不读取系统时钟；调用方负责将成功推进后的时间分派给订单簿的到期处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogicalClock {
+    /// 当前已由成功时间命令推进到的逻辑时间。
     now: LogicalTime,
 }
 

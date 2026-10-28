@@ -14,6 +14,9 @@ fn shadow(input: &LimitGtcOrder) -> ReservationState {
         user_id: input.user_id,
         market_id: MarketId::new(7),
         version: 11,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 0,
         reserves: vec![AssetReserve {
             asset: AssetId::new(3),
             atoms: 17,
@@ -69,16 +72,21 @@ impl Outcome {
 
 #[derive(Debug, PartialEq, Eq)]
 struct State {
+    /// 可观察订单簿、深度与事件状态。
     book: ObservedBook,
     /// 与业务价序及 FIFO 投影保持相同原序，包含完整预留内容和版本。
     timed_shadows: Vec<(OrderId, TimeInForce, Option<ReservationState>)>,
+    /// 下一普通队列优先级计数。
     next: u128,
+    /// 下一止损优先级计数。
     stop_next: u128,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct Record {
+    /// 单条命令的可观察成功或拒绝结果。
     outcome: Outcome,
+    /// 单条命令后的完整可观察状态。
     state: State,
 }
 
@@ -152,11 +160,17 @@ fn production_snapshot(book: &ProductionOrderBook) -> String {
 }
 
 struct Harness {
+    /// 独立参考订单簿。
     reference: ReferenceOrderBook,
+    /// 待差分比较的生产订单簿。
     production: ProductionOrderBook,
+    /// 每条时间命令显式推进的逻辑时钟。
     clock: LogicalClock,
+    /// 单调递增的测试成交身份来源。
     ids: TradeIdSource,
+    /// 当前仍可操作的订单身份集合。
     known_ids: BTreeSet<OrderId>,
+    /// 当前磁带中的零基命令序号。
     step: usize,
 }
 

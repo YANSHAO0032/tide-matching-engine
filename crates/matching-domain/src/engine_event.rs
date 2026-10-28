@@ -1,17 +1,8 @@
+use crate::reservation_release_reason::ReservationReleaseReason;
 use crate::{
     AmendedQuantity, CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason,
     ReservationId, TradeEvent, TriggeredOrderKind,
 };
-
-/// 订单终结时释放本地预留的稳定原因。
-///
-/// 数值是 `ReservationReleased` 事件载荷的公开协议；只能追加，不能重排或复用。
-#[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReservationReleaseReason {
-    /// 触发后的 child 未通过 Trigger-R1。
-    TriggerRejected = 1305,
-}
 
 /// 当前订单簿使用的最小订单生命周期事件载荷。
 ///
@@ -60,7 +51,8 @@ pub enum EngineEvent {
         /// 已全部成交的订单标识符。
         order_id: OrderId,
     },
-    /// 未成交的严格正基础资产余量按指定原因终结；不表示取消了一张挂单订单。
+    /// 未成交的严格正基础资产余量按指定原因终结。
+    /// 适用于活动挂单取消（含 CancelReplace），以及 IOC 尚未入簿的余量终结。
     OrderCanceled {
         /// 被终结订单的标识符。
         order_id: OrderId,
@@ -83,7 +75,9 @@ pub enum EngineEvent {
         /// child 被拒绝的稳定原因。
         reason: RejectReason,
     },
-    /// 触发后的 child 未通过预检，原 Stop 的预留已终结释放。
+    /// 已接管的预留在真实释放时携带指定业务原因；订单终结本身不表示预留已释放。
+    /// 撤单替换先发出旧单取消事件，再发出替换下单事件链，之后才允许真实 R2 释放旧预留。
+    /// 复用旧预留的撤单替换不发出旧预留释放事件。
     ReservationReleased {
         /// 终结订单的标识符。
         order_id: OrderId,
@@ -133,11 +127,6 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
-    }
-
-    #[test]
-    fn trigger_rejected_release_reason_code_is_stable() {
-        assert_eq!(ReservationReleaseReason::TriggerRejected as u16, 1305);
     }
 
     #[test]

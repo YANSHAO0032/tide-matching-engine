@@ -28,7 +28,7 @@ struct VirtualMaker {
     peak: Option<Qty>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SliceFill {
     /// 被成交冰山挂单的订单标识符。
     id: OrderId,
@@ -42,6 +42,14 @@ pub(super) struct SliceFill {
     refresh: Option<(Qty, QueuePriority)>,
 }
 
+impl SliceFill {
+    /// 只有该片耗尽整张挂单时，返回需要终结预留归属的身份。
+    pub(super) fn terminal_maker(&self) -> Option<OrderId> {
+        (self.total_after == 0).then_some(self.id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct IcebergPlan {
     /// 按撮合顺序排列的冰山片成交计划。
     pub(super) fills: Vec<SliceFill>,
@@ -60,6 +68,14 @@ pub(super) struct IcebergPlan {
 pub(super) enum Budget {
     Base(u64),
     Quote(QuoteAmount),
+}
+
+/// 同一生产扫描的只读选择条件；排除身份不会进入补量队列。
+pub(super) struct SliceScan {
+    /// 调用方允许扫描并冻结的最大成交笔数。
+    pub(super) max_fills: Option<usize>,
+    /// 撤单替换预检中逻辑排除的旧订单身份。
+    pub(super) excluded_order_id: Option<OrderId>,
 }
 
 impl ProductionOrderBook {
@@ -144,11 +160,38 @@ impl ProductionOrderBook {
         &self,
         side: Side,
         limit: Option<Price>,
-        mut budget: Budget,
+        budget: Budget,
         math: Option<&MarketMath>,
         protection: Option<(Price, ProtectionSource)>,
         max_fills: Option<usize>,
     ) -> Result<IcebergPlan, RejectReason> {
+        self.preflight_iceberg_scan(
+            side,
+            limit,
+            budget,
+            math,
+            protection,
+            SliceScan {
+                max_fills,
+                excluded_order_id: None,
+            },
+        )
+    }
+
+    /// 普通下单与逻辑删除视图共用生产扫描；只在临时可见片队列中模拟。
+    pub(super) fn preflight_iceberg_scan(
+        &self,
+        side: Side,
+        limit: Option<Price>,
+        mut budget: Budget,
+        math: Option<&MarketMath>,
+        protection: Option<(Price, ProtectionSource)>,
+        scan: SliceScan,
+    ) -> Result<IcebergPlan, RejectReason> {
+        let SliceScan {
+            max_fills,
+            excluded_order_id,
+        } = scan;
         let maker_side = match side {
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
@@ -166,6 +209,20 @@ impl ProductionOrderBook {
         let mut next_priority = self.next_queue_priority();
         let mut stop = None;
         'levels: for (price, level) in ordered {
+            // 独占价档随旧单逻辑消失，不能触发保护边界或贡献最优价格。
+            if level.count() == 1
+                && level.head().is_some_and(|index| {
+                    Some(
+                        self.arena
+                            .get(index)
+                            .expect("view level head")
+                            .original_order()
+                            .order_id,
+                    ) == excluded_order_id
+                })
+            {
+                continue;
+            }
             if max_fills.is_some_and(|max| fills.len() >= max) {
                 break;
             }
@@ -224,18 +281,28 @@ impl ProductionOrderBook {
                     count <= level.count(),
                     "iceberg plan FIFO cycle or count mismatch"
                 );
-                virtual_fifo.push_back(VirtualMaker {
-                    id: node.original_order().order_id,
-                    visible: node.remaining(),
-                    hidden: node.hidden_remaining(),
-                    peak: node.peak_size(),
-                });
+                if Some(node.original_order().order_id) != excluded_order_id {
+                    virtual_fifo.push_back(VirtualMaker {
+                        id: node.original_order().order_id,
+                        visible: node.remaining(),
+                        hidden: node.hidden_remaining(),
+                        peak: node.peak_size(),
+                    });
+                }
                 previous = Some(index);
                 cursor = node.next();
             }
             assert_eq!(previous, level.tail(), "iceberg plan FIFO tail mismatch");
             assert_eq!(aggregate, level.total_visible_qty());
             assert_eq!(count, level.count());
+            if let Some(excluded) = excluded_order_id.and_then(|id| self.order(id))
+                && excluded.original_order().side == maker_side
+                && excluded.original_order().price == *price
+            {
+                aggregate = aggregate
+                    .checked_sub(excluded.remaining())
+                    .expect("excluded visible belongs to level");
+            }
             while let Some(mut maker) = virtual_fifo.pop_front() {
                 if max_fills.is_some_and(|max| fills.len() >= max) {
                     break 'levels;
@@ -539,7 +606,12 @@ impl ProductionOrderBook {
         Ok(())
     }
 
-    fn commit_iceberg_rest(&mut self, iceberg: IcebergOrder, total: u64, plan: RestPlan) {
+    pub(super) fn commit_iceberg_rest(
+        &mut self,
+        iceberg: IcebergOrder,
+        total: u64,
+        plan: RestPlan,
+    ) {
         let id = iceberg.order().order_id;
         let node = OrderNode::new_iceberg(iceberg, total, plan.priority);
         let slot = match plan.side {

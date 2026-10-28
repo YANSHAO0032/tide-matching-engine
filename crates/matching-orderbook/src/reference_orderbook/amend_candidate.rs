@@ -667,13 +667,3 @@ impl ReferenceOrderBook {
         }
     }
 }
-
-/// 差分边界测试专用故障注入，不进入公开订单簿接口。
-#[cfg(test)]
-pub(crate) fn test_exhaust_priority(book: &mut ReferenceOrderBook, stop: bool) {
-    if stop {
-        book.next_stop_priority = u128::MAX - super::PRIORITY_GUARD;
-    } else {
-        book.next_priority = u128::MAX - super::PRIORITY_GUARD;
-    }
-}

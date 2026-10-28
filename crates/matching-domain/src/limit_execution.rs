@@ -6,6 +6,8 @@ use crate::{
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelReason {
+    /// 旧订单在原子撤单替换成功时终结。
+    CancelReplace = 1109,
     /// IOC 完成立即可执行成交后，取消尚未入簿的余量。
     IocRemainder = 1114,
 }
@@ -74,8 +76,9 @@ impl LimitImmediateExecution {
 /// 校验当前基础订单执行范围的类型/TIF/标志组合。
 ///
 /// 限价单支持 GTC/IOC/FOK，冰山支持 GTC；PostOnly 允许限价单/冰山 GTC。
-/// 两类市价单均仅开放 IOC，因此市价单 FOK 在此范围暂禁。止损订单、
-/// DAY/GTD 与 ReduceOnly 的执行支持尚未接入，返回 InvalidOrderCombination。
+/// 两类市价单均仅开放 IOC，因此市价单 FOK 在此范围暂禁。此基础组合校验不处理
+/// 止损订单、DAY/GTD 或 ReduceOnly；定时限价入口另行校验 DAY/GTD，其他组合返回
+/// InvalidOrderCombination。
 /// 这只是命令适配层可调用的结构定义校验，不代替数值、簿或资金校验。
 pub fn validate_basic_order_combination(
     kind: OrderType,

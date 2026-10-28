@@ -6,7 +6,7 @@ use matching_domain::{LimitGtcOrder, Qty, RejectReason, TimeInForce};
 /// 使用双向链表维护同价订单的先进先出顺序。
 /// 支持尾插、头部部分成交、头删、中尾删除和只读访问。
 /// 修改前执行涉及节点的只读预检；内部状态损坏时直接触发不变量断言。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PriceLevel {
     /// 先进先出头节点的 Arena 槽位；合法空档必须为 `None`。
     head: Option<OrderIndex>,

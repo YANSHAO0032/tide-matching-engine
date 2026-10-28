@@ -33,6 +33,9 @@ fn shadow(id: OrderId) -> ReservationState {
         user_id: UserId::new(4),
         market_id: MarketId::new(7),
         version: 11,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 2,
+        fee_tier_id: 0,
         reserves: vec![AssetReserve {
             asset: AssetId::new(2),
             atoms: 9000,
@@ -81,7 +84,9 @@ pub(super) fn production_snapshot(book: &ProductionOrderBook) -> String {
 }
 
 struct Pair {
+    /// 独立参考订单簿。
     reference: ReferenceOrderBook,
+    /// 待与参考模型比较的生产订单簿。
     production: ProductionOrderBook,
 }
 

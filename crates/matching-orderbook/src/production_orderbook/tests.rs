@@ -25,6 +25,8 @@ mod amend_reservation;
 mod amend_stop;
 mod broad_review;
 mod cancel;
+mod cancel_replace;
+mod cancel_replace_view;
 mod differential;
 mod expiry;
 mod iceberg;

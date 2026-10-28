@@ -790,7 +790,7 @@ fn generated_tape_rejects_overlong_length() {
     let _ = generate_tape([0x05; 32], 100_001);
 }
 
-/// T05.4：新的最大长度在输入域中合法；仍只验证输入，不回放该命令序列。
+/// 新的最大长度在输入域中合法；仍只验证输入，不回放该命令序列。
 #[test]
 fn tape_domain_accepts_100k_boundary() {
     let tape: Vec<_> = (0..MAX_TAPE_LENGTH)
@@ -800,7 +800,7 @@ fn tape_domain_accepts_100k_boundary() {
     assert_eq!(validate_tape_domain(&tape), Ok(()));
 }
 
-/// T05.4：生成器必须先通过长度门禁，之后才允许初始化 RNG / 分配 Vec。
+/// 生成器必须先通过长度门禁，之后才允许初始化 RNG 或分配 Vec。
 #[test]
 fn generated_tape_accepts_100k_boundary() {
     let tape = generate_tape([0x05; 32], MAX_TAPE_LENGTH);
@@ -808,7 +808,7 @@ fn generated_tape_accepts_100k_boundary() {
     assert_eq!(validate_tape_domain(&tape), Ok(()));
 }
 
-/// T05.4：固定种子的 100k 单条命令序列，逐命令检查但不保留 StepRecord。
+/// 固定种子的 100k 单条命令序列，逐命令检查但不保留 StepRecord。
 #[test]
 fn streamed_fixed_seed_100k_tape_processes_every_step() {
     const SEED: [u8; 32] = [0x05; 32];
@@ -828,7 +828,7 @@ fn streamed_fixed_seed_100k_tape_processes_every_step() {
     assert_eq!(run_tape_streaming(&tape), LENGTH);
 }
 
-/// T05.5 两个具名固定种子；每个独立生成两次并完整比较输入。
+/// 两个具名固定种子；每个独立生成两次并完整比较输入。
 /// 所有 §54 声明的覆盖范围见 assert_regular_book_invariants 注释。
 /// 这不是止损订单 / 到期索引 / WAL / 摘要 / 崩溃 / 跨分片断言。
 fn assert_reproducible_streamed_10k(name: &str, seed: [u8; 32]) {

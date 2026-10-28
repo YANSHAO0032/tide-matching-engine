@@ -26,6 +26,9 @@ fn reservation(order: &LimitGtcOrder, version: u64) -> ReservationState {
         user_id: order.user_id,
         market_id: MarketId::new(7),
         version,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 1,
         reserves: Vec::new(),
     }
 }
@@ -38,6 +41,58 @@ fn reservation_with_reserve(order: &LimitGtcOrder, version: u64) -> ReservationS
         }],
         ..reservation(order, version)
     }
+}
+
+fn reject_unusable_shadow_without_adjustment(case: u8) {
+    let keys = matching_risk::RiskKeySet::new(2, []).unwrap();
+    for side in [Side::Buy, Side::Sell] {
+        let mut book = ReferenceOrderBook::new();
+        let input = order(1, 11, side, 100, 10);
+        book.rest_with_reservation(input.clone(), reservation_with_reserve(&input, 5))
+            .unwrap();
+        let shadow = book.reservations.get_mut(&input.order_id).unwrap();
+        match case {
+            0 => shadow.status = matching_risk::ReservationStatus::Released,
+            1 => shadow.fee_schedule_version = 2,
+            2 => shadow.fee_tier_id = 2,
+            _ => unreachable!(),
+        }
+        let mut command = amend(&input);
+        command.new_qty = Some(Qty::try_new(8).unwrap());
+        assert!(command.reservation_adjustment.is_none());
+        let context = crate::AmendExecutionContext {
+            market_math: matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            command_id: CommandId::new(80),
+            fee_schedule_version: 1,
+            fee_tier_id: 1,
+            risk_keys: &keys,
+            required_reserves: vec![AssetReserve {
+                asset: AssetId::new(9),
+                atoms: 10,
+            }],
+        };
+        let before = book.test_deterministic_state();
+        assert_eq!(
+            book.amend_with_context(&command, LogicalTime::new(1), 9, &[], &context),
+            Err(RejectReason::InvalidReservation)
+        );
+        assert_eq!(book.test_deterministic_state(), before);
+    }
+}
+
+#[test]
+fn amend_no_adjustment_rejects_released_shadow_atomically() {
+    reject_unusable_shadow_without_adjustment(0);
+}
+
+#[test]
+fn amend_no_adjustment_rejects_pinned_fee_version_mismatch_atomically() {
+    reject_unusable_shadow_without_adjustment(1);
+}
+
+#[test]
+fn amend_no_adjustment_rejects_pinned_fee_tier_mismatch_atomically() {
+    reject_unusable_shadow_without_adjustment(2);
 }
 
 fn amend(order: &LimitGtcOrder) -> AmendOrder {
@@ -60,6 +115,7 @@ fn amend(order: &LimitGtcOrder) -> AmendOrder {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
+    /// 普通订单原始载荷、可见量、隐藏量、峰值、优先级和有效期的有序快照。
     orders: Vec<(
         LimitGtcOrder,
         u64,
@@ -68,10 +124,15 @@ struct Snapshot {
         QueuePriority,
         TimeInForce,
     )>,
+    /// 未触发止损订单及其止损优先级的有序快照。
     stops: Vec<(StopOrder, StopPriority)>,
+    /// 活动订单到金融预留影子的有序快照。
     reservations: Vec<(OrderId, ReservationState)>,
+    /// 下一普通队列优先级计数。
     next_priority: u128,
+    /// 下一止损优先级计数。
     next_stop_priority: u128,
+    /// 触发和保护计算使用的参考价状态。
     reference_prices: PriceReferenceState,
 }
 
@@ -136,6 +197,9 @@ fn seed_unrelated_deterministic_state(book: &mut ReferenceOrderBook) {
         user_id: UserId::new(92),
         market_id: MarketId::new(7),
         version: 10,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 1,
         reserves: vec![AssetReserve {
             asset: AssetId::new(10),
             atoms: 19,

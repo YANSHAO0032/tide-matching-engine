@@ -1,6 +1,7 @@
 //! 差分测试入口与共享观察类型；各场景独立调用参考簿和生产簿。
 mod amend_full;
 mod amend_regular;
+mod cancel_replace;
 mod execution_constraints;
 mod expiry;
 mod iceberg;

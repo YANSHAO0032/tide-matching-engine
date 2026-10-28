@@ -240,7 +240,7 @@ pub(super) fn observe_production(book: &ProductionOrderBook) -> ObservedBook {
     }
 }
 
-/// T05.5 当前普通订单簿的只读不变量检查。
+/// 当前普通订单簿的只读不变量检查。
 ///
 /// 适用范围（以当前普通订单限价单 GTC / 取消测试域为准）：
 /// §54: 1–5、7–11、26、49；16 仅成交正量与单命令序列内 TradeId 唯一；

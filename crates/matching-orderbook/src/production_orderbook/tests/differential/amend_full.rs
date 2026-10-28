@@ -30,6 +30,9 @@ fn shadow(input: &LimitGtcOrder) -> ReservationState {
         user_id: input.user_id,
         market_id: MarketId::new(7),
         version: 11,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 5,
+        fee_tier_id: 1,
         reserves: reserves(10_000),
     }
 }
@@ -216,29 +219,45 @@ impl Outcome {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Regular {
+    /// 订单创建时的完整普通限价载荷。
     original: LimitGtcOrder,
+    /// 当前可见剩余基础数量。
     visible: u64,
+    /// 当前隐藏剩余基础数量。
     hidden: u64,
+    /// 当前全部剩余基础数量。
     total: u64,
+    /// 冰山订单的单片峰值；普通订单为空。
     peak: Option<Qty>,
+    /// 当前订单有效期。
     tif: TimeInForce,
+    /// 当前队列优先级。
     priority: QueuePriority,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct State {
+pub(super) struct State {
+    /// 双模型共享的可观察订单簿、深度与事件状态。
     book: ObservedBook,
+    /// 普通订单完整运行态的有序投影。
     regular: Vec<Regular>,
+    /// 买卖两侧未触发止损订单及其优先级。
     stops: [Vec<(StopOrder, StopPriority)>; 2],
     /// 身份排序只用于查询完整映射；业务队列、成交和事件始终保留原序。
     reservations: Vec<(OrderId, ReservationState)>,
     /// 参考模型从自身载荷派生，生产读取实际二级到期桶。
     expiry: Vec<(OrderId, TimeInForce)>,
+    /// 未触发止损订单的到期、触发来源和价格投影。
     stop_expiry: Vec<(OrderId, TriggerExpiry, PriceReferenceKind, Side, Price)>,
+    /// 下一普通队列优先级计数。
     next: u128,
+    /// 下一止损优先级计数。
     stop_next: u128,
+    /// 当前各类参考价及其序列状态。
     sources: PriceReferenceState,
+    /// 已执行命令后的逻辑时间。
     now: LogicalTime,
+    /// 当前交易时段身份。
     session: u64,
 }
 
@@ -260,7 +279,7 @@ impl State {
     }
 }
 
-fn reference_state(book: &ReferenceOrderBook, now: LogicalTime) -> State {
+pub(super) fn reference_state(book: &ReferenceOrderBook, now: LogicalTime) -> State {
     let regular = [Side::Buy, Side::Sell]
         .into_iter()
         .flat_map(|side| book.orders(side))
@@ -315,7 +334,7 @@ fn reference_state(book: &ReferenceOrderBook, now: LogicalTime) -> State {
     }
 }
 
-fn production_state(book: &ProductionOrderBook, now: LogicalTime) -> State {
+pub(super) fn production_state(book: &ProductionOrderBook, now: LogicalTime) -> State {
     assert_eq!(validate_book(book), Ok(()));
     assert_eq!(book.validate_regular_expiry(), Ok(()));
     assert_eq!(book.validate_stop_book(), Ok(()));
@@ -365,7 +384,7 @@ fn production_state(book: &ProductionOrderBook, now: LogicalTime) -> State {
     }
 }
 
-fn invariants(state: &State, step: usize) {
+pub(super) fn invariants(state: &State, step: usize) {
     assert_regular_book_invariants(&state.book, state.next, step);
     let mut ids = BTreeSet::new();
     for o in &state.regular {
@@ -400,16 +419,24 @@ fn invariants(state: &State, step: usize) {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Record {
+    /// 单条命令在两个独立模型中的可观察结果。
     outcome: Outcome,
+    /// 单条命令后的完整状态投影。
     state: State,
 }
 
 struct Harness {
+    /// 独立参考订单簿。
     r: ReferenceOrderBook,
+    /// 待差分比较的生产订单簿。
     p: ProductionOrderBook,
+    /// 每条时间命令显式推进的逻辑时钟。
     clock: LogicalClock,
+    /// 验证签名调整令牌的确定性公钥集合。
     keys: RiskKeySet,
+    /// 为成交预先分配的单调身份来源。
     trades: TradeIdSource,
+    /// 当前磁带中的零基命令序号。
     step: usize,
 }
 

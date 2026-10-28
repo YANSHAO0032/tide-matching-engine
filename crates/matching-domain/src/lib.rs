@@ -4,6 +4,8 @@
 
 /// 改单绝对目标、显式补丁与纯候选计算。
 pub mod amend_order;
+/// 撤单替换的独立新订单、资金过渡及拒绝结果。
+pub mod cancel_replace;
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
 /// 订单到期的稳定业务原因。
@@ -39,6 +41,10 @@ pub mod queue_priority;
 pub mod reject_reason;
 /// 资金预留调整令牌与规范签名载荷。
 pub mod reservation_adjustment;
+/// 订单终结时释放本地预留的稳定业务原因。
+pub mod reservation_release_reason;
+/// 独立新预留的规范签名授权载荷。
+pub mod reservation_token;
 /// 买卖方向。
 pub mod side;
 /// 未触发 Stop 的输入载荷和触发后 child 的数量模式。
@@ -61,10 +67,14 @@ pub use amend_order::{
     TriggerExpiryPatch, classify_regular_amend, remaining_after_target_total,
     validate_amend_quantity_mode,
 };
+/// 撤单替换的最小稳定领域协议与纯结构校验。
+pub use cancel_replace::{
+    CancelReplaceOrder, CancelReplaceRejection, ReplacementOrder, ReplacementOrderKind,
+    ReservationTransition, UnadoptedReservation, validate_cancel_replace_old_type,
+    validate_replacement_combination,
+};
 /// 最小订单生命周期事件。
 pub use engine_event::EngineEvent;
-/// 订单终结时释放本地预留的稳定原因。
-pub use engine_event::ReservationReleaseReason;
 /// 订单到期的稳定业务原因。
 pub use expire_reason::ExpireReason;
 /// 到期订单的最小业务结果。
@@ -94,6 +104,10 @@ pub use queue_priority::QueuePriority;
 pub use reject_reason::RejectReason;
 /// 按资产排序的目标预留与签名授权令牌。
 pub use reservation_adjustment::{AssetReserve, ReservationAdjustmentToken};
+/// 订单终结时释放本地预留的稳定原因。
+pub use reservation_release_reason::ReservationReleaseReason;
+/// 独立新资金预留的签名授权。
+pub use reservation_token::ReservationToken;
 /// 买卖方向。
 pub use side::Side;
 /// 未触发 Stop 的领域订单和数量模式。

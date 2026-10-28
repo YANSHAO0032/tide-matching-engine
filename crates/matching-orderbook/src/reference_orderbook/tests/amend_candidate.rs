@@ -15,6 +15,9 @@ fn reservation(order_id: OrderId, user_id: UserId) -> ReservationState {
         user_id,
         market_id: MarketId::new(7),
         version: 3,
+        status: matching_risk::ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 0,
         reserves: Vec::new(),
     }
 }
@@ -39,6 +42,7 @@ fn amend(order_id: OrderId, user_id: UserId, new_qty: Qty) -> AmendOrder {
 
 #[derive(Debug, PartialEq, Eq)]
 struct BookSnapshot {
+    /// 普通订单原始载荷、剩余量、峰值、优先级和有效期的有序快照。
     regular: Vec<(
         LimitGtcOrder,
         u64,
@@ -47,9 +51,13 @@ struct BookSnapshot {
         QueuePriority,
         TimeInForce,
     )>,
+    /// 未触发止损订单及其优先级的有序快照。
     stops: Vec<(StopOrder, StopPriority)>,
+    /// 活动订单到金融预留影子的有序快照。
     reservations: Vec<(OrderId, ReservationState)>,
+    /// 下一普通队列优先级计数。
     next_priority: u128,
+    /// 下一止损优先级计数。
     next_stop_priority: u128,
 }
 
