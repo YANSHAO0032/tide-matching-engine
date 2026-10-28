@@ -8,8 +8,8 @@ pub(super) fn policy() -> QueuePriorityPolicy {
 }
 
 /// 从受控有效样本构造最小限价单 GTC 输入。
-pub(super) fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+pub(super) fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -22,7 +22,7 @@ pub(super) fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder
 ///
 /// 必须经过真实分配器 + Arena + `PriceLevel::push_back`，
 /// 不允许只往 BTreeMap 塞空 PriceLevel。
-pub(super) fn rest_fixture(book: &mut ProductionOrderBook, original: LimitGtcOrder) -> OrderIndex {
+pub(super) fn rest_fixture(book: &mut ProductionOrderBook, original: LimitOrder) -> OrderIndex {
     let order_id = original.order_id;
     let side = original.side;
     let price = original.price;
@@ -64,7 +64,7 @@ pub(super) fn level_snapshot(levels: &BTreeMap<Price, PriceLevel>) -> Vec<LevelS
 
 pub(super) fn assert_rest_error_preserves_state(
     book: &mut ProductionOrderBook,
-    candidate: LimitGtcOrder,
+    candidate: LimitOrder,
     expected: RejectReason,
 ) {
     let bids_before = level_snapshot(&book.bids);
@@ -120,7 +120,7 @@ pub(super) struct NodeSnapshotEntry {
     /// 发起查询时使用的标识符，用于保留查询结果与输入的对应关系。
     order_id: OrderId,
     /// 原始订单请求及当前剩余量。
-    original: LimitGtcOrder,
+    original: LimitOrder,
     /// 快照取得时该节点剩余的基础资产数量。
     remaining: u64,
     /// 当前先进先出优先级及双向邻居槽位。

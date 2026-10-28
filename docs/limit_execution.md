@@ -1,6 +1,6 @@
 # 限价订单的执行约束
 
-ReferenceOrderBook 与 ProductionOrderBook 提供相同的 IOC、FOK 和 PostOnly 窄入口。输入沿用 `LimitGtcOrder` 的身份、方向、限价和数量字段；这个历史类型名不决定执行策略，调用的入口决定策略。
+ReferenceOrderBook 与 ProductionOrderBook 提供相同的 IOC、FOK 和 PostOnly 窄入口。输入使用 `LimitOrder` 的身份、方向、限价和数量字段；该载荷不决定执行策略，调用的入口决定策略。
 
 | 入口 | 成交 | 正余量 | incoming QueuePriority |
 |---|---|---|---|

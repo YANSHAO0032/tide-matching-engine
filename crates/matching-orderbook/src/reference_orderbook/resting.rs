@@ -2,14 +2,14 @@
 
 use super::{PRIORITY_GUARD, ReferenceOrderBook};
 use crate::ReferenceOrder;
-use matching_domain::{LimitGtcOrder, OrderId, QueuePriority, RejectReason};
+use matching_domain::{LimitOrder, OrderId, QueuePriority, RejectReason};
 use matching_risk::ReservationState;
 
 impl ReferenceOrderBook {
     /// 独立校验并在一次独占提交中挂单、登记预留状态。
     pub fn rest_with_reservation(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         state: ReservationState,
     ) -> Result<(), RejectReason> {
         self.validate_new_reservation(order.order_id, order.user_id, &state)?;
@@ -28,7 +28,7 @@ impl ReferenceOrderBook {
     /// 4. 创建运行态订单并追加到源 Vec。
     ///
     /// 失败时不修改现有订单、剩余量或 next_priority。
-    pub fn rest(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
+    pub fn rest(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
         // 必须先检查重复标识符，即使计数器已经耗尽也是如此。
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);

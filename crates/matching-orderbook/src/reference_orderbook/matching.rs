@@ -2,15 +2,13 @@
 
 use super::ReferenceOrderBook;
 use crate::{IncomingOrder, ReferenceOrder};
-use matching_domain::{
-    LimitGtcOrder, OrderId, Price, Qty, RejectReason, Side, TradeEvent, TradeId,
-};
+use matching_domain::{LimitOrder, OrderId, Price, Qty, RejectReason, Side, TradeEvent, TradeId};
 
 impl ReferenceOrderBook {
     /// 返回对 `incoming` 价格可成交的最优挂单。
     ///
     /// 选择遵循对手方价格优先和同价先进先出，并忽略已经耗尽的运行态。
-    pub fn best_crossing_maker(&self, incoming: &LimitGtcOrder) -> Option<&ReferenceOrder> {
+    pub fn best_crossing_maker(&self, incoming: &LimitOrder) -> Option<&ReferenceOrder> {
         self.best_crossing_maker_index(incoming)
             .map(|index| &self.orders[index])
     }
@@ -18,7 +16,7 @@ impl ReferenceOrderBook {
     /// 查找最佳可成交挂单在源 `Vec` 中的索引。
     ///
     /// 该索引只在当前不可变借用期间有效，供后续规划和一次性执行定位同一挂单。
-    pub(crate) fn best_crossing_maker_index(&self, incoming: &LimitGtcOrder) -> Option<usize> {
+    pub(crate) fn best_crossing_maker_index(&self, incoming: &LimitOrder) -> Option<usize> {
         let opposite_side = match incoming.side {
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,

@@ -529,7 +529,7 @@ fn cancel_panics_without_mutation_when_exact_price_level_is_missing() {
         let order_id = OrderId::new(1);
         let price = Price::try_new(price).unwrap();
 
-        book.rest(LimitGtcOrder {
+        book.rest(LimitOrder {
             order_id,
             user_id: UserId::new(1),
             side,

@@ -3,7 +3,7 @@
 use super::{ProductionOrderBook, RestPlan, RestTargetPlan};
 use crate::{OrderArena, OrderIndex, OrderNode, PriceLevel};
 use matching_domain::{
-    LimitGtcOrder, LogicalTime, OrderId, Price, QueuePriority, RejectReason, Side, TimeInForce,
+    LimitOrder, LogicalTime, OrderId, Price, QueuePriority, RejectReason, Side, TimeInForce,
 };
 use matching_risk::ReservationState;
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ impl ProductionOrderBook {
     /// 在一次独占提交中挂入普通订单并登记预留状态。
     pub fn rest_with_reservation(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         state: ReservationState,
     ) -> Result<(), RejectReason> {
         self.validate_new_reservation(order.order_id, order.user_id, &state)?;
@@ -25,7 +25,7 @@ impl ProductionOrderBook {
     /// 完成时效预检后，原子挂单并保存调用方预留状态。
     pub fn rest_timed_with_reservation(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         now: LogicalTime,
         current_session_id: u64,
@@ -47,7 +47,7 @@ impl ProductionOrderBook {
     ///
     /// 若调用方传入会价格交叉或价格相等的订单，或内部状态/提交顺序损坏，
     /// 方法会立即停止处理而不是将其伪装成另一种业务拒绝。
-    pub fn rest(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
+    pub fn rest(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
         // 1. 与价格交叉无关的全部可预期失败先预检。
         let plan = self.preflight_rest_common(&order)?;
 
@@ -66,7 +66,7 @@ impl ProductionOrderBook {
     /// 时效和会话校验发生在优先级、Arena 或价格档位发生任何写入之前。
     pub fn rest_timed(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         now: LogicalTime,
         current_session_id: u64,
@@ -134,14 +134,14 @@ impl ProductionOrderBook {
     /// 本函数只允许在单写者已持有 `RestPlan` 的写屏障之后调用。
     /// 预检/提交之间的身份、优先级、Arena 或目标档位分歧表示
     /// 内部损坏，必须触发不变量断言并停止处理，不能在已经写入部分状态后返回 Err。
-    pub(super) fn commit_rest(&mut self, order: LimitGtcOrder, plan: RestPlan) {
+    pub(super) fn commit_rest(&mut self, order: LimitOrder, plan: RestPlan) {
         self.commit_rest_timed(order, TimeInForce::Gtc, plan);
     }
 
     /// 提交已通过所有时效、索引和挂单预检的普通订单。
     pub(super) fn commit_rest_timed(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         tif: TimeInForce,
         plan: RestPlan,
     ) {
@@ -377,7 +377,7 @@ impl ProductionOrderBook {
     /// 余量调用本函数，确保所有可预期挂单错误都发生在首笔成交前。
     pub(super) fn preflight_rest_common(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
     ) -> Result<RestPlan, RejectReason> {
         let order_id = order.order_id;
         let side = order.side;

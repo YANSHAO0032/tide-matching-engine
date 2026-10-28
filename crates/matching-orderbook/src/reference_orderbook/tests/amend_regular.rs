@@ -9,8 +9,8 @@ use matching_domain::{
 use matching_risk::ReservationState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-fn order(id: u128, user: u64, side: Side, price: u64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, user: u64, side: Side, price: u64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(user),
         side,
@@ -19,7 +19,7 @@ fn order(id: u128, user: u64, side: Side, price: u64, qty: u64) -> LimitGtcOrder
     }
 }
 
-fn reservation(order: &LimitGtcOrder, version: u64) -> ReservationState {
+fn reservation(order: &LimitOrder, version: u64) -> ReservationState {
     ReservationState {
         reservation_id: ReservationId::new(order.order_id.get()),
         order_id: order.order_id,
@@ -33,7 +33,7 @@ fn reservation(order: &LimitGtcOrder, version: u64) -> ReservationState {
     }
 }
 
-fn reservation_with_reserve(order: &LimitGtcOrder, version: u64) -> ReservationState {
+fn reservation_with_reserve(order: &LimitOrder, version: u64) -> ReservationState {
     ReservationState {
         reserves: vec![AssetReserve {
             asset: AssetId::new(9),
@@ -95,7 +95,7 @@ fn amend_no_adjustment_rejects_pinned_fee_tier_mismatch_atomically() {
     reject_unusable_shadow_without_adjustment(2);
 }
 
-fn amend(order: &LimitGtcOrder) -> AmendOrder {
+fn amend(order: &LimitOrder) -> AmendOrder {
     AmendOrder {
         market_id: MarketId::new(7),
         user_id: order.user_id,
@@ -117,7 +117,7 @@ fn amend(order: &LimitGtcOrder) -> AmendOrder {
 struct Snapshot {
     /// 普通订单原始载荷、可见量、隐藏量、峰值、优先级和有效期的有序快照。
     orders: Vec<(
-        LimitGtcOrder,
+        LimitOrder,
         u64,
         u64,
         Option<Qty>,

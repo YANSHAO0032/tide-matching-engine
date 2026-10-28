@@ -2,7 +2,7 @@
 
 use super::*;
 use matching_domain::{
-    AmendOrder, IcebergOrder, LimitGtcOrder, LogicalTime, MarketId, MarketMath, QueuePriority,
+    AmendOrder, IcebergOrder, LimitOrder, LogicalTime, MarketId, MarketMath, QueuePriority,
     RegularAmendKind, ReservationId, StopLimitOrder, StopOrder, StopPriority, TimeInForce,
     TriggerExpiry, UserId,
 };
@@ -44,7 +44,7 @@ fn amend(order_id: OrderId, user_id: UserId, new_qty: Qty) -> AmendOrder {
 struct BookSnapshot {
     /// 普通订单原始载荷、剩余量、峰值、优先级和有效期的有序快照。
     regular: Vec<(
-        LimitGtcOrder,
+        LimitOrder,
         u64,
         u64,
         Option<Qty>,
@@ -99,7 +99,7 @@ fn snapshot(book: &ReferenceOrderBook) -> BookSnapshot {
 #[test]
 fn regular_candidate_is_read_only_before_any_amend_commit_exists() {
     let mut book = ReferenceOrderBook::new();
-    let input = LimitGtcOrder {
+    let input = LimitOrder {
         order_id: OrderId::new(11),
         user_id: UserId::new(22),
         side: Side::Buy,
@@ -132,7 +132,7 @@ fn regular_candidate_is_read_only_before_any_amend_commit_exists() {
 #[test]
 fn iceberg_and_stop_candidates_keep_every_observable_state_unchanged() {
     let mut book = ReferenceOrderBook::new();
-    let iceberg_input = LimitGtcOrder {
+    let iceberg_input = LimitOrder {
         order_id: OrderId::new(12),
         user_id: UserId::new(23),
         side: Side::Sell,
@@ -197,7 +197,7 @@ fn iceberg_and_stop_candidates_keep_every_observable_state_unchanged() {
 #[test]
 fn missing_or_wrong_quantity_mode_rejects_without_reference_state_drift() {
     let mut book = ReferenceOrderBook::new();
-    let input = LimitGtcOrder {
+    let input = LimitOrder {
         order_id: OrderId::new(14),
         user_id: UserId::new(25),
         side: Side::Buy,
@@ -253,7 +253,7 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
 
     assert_missing(&book, OrderId::new(1));
 
-    let canceled = LimitGtcOrder {
+    let canceled = LimitOrder {
         order_id: OrderId::new(2),
         user_id: UserId::new(2),
         side: Side::Buy,
@@ -268,7 +268,7 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     book.cancel(canceled.order_id).unwrap();
     assert_missing(&book, canceled.order_id);
 
-    let filled = LimitGtcOrder {
+    let filled = LimitOrder {
         order_id: OrderId::new(3),
         user_id: UserId::new(3),
         side: Side::Sell,
@@ -277,7 +277,7 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     };
     book.rest_with_reservation(filled.clone(), reservation(filled.order_id, filled.user_id))
         .unwrap();
-    let mut incoming = IncomingOrder::new(LimitGtcOrder {
+    let mut incoming = IncomingOrder::new(LimitOrder {
         order_id: OrderId::new(4),
         user_id: UserId::new(4),
         side: Side::Buy,
@@ -287,7 +287,7 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     book.execute_next_fill(&mut incoming).unwrap();
     assert_missing(&book, filled.order_id);
 
-    let expired = LimitGtcOrder {
+    let expired = LimitOrder {
         order_id: OrderId::new(5),
         user_id: UserId::new(5),
         side: Side::Buy,

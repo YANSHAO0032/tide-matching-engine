@@ -6,8 +6,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 fn math() -> MarketMath {
     MarketMath::try_new(0, 0, 0, 1, 1).unwrap()
 }
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
         side,
@@ -47,7 +47,7 @@ fn trades(events: &[EngineEvent]) -> Vec<(OrderId, u64)> {
         .collect()
 }
 type Snapshot = (
-    Vec<(LimitGtcOrder, u64, u64, Option<Qty>, QueuePriority)>,
+    Vec<(LimitOrder, u64, u64, Option<Qty>, QueuePriority)>,
     u128,
 );
 fn snapshot(book: &ReferenceOrderBook) -> Snapshot {
@@ -529,8 +529,8 @@ fn reference_iceberg_protected_boundary_after_refresh_has_raw_event_order() {
     assert_eq!(book.next_priority, 4);
 }
 
-fn order_at_100(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order_at_100(id: u128, side: Side, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
         side,

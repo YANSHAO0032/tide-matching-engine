@@ -27,7 +27,7 @@ use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
 use matching_domain::market_order::CommandStartProtectionContext;
 use matching_domain::{
-    EngineEvent, LimitGtcOrder, MarketByBase, MarketByQuote, MarketByQuoteExecution, MarketMath,
+    EngineEvent, LimitOrder, MarketByBase, MarketByQuote, MarketByQuoteExecution, MarketMath,
     MarketProtection, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteBudget,
     RejectReason, Side, TradeEvent, TradeId, UserId,
 };
@@ -48,7 +48,7 @@ use tape::{
 /// 保护市价与 IOC/FOK/PostOnly 使用各自的命令结构和独立执行适配。
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Place(LimitGtcOrder),
+    Place(LimitOrder),
     Cancel(OrderId),
     MarketByBase(MarketByBase, Vec<TradeId>),
     MarketByQuote(MarketByQuote, Vec<TradeId>),
@@ -64,7 +64,7 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 struct ObservedOrder {
     /// 不随成交扣减改变的原始限价订单载荷。
-    original: LimitGtcOrder,
+    original: LimitOrder,
     /// 观察时该挂单尚未成交的基础资产数量。
     remaining: u64,
     /// 挂单当前持有的市场本地队列优先级。

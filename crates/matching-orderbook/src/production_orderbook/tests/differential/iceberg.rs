@@ -8,10 +8,10 @@ use matching_domain::{IcebergOrder, LimitImmediateExecution};
 enum IceCommand {
     Iceberg(IcebergOrder),
     IcebergPostOnly(IcebergOrder),
-    Gtc(LimitGtcOrder),
-    Ioc(LimitGtcOrder),
-    Fok(LimitGtcOrder),
-    PostOnly(LimitGtcOrder),
+    Gtc(LimitOrder),
+    Ioc(LimitOrder),
+    Fok(LimitOrder),
+    PostOnly(LimitOrder),
     ProtectedBase(MarketByBase),
     ProtectedQuote(MarketByQuote),
     Cancel(OrderId),
@@ -50,7 +50,7 @@ impl IceOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IceOrder {
     /// 不随成交扣减改变的原始限价订单载荷。
-    original: LimitGtcOrder,
+    original: LimitOrder,
     /// 当前可参与深度与撮合的可见基础数量。
     visible: u64,
     /// 当前尚未展示的隐藏基础数量。

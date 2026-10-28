@@ -15,8 +15,8 @@ use matching_risk::{
     ReservationStatus, RiskKeySet,
 };
 
-fn order(id: u128, side: Side, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
         side,

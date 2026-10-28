@@ -150,7 +150,7 @@ fn broad_review_all_regular_initializers_reject_wrong_user_atomically() {
     }
 }
 
-fn stop(input: &LimitGtcOrder, market: bool) -> StopOrder {
+fn stop(input: &LimitOrder, market: bool) -> StopOrder {
     if market {
         StopOrder::Market(StopMarketOrder {
             trigger_reference: PriceReferenceKind::LastTrade,

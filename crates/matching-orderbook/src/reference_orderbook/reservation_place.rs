@@ -5,8 +5,8 @@
 
 use super::ReferenceOrderBook;
 use matching_domain::{
-    EngineEvent, IcebergOrder, LimitGtcOrder, LogicalTime, MarketMath, Qty, RejectReason,
-    TimeInForce, TradeId,
+    EngineEvent, IcebergOrder, LimitOrder, LogicalTime, MarketMath, Qty, RejectReason, TimeInForce,
+    TradeId,
 };
 use matching_risk::{
     PlannedBindingTransition, ReservationApplyError, ReservationRegistry, ReservationState,
@@ -18,7 +18,7 @@ pub enum ReferencePlaceOrder {
     /// 普通限价载荷及其执行策略；只挂单标志仅允许搭配 GTC。
     Limit {
         /// 独立的完整下单载荷。
-        order: LimitGtcOrder,
+        order: LimitOrder,
         /// 普通限价支持 GTC、IOC、FOK、DAY 与 GTD。
         time_in_force: TimeInForce,
         /// 是否要求只挂单。
@@ -72,7 +72,7 @@ pub(super) struct ReferencePlacePreflight {
     /// 不含金融归属提交的撮合后参考簿快照。
     after: ReferenceOrderBook,
     /// 已通过结构与数值验证的普通限价订单载荷。
-    accepted: LimitGtcOrder,
+    accepted: LimitOrder,
     /// 在本次预演中完全成交而必须转入 PendingR2 的 maker 金融快照。
     terminal_makers: Vec<ReservationState>,
     /// 正常下单链产生的原序事件。

@@ -4,8 +4,8 @@ use matching_domain::UserId;
 use proptest::prelude::*;
 
 /// 构造生成式测试使用的合法订单测试数据。
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -15,7 +15,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
 }
 
 /// 保存源 `Vec` 顺序、原始订单、剩余量和优先级。
-fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
+fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitOrder, u64, QueuePriority)> {
     book.orders
         .iter()
         .map(|maker| {

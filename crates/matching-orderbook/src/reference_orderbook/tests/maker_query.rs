@@ -3,8 +3,8 @@ use super::*;
 use matching_domain::{OrderId, Price, Qty, UserId};
 
 /// 构造指定方向、价格和数量的订单测试数据。
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -216,7 +216,7 @@ fn repeated_queries_preserve_all_book_state() {
 
 fn assert_index_matches_reference(
     book: &ReferenceOrderBook,
-    incoming: &LimitGtcOrder,
+    incoming: &LimitOrder,
     expected: Option<usize>,
 ) {
     let index = book.best_crossing_maker_index(incoming);

@@ -1,5 +1,5 @@
 use crate::OrderIndex;
-use matching_domain::{IcebergOrder, LimitGtcOrder, Qty, QueuePriority, TimeInForce};
+use matching_domain::{IcebergOrder, LimitOrder, Qty, QueuePriority, TimeInForce};
 
 /// Arena 中的订单节点。
 ///
@@ -8,7 +8,7 @@ use matching_domain::{IcebergOrder, LimitGtcOrder, Qty, QueuePriority, TimeInFor
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderNode {
     /// 最近一次已接受的绝对总量载荷；成交和运行态链接不回写该值。
-    order: LimitGtcOrder,
+    order: LimitOrder,
     /// 当前仍显示在本档位的正数量；冰山挂单只显示当前可见片。
     remaining: u64,
     /// 未计入公开深度、等待后续补量的数量；普通订单为零。
@@ -30,16 +30,12 @@ impl OrderNode {
     ///
     /// `remaining` 精确复制原始 `Qty`，两个链接均为空；只有 `PriceLevel`
     /// 在完成局部不变量预检后才可连接该节点。
-    pub fn new(order: LimitGtcOrder, priority: QueuePriority) -> Self {
+    pub fn new(order: LimitOrder, priority: QueuePriority) -> Self {
         Self::new_timed(order, priority, TimeInForce::Gtc)
     }
 
     /// 使用已验证有效期构造尚未链接的普通挂单运行态节点。
-    pub(crate) fn new_timed(
-        order: LimitGtcOrder,
-        priority: QueuePriority,
-        tif: TimeInForce,
-    ) -> Self {
+    pub(crate) fn new_timed(order: LimitOrder, priority: QueuePriority, tif: TimeInForce) -> Self {
         let remaining = order.qty.get();
         OrderNode {
             order,
@@ -77,7 +73,7 @@ impl OrderNode {
     }
 
     /// 借用最近一次已接受的订单载荷，数量包含已经成交的部分。
-    pub fn original_order(&self) -> &LimitGtcOrder {
+    pub fn original_order(&self) -> &LimitOrder {
         &self.order
     }
 
@@ -171,7 +167,7 @@ impl OrderNode {
     /// 本方法不触碰链接或优先级，因而保留原有先进先出位置。
     pub(crate) fn amend_regular_in_place(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         remaining: Qty,
         tif: TimeInForce,
     ) {
@@ -207,7 +203,7 @@ impl OrderNode {
     /// 冰山同价非增暴露改单只写入已校验的显示片与隐藏片，保留链接及优先级。
     pub(crate) fn amend_iceberg_in_place(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         total: Qty,
         visible: Qty,
         peak: Qty,
@@ -259,7 +255,7 @@ mod tests {
         ];
 
         for (id, side, qty, priority) in cases {
-            let original = LimitGtcOrder {
+            let original = LimitOrder {
                 order_id: OrderId::new(id),
                 user_id: UserId::new(id as u64),
                 side,
@@ -279,7 +275,7 @@ mod tests {
     }
     #[test]
     fn commit_partial_remaining_changes_only_remaining() {
-        let original = LimitGtcOrder {
+        let original = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(1),
             side: Side::Buy,
@@ -302,7 +298,7 @@ mod tests {
     #[test]
     fn iceberg_tracks_visible_hidden_and_total_independently() {
         use matching_domain::IcebergOrder;
-        let original = LimitGtcOrder {
+        let original = LimitOrder {
             order_id: OrderId::new(11),
             user_id: UserId::new(1),
             side: Side::Sell,

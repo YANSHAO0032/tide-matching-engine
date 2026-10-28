@@ -146,7 +146,7 @@ ID 查找平均 O(1)，已知节点的局部链表删除为 O(1)；定位或删�
 ## 生产订单簿的完整 Limit GTC
 
 ```text
-LimitGtcOrder + caller-supplied TradeIds
+LimitOrder + caller-supplied TradeIds
                  |
                  v
 1. reject duplicate active OrderId

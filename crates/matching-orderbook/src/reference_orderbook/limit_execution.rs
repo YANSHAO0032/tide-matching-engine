@@ -2,7 +2,7 @@
 
 use super::ReferenceOrderBook;
 use matching_domain::{
-    LimitGtcOrder, LimitImmediateExecution, MarketMath, MathError, Qty, RejectReason, Side,
+    LimitImmediateExecution, LimitOrder, MarketMath, MathError, Qty, RejectReason, Side,
     TradeEvent, TradeId,
 };
 
@@ -33,7 +33,7 @@ impl ReferenceOrderBook {
     /// 不表示订单已经接受或成功挂簿。
     ///
     /// 不修改订单簿，不检查或分配 QueuePriority。
-    pub(super) fn preflight_post_only(&self, order: &LimitGtcOrder) -> Result<(), RejectReason> {
+    pub(super) fn preflight_post_only(&self, order: &LimitOrder) -> Result<(), RejectReason> {
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -51,7 +51,7 @@ impl ReferenceOrderBook {
     /// 拒绝时保持完整订单簿和分配器状态不变。
     /// 完成重复与交叉检查后，在挂单前检查优先级及当前价档数量。
     /// 与既有挂单接口相同，调用方负责校验市场价格步长和数量步长对齐。
-    pub fn place_limit_post_only(&mut self, order: LimitGtcOrder) -> Result<(), RejectReason> {
+    pub fn place_limit_post_only(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
         self.preflight_post_only(&order)?;
         if self.next_priority >= u128::MAX - super::PRIORITY_GUARD {
             return Err(RejectReason::PrioritySpaceExhaustion);
@@ -73,13 +73,13 @@ impl ReferenceOrderBook {
 
     /// 执行限价 IOC；正余量直接取消，不进入订单簿。
     ///
-    /// 既有 `LimitGtcOrder` 值提供限价字段；本入口选择 IOC 策略。
+    /// 既有 `LimitOrder` 值提供限价字段；本入口选择 IOC 策略。
     /// 首笔改簿前完成所有可执行成交及其本金的检查，
     /// 调用方提供的成交标识符必须覆盖计划中的全部成交笔数；
     /// 不足时与市价接口一样，在改簿前触发调用方契约断言。
     pub fn place_limit_ioc(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
@@ -103,7 +103,7 @@ impl ReferenceOrderBook {
     /// 成交标识符的全局唯一性仍由调用方保证。
     pub fn place_limit_fok(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
@@ -121,7 +121,7 @@ impl ReferenceOrderBook {
     /// 执行过程来生成参考结果。
     pub(super) fn preflight_limit_immediate(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         math: &MarketMath,
     ) -> Result<LimitFillPlan, RejectReason> {
         if self.contains_active_order(order.order_id) {
@@ -190,7 +190,7 @@ impl ReferenceOrderBook {
     /// 新到订单的余量也不会进入挂单 Vec。
     fn commit_limit_immediate(
         &mut self,
-        order: LimitGtcOrder,
+        order: LimitOrder,
         plan: LimitFillPlan,
         trade_ids: &[TradeId],
     ) -> LimitImmediateExecution {

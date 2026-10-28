@@ -6,8 +6,8 @@ use matching_domain::{
     TradeEvent, UserId,
 };
 
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
         side,
@@ -16,7 +16,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
     }
 }
 
-fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitGtcOrder, u64, QueuePriority)>, u128) {
+fn snapshot(book: &ReferenceOrderBook) -> (Vec<(LimitOrder, u64, QueuePriority)>, u128) {
     (
         book.orders
             .iter()
@@ -65,7 +65,7 @@ fn post_only_checks_level_aggregate_after_crossing_and_priority() {
 fn execute(
     book: &mut ReferenceOrderBook,
     fok: bool,
-    incoming: LimitGtcOrder,
+    incoming: LimitOrder,
     math: &MarketMath,
     ids: &[TradeId],
 ) -> Result<LimitImmediateExecution, RejectReason> {

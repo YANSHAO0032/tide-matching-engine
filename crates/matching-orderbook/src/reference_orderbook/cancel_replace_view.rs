@@ -3,7 +3,7 @@
 use super::{ReferenceOrderBook, iceberg::SliceRequest};
 use crate::ReferenceOrder;
 use matching_domain::{
-    LimitGtcOrder, MarketMath, OrderId, RejectReason, Side, StopOrder, StopPriority,
+    LimitOrder, MarketMath, OrderId, RejectReason, Side, StopOrder, StopPriority,
 };
 
 /// 完整过滤旧身份的不可变参考簿视图，是后续撤单替换计划的只读输入。
@@ -86,7 +86,7 @@ impl ReferenceBookWithout {
     }
 
     /// 使用既有限价预检核对包含等价价格的只挂单交叉条件，不分配优先级。
-    pub fn preflight_post_only(&self, order: &LimitGtcOrder) -> Result<(), RejectReason> {
+    pub fn preflight_post_only(&self, order: &LimitOrder) -> Result<(), RejectReason> {
         self.book.preflight_post_only(order)
     }
 
@@ -95,7 +95,7 @@ impl ReferenceBookWithout {
     /// 冰山补量及其优先级、聚合与精确本金检查仅作用于可丢弃模拟状态。
     pub fn preflight_limit_fok(
         &self,
-        order: &LimitGtcOrder,
+        order: &LimitOrder,
         math: &MarketMath,
     ) -> Result<(), RejectReason> {
         let remaining = if self.book.has_iceberg_maker(order.side) {

@@ -23,7 +23,7 @@ fn math() -> MarketMath {
     MarketMath::try_new(0, 0, 0, 1, 1).unwrap()
 }
 
-fn shadow(input: &LimitGtcOrder) -> ReservationState {
+fn shadow(input: &LimitOrder) -> ReservationState {
     ReservationState {
         reservation_id: ReservationId::new(input.order_id.get()),
         order_id: input.order_id,
@@ -170,11 +170,11 @@ fn stop(id: u128, kind: u8, side: Side, expiry: TriggerExpiry) -> StopOrder {
 /// 所有命令和预留需求均在回放前构造，不从任一模型的执行结果生成另一方输入。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
-    Rest(LimitGtcOrder, TimeInForce),
+    Rest(LimitOrder, TimeInForce),
     Iceberg(IcebergOrder),
     Stop(StopOrder),
-    ReservedPlace(LimitGtcOrder),
-    Place(LimitGtcOrder, TimeInForce),
+    ReservedPlace(LimitOrder),
+    Place(LimitOrder, TimeInForce),
     Amend {
         patch: Box<AmendOrder>,
         command_id: u128,
@@ -220,7 +220,7 @@ impl Outcome {
 #[derive(Debug, PartialEq, Eq)]
 struct Regular {
     /// 订单创建时的完整普通限价载荷。
-    original: LimitGtcOrder,
+    original: LimitOrder,
     /// 当前可见剩余基础数量。
     visible: u64,
     /// 当前隐藏剩余基础数量。

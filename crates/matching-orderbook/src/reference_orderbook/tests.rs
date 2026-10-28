@@ -4,7 +4,7 @@ use super::{PRIORITY_GUARD, ReferenceOrderBook};
 use crate::{IncomingOrder, ReferenceOrder};
 use matching_domain::market_order::CommandStartProtectionContext;
 use matching_domain::{
-    EngineEvent, LimitGtcOrder, MarketByQuote, MarketMath, OrderId, Price, ProtectionSource, Qty,
+    EngineEvent, LimitOrder, MarketByQuote, MarketMath, OrderId, Price, ProtectionSource, Qty,
     QueuePriority, QuoteAmount, RejectReason, Side, TradeEvent, TradeId,
 };
 mod amend_candidate;

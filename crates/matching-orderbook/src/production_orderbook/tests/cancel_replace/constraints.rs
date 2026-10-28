@@ -28,7 +28,7 @@ impl Pair {
         }
     }
 
-    fn rest(&mut self, input: LimitGtcOrder, iceberg: bool, math: &MarketMath) {
+    fn rest(&mut self, input: LimitOrder, iceberg: bool, math: &MarketMath) {
         let state = reserve(input.order_id.get());
         if iceberg {
             let order = IcebergOrder::try_new(input, Qty::try_new(2).unwrap()).unwrap();
@@ -178,7 +178,7 @@ impl Pair {
     }
 }
 
-fn at(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
+fn at(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
     let mut order = input(id, side, qty);
     order.price = Price::try_new(price).unwrap();
     order

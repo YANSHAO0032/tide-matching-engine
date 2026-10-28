@@ -4,7 +4,7 @@ use crate::ReferenceOrderBook;
 use matching_domain::{AmendOrder, IcebergOrder, LogicalTime, MarketId, ReservationId};
 use matching_risk::ReservationState;
 
-fn command(input: &LimitGtcOrder) -> AmendOrder {
+fn command(input: &LimitOrder) -> AmendOrder {
     AmendOrder {
         market_id: MarketId::new(7),
         user_id: input.user_id,
@@ -21,7 +21,7 @@ fn command(input: &LimitGtcOrder) -> AmendOrder {
         reservation_adjustment: None,
     }
 }
-fn shadow(input: &LimitGtcOrder) -> ReservationState {
+fn shadow(input: &LimitOrder) -> ReservationState {
     ReservationState {
         reservation_id: ReservationId::new(input.order_id.get()),
         order_id: input.order_id,
@@ -132,7 +132,7 @@ fn pair(
     price: i64,
     total: u64,
     peak: u64,
-) -> (ProductionOrderBook, ReferenceOrderBook, LimitGtcOrder) {
+) -> (ProductionOrderBook, ReferenceOrderBook, LimitOrder) {
     let mut p = ProductionOrderBook::new(policy());
     let mut r = ReferenceOrderBook::new();
     let input = order(1, side, price, total);

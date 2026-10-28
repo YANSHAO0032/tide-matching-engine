@@ -8,7 +8,7 @@ use crate::{
 };
 use matching_domain::{
     CancelReason, CancelReplaceOrder, CancelReplaceRejection, EngineEvent, IcebergOrder,
-    LimitGtcOrder, LogicalTime, MarketMath, OrderId, Price, PriceReferenceState, Qty, RejectReason,
+    LimitOrder, LogicalTime, MarketMath, OrderId, Price, PriceReferenceState, Qty, RejectReason,
     ReplacementOrderKind, StopOrder, StopPriority, TimeInForce, TradeId,
 };
 use matching_risk::{
@@ -101,7 +101,7 @@ pub struct ProductionCancelReplacePlan {
     /// 取消事件使用的旧单总剩余基础数量。
     old_remaining: Qty,
     /// 已通过结构和数值验证的新普通限价载荷。
-    accepted: LimitGtcOrder,
+    accepted: LimitOrder,
     /// 新单为冰山时已验证的单片峰值；普通限价时为空。
     peak: Option<Qty>,
     /// 新单已验证的有效期。
@@ -197,7 +197,7 @@ impl ProductionOrderBook {
             .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
 
         let replacement = &request.replacement;
-        let accepted = LimitGtcOrder {
+        let accepted = LimitOrder {
             order_id: replacement.order_id,
             user_id: replacement.user_id,
             side: replacement.side,

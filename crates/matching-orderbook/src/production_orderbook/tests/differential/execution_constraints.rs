@@ -6,11 +6,11 @@ use matching_domain::{CancelReason, LimitImmediateExecution};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConstraintCommand {
-    Gtc(LimitGtcOrder),
+    Gtc(LimitOrder),
     Cancel(OrderId),
-    Ioc(LimitGtcOrder),
-    Fok(LimitGtcOrder),
-    PostOnly(LimitGtcOrder),
+    Ioc(LimitOrder),
+    Fok(LimitOrder),
+    PostOnly(LimitOrder),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,10 +68,7 @@ fn constraint_tape(seed: [u8; 32], length: usize) -> Vec<ConstraintCommand> {
         .collect()
 }
 
-fn crossing_orders<'a>(
-    before: &'a ObservedBook,
-    incoming: &LimitGtcOrder,
-) -> Vec<&'a ObservedOrder> {
+fn crossing_orders<'a>(before: &'a ObservedBook, incoming: &LimitOrder) -> Vec<&'a ObservedOrder> {
     let makers = match incoming.side {
         Side::Buy => &before.asks,
         Side::Sell => &before.bids,
@@ -89,7 +86,7 @@ fn crossing_orders<'a>(
 /// 独立于两套撮合器验证数量守恒及原始价格优先、同价先进先出前缀，
 /// 此处无需调用共享领域算术来计算期望结果。
 fn assert_immediate_semantics(
-    incoming: &LimitGtcOrder,
+    incoming: &LimitOrder,
     fok: bool,
     before: &ObservedBook,
     result: &Result<LimitImmediateExecution, RejectReason>,

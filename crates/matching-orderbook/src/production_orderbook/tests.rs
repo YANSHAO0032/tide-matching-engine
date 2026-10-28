@@ -7,7 +7,7 @@ use matching_domain::market_order::{
     CommandStartProtectionContext, ProtectedMarketByQuoteExecution,
 };
 use matching_domain::{
-    EngineEvent, LimitGtcOrder, MarketByBase, MarketByQuote, MarketMath, OrderId, Price,
+    EngineEvent, LimitOrder, MarketByBase, MarketByQuote, MarketMath, OrderId, Price,
     ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason, Side, TradeEvent, TradeId,
     UserId,
 };

@@ -3,8 +3,8 @@ use super::*;
 use matching_domain::{OrderId, Price, Qty, UserId};
 
 /// 构造指定方向、价格和数量的订单测试数据。
-fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitGtcOrder {
-    LimitGtcOrder {
+fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
+    LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
         side,
@@ -19,7 +19,7 @@ fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
 }
 
 /// 保存源 `Vec` 顺序、原始订单、剩余量和优先级。
-fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitGtcOrder, u64, QueuePriority)> {
+fn snapshot(book: &ReferenceOrderBook) -> Vec<(LimitOrder, u64, QueuePriority)> {
     book.orders
         .iter()
         .map(|maker| {
@@ -480,11 +480,7 @@ fn no_fill_produces_no_trade_event() {
     assert_eq!(taker.remaining(), remaining_before);
 }
 /// 在独立空簿上执行固定命令带，供确定性回归比较。
-fn run_fixed_command_tape() -> (
-    Vec<TradeEvent>,
-    Vec<(LimitGtcOrder, u64, QueuePriority)>,
-    u128,
-) {
+fn run_fixed_command_tape() -> (Vec<TradeEvent>, Vec<(LimitOrder, u64, QueuePriority)>, u128) {
     // 每次独立从空簿开始。
     let mut book = ReferenceOrderBook::new();
     let mut trades = Vec::new();

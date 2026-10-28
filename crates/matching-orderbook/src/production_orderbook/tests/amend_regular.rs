@@ -8,7 +8,7 @@ use matching_domain::{
 };
 use matching_risk::ReservationState;
 
-fn shadow(input: &LimitGtcOrder) -> ReservationState {
+fn shadow(input: &LimitOrder) -> ReservationState {
     ReservationState {
         reservation_id: ReservationId::new(input.order_id.get()),
         order_id: input.order_id,
@@ -25,7 +25,7 @@ fn shadow(input: &LimitGtcOrder) -> ReservationState {
     }
 }
 
-fn command(input: &LimitGtcOrder) -> AmendOrder {
+fn command(input: &LimitOrder) -> AmendOrder {
     AmendOrder {
         market_id: MarketId::new(7),
         user_id: input.user_id,
@@ -43,7 +43,7 @@ fn command(input: &LimitGtcOrder) -> AmendOrder {
     }
 }
 
-fn rest(book: &mut ProductionOrderBook, input: &LimitGtcOrder) {
+fn rest(book: &mut ProductionOrderBook, input: &LimitOrder) {
     book.rest_with_reservation(input.clone(), shadow(input))
         .unwrap();
 }
