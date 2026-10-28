@@ -5,7 +5,7 @@
 use super::{ReferenceOrderBook, ReferencePlaceContext, ReferencePlaceOrder};
 use matching_domain::{
     CancelReason, CancelReplaceOrder, CancelReplaceRejection, EngineEvent, IcebergOrder,
-    LimitOrder, Qty, RejectReason, ReplacementOrderKind, StopOrder,
+    LimitOrder, OrderRemaining, Qty, RejectReason, ReplacementOrderKind, StopOrder,
 };
 use matching_risk::{
     ExpectedReplacementReservation, ReservationApplyError, ReservationRegistry, ReservationStatus,
@@ -149,7 +149,7 @@ impl ReferenceOrderBook {
             after_book.bind_place_preflight(place_preflight, active, &after_registry)?;
         let mut events = vec![EngineEvent::OrderCanceled {
             order_id: request.old_order_id,
-            remaining: Qty::try_new(old_remaining)?,
+            remaining: OrderRemaining::Base(Qty::try_new(old_remaining)?),
             reason: CancelReason::CancelReplace,
         }];
         events.extend(

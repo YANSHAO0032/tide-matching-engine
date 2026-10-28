@@ -143,7 +143,7 @@ fn assert_immediate_semantics(
             execution.events().last(),
             Some(&EngineEvent::OrderCanceled {
                 order_id: incoming.order_id,
-                remaining: Qty::try_new(remaining).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(remaining).unwrap()),
                 reason: CancelReason::IocRemainder,
             })
         );
@@ -471,7 +471,7 @@ fn immediate_empty_book_is_canceled_or_rejected_without_resting() {
         actual.events(),
         &[EngineEvent::OrderCanceled {
             order_id: incoming.order_id,
-            remaining: incoming.qty,
+            remaining: matching_domain::OrderRemaining::Base(incoming.qty),
             reason: CancelReason::IocRemainder,
         }]
     );

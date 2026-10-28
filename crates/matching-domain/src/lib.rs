@@ -26,6 +26,7 @@ pub mod logical_time;
 pub mod market_math;
 /// 市价输入、执行结果与固定参考价的保护边界。
 pub mod market_order;
+pub mod mass_cancel;
 /// 价格、数量和金额的整数值对象及带溢出检查的算术。
 pub mod numbers;
 /// 附加订单约束标志。
@@ -59,7 +60,10 @@ pub mod trade_event;
 pub mod trigger_expiry;
 
 /// 对外公开的集群、市场、用户、订单、命令、成交和预留身份。
-pub use ids::{AssetId, ClusterId, CommandId, MarketId, OrderId, ReservationId, TradeId, UserId};
+pub use ids::{
+    AssetId, ClusterId, CommandId, MarketId, OrderId, OriginSessionId, ReservationId, TradeId,
+    UserId,
+};
 
 /// 改单载荷、数量模式及纯候选计算。
 pub use amend_order::{
@@ -73,8 +77,8 @@ pub use cancel_replace::{
     ReservationTransition, UnadoptedReservation, validate_cancel_replace_old_type,
     validate_replacement_combination,
 };
-/// 最小订单生命周期事件。
-pub use engine_event::EngineEvent;
+/// 最小订单生命周期事件及终结余量的计价模式。
+pub use engine_event::{EngineEvent, OrderRemaining};
 /// 订单到期的稳定业务原因。
 pub use expire_reason::ExpireReason;
 /// 到期订单的最小业务结果。
@@ -89,6 +93,9 @@ pub use limit_execution::{
 pub use limit_order::LimitOrder;
 /// 确定性逻辑时间值。
 pub use logical_time::{LogicalClock, LogicalTime};
+pub use mass_cancel::{
+    MassCancelShard, ShardCancelScope, ShardMassCancelResult, matches_shard_cancel_scope,
+};
 /// 整数价格、数量和金额值对象。
 pub use numbers::{Price, Qty, QuoteAmount, QuoteBudget, SignedAmount};
 /// 订单附加约束标志。

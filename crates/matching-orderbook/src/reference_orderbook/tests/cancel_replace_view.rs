@@ -28,6 +28,7 @@ fn state(id: u128) -> ReservationState {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
         market_id: MarketId::new(7),
+        origin_session_id: matching_domain::OriginSessionId::new(1),
         version: 3,
         status: ReservationStatus::Active,
         fee_schedule_version: 1,

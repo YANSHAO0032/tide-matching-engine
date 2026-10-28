@@ -154,7 +154,7 @@ fn immediate_empty_book_cancels_ioc_and_rejects_fok_without_priority() {
             result.events(),
             &[EngineEvent::OrderCanceled {
                 order_id: OrderId::new(99),
-                remaining: Qty::try_new(3).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(3).unwrap()),
                 reason: CancelReason::IocRemainder
             }]
         );
@@ -256,7 +256,7 @@ fn ioc_partial_liquidity_emits_cancel_after_trades_and_never_rests() {
                 trade(10, 1, side, 100, 2),
                 EngineEvent::OrderCanceled {
                     order_id: OrderId::new(99),
-                    remaining: Qty::try_new(3).unwrap(),
+                    remaining: matching_domain::OrderRemaining::Base(Qty::try_new(3).unwrap()),
                     reason: CancelReason::IocRemainder
                 }
             ]

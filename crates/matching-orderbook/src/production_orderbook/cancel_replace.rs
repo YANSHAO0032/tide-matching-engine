@@ -8,8 +8,8 @@ use crate::{
 };
 use matching_domain::{
     CancelReason, CancelReplaceOrder, CancelReplaceRejection, EngineEvent, IcebergOrder,
-    LimitOrder, LogicalTime, MarketMath, OrderId, Price, PriceReferenceState, Qty, RejectReason,
-    ReplacementOrderKind, StopOrder, StopPriority, TimeInForce, TradeId,
+    LimitOrder, LogicalTime, MarketMath, OrderId, OrderRemaining, Price, PriceReferenceState, Qty,
+    RejectReason, ReplacementOrderKind, StopOrder, StopPriority, TimeInForce, TradeId,
 };
 use matching_risk::{
     ExpectedReplacementReservation, ReservationApplyError, ReservationRegistry, ReservationState,
@@ -368,7 +368,7 @@ impl ProductionOrderBook {
         *registry = plan.after_registry;
         let mut events = vec![EngineEvent::OrderCanceled {
             order_id: plan.old_id,
-            remaining: plan.old_remaining,
+            remaining: OrderRemaining::Base(plan.old_remaining),
             reason: CancelReason::CancelReplace,
         }];
         events.extend(self.commit_iceberg_plan(
@@ -393,8 +393,9 @@ impl ProductionOrderBook {
         if plan.tif == TimeInForce::Ioc && plan.fills.base_remaining > 0 {
             events.push(EngineEvent::OrderCanceled {
                 order_id: plan.accepted.order_id,
-                remaining: Qty::try_new(plan.fills.base_remaining)
-                    .expect("positive frozen IOC residual"),
+                remaining: OrderRemaining::Base(
+                    Qty::try_new(plan.fills.base_remaining).expect("positive frozen IOC residual"),
+                ),
                 reason: CancelReason::IocRemainder,
             });
         }

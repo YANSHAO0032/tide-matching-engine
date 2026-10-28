@@ -229,6 +229,7 @@ mod tests {
                 order_id: id,
                 user_id: UserId::new(4),
                 market_id: MarketId::new(7),
+                origin_session_id: matching_domain::OriginSessionId::new(1),
                 version: 11,
                 status: matching_risk::ReservationStatus::Active,
                 fee_schedule_version: 2,

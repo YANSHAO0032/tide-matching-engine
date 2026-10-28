@@ -18,6 +18,11 @@ pub struct AssetId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UserId(pub u64);
 
+/// 订单接收时持久化的网关来源会话身份。
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OriginSessionId(pub u64);
+
 /// 订单身份
 ///
 /// 数值顺序不表示先进先出、创建时间或撮合优先级。
@@ -77,6 +82,7 @@ impl_id!(ClusterId, u16);
 impl_id!(MarketId, u32);
 impl_id!(AssetId, u32);
 impl_id!(UserId, u64);
+impl_id!(OriginSessionId, u64);
 impl_id!(OrderId, u128);
 impl_id!(CommandId, u128);
 impl_id!(TradeId, u128);

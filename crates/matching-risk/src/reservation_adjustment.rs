@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use matching_domain::{
-    AssetReserve, CommandId, MarketId, OrderId, RejectReason, ReservationAdjustmentToken,
-    ReservationId, UserId,
+    AssetReserve, CommandId, MarketId, OrderId, OriginSessionId, RejectReason,
+    ReservationAdjustmentToken, ReservationId, UserId,
 };
 
 /// 配置状态中的公钥版本及按标识符确定性排序的已加载公钥。
@@ -67,6 +67,8 @@ pub struct ReservationState {
     pub user_id: UserId,
     /// 预留生效的市场身份。
     pub market_id: MarketId,
+    /// 网关接收时的来源会话，不等同于交易 DAY 时段。
+    pub origin_session_id: OriginSessionId,
     /// 用于拒绝陈旧授权的单调版本。
     pub version: u64,
     /// 按资产严格升序保存的已锁定原子数量。

@@ -29,6 +29,7 @@ pub(super) fn state(input: &LimitOrder) -> ReservationState {
         order_id: input.order_id,
         user_id: input.user_id,
         market_id: MarketId::new(7),
+        origin_session_id: matching_domain::OriginSessionId::new(1),
         version: 11,
         status: matching_risk::ReservationStatus::Active,
         fee_schedule_version: 5,

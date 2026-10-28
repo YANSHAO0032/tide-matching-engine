@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signer, SigningKey};
 use matching_domain::{
-    AssetId, AssetReserve, CommandId, MarketId, OrderId, RejectReason, ReservationAdjustmentToken,
-    ReservationId, ReservationToken, ReservationTransition, UserId,
+    AssetId, AssetReserve, CommandId, MarketId, OrderId, OriginSessionId, RejectReason,
+    ReservationAdjustmentToken, ReservationId, ReservationToken, ReservationTransition, UserId,
 };
 use matching_risk::{
     ExpectedReplacementReservation, ReservationApplyError, ReservationRegistry, ReservationState,
@@ -34,6 +34,7 @@ fn fixture() -> (
         order_id: OrderId(4),
         user_id: UserId(5),
         market_id: MarketId(6),
+        origin_session_id: OriginSessionId(7),
         version: 7,
         reserves: reserves(20),
         status: ReservationStatus::Active,

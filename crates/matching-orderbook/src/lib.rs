@@ -51,11 +51,13 @@ pub use queue_priority_allocator::{
 /// 参考挂单订单。
 pub use reference_order::ReferenceOrder;
 /// `Vec + sort` 参考订单簿。
-pub use reference_orderbook::{ReferenceBookWithout, ReferenceOrderBook};
+pub use reference_orderbook::{ReferenceBookWithout, ReferenceMassCancelPlan, ReferenceOrderBook};
 /// 未触发止损订单的市场本地容器。
 pub use stop_book::StopBook;
 /// StopPriority 的高水位保护分配器。
 pub use stop_priority_allocator::{StopPriorityAllocator, StopPriorityInitError};
 
 /// 生产簿的挂单、撤单、限价和市价执行入口。
-pub use production_orderbook::{ProductionBookWithout, ProductionOrderBook};
+pub use production_orderbook::{
+    ProductionBookWithout, ProductionMassCancelPlan, ProductionOrderBook,
+};

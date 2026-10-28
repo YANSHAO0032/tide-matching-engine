@@ -344,7 +344,7 @@ fn cancel_replace_differential_fixed_partial_regular_and_replenished_iceberg_old
                 ));
                 assert!(!record.outcome.failed());
                 assert!(
-                    matches!(record.outcome.events().first(), Some(EngineEvent::OrderCanceled { order_id, remaining, .. }) if *order_id == OrderId::new(1) && remaining.get() == 8)
+                    matches!(record.outcome.events().first(), Some(EngineEvent::OrderCanceled { order_id, remaining: matching_domain::OrderRemaining::Base(remaining), .. }) if *order_id == OrderId::new(1) && remaining.get() == 8)
                 );
             }
         }

@@ -18,6 +18,7 @@ mod iceberg;
 mod limit_execution;
 mod market_by_base;
 mod market_by_quote;
+mod mass_cancel;
 mod matching;
 mod resting;
 mod stop_orders;
@@ -26,6 +27,7 @@ mod stop_trigger;
 pub use cancel_replace::{ProductionCancelReplaceContext, ProductionCancelReplacePlan};
 pub use cancel_replace_view::ProductionBookWithout;
 use expiry::RegularExpiryIndex;
+pub use mass_cancel::ProductionMassCancelPlan;
 
 /// 指明已预检的余量将追加到既有档位还是新建档位。
 ///
@@ -92,7 +94,7 @@ struct FillPlan {
 /// OrderId 索引只承担定位，不决定业务顺序。当前支持已确定应挂单的
 /// 限价单 GTC 余量、已知标识符的取消、完整限价单 GTC、市价订单，以及
 /// 限价单 IOC/FOK/PostOnly 与冰山。实际挂单及冰山补量时分配优先级；不包含完整资金和命令协议。
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionOrderBook {
     /// 买侧价格档位；合法非空条目中的节点必须具有相同价格和买入方向。
     bids: BTreeMap<Price, PriceLevel>,
