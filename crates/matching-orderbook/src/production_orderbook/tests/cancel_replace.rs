@@ -33,6 +33,7 @@ fn reserve(id: u128) -> ReservationState {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
         market_id: MarketId::new(7),
+        origin_session_id: matching_domain::OriginSessionId::new(1),
         version: 3,
         reserves: vec![AssetReserve {
             asset: AssetId::new(1),
@@ -162,7 +163,7 @@ fn production_cancel_replace_plan_is_pure_and_new_identity_joins_fifo_tail() {
                 book.apply_cancel_replace(&mut registry, first).unwrap(),
                 vec![EngineEvent::OrderCanceled {
                     order_id: OrderId::new(1),
-                    remaining: Qty::try_new(5).unwrap(),
+                    remaining: matching_domain::OrderRemaining::Base(Qty::try_new(5).unwrap()),
                     reason: CancelReason::CancelReplace
                 }]
             );
@@ -335,7 +336,9 @@ fn production_cancel_replace_old_cancel_precedes_every_normal_event_and_terminal
                     vec![
                         EngineEvent::OrderCanceled {
                             order_id: OrderId::new(1),
-                            remaining: Qty::try_new(5).unwrap(),
+                            remaining: matching_domain::OrderRemaining::Base(
+                                Qty::try_new(5).unwrap()
+                            ),
                             reason: CancelReason::CancelReplace
                         },
                         EngineEvent::Trade(TradeEvent {
@@ -712,7 +715,7 @@ fn production_cancel_replace_residual_and_ioc_lifecycle_keep_finances_and_origin
                     .unwrap();
                 let events = book.apply_cancel_replace(&mut registry, p).unwrap();
                 assert!(
-                    matches!(events[0], EngineEvent::OrderCanceled {order_id, remaining, reason: CancelReason::CancelReplace} if order_id == OrderId::new(1) && remaining.get() == 5)
+                    matches!(events[0], EngineEvent::OrderCanceled {order_id, remaining: matching_domain::OrderRemaining::Base(remaining), reason: CancelReason::CancelReplace} if order_id == OrderId::new(1) && remaining.get() == 5)
                 );
                 assert!(!events.iter().any(|e| matches!(
                     e,
@@ -968,7 +971,7 @@ fn production_cancel_replace_iceberg_makers_refresh_fifo_and_terminalize_once() 
         vec![
             EngineEvent::OrderCanceled {
                 order_id: OrderId::new(1),
-                remaining: Qty::try_new(5).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(5).unwrap()),
                 reason: CancelReason::CancelReplace
             },
             EngineEvent::Trade(TradeEvent {
@@ -1247,12 +1250,12 @@ fn production_cancel_replace_iceberg_old_cancel_uses_total_and_terminal_new_is_p
             vec![
                 EngineEvent::OrderCanceled {
                     order_id: OrderId::new(1),
-                    remaining: Qty::try_new(10).unwrap(),
+                    remaining: matching_domain::OrderRemaining::Base(Qty::try_new(10).unwrap()),
                     reason: CancelReason::CancelReplace
                 },
                 EngineEvent::OrderCanceled {
                     order_id: OrderId::new(9),
-                    remaining: Qty::try_new(5).unwrap(),
+                    remaining: matching_domain::OrderRemaining::Base(Qty::try_new(5).unwrap()),
                     reason: CancelReason::IocRemainder
                 }
             ]

@@ -221,6 +221,29 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
         {
             batch.push(Command::Cancel(OrderId::new(id)));
         }
+        // 在不影响撤单替换主链的尾部重新放入不同容器，再验证批量撤单的原序差分。
+        batch.push(Command::Rest(
+            input(base + 6000, Side::Buy, 80, 6),
+            TimeInForce::Gtc,
+        ));
+        batch.push(Command::Iceberg(
+            IcebergOrder::try_new(
+                input(base + 6001, Side::Sell, 120, 12),
+                Qty::try_new(3).unwrap(),
+            )
+            .unwrap(),
+        ));
+        batch.push(Command::Stop(scenarios::stop(
+            base + 6002,
+            Side::Buy,
+            now + 20,
+        )));
+        batch.push(Command::MassCancel(ShardCancelScope::User {
+            user_id: UserId::new(5),
+        }));
+        batch.push(Command::MassCancel(ShardCancelScope::Market {
+            market_id: MarketId::new(8),
+        }));
         while batch.len() < 1023 {
             let (bad, _, _) = strategy.new_tree(&mut runner).unwrap().current();
             batch.push(if bad % 2 == 0 {
@@ -265,6 +288,10 @@ struct Coverage {
     expired: usize,
     /// 成功参考价更新命令次数。
     references: usize,
+    /// 成功实际终结至少一张订单的批量撤单次数。
+    mass_canceled: usize,
+    /// 成功匹配空集合的批量撤单次数。
+    mass_cancel_empty: usize,
 }
 
 impl Coverage {
@@ -290,6 +317,27 @@ impl Coverage {
             Command::Amend(_) if !result.outcome.failed() => self.amended += 1,
             Command::Cancel(_) if !result.outcome.failed() => self.canceled += 1,
             Command::Reference(_) if !result.outcome.failed() => self.references += 1,
+            Command::MassCancel(_) if !result.outcome.failed() => {
+                let canceled = result
+                    .outcome
+                    .events()
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            EngineEvent::OrderCanceled {
+                                reason: matching_domain::CancelReason::MassCancel,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                if canceled == 0 {
+                    self.mass_cancel_empty += 1;
+                } else {
+                    self.mass_canceled += 1;
+                }
+            }
             _ => {}
         }
         self.trades += result
@@ -314,6 +362,8 @@ impl Coverage {
                 && self.canceled > 0
                 && self.expired > 0
                 && self.references > 0
+                && self.mass_canceled > 0
+                && self.mass_cancel_empty > 0
         );
     }
 }

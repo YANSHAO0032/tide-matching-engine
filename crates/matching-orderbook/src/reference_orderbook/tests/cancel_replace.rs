@@ -31,6 +31,7 @@ fn state(id: u128) -> ReservationState {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
         market_id: MarketId::new(7),
+        origin_session_id: matching_domain::OriginSessionId::new(1),
         version: 3,
         reserves: vec![AssetReserve {
             asset: AssetId::new(1),
@@ -164,7 +165,7 @@ fn cancel_replace_plan_is_pure_and_rested_new_identity_loses_old_priority() {
             events,
             vec![EngineEvent::OrderCanceled {
                 order_id: OrderId::new(1),
-                remaining: Qty::try_new(5).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(5).unwrap()),
                 reason: CancelReason::CancelReplace,
             }]
         );
@@ -500,7 +501,7 @@ fn cancel_replace_partial_and_empty_ioc_keep_exact_event_order_and_pending_finan
             let events = book.apply_cancel_replace(&mut registry, plan).unwrap();
             let mut expected_events = vec![EngineEvent::OrderCanceled {
                 order_id: OrderId::new(1),
-                remaining: Qty::try_new(5).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(5).unwrap()),
                 reason: CancelReason::CancelReplace,
             }];
             if maker_qty != 0 {
@@ -520,7 +521,9 @@ fn cancel_replace_partial_and_empty_ioc_keep_exact_event_order_and_pending_finan
             if maker_qty < 5 {
                 expected_events.push(EngineEvent::OrderCanceled {
                     order_id: OrderId::new(9),
-                    remaining: Qty::try_new(5 - maker_qty).unwrap(),
+                    remaining: matching_domain::OrderRemaining::Base(
+                        Qty::try_new(5 - maker_qty).unwrap(),
+                    ),
                     reason: CancelReason::IocRemainder,
                 });
             }
@@ -631,12 +634,12 @@ fn cancel_replace_iceberg_old_cancel_reports_total_and_excludes_hidden_and_expir
         vec![
             EngineEvent::OrderCanceled {
                 order_id: OrderId::new(1),
-                remaining: Qty::try_new(10).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(10).unwrap()),
                 reason: CancelReason::CancelReplace
             },
             EngineEvent::OrderCanceled {
                 order_id: OrderId::new(9),
-                remaining: Qty::try_new(5).unwrap(),
+                remaining: matching_domain::OrderRemaining::Base(Qty::try_new(5).unwrap()),
                 reason: CancelReason::IocRemainder
             },
         ]

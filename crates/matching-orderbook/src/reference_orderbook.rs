@@ -17,6 +17,7 @@ mod iceberg;
 mod limit_execution;
 mod market_by_base;
 mod market_by_quote;
+mod mass_cancel;
 mod matching;
 mod reservation_place;
 mod resting;
@@ -25,6 +26,7 @@ mod stop_trigger;
 
 pub use cancel_replace::ReferenceCancelReplacePlan;
 pub use cancel_replace_view::ReferenceBookWithout;
+pub use mass_cancel::ReferenceMassCancelPlan;
 pub use reservation_place::{ReferencePlaceContext, ReferencePlaceOrder, ReferencePlacePlan};
 
 /// 为优先级计数器保留不可分配的高位保护空间。
@@ -80,6 +82,11 @@ impl ReferenceOrderBook {
     /// 按订单身份只读查询已登记的本地预留快照。
     pub fn reservation_state(&self, order_id: OrderId) -> Option<&ReservationState> {
         self.reservations.get(&order_id)
+    }
+
+    /// 读取下一次实际挂单或冰山补量将使用的队列优先级，不推进分配器。
+    pub fn next_queue_priority(&self) -> u128 {
+        self.next_priority
     }
 
     /// 批量成交只清除已终结身份，未触发止损仍拥有同一预留。

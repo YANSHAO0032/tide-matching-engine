@@ -1,8 +1,19 @@
 use crate::reservation_release_reason::ReservationReleaseReason;
 use crate::{
-    AmendedQuantity, CancelReason, OrderId, Price, ProtectionSource, Qty, RejectReason,
-    ReservationId, TradeEvent, TriggeredOrderKind,
+    AmendedQuantity, CancelReason, OrderId, Price, ProtectionSource, Qty, QuoteAmount,
+    RejectReason, ReservationId, TradeEvent, TriggeredOrderKind,
 };
+
+/// 订单终结时的业务余量。
+///
+/// Base 与 Quote 严格保留原始订单的计价模式；它不是预留余额，也不代表资金已经释放。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OrderRemaining {
+    /// 基础数量型订单尚未成交的总基础资产数量。
+    Base(Qty),
+    /// 报价预算型订单尚未使用的报价资产预算。
+    Quote(QuoteAmount),
+}
 
 /// 当前订单簿使用的最小订单生命周期事件载荷。
 ///
@@ -51,13 +62,15 @@ pub enum EngineEvent {
         /// 已全部成交的订单标识符。
         order_id: OrderId,
     },
-    /// 未成交的严格正基础资产余量按指定原因终结。
-    /// 适用于活动挂单取消（含 CancelReplace），以及 IOC 尚未入簿的余量终结。
+    /// 未成交的业务余量按指定原因终结。
+    ///
+    /// 适用于活动挂单取消（含 CancelReplace），以及 IOC 尚未入簿的余量终结；
+    /// Quote 只表示报价预算型订单当前预算，不表示预留释放。
     OrderCanceled {
         /// 被终结订单的标识符。
         order_id: OrderId,
-        /// 被取消的严格正基础资产余量。
-        remaining: Qty,
+        /// 被取消订单按原始计价模式表示的业务余量。
+        remaining: OrderRemaining,
         /// 此次终结的稳定业务原因。
         reason: CancelReason,
     },

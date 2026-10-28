@@ -10,6 +10,8 @@ pub enum ReservationReleaseReason {
     FilledRemainder = 1301,
     /// 用户主动取消订单；撤单替换的旧预留仅在替换下单事件链之后由真实 R2 释放。
     UserCancel = 1302,
+    /// 批量撤单终结后的真实剩余预留释放原因；PendingR2 转换本身不发出该事件。
+    MassCancel = 1303,
     /// 触发后的 child 未通过 Trigger-R1。
     TriggerRejected = 1305,
 }

@@ -7,7 +7,7 @@ use std::cell::Cell;
 ///
 /// OrderIndex 表示槽位位置，继续追加不会改变已有索引。
 /// 空槽由 None 表示，不使用特殊索引值。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OrderArena {
     /// 按 `OrderIndex` 定位的稳定槽位；删除留下 `None`，不会压缩或重排。
     slots: Vec<Option<OrderNode>>,

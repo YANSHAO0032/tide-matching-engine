@@ -51,7 +51,7 @@ fn trade(id: u128, maker: u128, side: Side, price: i64, qty: u64) -> EngineEvent
 fn canceled(qty: u64) -> EngineEvent {
     EngineEvent::OrderCanceled {
         order_id: OrderId::new(100),
-        remaining: Qty::try_new(qty).unwrap(),
+        remaining: matching_domain::OrderRemaining::Base(Qty::try_new(qty).unwrap()),
         reason: CancelReason::IocRemainder,
     }
 }

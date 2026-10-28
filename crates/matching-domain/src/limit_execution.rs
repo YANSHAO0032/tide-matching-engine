@@ -1,11 +1,14 @@
 use crate::{
-    EngineEvent, OrderFlags, OrderId, OrderType, Qty, RejectReason, TimeInForce, TradeEvent,
+    EngineEvent, OrderFlags, OrderId, OrderRemaining, OrderType, Qty, RejectReason, TimeInForce,
+    TradeEvent,
 };
 
 /// 当前产生的取消原因；编号与规格的稳定协议表一致。
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelReason {
+    /// 分片本地批量撤单命中活动订单时终结。
+    MassCancel = 1102,
     /// 旧订单在原子撤单替换成功时终结。
     CancelReplace = 1109,
     /// IOC 完成立即可执行成交后，取消尚未入簿的余量。
@@ -52,7 +55,7 @@ impl LimitImmediateExecution {
         if let Some(remaining) = canceled_remaining {
             events.push(EngineEvent::OrderCanceled {
                 order_id,
-                remaining,
+                remaining: OrderRemaining::Base(remaining),
                 reason: CancelReason::IocRemainder,
             });
         }
@@ -125,7 +128,7 @@ mod tests {
             result.events()[2],
             EngineEvent::OrderCanceled {
                 order_id: incoming,
-                remaining: qty,
+                remaining: OrderRemaining::Base(qty),
                 reason: CancelReason::IocRemainder,
             }
         );
@@ -156,7 +159,7 @@ mod tests {
                 EngineEvent::Trade(trade(1)),
                 EngineEvent::OrderCanceled {
                     order_id: id,
-                    remaining: qty,
+                    remaining: OrderRemaining::Base(qty),
                     reason: CancelReason::IocRemainder
                 },
             ]

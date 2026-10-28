@@ -195,7 +195,7 @@ fn opposite(side: Side) -> Side {
 fn canceled(id: u128, qty: u64, reason: CancelReason) -> EngineEvent {
     EngineEvent::OrderCanceled {
         order_id: OrderId::new(id),
-        remaining: Qty::try_new(qty).unwrap(),
+        remaining: matching_domain::OrderRemaining::Base(Qty::try_new(qty).unwrap()),
         reason,
     }
 }

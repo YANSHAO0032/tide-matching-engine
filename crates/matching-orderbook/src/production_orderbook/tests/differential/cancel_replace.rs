@@ -10,8 +10,8 @@ use matching_domain::{
     AmendOrder, AssetId, AssetReserve, CancelReplaceOrder, CancelReplaceRejection, CommandId,
     ExpiredOrder, IcebergOrder, LogicalClock, LogicalTime, MarketId, OrderFlags, PriceReference,
     PriceReferenceKind, ReplacementOrder, ReplacementOrderKind, ReservationAdjustmentToken,
-    ReservationId, ReservationToken, ReservationTransition, StopLimitOrder, StopOrder, TimeInForce,
-    TriggerExpiry,
+    ReservationId, ReservationToken, ReservationTransition, ShardCancelScope, StopLimitOrder,
+    StopOrder, TimeInForce, TriggerExpiry,
 };
 use matching_risk::{
     ExpectedReplacementReservation, ReservationRegistry, ReservationState, ReservationStatus,
@@ -54,6 +54,7 @@ fn shadow(id: u128) -> ReservationState {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
         market_id: MarketId::new(7),
+        origin_session_id: matching_domain::OriginSessionId::new(1),
         version: 3,
         status: ReservationStatus::Active,
         fee_schedule_version: 5,
@@ -187,6 +188,7 @@ enum Command {
     },
     Amend(Box<AmendOrder>),
     Cancel(OrderId),
+    MassCancel(ShardCancelScope),
     AdvanceTime(LogicalTime),
     EndSession(u64),
     Reference(PriceReference),
@@ -529,6 +531,30 @@ impl Harness {
                 };
                 (Outcome::Unit(r), Outcome::Unit(p))
             }
+            Command::MassCancel(scope) => {
+                let rplan = self.r.plan_mass_cancel(*scope, &self.rr);
+                let pplan = self.p.plan_mass_cancel(*scope, &self.pr);
+                assert_eq!(self.r, before_r);
+                assert_eq!(
+                    super::super::amend_stop::production_snapshot(&self.p),
+                    before_p
+                );
+                assert_eq!(self.rr, before_rr);
+                assert_eq!(self.pr, before_pr);
+                let r = rplan.map(|plan| {
+                    self.r
+                        .apply_mass_cancel(&mut self.rr, plan)
+                        .expect("参考批量撤单预检后的提交不得失败")
+                        .1
+                });
+                let p = pplan.map(|plan| {
+                    self.p
+                        .apply_mass_cancel(&mut self.pr, plan)
+                        .expect("生产批量撤单预检后的提交不得失败")
+                        .1
+                });
+                (Outcome::Events(r), Outcome::Events(p))
+            }
             Command::AdvanceTime(at) => {
                 self.clock.advance_to(*at).unwrap();
                 (
@@ -559,7 +585,10 @@ impl Harness {
             );
             assert_eq!(self.rr, before_rr);
             assert_eq!(self.pr, before_pr);
-        } else if !matches!(command, Command::CancelReplace { .. }) {
+        } else if !matches!(
+            command,
+            Command::CancelReplace { .. } | Command::MassCancel(_)
+        ) {
             if let Some(state) = incoming.clone() {
                 admit(&mut self.rr, &mut self.known_r, state.clone());
                 admit(&mut self.pr, &mut self.known_p, state);

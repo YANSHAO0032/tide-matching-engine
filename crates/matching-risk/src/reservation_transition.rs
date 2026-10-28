@@ -363,6 +363,7 @@ impl ReservationRegistry {
                     order_id: token.order_id,
                     user_id: token.user_id,
                     market_id: token.market_id,
+                    origin_session_id: old.origin_session_id,
                     version: 0,
                     reserves: token.reserves.to_vec(),
                     status: ReservationStatus::Active,
