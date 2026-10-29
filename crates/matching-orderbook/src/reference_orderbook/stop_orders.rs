@@ -62,6 +62,7 @@ impl ReferenceOrderBook {
         now: LogicalTime,
         current_session_id: u64,
     ) -> Result<StopPriority, RejectReason> {
+        order.validate_stp_mode()?;
         if self.contains_active_order(order.order_id()) {
             return Err(RejectReason::DuplicateOrderId);
         }

@@ -1,9 +1,12 @@
 use super::*;
+use crate::{StpKey, StpMode};
 
 fn base(side: Side) -> MarketByBase {
     MarketByBase {
         order_id: OrderId::new(1),
         user_id: UserId::new(10),
+        stp_key: StpKey::new(0),
+        stp_mode: StpMode::None,
         side,
         qty: Qty::try_new(100).unwrap(),
         market_protection: None,
@@ -14,6 +17,8 @@ fn quote(side: Side) -> MarketByQuote {
     MarketByQuote {
         order_id: OrderId::new(2),
         user_id: UserId::new(20),
+        stp_key: StpKey::new(0),
+        stp_mode: StpMode::None,
         side,
         quote_budget: QuoteBudget::try_new(1000).unwrap(),
         market_protection: None,

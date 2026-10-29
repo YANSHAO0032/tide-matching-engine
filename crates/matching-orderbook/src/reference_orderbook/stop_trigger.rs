@@ -6,7 +6,7 @@ use matching_domain::{
     PriceReferenceKind, RejectReason, ReservationReleaseReason, Side, StopMarketQuantity,
     StopOrder, StopPriority, TimeInForce, TradeId,
 };
-use matching_risk::ReservationState;
+use matching_risk::{ReservationApplyError, ReservationRegistry, ReservationState};
 use std::collections::VecDeque;
 
 /// 已移出触发簿的订单及其待接续预留；只有实际挂入普通簿才重新关联预留。
@@ -17,7 +17,83 @@ pub(crate) type TriggeredStop = (
     Option<ReservationState>,
 );
 
+/// Stop 级联及终结预留归属的不可伪造参考计划。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceTriggerRegistryPlan {
+    /// 预演前的完整参考簿。
+    before_book: ReferenceOrderBook,
+    /// 预演前的完整预留登记表。
+    before_registry: ReservationRegistry,
+    /// 已完成触发级联的参考簿后态。
+    after_book: ReferenceOrderBook,
+    /// 已处理订单终结归属的登记表后态。
+    after_registry: ReservationRegistry,
+    /// 原序触发、成交和终结事件。
+    events: Vec<EngineEvent>,
+}
+
 impl ReferenceOrderBook {
+    /// 在参考副本上完成 Stop 级联并预检所有终结订单的 PendingR2 归属。
+    pub fn plan_trigger_stops_with_registry(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        registry: &ReservationRegistry,
+        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<ReferenceTriggerRegistryPlan, RejectReason> {
+        registry
+            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        let mut after_book = self.clone();
+        let mut events = after_book.trigger_stops(
+            reference,
+            context.now,
+            context.current_session_id,
+            context.math,
+            context.trade_ids,
+            trigger_r1,
+        )?;
+        // 登记表边界只迁移归属，不执行真实 R2；旧窄接口的释放投影不能当成金融事实。
+        events.retain(|event| !matches!(event, EngineEvent::ReservationReleased { .. }));
+        let mut terminal = self
+            .reservations
+            .iter()
+            .filter(|(id, _)| !after_book.reservations.contains_key(id))
+            .collect::<Vec<_>>();
+        terminal.sort_unstable_by_key(|(id, _)| **id);
+        let transition =
+            registry.plan_binding_transitions(terminal.iter().map(|(_, state)| *state), [])?;
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("fresh trigger binding plan");
+        after_registry.validate_order_bindings(
+            after_book
+                .reservations
+                .iter()
+                .map(|(id, state)| (*id, state)),
+        )?;
+        Ok(ReferenceTriggerRegistryPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
+    }
+
+    /// 校验完整前态后一次安装触发级联及其预留归属。
+    pub fn apply_trigger_stops_with_registry(
+        &mut self,
+        registry: &mut ReservationRegistry,
+        plan: ReferenceTriggerRegistryPlan,
+    ) -> Result<Vec<EngineEvent>, ReservationApplyError> {
+        if *self != plan.before_book || *registry != plan.before_registry {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        *self = plan.after_book;
+        *registry = plan.after_registry;
+        Ok(plan.events)
+    }
     /// 按一次真实参考价跨越移除止损订单，并产生确定性触发事件。
     pub(crate) fn collect_triggered_stops(
         &mut self,
@@ -223,6 +299,8 @@ impl ReferenceOrderBook {
                 matching_domain::LimitOrder {
                     order_id: stop.order_id,
                     user_id: stop.user_id,
+                    stp_key: stop.stp_key,
+                    stp_mode: stop.stp_mode,
                     side: stop.side,
                     price: stop.price,
                     qty: stop.qty,
@@ -237,11 +315,26 @@ impl ReferenceOrderBook {
                     let incoming = MarketByBase {
                         order_id: stop.order_id,
                         user_id: stop.user_id,
+                        stp_key: stop.stp_key,
+                        stp_mode: stop.stp_mode,
                         side: stop.side,
                         qty,
                         market_protection: stop.market_protection.clone(),
                     };
-                    if stop.market_protection.is_some() {
+                    if stop.market_protection.is_some()
+                        || stop.stp_mode != matching_domain::StpMode::None
+                    {
+                        let unprotected =
+                            matching_domain::market_order::CommandStartProtectionContext {
+                                reference_price_at_command_start: context
+                                    .reference_price_at_command_start,
+                                market_band_worst: None,
+                            };
+                        let context = if stop.market_protection.is_some() {
+                            context
+                        } else {
+                            &unprotected
+                        };
                         self.execute_market_by_base_with_protection(
                             incoming, context, math, trade_ids,
                         )
@@ -254,11 +347,26 @@ impl ReferenceOrderBook {
                     let incoming = MarketByQuote {
                         order_id: stop.order_id,
                         user_id: stop.user_id,
+                        stp_key: stop.stp_key,
+                        stp_mode: stop.stp_mode,
                         side: stop.side,
                         quote_budget,
                         market_protection: stop.market_protection.clone(),
                     };
-                    if stop.market_protection.is_some() {
+                    if stop.market_protection.is_some()
+                        || stop.stp_mode != matching_domain::StpMode::None
+                    {
+                        let unprotected =
+                            matching_domain::market_order::CommandStartProtectionContext {
+                                reference_price_at_command_start: context
+                                    .reference_price_at_command_start,
+                                market_band_worst: None,
+                            };
+                        let context = if stop.market_protection.is_some() {
+                            context
+                        } else {
+                            &unprotected
+                        };
                         self.execute_market_by_quote_with_protection(
                             incoming, context, math, trade_ids,
                         )

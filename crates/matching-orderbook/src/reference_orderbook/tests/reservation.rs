@@ -12,6 +12,8 @@ fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(if side == Side::Sell { 100 } else { 90 }).unwrap(),
         qty: Qty::try_new(qty).unwrap(),
@@ -80,6 +82,8 @@ fn released_reservation_cannot_be_adopted_by_any_reservation_constructor() {
                     matching_domain::StopOrder::Limit(matching_domain::StopLimitOrder {
                         order_id: candidate.order_id,
                         user_id: candidate.user_id,
+                        stp_key: matching_domain::StpKey::new(0),
+                        stp_mode: matching_domain::StpMode::None,
                         reservation_id: released.reservation_id,
                         fee_schedule_version: 1,
                         side: candidate.side,
@@ -319,6 +323,8 @@ fn market_base_quote_and_bulk_immediate_full_fills_clear_shadow_state() {
                 let taker = MarketByBase {
                     order_id: OrderId::new(9),
                     user_id: UserId::new(9),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     side: Side::Buy,
                     qty: Qty::try_new(2).unwrap(),
                     market_protection: None,
@@ -334,6 +340,8 @@ fn market_base_quote_and_bulk_immediate_full_fills_clear_shadow_state() {
                 let taker = MarketByQuote {
                     order_id: OrderId::new(9),
                     user_id: UserId::new(9),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     side: Side::Buy,
                     quote_budget: QuoteBudget::try_new(200).unwrap(),
                     market_protection: None,
@@ -350,6 +358,8 @@ fn market_base_quote_and_bulk_immediate_full_fills_clear_shadow_state() {
                 let taker = MarketByBase {
                     order_id: OrderId::new(9),
                     user_id: UserId::new(9),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     side: Side::Buy,
                     qty: Qty::try_new(2).unwrap(),
                     market_protection: None,
@@ -372,6 +382,8 @@ fn market_base_quote_and_bulk_immediate_full_fills_clear_shadow_state() {
                 let taker = MarketByQuote {
                     order_id: OrderId::new(9),
                     user_id: UserId::new(9),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     side: Side::Buy,
                     quote_budget: QuoteBudget::try_new(200).unwrap(),
                     market_protection: None,

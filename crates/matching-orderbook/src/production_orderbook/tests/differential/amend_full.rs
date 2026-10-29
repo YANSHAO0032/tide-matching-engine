@@ -137,6 +137,8 @@ fn stop(id: u128, kind: u8, side: Side, expiry: TriggerExpiry) -> StopOrder {
         StopOrder::Limit(StopLimitOrder {
             order_id: ordinary.order_id,
             user_id: ordinary.user_id,
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             reservation_id: ReservationId::new(id),
             fee_schedule_version: 5,
             trigger_reference: reference,
@@ -151,6 +153,8 @@ fn stop(id: u128, kind: u8, side: Side, expiry: TriggerExpiry) -> StopOrder {
         StopOrder::Market(StopMarketOrder {
             order_id: ordinary.order_id,
             user_id: ordinary.user_id,
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             reservation_id: ReservationId::new(id),
             fee_schedule_version: 5,
             trigger_reference: reference,

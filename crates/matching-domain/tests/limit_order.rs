@@ -5,6 +5,8 @@ fn crate_root_exports_strategy_neutral_limit_order_payload() {
     let order = LimitOrder {
         order_id: OrderId::new(41),
         user_id: UserId::new(7),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Sell,
         price: Price::try_new(125).unwrap(),
         qty: Qty::try_new(9).unwrap(),

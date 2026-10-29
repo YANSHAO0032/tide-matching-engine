@@ -98,26 +98,33 @@ impl ReferenceBookWithout {
         order: &LimitOrder,
         math: &MarketMath,
     ) -> Result<(), RejectReason> {
-        let remaining = if self.book.has_iceberg_maker(order.side) {
+        let (remaining, terminal) = if self.book.has_iceberg_maker(order.side)
+            || order.stp_mode != matching_domain::StpMode::None
+        {
             self.book.check_duplicate(order.order_id)?;
             math.trade_notional(order.price, order.qty)
                 .map_err(ReferenceOrderBook::reject_quote_math_error)?;
-            self.book
-                .plan_slices(SliceRequest {
-                    id: order.order_id,
-                    side: order.side,
-                    remaining: order.qty.get(),
-                    limit: Some(order.price),
-                    budget: None,
-                    math: Some(math),
-                    protection: None,
-                    one_fill: false,
-                })?
-                .remaining
+            let plan = self.book.plan_slices(SliceRequest {
+                id: order.order_id,
+                user_id: order.user_id,
+                stp_key: order.stp_key,
+                stp_mode: order.stp_mode,
+                side: order.side,
+                remaining: order.qty.get(),
+                limit: Some(order.price),
+                budget: None,
+                math: Some(math),
+                protection: None,
+                one_fill: false,
+            })?;
+            (plan.remaining, plan.taker_terminal)
         } else {
-            self.book.preflight_limit_immediate(order, math)?.remaining
+            (
+                self.book.preflight_limit_immediate(order, math)?.remaining,
+                false,
+            )
         };
-        if remaining != 0 {
+        if remaining != 0 && !terminal {
             return Err(RejectReason::FokInsufficientLiquidity);
         }
         Ok(())

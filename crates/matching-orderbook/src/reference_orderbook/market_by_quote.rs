@@ -259,20 +259,13 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<MarketByQuoteExecution, RejectReason> {
-        if self.has_iceberg_maker(incoming.side) {
+        incoming.validate_stp_mode()?;
+        if self.has_iceberg_maker(incoming.side)
+            || incoming.stp_mode != matching_domain::StpMode::None
+        {
             let (events, spent, unused) =
                 self.slice_market_quote(incoming, None, math, trade_ids)?;
-            let trades = events
-                .into_iter()
-                .filter_map(|event| {
-                    if let EngineEvent::Trade(t) = event {
-                        Some(t)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            return Ok(MarketByQuoteExecution::new(trades, spent, unused));
+            return Ok(MarketByQuoteExecution::from_events(events, spent, unused));
         }
         // 1. 全量只读预检。
         let plan = self.preflight_market_by_quote(&incoming, math)?;
@@ -392,7 +385,10 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
-        if self.has_iceberg_maker(incoming.side) {
+        incoming.validate_stp_mode()?;
+        if self.has_iceberg_maker(incoming.side)
+            || incoming.stp_mode != matching_domain::StpMode::None
+        {
             let (events, spent, unused) =
                 self.slice_market_quote(incoming, Some(context), math, trade_ids)?;
             return Ok(ProtectedMarketByQuoteExecution::new(events, spent, unused));

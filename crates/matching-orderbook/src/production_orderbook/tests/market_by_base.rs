@@ -6,6 +6,8 @@ fn market(id: u128, side: Side, qty: u64) -> MarketByBase {
     MarketByBase {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         qty: Qty::try_new(qty).unwrap(),
         market_protection: None,

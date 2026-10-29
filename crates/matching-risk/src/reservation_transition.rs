@@ -66,6 +66,15 @@ pub struct PlannedBindingTransition {
     bindings: BTreeMap<ReservationId, ReservationBinding>,
 }
 
+/// 已验证签名和身份的同单资金预留调整计划。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedAmendAdjustment {
+    /// 校验时的完整登记表前态。
+    before: ReservationRegistry,
+    /// 调整后的金融快照，订单身份保持不变。
+    after: ReservationState,
+}
+
 impl PlannedReservationTransition {
     /// 提交后接管新订单的状态。
     pub fn active_state(&self) -> &ReservationState {
@@ -96,6 +105,41 @@ pub struct ReservationRegistry {
 }
 
 impl ReservationRegistry {
+    /// 核验真实活动绑定和签名，冻结同单资金调整，不改变登记表。
+    pub fn plan_amend_adjustment(
+        &self,
+        keys: &RiskKeySet,
+        expected: &ExpectedAmendReservation,
+        token: &matching_domain::ReservationAdjustmentToken,
+    ) -> Result<PlannedAmendAdjustment, RejectReason> {
+        let before = self
+            .get(expected.reservation_id)
+            .ok_or(RejectReason::InvalidReservation)?;
+        if self.bindings.get(&expected.reservation_id)
+            != Some(&ReservationBinding::ActiveOrder(expected.order_id))
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let verified = verify_amend_reservation(keys, before, expected, token)?;
+        let mut after = before.clone();
+        after.apply_verified_adjustment(&verified)?;
+        Ok(PlannedAmendAdjustment {
+            before: self.clone(),
+            after,
+        })
+    }
+
+    /// 检查完整金融前态后应用已验签的同单调整。
+    pub fn apply_amend_adjustment(
+        &mut self,
+        plan: PlannedAmendAdjustment,
+    ) -> Result<(), ReservationApplyError> {
+        if *self != plan.before {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        self.states.insert(plan.after.reservation_id, plan.after);
+        Ok(())
+    }
     /// 从已接管状态及释放历史建立唯一身份边界。
     ///
     /// 该实例持有实际状态，调用方必须保留其释放历史，不能每次仅从活动订单重建。

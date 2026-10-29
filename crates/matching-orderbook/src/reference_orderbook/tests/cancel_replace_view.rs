@@ -12,6 +12,8 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(price).unwrap(),
         qty: Qty::try_new(qty).unwrap(),
@@ -50,6 +52,8 @@ fn stop(id: u128, expiry: TriggerExpiry) -> StopOrder {
     StopOrder::Limit(StopLimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(id + 100),
         fee_schedule_version: 1,
         side: Side::Sell,
@@ -84,6 +88,21 @@ fn book_without_regular_fok_never_counts_old_five() {
         );
         assert_eq!(book.test_deterministic_state(), before);
     }
+}
+
+#[test]
+fn book_without_fok_does_not_count_stp_cancel_maker_liquidity() {
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Sell, 100, 5), state(1))
+        .unwrap();
+    book.rest(order(2, Side::Sell, 100, 5)).unwrap();
+    let mut replacement = order(3, Side::Buy, 100, 5);
+    replacement.stp_mode = matching_domain::StpMode::CancelMaker;
+    let view = book.book_without(OrderId::new(1)).unwrap();
+    assert_eq!(
+        view.preflight_limit_fok(&replacement, &math()),
+        Err(RejectReason::FokInsufficientLiquidity)
+    );
 }
 
 #[test]
@@ -305,6 +324,8 @@ fn book_without_rejects_unsupported_stop_market_without_mutation() {
             StopOrder::Market(StopMarketOrder {
                 order_id: OrderId::new(1),
                 user_id: UserId::new(1),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
                 reservation_id: ReservationId::new(101),
                 fee_schedule_version: 1,
                 side: Side::Buy,

@@ -532,6 +532,8 @@ fn cancel_panics_without_mutation_when_exact_price_level_is_missing() {
         book.rest(LimitOrder {
             order_id,
             user_id: UserId::new(1),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             side,
             price,
             qty: Qty::try_new(5).unwrap(),

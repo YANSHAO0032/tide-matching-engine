@@ -94,6 +94,57 @@ fn valid_signature_verifies_without_mutating_state_and_explicit_apply_is_once() 
 }
 
 #[test]
+fn registry_amend_plan_verifies_signature_and_rejects_stale_reapply() {
+    let (_, keys, state, expected, token) = fixture();
+    let mut registry = matching_risk::ReservationRegistry::new([state.clone()]).unwrap();
+    let plan = registry
+        .plan_amend_adjustment(&keys, &expected, &token)
+        .unwrap();
+    assert_eq!(registry.get(state.reservation_id), Some(&state));
+    registry.apply_amend_adjustment(plan.clone()).unwrap();
+    assert_eq!(registry.get(state.reservation_id).unwrap().version, 8);
+    assert_eq!(
+        registry
+            .get(state.reservation_id)
+            .unwrap()
+            .reserves
+            .as_slice(),
+        token.target_reserves.as_slice()
+    );
+    let after = registry.clone();
+    assert_eq!(
+        registry.apply_amend_adjustment(plan),
+        Err(matching_risk::ReservationApplyError::StateChanged)
+    );
+    assert_eq!(registry, after);
+    assert_eq!(
+        registry.plan_amend_adjustment(&keys, &expected, &token),
+        Err(RejectReason::InvalidReservation)
+    );
+}
+
+#[test]
+fn registry_amend_plan_rejects_invalid_signature_and_pending_binding() {
+    let (_, keys, state, expected, mut token) = fixture();
+    let registry = matching_risk::ReservationRegistry::new([state.clone()]).unwrap();
+    token.signature[0] ^= 1;
+    assert_eq!(
+        registry.plan_amend_adjustment(&keys, &expected, &token),
+        Err(RejectReason::InvalidReservation)
+    );
+    let (_, keys, state, expected, token) = fixture();
+    let registry = matching_risk::ReservationRegistry::new_with_pending_r2(
+        [state.clone()],
+        [state.reservation_id],
+    )
+    .unwrap();
+    assert_eq!(
+        registry.plan_amend_adjustment(&keys, &expected, &token),
+        Err(RejectReason::InvalidReservation)
+    );
+}
+
+#[test]
 fn unknown_key_and_bad_signature_are_rejected() {
     let (signing, keys, state, expected, mut token) = fixture();
     token.risk_key_id = 32;

@@ -114,7 +114,110 @@ struct RegularRepriceCommitPlan {
     residual: Option<(Qty, RestPlan)>,
 }
 
+/// 生产改单与资金归属的一次性完整后态计划。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionAmendRegistryPlan {
+    /// 预演前生产簿。
+    before_book: ProductionOrderBook,
+    /// 预演前真实金融登记表。
+    before_registry: matching_risk::ReservationRegistry,
+    /// 改单后的生产簿。
+    after_book: ProductionOrderBook,
+    /// 验签调整和终结归属后的登记表。
+    after_registry: matching_risk::ReservationRegistry,
+    /// 原序改单、成交和取消事件。
+    events: Vec<EngineEvent>,
+}
+
 impl ProductionOrderBook {
+    /// 在副本中完整预演改单、签名调整和终结预留归属。
+    pub fn plan_amend_with_registry(
+        &self,
+        amend: &AmendOrder,
+        registry: &matching_risk::ReservationRegistry,
+        context: crate::AmendRegistryContext<'_>,
+    ) -> Result<ProductionAmendRegistryPlan, RejectReason> {
+        registry
+            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        let mut after_book = self.clone();
+        let events = after_book.amend_with_context(
+            amend,
+            context.now,
+            context.current_session_id,
+            context.trade_ids,
+            context.execution,
+        )?;
+        let mut after_registry = registry.clone();
+        if let Some(token) = &amend.reservation_adjustment {
+            let state = self
+                .reservations
+                .get(&amend.order_id)
+                .ok_or(RejectReason::InvalidReservation)?;
+            let expected = matching_risk::ExpectedAmendReservation {
+                command_id: context.execution.command_id,
+                reservation_id: state.reservation_id,
+                order_id: amend.order_id,
+                user_id: amend.user_id,
+                market_id: amend.market_id,
+                fee_schedule_version: context.execution.fee_schedule_version,
+                fee_tier_id: context.execution.fee_tier_id,
+                required_reserves: context.execution.required_reserves.clone(),
+            };
+            let adjustment = after_registry.plan_amend_adjustment(
+                context.execution.risk_keys,
+                &expected,
+                token,
+            )?;
+            after_registry
+                .apply_amend_adjustment(adjustment)
+                .expect("fresh verified amend adjustment");
+        }
+        let mut ids = self
+            .reservations
+            .iter()
+            .filter(|(id, _)| !after_book.reservations.contains_key(id))
+            .map(|(id, state)| (*id, state.reservation_id))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by_key(|(id, _)| *id);
+        let transition = after_registry.plan_binding_transitions(
+            ids.iter().map(|(_, id)| {
+                after_registry
+                    .get(*id)
+                    .expect("verified terminal reservation")
+            }),
+            [],
+        )?;
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("fresh amend bindings");
+        after_registry.validate_order_bindings(
+            after_book
+                .reservations
+                .iter()
+                .map(|(id, state)| (*id, state)),
+        )?;
+        Ok(ProductionAmendRegistryPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
+    }
+
+    /// 校验完整前态并原子安装改单和资金归属后态。
+    pub fn apply_amend_with_registry(
+        &mut self,
+        registry: &mut matching_risk::ReservationRegistry,
+        plan: ProductionAmendRegistryPlan,
+    ) -> Result<Vec<EngineEvent>, matching_risk::ReservationApplyError> {
+        if *self != plan.before_book || *registry != plan.before_registry {
+            return Err(matching_risk::ReservationApplyError::StateChanged);
+        }
+        *self = plan.after_book;
+        *registry = plan.after_registry;
+        Ok(plan.events)
+    }
     /// 使用实际市场数值规则、候选资金需求和已加载公钥执行普通、冰山或未触发止损改单。
     ///
     /// 预留调整先在副本中验签和检查版本容量；任何后续簿预检失败均丢弃副本。
@@ -129,6 +232,38 @@ impl ProductionOrderBook {
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let candidate = self.build_amend_plan(amend, now, current_session_id)?;
         self.preflight_amend_numeric(amend, &candidate, context)?;
+        let (regular, peak) = match &candidate {
+            ProductionAmendPlan::Regular(plan) => (Some(*plan), None),
+            ProductionAmendPlan::Iceberg(plan) => (Some(plan.regular), Some(plan.new_peak)),
+            ProductionAmendPlan::Stop(_) => (None, None),
+        };
+        if let Some(plan) = regular
+            && plan.new_price != plan.old_price
+        {
+            let original = self
+                .order(plan.order_id)
+                .expect("validated amend order")
+                .original_order();
+            if original.stp_mode != matching_domain::StpMode::None {
+                let mut incoming = original.clone();
+                incoming.price = plan.new_price;
+                let total = Qty::try_new(
+                    plan.already_filled
+                        .checked_add(plan.new_remaining.get())
+                        .ok_or(RejectReason::ArithmeticOverflow)?,
+                )?;
+                incoming.qty = plan.new_remaining;
+                let mut after = self.clone();
+                after.cancel(plan.order_id).expect("validated amend order");
+                after.execute_limit_stp(
+                    incoming,
+                    trade_ids,
+                    Some(&context.market_math),
+                    peak.map(|peak| (peak, total)),
+                    false,
+                )?;
+            }
+        }
         let planned = context.prepare(
             amend,
             self.reservations
@@ -197,14 +332,20 @@ impl ProductionOrderBook {
                 .trade_notional(plan.new_price, plan.new_remaining)
                 .map_err(Self::reject_quote_math_error)?;
             if plan.new_price != plan.old_price {
-                self.preflight_iceberg_plan(
-                    plan.side,
-                    Some(plan.new_price),
-                    Budget::Base(plan.new_remaining.get()),
-                    Some(&context.market_math),
-                    None,
-                    None,
-                )?;
+                let original = self
+                    .order(plan.order_id)
+                    .expect("validated amend order")
+                    .original_order();
+                if original.stp_mode == matching_domain::StpMode::None {
+                    self.preflight_iceberg_plan(
+                        plan.side,
+                        Some(plan.new_price),
+                        Budget::Base(plan.new_remaining.get()),
+                        Some(&context.market_math),
+                        None,
+                        None,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -287,6 +428,52 @@ impl ProductionOrderBook {
                 Ok(vec![event])
             }
             RegularAmendKind::RepriceAndMatch => {
+                if amended.stp_mode != matching_domain::StpMode::None {
+                    let mut after = self.clone();
+                    let shadow = after
+                        .reservations
+                        .get(&plan.order_id)
+                        .expect("candidate shadow exists")
+                        .clone();
+                    after.cancel(plan.order_id).expect("candidate order exists");
+                    let mut incoming = amended.clone();
+                    incoming.qty = plan.new_remaining;
+                    let (matching_events, _) =
+                        after.execute_limit_stp(incoming, trade_ids, None, None, false)?;
+                    let traded = matching_events
+                        .iter()
+                        .any(|event| matches!(event, EngineEvent::Trade(_)));
+                    let terminal = matching_events.iter().any(|event| matches!(event, EngineEvent::OrderCanceled { order_id, .. } if *order_id == plan.order_id));
+                    let residual = after.order(plan.order_id).map(|node| {
+                        Qty::try_new(node.total_remaining()).expect("active residual is positive")
+                    });
+                    if let Some(index) = after.orders.get(&plan.order_id).copied() {
+                        let node = after
+                            .arena
+                            .get_mut(index)
+                            .expect("planned reprice residual");
+                        let remaining = Qty::try_new(node.total_remaining())?;
+                        node.amend_regular_in_place(amended, remaining, TimeInForce::Gtc);
+                        node.replace_initial_gtc_with_tif(plan.target_tif);
+                        after.regular_expiry.insert(plan.order_id, plan.target_tif);
+                        after.reservations.insert(plan.order_id, shadow);
+                    }
+                    let mut events = vec![event];
+                    events.extend(matching_events);
+                    if traded && !terminal {
+                        events.push(match residual {
+                            Some(remaining) => EngineEvent::OrderPartiallyFilled {
+                                order_id: plan.order_id,
+                                remaining,
+                            },
+                            None => EngineEvent::OrderFilled {
+                                order_id: plan.order_id,
+                            },
+                        });
+                    }
+                    *self = after;
+                    return Ok(events);
+                }
                 let commit = self.preflight_amend_reprice(plan, amended, trade_ids)?;
                 Ok(self.commit_amend_reprice(commit, event, trade_ids))
             }

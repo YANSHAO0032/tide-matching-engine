@@ -10,12 +10,23 @@ pub struct LimitOrder {
     pub order_id: OrderId,
     /// 提交订单的用户身份。
     pub user_id: UserId,
+    /// 账户层持久化的自成交防护分组身份；零值不参与跨用户分组匹配。
+    pub stp_key: crate::StpKey,
+    /// 此订单以后作为吃单时采用的自成交防护策略；改单不得改变该字段。
+    pub stp_mode: crate::StpMode,
     /// 买入或卖出方向。
     pub side: Side,
     /// 严格正的价格原始整数；市场价格步长对齐须由使用该载荷的校验层保证。
     pub price: Price,
     /// 严格正的原始下单数量；市场数量步长对齐须由使用该载荷的校验层保证。
     pub qty: Qty,
+}
+
+impl LimitOrder {
+    /// 在任何订单簿可见写入前拒绝尚未冻结执行规则的自成交模式。
+    pub fn validate_stp_mode(&self) -> Result<(), crate::RejectReason> {
+        self.stp_mode.submission_rejection().map_or(Ok(()), Err)
+    }
 }
 
 #[cfg(test)]
@@ -29,6 +40,8 @@ mod tests {
         let a = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
+            stp_key: crate::StpKey::new(0),
+            stp_mode: crate::StpMode::None,
             side: Side::Buy,
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(10).unwrap(),
@@ -37,6 +50,8 @@ mod tests {
         let b = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
+            stp_key: crate::StpKey::new(0),
+            stp_mode: crate::StpMode::None,
             side: Side::Buy,
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(10).unwrap(),
@@ -50,6 +65,8 @@ mod tests {
         LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
+            stp_key: crate::StpKey::new(0),
+            stp_mode: crate::StpMode::None,
             side: Side::Buy,
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(10).unwrap(),
@@ -67,6 +84,8 @@ mod tests {
             },
             LimitOrder {
                 user_id: UserId::new(4),
+                stp_key: crate::StpKey::new(0),
+                stp_mode: crate::StpMode::None,
                 ..sample_order()
             },
             LimitOrder {

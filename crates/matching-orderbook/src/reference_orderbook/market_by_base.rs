@@ -84,22 +84,14 @@ impl ReferenceOrderBook {
         &mut self,
         incoming: MarketByBase,
         trade_ids: &[TradeId],
-    ) -> Result<Vec<TradeEvent>, RejectReason> {
-        if self.has_iceberg_maker(incoming.side) {
+    ) -> Result<matching_domain::MarketByBaseExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if self.has_iceberg_maker(incoming.side)
+            || incoming.stp_mode != matching_domain::StpMode::None
+        {
             return self
                 .slice_market_base(incoming, None, trade_ids)
-                .map(|events| {
-                    events
-                        .into_iter()
-                        .filter_map(|event| {
-                            if let EngineEvent::Trade(t) = event {
-                                Some(t)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                });
+                .map(matching_domain::MarketByBaseExecution::from_events);
         }
         // 1. 只读预检。
         let required = self.preflight_market_by_base(&incoming)?;
@@ -177,7 +169,9 @@ impl ReferenceOrderBook {
         debug_assert_eq!(trades.len(), required);
 
         // 剩余量即使大于 0，也直接终结，不执行挂单。
-        Ok(trades)
+        Ok(matching_domain::MarketByBaseExecution::from_events(
+            trades.into_iter().map(EngineEvent::Trade).collect(),
+        ))
     }
 
     /// 参考簿专用：按命令开始时固定的保护边界执行 MarketByBase。
@@ -191,7 +185,10 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        if self.has_iceberg_maker(incoming.side) {
+        incoming.validate_stp_mode()?;
+        if self.has_iceberg_maker(incoming.side)
+            || incoming.stp_mode != matching_domain::StpMode::None
+        {
             return self.slice_market_base(incoming, Some((context, math)), trade_ids);
         }
         // 阶段一：完整只读计划。

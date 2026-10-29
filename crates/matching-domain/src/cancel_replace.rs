@@ -33,6 +33,10 @@ pub struct ReplacementOrder {
     pub market_id: MarketId,
     /// 新订单所属用户。
     pub user_id: UserId,
+    /// 替换订单自身的自成交防护分组身份，不继承旧订单配置。
+    pub stp_key: crate::StpKey,
+    /// 替换订单作为吃单时决定冲突处理的策略，不继承旧订单配置。
+    pub stp_mode: crate::StpMode,
     /// 独立于旧订单的新身份。
     pub order_id: OrderId,
     /// 新订单买卖方向，可与旧单不同。
@@ -104,6 +108,9 @@ impl CancelReplaceOrder {
         }
         if self.replacement.order_id == self.old_order_id {
             return Err(RejectReason::DuplicateOrderId);
+        }
+        if let Some(reason) = self.replacement.stp_mode.submission_rejection() {
+            return Err(reason);
         }
         match self.replacement.kind {
             ReplacementOrderKind::Limit { tif, flags } => {

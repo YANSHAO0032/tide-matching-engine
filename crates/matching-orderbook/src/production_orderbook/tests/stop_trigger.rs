@@ -18,6 +18,8 @@ fn stop_market(id: u128, side: Side, stop_price: i64) -> StopOrder {
         market_protection: None,
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(id + 1_000),
         fee_schedule_version: 7,
         side,
@@ -33,6 +35,8 @@ fn stop_limit(id: u128, side: Side, stop_price: i64, price: i64) -> StopOrder {
         trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(id + 1_000),
         fee_schedule_version: 7,
         side,
@@ -49,6 +53,147 @@ fn last_trade(source_seq: u64, price: i64) -> PriceReference {
         kind: PriceReferenceKind::LastTrade,
         source_seq,
         price: Price::try_new(price).unwrap(),
+    }
+}
+
+#[test]
+fn stop_quote_child_preserves_stp_identity_and_event_order_in_both_books() {
+    let mut production = ProductionOrderBook::new(policy());
+    let mut reference = ReferenceOrderBook::new();
+    let mut maker = order(10, Side::Sell, 100, 2);
+    maker.stp_key = matching_domain::StpKey::new(7);
+    production.rest(maker.clone()).unwrap();
+    reference.rest(maker).unwrap();
+    let mut stop = stop_market(11, Side::Buy, 105);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.stp_key = matching_domain::StpKey::new(7);
+    child.stp_mode = matching_domain::StpMode::CancelTaker;
+    child.quantity =
+        StopMarketQuantity::Quote(matching_domain::QuoteBudget::try_new(1000).unwrap());
+    production
+        .place_stop(stop.clone(), LogicalTime::new(1), 1)
+        .unwrap();
+    reference.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    production
+        .trigger_stops(
+            last_trade(1, 100),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    reference
+        .trigger_stops(
+            last_trade(1, 100),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    let actual = production
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    let expected = reference
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert!(
+        matches!(actual.as_slice(), [EngineEvent::StopTriggered { order_id, .. }, EngineEvent::OrderCanceled { remaining: matching_domain::OrderRemaining::Quote(q), reason: matching_domain::CancelReason::SelfTradePreventionTaker, .. }] if *order_id == OrderId::new(11) && q.get() == 1000)
+    );
+}
+
+#[test]
+fn stop_base_and_limit_children_keep_stp_events_in_both_books() {
+    for is_limit in [false, true] {
+        let mut production = ProductionOrderBook::new(policy());
+        let mut reference = ReferenceOrderBook::new();
+        let mut maker = order(10, Side::Sell, 100, 2);
+        maker.stp_key = matching_domain::StpKey::new(7);
+        production.rest(maker.clone()).unwrap();
+        reference.rest(maker).unwrap();
+        let mut stop = if is_limit {
+            stop_limit(11, Side::Buy, 105, 100)
+        } else {
+            stop_market(11, Side::Buy, 105)
+        };
+        match &mut stop {
+            StopOrder::Limit(child) => {
+                child.stp_key = matching_domain::StpKey::new(7);
+                child.stp_mode = matching_domain::StpMode::CancelTaker;
+            }
+            StopOrder::Market(child) => {
+                child.stp_key = matching_domain::StpKey::new(7);
+                child.stp_mode = matching_domain::StpMode::CancelTaker;
+            }
+        }
+        production
+            .place_stop(stop.clone(), LogicalTime::new(1), 1)
+            .unwrap();
+        reference.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+        production
+            .trigger_stops(
+                last_trade(1, 100),
+                LogicalTime::new(1),
+                1,
+                &math(),
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        reference
+            .trigger_stops(
+                last_trade(1, 100),
+                LogicalTime::new(1),
+                1,
+                &math(),
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        let actual = production
+            .trigger_stops(
+                last_trade(2, 105),
+                LogicalTime::new(1),
+                1,
+                &math(),
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        let expected = reference
+            .trigger_stops(
+                last_trade(2, 105),
+                LogicalTime::new(1),
+                1,
+                &math(),
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            matches!(actual.as_slice(), [EngineEvent::StopTriggered { order_id, .. }, EngineEvent::OrderCanceled { remaining: matching_domain::OrderRemaining::Base(q), reason: matching_domain::CancelReason::SelfTradePreventionTaker, .. }] if *order_id == OrderId::new(11) && q.get() == 1)
+        );
     }
 }
 

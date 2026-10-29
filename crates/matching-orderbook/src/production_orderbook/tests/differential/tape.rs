@@ -329,7 +329,8 @@ fn execute_tape(commands: &[Command], mut on_record: impl FnMut(StepRecord)) {
                     (Ok(reference_place), Ok(production_trades)) => {
                         // TradeEvent 必须保持实际成交顺序。
                         assert_eq!(
-                            reference_place.trades, production_trades,
+                            reference_place.trades,
+                            production_trades.to_vec(),
                             "TradeEvent tape diverged: \
                              step={step_index}, command={command:?}"
                         );
@@ -364,7 +365,7 @@ fn execute_tape(commands: &[Command], mut on_record: impl FnMut(StepRecord)) {
                                 .expect("differential expected priority overflow");
                         }
 
-                        CommandOutcome::Place(Ok(production_trades))
+                        CommandOutcome::Place(Ok(production_trades.to_vec()))
                     }
 
                     // ------------------------------------------------
@@ -445,7 +446,7 @@ fn execute_tape(commands: &[Command], mut on_record: impl FnMut(StepRecord)) {
                             production_next_before,
                             "MarketByBase consumed QueuePriority: step={step_index}"
                         );
-                        CommandOutcome::MarketByBase(Ok(production_trades))
+                        CommandOutcome::MarketByBase(Ok(production_trades.to_vec()))
                     }
                     (Err(RejectReason::DuplicateOrderId), Err(RejectReason::DuplicateOrderId)) => {
                         assert_eq!(observe_reference(&reference), reference_before);

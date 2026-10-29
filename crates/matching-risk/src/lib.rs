@@ -9,6 +9,6 @@ pub use reservation_adjustment::{
 };
 
 pub use reservation_transition::{
-    ExpectedReplacementReservation, PlannedBindingTransition, PlannedReservationTransition,
-    ReservationApplyError, ReservationRegistry,
+    ExpectedReplacementReservation, PlannedAmendAdjustment, PlannedBindingTransition,
+    PlannedReservationTransition, ReservationApplyError, ReservationRegistry,
 };

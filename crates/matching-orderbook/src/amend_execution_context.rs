@@ -25,6 +25,18 @@ pub struct AmendExecutionContext<'a> {
     pub required_reserves: Vec<AssetReserve>,
 }
 
+/// 改单与登记表归属预演的完整确定性输入。
+pub struct AmendRegistryContext<'a> {
+    /// 本次业务逻辑时间。
+    pub now: matching_domain::LogicalTime,
+    /// 当前交易时段。
+    pub current_session_id: u64,
+    /// 本次真实成交所需的身份。
+    pub trade_ids: &'a [matching_domain::TradeId],
+    /// 固定的数值、签名和资金校验上下文。
+    pub execution: &'a AmendExecutionContext<'a>,
+}
+
 impl AmendExecutionContext<'_> {
     /// 价格构造器只保证正值，此处使用本命令固定的实际市场步长。
     pub(crate) fn validate_price(&self, price: matching_domain::Price) -> Result<(), RejectReason> {

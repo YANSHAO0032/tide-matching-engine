@@ -111,6 +111,8 @@ impl ReferenceOrderBook {
         let order = LimitOrder {
             order_id: replacement.order_id,
             user_id: replacement.user_id,
+            stp_key: replacement.stp_key,
+            stp_mode: replacement.stp_mode,
             side: replacement.side,
             price: replacement.price,
             qty: replacement.qty,

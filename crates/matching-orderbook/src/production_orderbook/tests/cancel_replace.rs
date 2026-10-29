@@ -21,6 +21,8 @@ fn input(id: u128, side: Side, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(100).unwrap(),
         qty: Qty::try_new(qty).unwrap(),
@@ -99,6 +101,8 @@ fn request(new: bool, side: Side, qty: u64, tif: TimeInForce) -> CancelReplaceOr
         replacement: ReplacementOrder {
             market_id: e.market_id,
             user_id: e.user_id,
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             order_id: e.new_order_id,
             side,
             price: Price::try_new(100).unwrap(),
@@ -256,6 +260,125 @@ fn production_cancel_replace_fok_excludes_whole_old_regular_or_iceberg() {
 }
 
 #[test]
+fn production_cancel_replace_fok_stp_excludes_old_and_self_maker_atomically() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ProductionOrderBook::new(policy());
+    book.rest_with_reservation(input(1, Side::Sell, 5), reserve(1))
+        .unwrap();
+    book.rest_with_reservation(input(2, Side::Sell, 5), reserve(2))
+        .unwrap();
+    let registry = ReservationRegistry::new([reserve(1), reserve(2)]).unwrap();
+    let before = (production_snapshot(&book), registry.clone());
+    let mut replacement = request(false, Side::Buy, 5, TimeInForce::Fok);
+    replacement.replacement.stp_mode = matching_domain::StpMode::CancelMaker;
+    let result = book.plan_cancel_replace(
+        &replacement,
+        &expected(),
+        &registry,
+        &keys(),
+        context(&math, &[TradeId::new(1)]),
+    );
+    assert_eq!(
+        result.unwrap_err().reason,
+        RejectReason::FokInsufficientLiquidity
+    );
+    assert_eq!((production_snapshot(&book), registry), before);
+}
+
+#[test]
+fn cancel_replace_stp_cancel_taker_has_reference_parity_and_pending_binding() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = crate::ReferenceOrderBook::new();
+    for id in [1, 2] {
+        let order = input(id, Side::Sell, 5);
+        p.rest_with_reservation(order.clone(), reserve(id)).unwrap();
+        r.rest_with_reservation(order, reserve(id)).unwrap();
+    }
+    let mut pr = ReservationRegistry::new([reserve(1), reserve(2)]).unwrap();
+    let mut rr = pr.clone();
+    let mut replacement = request(false, Side::Buy, 5, TimeInForce::Fok);
+    replacement.replacement.stp_mode = matching_domain::StpMode::CancelTaker;
+    let pp = p
+        .plan_cancel_replace(&replacement, &expected(), &pr, &keys(), context(&math, &[]))
+        .unwrap();
+    let rc = crate::reference_orderbook::ReferencePlaceContext {
+        math: &math,
+        now: LogicalTime::new(10),
+        current_session_id: 7,
+        trade_ids: &[],
+    };
+    let rp = r
+        .plan_cancel_replace(&replacement, &expected(), &rr, &keys(), rc)
+        .unwrap();
+    let pe = p.apply_cancel_replace(&mut pr, pp).unwrap();
+    let re = r.apply_cancel_replace(&mut rr, rp).unwrap();
+    assert_eq!(pe, re);
+    assert!(
+        matches!(pe.as_slice(), [EngineEvent::OrderCanceled { reason: CancelReason::CancelReplace, .. }, EngineEvent::OrderCanceled { order_id, reason: CancelReason::SelfTradePreventionTaker, .. }] if *order_id == OrderId::new(9))
+    );
+    assert!(p.order(OrderId::new(1)).is_none());
+    assert_eq!(p.order(OrderId::new(2)).unwrap().remaining(), 5);
+    assert!(pr.is_pending_r2(ReservationId::new(101)));
+    assert_eq!(pr, rr);
+    parity(&p, &pr);
+}
+
+#[test]
+fn cancel_replace_stp_cancel_maker_moves_all_terminal_bindings_and_matches_reference() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = crate::ReferenceOrderBook::new();
+    for id in [1, 2] {
+        let order = input(id, Side::Sell, 5);
+        p.rest_with_reservation(order.clone(), reserve(id)).unwrap();
+        r.rest_with_reservation(order, reserve(id)).unwrap();
+    }
+    let mut external = input(3, Side::Sell, 5);
+    external.user_id = UserId::new(6);
+    let mut external_state = reserve(3);
+    external_state.user_id = UserId::new(6);
+    p.rest_with_reservation(external.clone(), external_state.clone())
+        .unwrap();
+    r.rest_with_reservation(external, external_state.clone())
+        .unwrap();
+    let mut pr = ReservationRegistry::new([reserve(1), reserve(2), external_state]).unwrap();
+    let mut rr = pr.clone();
+    let mut replacement = request(false, Side::Buy, 5, TimeInForce::Fok);
+    replacement.replacement.stp_mode = matching_domain::StpMode::CancelMaker;
+    let ids = [TradeId::new(1)];
+    let pp = p
+        .plan_cancel_replace(
+            &replacement,
+            &expected(),
+            &pr,
+            &keys(),
+            context(&math, &ids),
+        )
+        .unwrap();
+    let rc = crate::reference_orderbook::ReferencePlaceContext {
+        math: &math,
+        now: LogicalTime::new(10),
+        current_session_id: 7,
+        trade_ids: &ids,
+    };
+    let rp = r
+        .plan_cancel_replace(&replacement, &expected(), &rr, &keys(), rc)
+        .unwrap();
+    let pe = p.apply_cancel_replace(&mut pr, pp).unwrap();
+    let re = r.apply_cancel_replace(&mut rr, rp).unwrap();
+    assert_eq!(pe, re);
+    assert!(
+        matches!(pe.as_slice(), [EngineEvent::OrderCanceled { reason: CancelReason::CancelReplace, .. }, EngineEvent::OrderCanceled { order_id, reason: CancelReason::SelfTradePreventionMaker, .. }, EngineEvent::Trade(trade)] if *order_id == OrderId::new(2) && trade.maker_order_id == OrderId::new(3))
+    );
+    for id in [101, 102, 103] {
+        assert!(pr.is_pending_r2(ReservationId::new(id)));
+    }
+    assert_eq!(pr, rr);
+    parity(&p, &pr);
+}
+
+#[test]
 fn production_cancel_replace_post_only_filters_exclusive_old_level() {
     let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
     for side in [Side::Buy, Side::Sell] {
@@ -385,6 +508,8 @@ fn production_cancel_replace_stop_old_cleans_expiry_without_transferring_priorit
                 StopOrder::Limit(StopLimitOrder {
                     order_id: OrderId::new(1),
                     user_id: UserId::new(5),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     reservation_id: reserve(1).reservation_id,
                     fee_schedule_version: 1,
                     side: Side::Buy,
@@ -639,6 +764,8 @@ fn production_cancel_replace_apply_checks_complete_physical_book_and_registry_be
                     StopOrder::Limit(StopLimitOrder {
                         order_id: OrderId::new(88),
                         user_id: UserId::new(5),
+                        stp_key: matching_domain::StpKey::new(0),
+                        stp_mode: matching_domain::StpMode::None,
                         reservation_id: ReservationId::new(188),
                         fee_schedule_version: 1,
                         side: Side::Sell,
@@ -1189,6 +1316,8 @@ fn production_cancel_replace_stop_market_old_modes_are_unsupported_and_never_mut
             StopOrder::Market(matching_domain::StopMarketOrder {
                 order_id: OrderId::new(1),
                 user_id: UserId::new(5),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
                 reservation_id: reserve(1).reservation_id,
                 fee_schedule_version: 1,
                 side: Side::Buy,

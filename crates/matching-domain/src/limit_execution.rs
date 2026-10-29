@@ -9,6 +9,12 @@ use crate::{
 pub enum CancelReason {
     /// 分片本地批量撤单命中活动订单时终结。
     MassCancel = 1102,
+    /// 自成交防护按 CancelMaker 终结挂单。
+    SelfTradePreventionMaker = 1106,
+    /// 自成交防护按 CancelTaker 终结吃单余量。
+    SelfTradePreventionTaker = 1107,
+    /// 自成交防护按 CancelBoth 终结吃单余量。
+    SelfTradePreventionBoth = 1108,
     /// 旧订单在原子撤单替换成功时终结。
     CancelReplace = 1109,
     /// IOC 完成立即可执行成交后，取消尚未入簿的余量。

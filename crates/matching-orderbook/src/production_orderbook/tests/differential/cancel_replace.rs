@@ -163,6 +163,8 @@ fn replacement(
             replacement: ReplacementOrder {
                 market_id: expected.market_id,
                 user_id: expected.user_id,
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
                 order_id: expected.new_order_id,
                 side,
                 price: Price::try_new(price).unwrap(),
@@ -192,6 +194,7 @@ enum Command {
     AdvanceTime(LogicalTime),
     EndSession(u64),
     Reference(PriceReference),
+    Trigger(PriceReference),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -574,6 +577,31 @@ impl Harness {
                     assert!(removed.is_empty());
                 })),
             ),
+            Command::Trigger(source) => {
+                let context = || crate::TriggerRegistryContext {
+                    now,
+                    current_session_id: SESSION,
+                    math: &math,
+                    trade_ids: &ids,
+                };
+                let r = self
+                    .r
+                    .plan_trigger_stops_with_registry(*source, context(), &self.rr, |_| Ok(()))
+                    .map(|plan| {
+                        self.r
+                            .apply_trigger_stops_with_registry(&mut self.rr, plan)
+                            .unwrap()
+                    });
+                let p = self
+                    .p
+                    .plan_trigger_stops_with_registry(*source, context(), &self.pr, |_| Ok(()))
+                    .map(|plan| {
+                        self.p
+                            .apply_trigger_stops_with_registry(&mut self.pr, plan)
+                            .unwrap()
+                    });
+                (Outcome::Events(r), Outcome::Events(p))
+            }
         };
         assert_eq!(expected, actual, "step={} command={command:?}", self.step);
         if actual.failed() {
@@ -587,7 +615,7 @@ impl Harness {
             assert_eq!(self.pr, before_pr);
         } else if !matches!(
             command,
-            Command::CancelReplace { .. } | Command::MassCancel(_)
+            Command::CancelReplace { .. } | Command::MassCancel(_) | Command::Trigger(_)
         ) {
             if let Some(state) = incoming.clone() {
                 admit(&mut self.rr, &mut self.known_r, state.clone());

@@ -6,6 +6,8 @@ fn quote_market_command(id: u128, side: Side, budget: u128, ids: &[u128]) -> Com
         MarketByQuote {
             order_id: OrderId::new(id),
             user_id: UserId::new(id as u64),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             side,
             quote_budget: QuoteBudget::try_new(budget).unwrap(),
             market_protection: None,
@@ -379,6 +381,8 @@ proptest! {
         let taker = MarketByQuote {
             order_id: OrderId::new(100),
             user_id: UserId::new(100),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             side: taker_side,
             quote_budget,
             market_protection:None

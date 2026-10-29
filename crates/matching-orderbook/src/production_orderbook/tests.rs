@@ -40,6 +40,7 @@ mod query;
 mod reservation;
 mod resting;
 mod stop_trigger;
+mod stp;
 
 /// 一个价格档位的只读测试投影，不是持久化快照格式。
 #[derive(Debug, Clone, PartialEq, Eq)]

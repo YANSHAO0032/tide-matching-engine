@@ -8,15 +8,22 @@ use matching_domain::market_order::{
     maker_price_within_protection,
 };
 use matching_domain::{
-    EngineEvent, IcebergOrder, LimitImmediateExecution, LimitOrder, MarketByBase, MarketByQuote,
-    MarketMath, OrderId, Price, ProtectionSource, Qty, QueuePriority, QuoteAmount, RejectReason,
-    Side, TradeEvent, TradeId,
+    CancelReason, EngineEvent, IcebergOrder, LimitImmediateExecution, LimitOrder, MarketByBase,
+    MarketByQuote, MarketMath, OrderId, OrderRemaining, Price, ProtectionSource, Qty,
+    QueuePriority, QuoteAmount, RejectReason, Side, StpDecision, StpKey, StpMode, TradeEvent,
+    TradeId, UserId, decide_stp,
 };
 use matching_risk::ReservationState;
 
 pub(super) struct SliceRequest<'a> {
     /// 正在执行的订单标识符。
     pub id: OrderId,
+    /// 当前吃单订单的持久用户身份。
+    pub user_id: UserId,
+    /// 当前吃单订单的持久自成交防护分组身份。
+    pub stp_key: StpKey,
+    /// 只由当前吃单订单决定的自成交防护策略。
+    pub stp_mode: StpMode,
     /// 正在执行的买卖方向。
     pub side: Side,
     /// 尚待执行的基础资产数量。
@@ -46,6 +53,8 @@ pub(super) struct SlicePlan {
     pub spent: QuoteAmount,
     /// 计划结束后未使用的报价资产金额。
     pub unused: QuoteAmount,
+    /// 吃单是否已由 STP 终结，后续入口不得把同一余量挂回订单簿或再次取消。
+    pub taker_terminal: bool,
 }
 
 impl ReferenceOrderBook {
@@ -120,6 +129,7 @@ impl ReferenceOrderBook {
         let mut spent = QuoteAmount::new(0);
         let mut events = Vec::new();
         let mut fill_count = 0usize;
+        let mut taker_terminal = false;
         loop {
             if (request.budget.is_none() && remaining == 0)
                 || (request.budget.is_some() && unused.get() == 0)
@@ -164,8 +174,7 @@ impl ReferenceOrderBook {
             }
             let available = if request.budget.is_some() {
                 let math = request.math.expect("quote requests supply math");
-                // 预算不足一手时直接结束，不再规划成交；下方仅校验该预算
-                // 实际可执行的成交量，不校验尚未执行的整片数量。
+                // 预算不能支付一手时，本档不可执行，不能触发自成交防护。
                 let Some(qty) = math
                     .max_qty_for_quote(unused, price)
                     .map_err(Self::reject_quote_math_error)?
@@ -176,6 +185,69 @@ impl ReferenceOrderBook {
             } else {
                 remaining
             };
+            let maker_order = maker.original_order();
+            match decide_stp(
+                request.user_id,
+                request.stp_key,
+                request.stp_mode,
+                maker_order.user_id,
+                maker_order.stp_key,
+            ) {
+                StpDecision::NoConflict => {}
+                StpDecision::CancelTaker => {
+                    events.push(EngineEvent::OrderCanceled {
+                        order_id: request.id,
+                        remaining: if request.budget.is_some() {
+                            OrderRemaining::Quote(unused)
+                        } else {
+                            OrderRemaining::Base(
+                                Qty::try_new(remaining)
+                                    .expect("active base taker has positive remaining"),
+                            )
+                        },
+                        reason: CancelReason::SelfTradePreventionTaker,
+                    });
+                    taker_terminal = true;
+                    break;
+                }
+                StpDecision::CancelMaker => {
+                    let canceled = virtual_book.orders.remove(index);
+                    events.push(EngineEvent::OrderCanceled {
+                        order_id: canceled.original_order().order_id,
+                        remaining: OrderRemaining::Base(
+                            Qty::try_new(canceled.total_remaining())
+                                .expect("active maker has positive total remaining"),
+                        ),
+                        reason: CancelReason::SelfTradePreventionMaker,
+                    });
+                    continue;
+                }
+                StpDecision::CancelBoth => {
+                    let canceled = virtual_book.orders.remove(index);
+                    events.push(EngineEvent::OrderCanceled {
+                        order_id: canceled.original_order().order_id,
+                        remaining: OrderRemaining::Base(
+                            Qty::try_new(canceled.total_remaining())
+                                .expect("active maker has positive total remaining"),
+                        ),
+                        reason: CancelReason::SelfTradePreventionMaker,
+                    });
+                    events.push(EngineEvent::OrderCanceled {
+                        order_id: request.id,
+                        remaining: if request.budget.is_some() {
+                            OrderRemaining::Quote(unused)
+                        } else {
+                            OrderRemaining::Base(
+                                Qty::try_new(remaining)
+                                    .expect("active base taker has positive remaining"),
+                            )
+                        },
+                        reason: CancelReason::SelfTradePreventionBoth,
+                    });
+                    taker_terminal = true;
+                    break;
+                }
+            }
             let qty = Qty::try_new(available.min(maker.remaining()))?;
             if let Some(math) = request.math {
                 let value = math
@@ -241,6 +313,7 @@ impl ReferenceOrderBook {
             remaining,
             spent,
             unused,
+            taker_terminal,
         })
     }
 
@@ -306,6 +379,9 @@ impl ReferenceOrderBook {
     ) -> Result<SlicePlan, RejectReason> {
         self.plan_slices(SliceRequest {
             id: order.order_id,
+            user_id: order.user_id,
+            stp_key: order.stp_key,
+            stp_mode: order.stp_mode,
             side: order.side,
             remaining,
             limit: Some(order.price),
@@ -326,11 +402,67 @@ impl ReferenceOrderBook {
         self.check_duplicate(order.order_id)?;
         math.trade_notional(order.price, order.qty)
             .map_err(Self::reject_quote_math_error)?;
-        let plan = self.plan_limit_slices(&order, Some(math), order.qty.get(), false)?;
-        if fok && plan.remaining != 0 {
+        let mut plan = self.plan_limit_slices(&order, Some(math), order.qty.get(), false)?;
+        if fok && plan.taker_terminal {
+            let terminal = plan
+                .events
+                .last()
+                .cloned()
+                .expect("terminal plan has cancellation");
+            let maker_cancel = if matches!(
+                terminal,
+                EngineEvent::OrderCanceled {
+                    reason: CancelReason::SelfTradePreventionBoth,
+                    ..
+                }
+            ) {
+                plan.events
+                    .iter()
+                    .rev()
+                    .find(|event| {
+                        matches!(
+                            event,
+                            EngineEvent::OrderCanceled {
+                                reason: CancelReason::SelfTradePreventionMaker,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+            plan.orders = self.orders.clone();
+            plan.next_priority = self.next_priority;
+            plan.events.clear();
+            if let Some(EngineEvent::OrderCanceled { order_id, .. }) = maker_cancel {
+                let index = plan
+                    .orders
+                    .iter()
+                    .position(|maker| maker.original_order().order_id == order_id)
+                    .expect("planned STP maker remains active");
+                let maker = plan.orders.remove(index);
+                plan.events.push(EngineEvent::OrderCanceled {
+                    order_id,
+                    remaining: OrderRemaining::Base(Qty::try_new(maker.total_remaining())?),
+                    reason: CancelReason::SelfTradePreventionMaker,
+                });
+            }
+            let reason = match terminal {
+                EngineEvent::OrderCanceled { reason, .. } => reason,
+                _ => unreachable!("terminal cancellation"),
+            };
+            plan.events.push(EngineEvent::OrderCanceled {
+                order_id: order.order_id,
+                remaining: OrderRemaining::Base(order.qty),
+                reason,
+            });
+            plan.remaining = order.qty.get();
+        }
+        if fok && plan.remaining != 0 && !plan.taker_terminal {
             return Err(RejectReason::FokInsufficientLiquidity);
         }
-        let canceled = if plan.remaining == 0 {
+        let canceled = if plan.remaining == 0 || plan.taker_terminal {
             None
         } else {
             Some(Qty::try_new(plan.remaining)?)
@@ -377,6 +509,7 @@ impl ReferenceOrderBook {
         math: Option<&MarketMath>,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        order.validate_stp_mode()?;
         self.check_duplicate(order.order_id)?;
         if let Some(math) = math {
             math.trade_notional(order.price, order.qty)
@@ -395,7 +528,7 @@ impl ReferenceOrderBook {
             next_stop_priority: self.next_stop_priority,
             reference_prices: self.reference_prices.clone(),
         };
-        if plan.remaining != 0 {
+        if plan.remaining != 0 && !plan.taker_terminal {
             let priority = virtual_book.allocate_slice_priority()?;
             let mut payload = order.clone();
             payload.qty = Qty::try_new(plan.remaining)?;
@@ -409,7 +542,7 @@ impl ReferenceOrderBook {
         }
         plan.orders = virtual_book.orders;
         plan.next_priority = virtual_book.next_priority;
-        if peak.is_some() && plan.remaining != order.qty.get() {
+        if peak.is_some() && !plan.taker_terminal && plan.remaining != order.qty.get() {
             plan.events.push(if plan.remaining == 0 {
                 EngineEvent::OrderFilled {
                     order_id: order.order_id,
@@ -500,6 +633,9 @@ impl ReferenceOrderBook {
         };
         let plan = self.plan_slices(SliceRequest {
             id: incoming.order_id,
+            user_id: incoming.user_id,
+            stp_key: incoming.stp_key,
+            stp_mode: incoming.stp_mode,
             side: incoming.side,
             remaining: incoming.qty.get(),
             limit: None,
@@ -531,6 +667,9 @@ impl ReferenceOrderBook {
         };
         let plan = self.plan_slices(SliceRequest {
             id: incoming.order_id,
+            user_id: incoming.user_id,
+            stp_key: incoming.stp_key,
+            stp_mode: incoming.stp_mode,
             side: incoming.side,
             remaining: 0,
             limit: None,

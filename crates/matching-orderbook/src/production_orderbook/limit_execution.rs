@@ -4,7 +4,7 @@ use super::{FillPlan, ProductionOrderBook};
 use crate::{IncomingOrder, PriceLevel};
 use matching_domain::{
     LimitImmediateExecution, LimitOrder, MarketMath, MathError, Price, Qty, RejectReason, Side,
-    TradeEvent, TradeId,
+    TradeId,
 };
 
 impl ProductionOrderBook {
@@ -26,11 +26,17 @@ impl ProductionOrderBook {
         &mut self,
         order: LimitOrder,
         trade_ids: &[TradeId],
-    ) -> Result<Vec<TradeEvent>, RejectReason> {
+    ) -> Result<matching_domain::LimitGtcExecution, RejectReason> {
+        order.validate_stp_mode()?;
+        if order.stp_mode != matching_domain::StpMode::None {
+            return self
+                .place_limit_gtc_with_events(order, trade_ids)
+                .map(matching_domain::LimitGtcExecution::from_events);
+        }
         if self.has_iceberg_maker(order.side) {
             return self
                 .place_limit_gtc_with_events(order, trade_ids)
-                .map(Self::trades_only);
+                .map(matching_domain::LimitGtcExecution::from_events);
         }
         let order_id = order.order_id;
 
@@ -169,7 +175,12 @@ impl ProductionOrderBook {
             );
         }
 
-        Ok(trades)
+        Ok(matching_domain::LimitGtcExecution::from_events(
+            trades
+                .into_iter()
+                .map(matching_domain::EngineEvent::Trade)
+                .collect(),
+        ))
     }
     /// 仅当限价单不会立即作为吃单方时，将其挂入本侧先进先出尾部。
     ///
@@ -177,6 +188,7 @@ impl ProductionOrderBook {
     /// 消耗 QueuePriority。正值由领域类型保证；市场价格步长/数量步长对齐须由调用方校验。
     /// 不接受市价单或 IOC/FOK 标志组合。
     pub fn place_limit_post_only(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
+        order.validate_stp_mode()?;
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -241,6 +253,18 @@ impl ProductionOrderBook {
         trade_ids: &[TradeId],
         fill_or_kill: bool,
     ) -> Result<LimitImmediateExecution, RejectReason> {
+        order.validate_stp_mode()?;
+        if fill_or_kill && order.stp_mode != matching_domain::StpMode::None {
+            return self.place_fok_stp(order, math, trade_ids);
+        }
+        if !fill_or_kill && order.stp_mode != matching_domain::StpMode::None {
+            let order_id = order.order_id;
+            let (events, canceled) =
+                self.execute_limit_stp(order, trade_ids, Some(math), None, true)?;
+            return Ok(LimitImmediateExecution::from_events(
+                order_id, events, canceled,
+            ));
+        }
         if self.has_iceberg_maker(order.side) {
             return self.place_immediate_iceberg(order, math, trade_ids, fill_or_kill);
         }

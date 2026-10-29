@@ -11,7 +11,7 @@
 | 冰山 replacement | GTC、GTC + PostOnly；峰值严格小于总量且满足 lot |
 | 资金过渡 | ReuseOld，无调整或真实签名调整；ReplaceWithNew，真实签名的新预留 |
 
-StopMarket 两种计量模式的旧单，以及所有 Market/Stop replacement 均不支持。PostOnly 仅可配 GTC；非 GTC 冰山、reduce-only 和依赖尚未实现的 STP、PriceBand、MarketState 的请求不可降级接入。可表达但不支持的组合返回 `InvalidOrderCombination (2001)`；当前 sum type 本身不提供 Market/Stop replacement。
+StopMarket 两种计量模式的旧单，以及所有 Market/Stop replacement 均不支持。PostOnly 仅可配 GTC；非 GTC 冰山、reduce-only、未实现的 STP 模式及依赖 PriceBand、MarketState 的请求不可降级接入。可表达但不支持的组合返回 `InvalidOrderCombination (2001)`；当前 sum type 本身不提供 Market/Stop replacement。
 
 活动旧身份缺失或 command 的所有权/执行市场不符返回 `OrderNotFound (2010)`；活动旧单缺失或不匹配 shadow 返回 `InvalidReservation (4002)`。replacement 的用户/市场必须与命令一致，新 OrderId 不得等于 old 或任何其他活动身份，否则按结构错误或 `DuplicateOrderId (2008)` 拒绝。市场身份由可信执行上下文及旧 shadow 核对，不能从新 token 反推。
 
@@ -21,9 +21,9 @@ Reference 的 `ReferenceBookWithout` 独立过滤自身 Vec 的完整 old 身份
 
 两侧依次核对旧身份及 shadow/registry parity、replacement 结构、真实 MarketMath 的 tick/lot/峰值/精确本金、逻辑时间/session、BookWithout 的 FOK/PostOnly、逐笔与累计 checked 本金、补量、余量挂单、优先级、TradeId 容量及终结 maker shadow。随后才验证金融过渡，并预计算全部终结订单的绑定批次。资金需求来自可信调用者按实际资产、最大费用和安全量计算的 `ExpectedReplacementReservation`，不能复制 token 覆盖量作为需求。
 
-当前 replacement 和执行 context 没有市价保护、STP 或市场价格带输入。因此这里验证真实限价边界，不声称验证了不可达的保护分支。已有保护市价入口由既有回归保留。
+replacement 自带 STP 身份和模式；扫描时排除旧订单，处理其他实际冲突挂单。当前 replacement 和执行 context 没有市价保护或市场价格带输入，因此这里只验证真实限价边界。已有保护市价入口由既有回归保留。
 
-Reference 在可丢弃副本完成自身正常 Place 预演，真实 Apply 比较完整簿及 registry 前态后安装已验证后态。Production 冻结自身片成交、FIFO/价档后态、Arena 槽位/free-list、expiry、两个 allocator 和 registry，再直接消费计划。两套计划、maker 扫描、BookWithout 和提交不共享。
+Reference 在可丢弃副本完成自身正常 Place 预演，真实 Apply 比较完整簿及 registry 前态后安装已验证后态。Production 使用自己的价格索引与 FIFO 规划；启用 STP 时在排除旧单的候选副本完成撮合和归属规划，再安装冻结后态。两套计划、maker 扫描、BookWithout 和提交不共享。
 
 Apply 前态漂移返回 `ReservationApplyError::StateChanged`，属于必须停止处理的不变量错误。首次真实写入后不再执行正常业务拒绝、重新验签或回滚。TradeId 不足沿用调用方契约，在首次写入前 fail-stop。普通旧单和全成 maker 的槽位释放顺序由生产计划预测并在提交核对。新单仅实际 rest 才取得新 QueuePriority；补量也使用新 priority。旧 QueuePriority/StopPriority 不转移或返还。
 
@@ -33,7 +33,7 @@ Apply 前态漂移返回 `ReservationApplyError::StateChanged`，属于必须停
 
 - ReuseOld 保留 ReservationId，将预留重绑新 OrderId，并以 checked 运算推进一次版本。原覆盖不足时必须有绑定最终 CommandId、旧 OrderId、身份、版本、费率及资产的真实 Ed25519 adjustment；不释放旧预留。
 - ReplaceWithNew 严格验证 RiskKeySet 中的已加载公钥、新 token 的规范签名字节、身份、费率、资产集合和足额覆盖；新 ReservationId 不得与活动、PendingR2 或 Released 历史冲突。旧金融 status/version/reserves/fee 全部保持，仅归属转 PendingR2；新预留版本从零开始。
-- 全成 maker 与不 rest 的 replacement 也预先规划为 PendingR2；实际 residual 保持 ActiveOrder。批次和金融过渡在不可见候选中组合，通过全部校验后才提交真实状态。
+- 全成或由自成交防护终结的 maker 与不 rest 的 replacement 也预先规划为 PendingR2；实际 residual 保持 ActiveOrder。批次和金融过渡在不可见候选中组合，通过全部校验后才提交真实状态。
 
 稳定编号为 `CancelReason::CancelReplace = 1109`、`ReservationReleaseReason::FilledRemainder = 1301`、`UserCancel = 1302`。后两项在本功能中均不发射。只有未来真实 R2 在扣减并计算剩余预留后才能决定释放；本实现没有 R2、SettlementDelta、费用扣减或账户余额计算。此用户裁定取代初始任务书中的提前 Released/释放事件顺序。
 

@@ -1,6 +1,6 @@
 //! 生产撤单替换的只读组合计划与无业务拒绝提交。
 //!
-//! 预检始终借用排除旧身份的生产视图；提交只消费冻结的片成交、链尾和资金后态。
+//! 预检使用排除旧身份的生产视图；提交消费冻结的片计划或 STP 候选后态及资金后态。
 
 use super::{ProductionOrderBook, RestPlan, expiry::RegularExpiryIndex, iceberg::IcebergPlan};
 use crate::{
@@ -85,7 +85,7 @@ enum OldLocation {
 /// 不可伪造的生产撤单替换计划；固定完整前态和全部确定性提交输入。
 ///
 /// 普通片成交由真实生产价格索引、先进先出链与独立补量扫描生成，
-/// 不保存参考簿或调用其计划/撮合。资金后态同时包含旧单、全成挂单和新单的归属。
+/// 不保存参考簿或调用其计划/撮合。资金后态包含旧单、终结挂单和新单的归属。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionCancelReplacePlan {
     /// 计划生成时的完整物理订单簿快照，用于提交前漂移检测。
@@ -94,6 +94,27 @@ pub struct ProductionCancelReplacePlan {
     before_registry: ReservationRegistry,
     /// 预先验证的提交后金融登记表状态。
     after_registry: ReservationRegistry,
+    /// 按订单策略冻结的独立生产提交计划。
+    commit: ProductionReplaceCommit,
+}
+
+/// 普通撮合沿用物理片计划；STP 预演使用完整生产簿后态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProductionReplaceCommit {
+    /// 已冻结的常规片成交与剩余挂单计划。
+    Standard(Box<ProductionStandardReplace>),
+    /// 已完成所有 STP 动作及结构校验的候选后态。
+    Stp {
+        /// 排除旧单并执行替换单后的完整生产簿。
+        after_book: Box<ProductionOrderBook>,
+        /// 旧单取消及替换执行的原序事件。
+        events: Vec<EngineEvent>,
+    },
+}
+
+/// 非 STP 替换的既有生产提交输入。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductionStandardReplace {
     /// 待移除旧订单的身份。
     old_id: OrderId,
     /// 旧单在普通簿或止损簿中的实际位置。
@@ -200,6 +221,8 @@ impl ProductionOrderBook {
         let accepted = LimitOrder {
             order_id: replacement.order_id,
             user_id: replacement.user_id,
+            stp_key: replacement.stp_key,
+            stp_mode: replacement.stp_mode,
             side: replacement.side,
             price: replacement.price,
             qty: replacement.qty,
@@ -238,6 +261,131 @@ impl ProductionOrderBook {
         }
 
         let view = self.book_without(request.old_order_id)?;
+        if accepted.stp_mode != matching_domain::StpMode::None {
+            if flags.post_only {
+                view.preflight_post_only(&accepted)?;
+            }
+            let mut after_book = self.clone();
+            match old_location {
+                OldLocation::Regular(_) => {
+                    after_book
+                        .cancel(request.old_order_id)
+                        .expect("planned old order");
+                }
+                OldLocation::Stop(_) => {
+                    after_book
+                        .cancel_stop(request.old_order_id)
+                        .expect("planned old stop");
+                }
+            }
+            let matching_events = if let Some(peak) = peak {
+                let iceberg = IcebergOrder::try_new(accepted.clone(), peak)?;
+                if flags.post_only {
+                    after_book.place_iceberg_post_only(iceberg, context.math)?;
+                    Vec::new()
+                } else {
+                    after_book.place_iceberg(iceberg, context.math, context.trade_ids)?
+                }
+            } else if flags.post_only {
+                after_book.place_limit_post_only(accepted.clone())?;
+                Vec::new()
+            } else {
+                match tif {
+                    TimeInForce::Ioc => after_book
+                        .place_limit_ioc(accepted.clone(), context.math, context.trade_ids)?
+                        .events()
+                        .to_vec(),
+                    TimeInForce::Fok => after_book
+                        .place_limit_fok(accepted.clone(), context.math, context.trade_ids)?
+                        .events()
+                        .to_vec(),
+                    _ => after_book.place_limit_timed_with_events(
+                        accepted.clone(),
+                        tif,
+                        context.now,
+                        context.current_session_id,
+                        context.trade_ids,
+                    )?,
+                }
+            };
+            let mut total = matching_domain::QuoteAmount::new(0);
+            for event in &matching_events {
+                if let EngineEvent::Trade(trade) = event {
+                    total = total.checked_add(
+                        context
+                            .math
+                            .trade_notional(trade.price, trade.qty)
+                            .map_err(Self::reject_quote_math_error)?,
+                    )?;
+                }
+            }
+            let mut terminal_ids = self
+                .orders
+                .keys()
+                .copied()
+                .filter(|id| *id != request.old_order_id && !after_book.orders.contains_key(id))
+                .collect::<Vec<_>>();
+            terminal_ids.sort_unstable();
+            let mut terminal = Vec::new();
+            for id in &terminal_ids {
+                terminal.push(
+                    self.reservations
+                        .get(id)
+                        .ok_or(RejectReason::InvalidReservation)?,
+                );
+            }
+            let transition = registry
+                .plan_transition(keys, expected, &request.reservation_transition)
+                .map_err(|rejection| rejection.reason)?;
+            let active = transition.active_state().clone();
+            let mut after_registry = registry.clone();
+            after_registry
+                .apply_transition(transition)
+                .expect("fresh replacement transition");
+            if let Some(index) = after_book.orders.get(&accepted.order_id).copied() {
+                if peak.is_none() {
+                    let node = after_book
+                        .arena
+                        .get_mut(index)
+                        .expect("replacement residual");
+                    let remaining = Qty::try_new(node.total_remaining())?;
+                    node.amend_regular_in_place(accepted.clone(), remaining, node.time_in_force());
+                }
+                assert!(
+                    after_book
+                        .reservations
+                        .insert(accepted.order_id, active.clone())
+                        .is_none()
+                );
+            } else {
+                terminal.push(&active);
+            }
+            let bindings = after_registry.plan_binding_transitions(terminal, [])?;
+            after_registry
+                .apply_binding_transition(bindings)
+                .expect("fresh replacement bindings");
+            after_registry.validate_order_bindings(
+                after_book
+                    .reservations
+                    .iter()
+                    .map(|(id, state)| (*id, state)),
+            )?;
+            let mut events = vec![EngineEvent::OrderCanceled {
+                order_id: request.old_order_id,
+                remaining: OrderRemaining::Base(Qty::try_new(old_remaining)?),
+                reason: CancelReason::CancelReplace,
+            }];
+            events.extend(matching_events);
+            return Ok(ProductionCancelReplacePlan {
+                before: ProductionSnapshot::capture(self),
+                before_registry: registry.clone(),
+                after_registry,
+                commit: ProductionReplaceCommit::Stp {
+                    after_book: Box::new(after_book),
+                    events,
+                },
+            });
+        }
         let fills = view.plan_limit_fills(&accepted, context.math, flags.post_only)?;
         if tif == TimeInForce::Fok && fills.base_remaining != 0 {
             return Err(RejectReason::FokInsufficientLiquidity);
@@ -326,17 +474,19 @@ impl ProductionOrderBook {
             before: ProductionSnapshot::capture(self),
             before_registry: registry.clone(),
             after_registry,
-            old_id: request.old_order_id,
-            old_location,
-            old_remaining: Qty::try_new(old_remaining)?,
-            accepted,
-            peak,
-            tif,
-            fills,
-            trade_ids,
-            residual,
-            residual_slot,
-            active_reservation,
+            commit: ProductionReplaceCommit::Standard(Box::new(ProductionStandardReplace {
+                old_id: request.old_order_id,
+                old_location,
+                old_remaining: Qty::try_new(old_remaining)?,
+                accepted,
+                peak,
+                tif,
+                fills,
+                trade_ids,
+                residual,
+                residual_slot,
+                active_reservation,
+            })),
         })
     }
 
@@ -352,6 +502,20 @@ impl ProductionOrderBook {
         if ProductionSnapshot::capture(self) != plan.before || *registry != plan.before_registry {
             return Err(ReservationApplyError::StateChanged);
         }
+        let ProductionCancelReplacePlan {
+            before: _,
+            before_registry: _,
+            after_registry,
+            commit,
+        } = plan;
+        let plan = match commit {
+            ProductionReplaceCommit::Stp { after_book, events } => {
+                *self = *after_book;
+                *registry = after_registry;
+                return Ok(events);
+            }
+            ProductionReplaceCommit::Standard(plan) => *plan,
+        };
         match plan.old_location {
             OldLocation::Regular(index) => {
                 assert_eq!(self.orders.get(&plan.old_id), Some(&index));
@@ -365,7 +529,7 @@ impl ProductionOrderBook {
                 assert_eq!(actual, priority);
             }
         }
-        *registry = plan.after_registry;
+        *registry = after_registry;
         let mut events = vec![EngineEvent::OrderCanceled {
             order_id: plan.old_id,
             remaining: OrderRemaining::Base(plan.old_remaining),

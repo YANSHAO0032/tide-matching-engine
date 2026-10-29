@@ -34,6 +34,7 @@ impl ReferenceOrderBook {
     ///
     /// 不修改订单簿，不检查或分配 QueuePriority。
     pub(super) fn preflight_post_only(&self, order: &LimitOrder) -> Result<(), RejectReason> {
+        order.validate_stp_mode()?;
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
@@ -83,7 +84,8 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        if self.has_iceberg_maker(order.side) {
+        order.validate_stp_mode()?;
+        if self.has_iceberg_maker(order.side) || order.stp_mode != matching_domain::StpMode::None {
             return self.iceberg_immediate(order, math, trade_ids, false);
         }
         let plan = self.preflight_limit_immediate(&order, math)?;
@@ -107,7 +109,8 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        if self.has_iceberg_maker(order.side) {
+        order.validate_stp_mode()?;
+        if self.has_iceberg_maker(order.side) || order.stp_mode != matching_domain::StpMode::None {
             return self.iceberg_immediate(order, math, trade_ids, true);
         }
         let plan = self.preflight_limit_immediate(&order, math)?;

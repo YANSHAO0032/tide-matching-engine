@@ -37,6 +37,41 @@ fn shadow(input: &LimitOrder) -> ReservationState {
 }
 
 #[test]
+fn iceberg_reprice_stp_cancel_taker_matches_reference() {
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = ReferenceOrderBook::new();
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut target = order(1, Side::Sell, 120, 10);
+    target.stp_key = matching_domain::StpKey::new(7);
+    target.stp_mode = matching_domain::StpMode::CancelTaker;
+    let ice = IcebergOrder::try_new(target.clone(), Qty::try_new(3).unwrap()).unwrap();
+    p.place_iceberg_post_only_with_reservation(ice.clone(), &math, shadow(&target))
+        .unwrap();
+    r.place_iceberg_post_only_with_reservation(ice, &math, shadow(&target))
+        .unwrap();
+    let mut maker = order(2, Side::Buy, 110, 3);
+    maker.stp_key = matching_domain::StpKey::new(7);
+    p.rest_with_reservation(maker.clone(), shadow(&maker))
+        .unwrap();
+    r.rest_with_reservation(maker.clone(), shadow(&maker))
+        .unwrap();
+    let mut amend = command(&target);
+    amend.new_price = Some(Price::try_new(100).unwrap());
+    let pe = p
+        .amend_regular_with_events(&amend, LogicalTime::new(1), 9, &[])
+        .unwrap();
+    let re = r
+        .amend_regular_with_events(&amend, LogicalTime::new(1), 9, &[])
+        .unwrap();
+    assert_eq!(pe, re);
+    assert!(
+        matches!(pe.as_slice(), [EngineEvent::OrderAmended { .. }, EngineEvent::OrderCanceled { remaining: matching_domain::OrderRemaining::Base(q), reason: matching_domain::CancelReason::SelfTradePreventionTaker, .. }] if q.get() == 10)
+    );
+    assert!(p.order(target.order_id).is_none());
+    assert_eq!(p.order(maker.order_id).unwrap().remaining(), 3);
+}
+
+#[test]
 fn amend_iceberg_matrix_preserves_only_nonincreasing_exposure() {
     for side in [Side::Buy, Side::Sell] {
         for (total, peak, price, retained, visible, hidden) in [

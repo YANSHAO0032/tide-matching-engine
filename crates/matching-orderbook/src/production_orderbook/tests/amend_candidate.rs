@@ -130,6 +130,8 @@ fn iceberg_and_stop_candidates_keep_every_observable_state_unchanged() {
         trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(13),
         user_id: UserId::new(24),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(13),
         fee_schedule_version: 1,
         side: Side::Buy,

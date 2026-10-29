@@ -24,6 +24,8 @@ fn setup(side: Side, qty: u64) -> (ReferenceOrderBook, ReservationRegistry) {
         StopOrder::Limit(StopLimitOrder {
             order_id: OrderId::new(3),
             user_id: UserId::new(5),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             reservation_id: state(3).reservation_id,
             fee_schedule_version: 1,
             side,

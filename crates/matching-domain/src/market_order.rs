@@ -13,12 +13,75 @@ pub struct MarketByBase {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
+    /// 账户层固定的自成交防护分组身份。
+    pub stp_key: crate::StpKey,
+    /// 本市价订单作为吃单时决定冲突处理的策略。
+    pub stp_mode: crate::StpMode,
     /// 买入或卖出的撮合方向。
     pub side: Side,
     /// 请求成交的严格正基础资产数量。
     pub qty: Qty,
     /// 可选的用户价格保护输入。
     pub market_protection: Option<MarketProtection>,
+}
+
+/// 基础数量市价单的有序业务事件及成交投影。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketByBaseExecution {
+    /// 完整保留撮合和自成交取消原序的业务事件。
+    events: Vec<EngineEvent>,
+    /// 从业务事件中按原序提取的真实成交。
+    trades: Vec<TradeEvent>,
+}
+
+/// 可保留完整生命周期事件及成交投影的限价 GTC 执行结果。
+pub type LimitGtcExecution = MarketByBaseExecution;
+
+impl MarketByBaseExecution {
+    /// 从已有原序业务事件构造结果；不会产生新的撮合行为。
+    pub fn from_events(events: Vec<EngineEvent>) -> Self {
+        let trades = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Trade(trade) => Some(trade.clone()),
+                _ => None,
+            })
+            .collect();
+        Self { events, trades }
+    }
+
+    /// 按原序返回成交及取消等完整业务事件。
+    pub fn events(&self) -> &[EngineEvent] {
+        &self.events
+    }
+
+    /// 按原序返回真实成交投影。
+    pub fn trades(&self) -> &[TradeEvent] {
+        &self.trades
+    }
+}
+
+impl std::ops::Deref for MarketByBaseExecution {
+    type Target = [TradeEvent];
+    fn deref(&self) -> &Self::Target {
+        &self.trades
+    }
+}
+
+impl IntoIterator for MarketByBaseExecution {
+    type Item = TradeEvent;
+    type IntoIter = std::vec::IntoIter<TradeEvent>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.trades.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a MarketByBaseExecution {
+    type Item = &'a TradeEvent;
+    type IntoIter = std::slice::Iter<'a, TradeEvent>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.trades.iter()
+    }
 }
 
 /// 按报价币预算提交的市价订单输入。
@@ -33,12 +96,30 @@ pub struct MarketByQuote {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
+    /// 账户层固定的自成交防护分组身份。
+    pub stp_key: crate::StpKey,
+    /// 本市价订单作为吃单时决定冲突处理的策略。
+    pub stp_mode: crate::StpMode,
     /// 买入或卖出的撮合方向。
     pub side: Side,
     /// 不含手续费的严格正初始报价资产预算。
     pub quote_budget: QuoteBudget,
     /// 可选的用户价格保护输入。
     pub market_protection: Option<MarketProtection>,
+}
+
+impl MarketByBase {
+    /// 在扫描或修改可执行流动性前验证自成交模式可以在当前阶段执行。
+    pub fn validate_stp_mode(&self) -> Result<(), RejectReason> {
+        self.stp_mode.submission_rejection().map_or(Ok(()), Err)
+    }
+}
+
+impl MarketByQuote {
+    /// 在扫描或修改可执行流动性前验证自成交模式可以在当前阶段执行。
+    pub fn validate_stp_mode(&self) -> Result<(), RejectReason> {
+        self.stp_mode.submission_rejection().map_or(Ok(()), Err)
+    }
 }
 
 /// 市价命令可选的用户保护参数。
@@ -453,6 +534,8 @@ pub fn slippage_protection_price(
 /// 不负责检查 spent_quote + unused_quote 与初始预算的关系。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketByQuoteExecution {
+    /// 按撮合顺序保留成交、自成交取消及冰山生命周期事件。
+    events: Vec<EngineEvent>,
     /// 按撮合顺序产生的成交事件。
     trades: Vec<TradeEvent>,
     /// 已实际使用的报价资产本金。
@@ -468,11 +551,39 @@ impl MarketByQuoteExecution {
         spent_quote: QuoteAmount,
         unused_quote: QuoteAmount,
     ) -> Self {
+        let events = trades.iter().cloned().map(EngineEvent::Trade).collect();
         Self {
+            events,
             trades,
             spent_quote,
             unused_quote,
         }
+    }
+
+    /// 从原序事件构造结果，保留报价金额和真实成交投影。
+    pub fn from_events(
+        events: Vec<EngineEvent>,
+        spent_quote: QuoteAmount,
+        unused_quote: QuoteAmount,
+    ) -> Self {
+        let trades = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Trade(trade) => Some(trade.clone()),
+                _ => None,
+            })
+            .collect();
+        Self {
+            events,
+            trades,
+            spent_quote,
+            unused_quote,
+        }
+    }
+
+    /// 按原序读取全部业务事件。
+    pub fn events(&self) -> &[EngineEvent] {
+        &self.events
     }
 
     /// 按产生顺序借用成交事件。
