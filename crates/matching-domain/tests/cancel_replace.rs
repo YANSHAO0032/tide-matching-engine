@@ -42,6 +42,8 @@ fn command() -> CancelReplaceOrder {
         replacement: ReplacementOrder {
             market_id: MarketId(6),
             user_id: UserId(5),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             order_id: OrderId(4),
             side: Side::Buy,
             price: Price::try_new(100).unwrap(),

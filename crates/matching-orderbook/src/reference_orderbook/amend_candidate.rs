@@ -100,7 +100,110 @@ pub(crate) enum ReferenceAmendPlan {
     Stop(StopAmendPlan),
 }
 
+/// 独立参考改单与资金归属的一次性完整后态计划。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceAmendRegistryPlan {
+    /// 预演前参考簿。
+    before_book: ReferenceOrderBook,
+    /// 预演前真实金融登记表。
+    before_registry: matching_risk::ReservationRegistry,
+    /// 改单后的参考簿。
+    after_book: ReferenceOrderBook,
+    /// 验签调整和终结归属后的登记表。
+    after_registry: matching_risk::ReservationRegistry,
+    /// 原序改单、成交和取消事件。
+    events: Vec<EngineEvent>,
+}
+
 impl ReferenceOrderBook {
+    /// 在独立参考副本中预演改单、签名调整和终结预留归属。
+    pub fn plan_amend_with_registry(
+        &self,
+        amend: &AmendOrder,
+        registry: &matching_risk::ReservationRegistry,
+        context: crate::AmendRegistryContext<'_>,
+    ) -> Result<ReferenceAmendRegistryPlan, RejectReason> {
+        registry
+            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        let mut after_book = self.clone();
+        let events = after_book.amend_with_context(
+            amend,
+            context.now,
+            context.current_session_id,
+            context.trade_ids,
+            context.execution,
+        )?;
+        let mut after_registry = registry.clone();
+        if let Some(token) = &amend.reservation_adjustment {
+            let state = self
+                .reservations
+                .get(&amend.order_id)
+                .ok_or(RejectReason::InvalidReservation)?;
+            let expected = matching_risk::ExpectedAmendReservation {
+                command_id: context.execution.command_id,
+                reservation_id: state.reservation_id,
+                order_id: amend.order_id,
+                user_id: amend.user_id,
+                market_id: amend.market_id,
+                fee_schedule_version: context.execution.fee_schedule_version,
+                fee_tier_id: context.execution.fee_tier_id,
+                required_reserves: context.execution.required_reserves.clone(),
+            };
+            let adjustment = after_registry.plan_amend_adjustment(
+                context.execution.risk_keys,
+                &expected,
+                token,
+            )?;
+            after_registry
+                .apply_amend_adjustment(adjustment)
+                .expect("fresh verified amend adjustment");
+        }
+        let mut ids = self
+            .reservations
+            .iter()
+            .filter(|(id, _)| !after_book.reservations.contains_key(id))
+            .map(|(id, state)| (*id, state.reservation_id))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by_key(|(id, _)| *id);
+        let transition = after_registry.plan_binding_transitions(
+            ids.iter().map(|(_, id)| {
+                after_registry
+                    .get(*id)
+                    .expect("verified terminal reservation")
+            }),
+            [],
+        )?;
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("fresh amend bindings");
+        after_registry.validate_order_bindings(
+            after_book
+                .reservations
+                .iter()
+                .map(|(id, state)| (*id, state)),
+        )?;
+        Ok(ReferenceAmendRegistryPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
+    }
+
+    /// 校验完整前态并原子安装参考改单和资金归属后态。
+    pub fn apply_amend_with_registry(
+        &mut self,
+        registry: &mut matching_risk::ReservationRegistry,
+        plan: ReferenceAmendRegistryPlan,
+    ) -> Result<Vec<EngineEvent>, matching_risk::ReservationApplyError> {
+        if *self != plan.before_book || *registry != plan.before_registry {
+            return Err(matching_risk::ReservationApplyError::StateChanged);
+        }
+        *self = plan.after_book;
+        *registry = plan.after_registry;
+        Ok(plan.events)
+    }
     /// 使用实际市场数值规则、候选资金需求和已加载公钥执行普通、冰山或未触发止损改单。
     ///
     /// 预留调整先在副本中验签和检查版本容量；任何后续簿预检失败均丢弃副本。
@@ -192,8 +295,17 @@ impl ReferenceOrderBook {
                 .trade_notional(plan.new_price, plan.new_remaining)
                 .map_err(Self::reject_quote_math_error)?;
             if plan.new_price != plan.old_price {
+                let original = self
+                    .orders
+                    .iter()
+                    .find(|maker| maker.original_order().order_id == plan.order_id)
+                    .expect("validated reference Amend order must remain active")
+                    .original_order();
                 self.plan_slices(SliceRequest {
                     id: plan.order_id,
+                    user_id: original.user_id,
+                    stp_key: original.stp_key,
+                    stp_mode: original.stp_mode,
                     side: plan.side,
                     remaining: plan.new_remaining.get(),
                     limit: Some(plan.new_price),
@@ -359,6 +471,9 @@ impl ReferenceOrderBook {
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let mut slice = self.plan_slices(SliceRequest {
             id: plan.order_id,
+            user_id: amended.user_id,
+            stp_key: amended.stp_key,
+            stp_mode: amended.stp_mode,
             side: plan.side,
             remaining: plan.new_remaining.get(),
             limit: Some(plan.new_price),
@@ -377,12 +492,12 @@ impl ReferenceOrderBook {
             "insufficient TradeIds for preflighted reference Amend reprice"
         );
 
-        let residual = if slice.remaining == 0 {
+        let residual = if slice.remaining == 0 || slice.taker_terminal {
             None
         } else {
             Some(Qty::try_new(slice.remaining)?)
         };
-        let residual_priority = if slice.remaining == 0 {
+        let residual_priority = if residual.is_none() {
             None
         } else {
             if slice.next_priority >= u128::MAX - super::PRIORITY_GUARD {
@@ -400,12 +515,17 @@ impl ReferenceOrderBook {
         }
 
         let mut ids = trade_ids.iter().copied();
+        let preserve_order = amended.stp_mode != matching_domain::StpMode::None;
         let mut trades = Vec::with_capacity(required_trade_ids);
         let mut order_events = Vec::new();
         for mut event in slice.events {
             if let EngineEvent::Trade(trade) = &mut event {
                 trade.trade_id = ids.next().expect("preflighted TradeId");
-                trades.push(event);
+                if preserve_order {
+                    order_events.push(event);
+                } else {
+                    trades.push(event);
+                }
             } else {
                 order_events.push(event);
             }
@@ -425,7 +545,7 @@ impl ReferenceOrderBook {
             ));
         }
 
-        if !trades.is_empty() {
+        if !slice.taker_terminal && required_trade_ids > 0 {
             order_events.push(if slice.remaining == 0 {
                 EngineEvent::OrderFilled {
                     order_id: plan.order_id,

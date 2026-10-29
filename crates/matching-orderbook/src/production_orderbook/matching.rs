@@ -22,6 +22,18 @@ impl ProductionOrderBook {
         incoming: &mut IncomingOrder,
         trade_id: TradeId,
     ) -> Result<Option<TradeEvent>, RejectReason> {
+        if incoming.original_order().stp_mode != matching_domain::StpMode::None {
+            return Err(RejectReason::InvalidOrderCombination);
+        }
+        self.execute_next_fill_trade_after_stp(incoming, trade_id)
+    }
+
+    /// 调用方已对当前可成交挂单完成 STP 决策后执行单笔成交。
+    pub(super) fn execute_next_fill_trade_after_stp(
+        &mut self,
+        incoming: &mut IncomingOrder,
+        trade_id: TradeId,
+    ) -> Result<Option<TradeEvent>, RejectReason> {
         if self.has_iceberg_maker(incoming.original_order().side) {
             return self.execute_next_fill_iceberg(incoming, trade_id);
         }
@@ -307,6 +319,9 @@ impl ProductionOrderBook {
         incoming: &mut IncomingOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<TradeEvent>, RejectReason> {
+        if incoming.original_order().stp_mode != matching_domain::StpMode::None {
+            return Err(RejectReason::InvalidOrderCombination);
+        }
         if self.has_iceberg_maker(incoming.original_order().side) {
             return self.execute_fill_trades_iceberg(incoming, trade_ids);
         }

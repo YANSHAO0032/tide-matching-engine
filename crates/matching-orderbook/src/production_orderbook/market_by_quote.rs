@@ -38,10 +38,19 @@ impl ProductionOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<MarketByQuoteExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming.stp_mode != matching_domain::StpMode::None {
+            let execution = self.execute_market_quote_stp(incoming, None, math, trade_ids)?;
+            return Ok(MarketByQuoteExecution::from_events(
+                execution.events().to_vec(),
+                execution.spent_quote(),
+                execution.unused_quote(),
+            ));
+        }
         if self.has_iceberg_maker(incoming.side) {
             let execution = self.execute_market_quote_iceberg(incoming, math, None, trade_ids)?;
-            return Ok(MarketByQuoteExecution::new(
-                Self::trades_only(execution.events().to_vec()),
+            return Ok(MarketByQuoteExecution::from_events(
+                execution.events().to_vec(),
                 execution.spent_quote(),
                 execution.unused_quote(),
             ));
@@ -181,6 +190,10 @@ impl ProductionOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming.stp_mode != matching_domain::StpMode::None {
+            return self.execute_market_quote_stp(incoming, Some(context), math, trade_ids);
+        }
         if self.has_iceberg_maker(incoming.side) {
             return self.execute_market_quote_iceberg(incoming, math, Some(context), trade_ids);
         }

@@ -103,6 +103,8 @@ fn regular_candidate_is_read_only_before_any_amend_commit_exists() {
     let input = LimitOrder {
         order_id: OrderId::new(11),
         user_id: UserId::new(22),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Buy,
         price: Price::try_new(90).unwrap(),
         qty: Qty::try_new(10).unwrap(),
@@ -136,6 +138,8 @@ fn iceberg_and_stop_candidates_keep_every_observable_state_unchanged() {
     let iceberg_input = LimitOrder {
         order_id: OrderId::new(12),
         user_id: UserId::new(23),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Sell,
         price: Price::try_new(110).unwrap(),
         qty: Qty::try_new(10).unwrap(),
@@ -152,6 +156,8 @@ fn iceberg_and_stop_candidates_keep_every_observable_state_unchanged() {
         trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(13),
         user_id: UserId::new(24),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(13),
         fee_schedule_version: 1,
         side: Side::Buy,
@@ -201,6 +207,8 @@ fn missing_or_wrong_quantity_mode_rejects_without_reference_state_drift() {
     let input = LimitOrder {
         order_id: OrderId::new(14),
         user_id: UserId::new(25),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Buy,
         price: Price::try_new(90).unwrap(),
         qty: Qty::try_new(10).unwrap(),
@@ -257,6 +265,8 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     let canceled = LimitOrder {
         order_id: OrderId::new(2),
         user_id: UserId::new(2),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Buy,
         price: Price::try_new(90).unwrap(),
         qty: Qty::try_new(1).unwrap(),
@@ -272,6 +282,8 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     let filled = LimitOrder {
         order_id: OrderId::new(3),
         user_id: UserId::new(3),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Sell,
         price: Price::try_new(100).unwrap(),
         qty: Qty::try_new(1).unwrap(),
@@ -281,6 +293,8 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     let mut incoming = IncomingOrder::new(LimitOrder {
         order_id: OrderId::new(4),
         user_id: UserId::new(4),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Buy,
         price: Price::try_new(100).unwrap(),
         qty: Qty::try_new(1).unwrap(),
@@ -291,6 +305,8 @@ fn terminal_or_unknown_order_amend_reports_order_not_found_before_reservation_lo
     let expired = LimitOrder {
         order_id: OrderId::new(5),
         user_id: UserId::new(5),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Buy,
         price: Price::try_new(90).unwrap(),
         qty: Qty::try_new(1).unwrap(),

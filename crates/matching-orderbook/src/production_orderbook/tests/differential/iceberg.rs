@@ -211,6 +211,8 @@ fn ice_tape(seed: [u8; 32], length: usize) -> Vec<IceCommand> {
                 9 => IceCommand::ProtectedBase(MarketByBase {
                     order_id: OrderId::new(id),
                     user_id: UserId::new(1),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     side,
                     qty: Qty::try_new(total).unwrap(),
                     market_protection: Some(MarketProtection {
@@ -221,6 +223,8 @@ fn ice_tape(seed: [u8; 32], length: usize) -> Vec<IceCommand> {
                 10 => IceCommand::ProtectedQuote(MarketByQuote {
                     order_id: OrderId::new(id),
                     user_id: UserId::new(1),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
                     side,
                     quote_budget: QuoteBudget::try_new(u128::from(total) * 100).unwrap(),
                     market_protection: Some(MarketProtection {

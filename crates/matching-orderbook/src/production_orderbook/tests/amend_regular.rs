@@ -49,6 +49,63 @@ fn rest(book: &mut ProductionOrderBook, input: &LimitOrder) {
         .unwrap();
 }
 
+#[test]
+fn amend_reprice_cancel_taker_keeps_maker_and_removes_taker() {
+    let mut book = ProductionOrderBook::new(policy());
+    let mut maker = order(1, Side::Buy, 101, 3);
+    maker.stp_key = matching_domain::StpKey::new(7);
+    let mut target = order(2, Side::Sell, 105, 5);
+    target.stp_key = matching_domain::StpKey::new(7);
+    target.stp_mode = matching_domain::StpMode::CancelTaker;
+    rest(&mut book, &maker);
+    rest(&mut book, &target);
+    let mut amend = command(&target);
+    amend.new_price = Some(Price::try_new(100).unwrap());
+    let events = book
+        .amend_regular_with_events(&amend, LogicalTime::new(1), 9, &[])
+        .unwrap();
+    assert!(
+        matches!(events.as_slice(), [EngineEvent::OrderAmended { .. }, EngineEvent::OrderCanceled { order_id, remaining: matching_domain::OrderRemaining::Base(q), reason: matching_domain::CancelReason::SelfTradePreventionTaker }] if *order_id == target.order_id && q.get() == 5)
+    );
+    assert!(book.order(target.order_id).is_none());
+    assert_eq!(book.order(maker.order_id).unwrap().remaining(), 3);
+    valid(&book);
+}
+
+#[test]
+fn amend_reprice_cancel_maker_then_fill_matches_reference_event_order() {
+    let mut production = ProductionOrderBook::new(policy());
+    let mut reference = crate::ReferenceOrderBook::new();
+    let mut own = order(1, Side::Buy, 101, 2);
+    own.stp_key = matching_domain::StpKey::new(7);
+    let mut external = order(2, Side::Buy, 101, 3);
+    external.stp_key = matching_domain::StpKey::new(8);
+    let mut target = order(3, Side::Sell, 105, 3);
+    target.stp_key = matching_domain::StpKey::new(7);
+    target.stp_mode = matching_domain::StpMode::CancelMaker;
+    for input in [&own, &external, &target] {
+        production
+            .rest_with_reservation(input.clone(), shadow(input))
+            .unwrap();
+        reference
+            .rest_with_reservation(input.clone(), shadow(input))
+            .unwrap();
+    }
+    let mut amend = command(&target);
+    amend.new_price = Some(Price::try_new(100).unwrap());
+    let actual = production
+        .amend_regular_with_events(&amend, LogicalTime::new(1), 9, &[TradeId::new(1)])
+        .unwrap();
+    let expected = reference
+        .amend_regular_with_events(&amend, LogicalTime::new(1), 9, &[TradeId::new(1)])
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert!(
+        matches!(actual.as_slice(), [EngineEvent::OrderAmended { .. }, EngineEvent::OrderCanceled { order_id, .. }, EngineEvent::Trade(trade), EngineEvent::OrderFilled { .. }] if *order_id == own.order_id && trade.maker_order_id == external.order_id)
+    );
+    valid(&production);
+}
+
 fn valid(book: &ProductionOrderBook) {
     assert_eq!(validate_book(book), Ok(()));
     assert_eq!(book.validate_regular_expiry(), Ok(()));
@@ -121,6 +178,8 @@ fn seed_unrelated(book: &mut ProductionOrderBook) {
         trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: input.order_id,
         user_id: input.user_id,
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(92),
         fee_schedule_version: 1,
         side: input.side,

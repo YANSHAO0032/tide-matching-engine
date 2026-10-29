@@ -63,6 +63,23 @@ pub struct ReferencePlacePlan {
     events: Vec<EngineEvent>,
 }
 
+/// 完整冻结市价执行、报价余量及预留归属的独立参考计划。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceMarketPlan {
+    /// 预演前参考簿。
+    before_book: ReferenceOrderBook,
+    /// 预演前金融登记表。
+    before_registry: ReservationRegistry,
+    /// 执行后的参考簿。
+    after_book: ReferenceOrderBook,
+    /// 终结归属迁移后的登记表。
+    after_registry: ReservationRegistry,
+    /// 原序业务事件。
+    events: Vec<EngineEvent>,
+    /// 报价模式使用金额；基础模式为空。
+    quote_amounts: Option<(matching_domain::QuoteAmount, matching_domain::QuoteAmount)>,
+}
+
 /// 与新到订单金融接管无关的完整只读下单预演，供普通下单与撤单替换共同使用。
 ///
 /// 已固定结构、时间、市场数值、撮合、余量挂单和终结挂单快照；不分配真实优先级。
@@ -73,13 +90,131 @@ pub(super) struct ReferencePlacePreflight {
     after: ReferenceOrderBook,
     /// 已通过结构与数值验证的普通限价订单载荷。
     accepted: LimitOrder,
-    /// 在本次预演中完全成交而必须转入 PendingR2 的 maker 金融快照。
+    /// 在本次预演中成交或自成交防护终结、必须转入 PendingR2 的 maker 金融快照。
     terminal_makers: Vec<ReservationState>,
     /// 正常下单链产生的原序事件。
     events: Vec<EngineEvent>,
 }
 
 impl ReferenceOrderBook {
+    /// 在独立参考副本中预演市价执行及全部终结预留归属。
+    pub fn plan_market_with_registry(
+        &self,
+        request: crate::MarketRegistryOrder,
+        state: ReservationState,
+        registry: &ReservationRegistry,
+        context: crate::MarketRegistryContext<'_>,
+    ) -> Result<ReferenceMarketPlan, RejectReason> {
+        let (id, user) = match &request {
+            crate::MarketRegistryOrder::Base(order) => (order.order_id, order.user_id),
+            crate::MarketRegistryOrder::Quote(order) => (order.order_id, order.user_id),
+        };
+        self.validate_new_reservation(id, user, &state)?;
+        registry.validate_order_bindings(
+            self.reservations
+                .iter()
+                .map(|(id, state)| (*id, state))
+                .chain(std::iter::once((id, &state))),
+        )?;
+        let mut after_book = self.clone();
+        let (events, quote_amounts) = match request {
+            crate::MarketRegistryOrder::Base(order) => {
+                let events = if let Some(protection) = context.protection {
+                    after_book.execute_market_by_base_with_protection(
+                        order,
+                        protection,
+                        context.math,
+                        context.trade_ids,
+                    )?
+                } else {
+                    after_book
+                        .execute_market_by_base(order, context.trade_ids)?
+                        .events()
+                        .to_vec()
+                };
+                (events, None)
+            }
+            crate::MarketRegistryOrder::Quote(order) => {
+                if let Some(protection) = context.protection {
+                    let execution = after_book.execute_market_by_quote_with_protection(
+                        order,
+                        protection,
+                        context.math,
+                        context.trade_ids,
+                    )?;
+                    (
+                        execution.events().to_vec(),
+                        Some((execution.spent_quote(), execution.unused_quote())),
+                    )
+                } else {
+                    let execution = after_book.execute_market_by_quote(
+                        order,
+                        context.math,
+                        context.trade_ids,
+                    )?;
+                    (
+                        execution.events().to_vec(),
+                        Some((execution.spent_quote(), execution.unused_quote())),
+                    )
+                }
+            }
+        };
+        let mut total = matching_domain::QuoteAmount::new(0);
+        for event in &events {
+            if let EngineEvent::Trade(trade) = event {
+                total = total.checked_add(
+                    context
+                        .math
+                        .trade_notional(trade.price, trade.qty)
+                        .map_err(Self::reject_quote_math_error)?,
+                )?;
+            }
+        }
+        let mut terminal = vec![&state];
+        for maker in &self.orders {
+            let id = maker.original_order().order_id;
+            if !after_book.contains_active_order(id) {
+                terminal.push(
+                    self.reservations
+                        .get(&id)
+                        .ok_or(RejectReason::InvalidReservation)?,
+                );
+            }
+        }
+        let transition = registry.plan_binding_transitions(terminal, [])?;
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("fresh market binding plan");
+        after_registry.validate_order_bindings(
+            after_book
+                .reservations
+                .iter()
+                .map(|(id, state)| (*id, state)),
+        )?;
+        Ok(ReferenceMarketPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+            quote_amounts,
+        })
+    }
+
+    /// 校验前态并提交市价结果与预留归属。
+    pub fn apply_market_with_registry(
+        &mut self,
+        registry: &mut ReservationRegistry,
+        plan: ReferenceMarketPlan,
+    ) -> Result<crate::MarketRegistryResult, ReservationApplyError> {
+        if *self != plan.before_book || *registry != plan.before_registry {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        *self = plan.after_book;
+        *registry = plan.after_registry;
+        Ok((plan.events, plan.quote_amounts))
+    }
     /// 在零真实写入的普通下单预演中收集所有终结归属并验证整批计划。
     ///
     /// 新到订单的真实金融状态须已登记为其 ActiveOrder；任何终结挂单缺少

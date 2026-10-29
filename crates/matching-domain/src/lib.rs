@@ -52,6 +52,8 @@ pub mod side;
 pub mod stop_order;
 /// 未触发 Stop 的市场本地触发优先级值。
 pub mod stop_priority;
+/// 自成交防护身份、吃单方策略和纯决策。
+pub mod stp;
 /// 有效期策略参数。
 pub mod time_in_force;
 /// 实际成交的最小载荷。
@@ -123,6 +125,8 @@ pub use stop_order::{
 };
 /// 未触发 Stop 的市场本地触发优先级。
 pub use stop_priority::StopPriority;
+/// 自成交防护的纯身份判断与策略结果。
+pub use stp::{StpDecision, StpKey, StpMode, decide_stp};
 /// 订单有效期策略。
 pub use time_in_force::TimeInForce;
 /// 一笔实际成交的载荷。
@@ -135,5 +139,6 @@ pub use market_math::{MarketMath, MathConfigError, MathError};
 
 /// 市价输入、报价执行结果与保护参数的常用重导出。
 pub use market_order::{
-    MarketByBase, MarketByQuote, MarketByQuoteExecution, MarketProtection, ProtectionSource,
+    LimitGtcExecution, MarketByBase, MarketByBaseExecution, MarketByQuote, MarketByQuoteExecution,
+    MarketProtection, ProtectionSource,
 };

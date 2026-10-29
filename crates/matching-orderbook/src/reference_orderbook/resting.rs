@@ -29,6 +29,7 @@ impl ReferenceOrderBook {
     ///
     /// 失败时不修改现有订单、剩余量或 next_priority。
     pub fn rest(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
+        order.validate_stp_mode()?;
         // 必须先检查重复标识符，即使计数器已经耗尽也是如此。
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);

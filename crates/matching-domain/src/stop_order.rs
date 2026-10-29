@@ -32,6 +32,10 @@ pub struct StopLimitOrder {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
+    /// 触发 child 继承的自成交防护分组身份。
+    pub stp_key: crate::StpKey,
+    /// 触发 child 继承的吃单方自成交防护策略。
+    pub stp_mode: crate::StpMode,
     /// 接收阶段锁定、触发拒绝时必须释放的预留身份。
     pub reservation_id: ReservationId,
     /// 接收阶段固定的费率版本。
@@ -61,6 +65,10 @@ pub struct StopMarketOrder {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
+    /// 触发 child 继承的自成交防护分组身份。
+    pub stp_key: crate::StpKey,
+    /// 触发 child 继承的吃单方自成交防护策略。
+    pub stp_mode: crate::StpMode,
     /// 接收阶段锁定、触发拒绝时必须释放的预留身份。
     pub reservation_id: ReservationId,
     /// 接收阶段固定的费率版本。
@@ -87,6 +95,10 @@ pub enum StopOrder {
 }
 
 impl StopOrder {
+    /// 在写入 StopBook 前拒绝尚未冻结 child 执行规则的自成交模式。
+    pub fn validate_stp_mode(&self) -> Result<(), crate::RejectReason> {
+        self.stp_mode().submission_rejection().map_or(Ok(()), Err)
+    }
     /// 返回本单所属的触发来源。
     pub fn trigger_reference(&self) -> crate::PriceReferenceKind {
         match self {
@@ -115,6 +127,22 @@ impl StopOrder {
         match self {
             Self::Limit(order) => order.side,
             Self::Market(order) => order.side,
+        }
+    }
+
+    /// 返回触发 child 必须继承的自成交防护分组身份。
+    pub fn stp_key(&self) -> crate::StpKey {
+        match self {
+            Self::Limit(order) => order.stp_key,
+            Self::Market(order) => order.stp_key,
+        }
+    }
+
+    /// 返回触发 child 必须继承的吃单方自成交防护策略。
+    pub fn stp_mode(&self) -> crate::StpMode {
+        match self {
+            Self::Limit(order) => order.stp_mode,
+            Self::Market(order) => order.stp_mode,
         }
     }
 
@@ -168,6 +196,8 @@ mod tests {
             market_protection: None,
             order_id: OrderId::new(7),
             user_id: UserId::new(8),
+            stp_key: crate::StpKey::new(0),
+            stp_mode: crate::StpMode::None,
             reservation_id: ReservationId::new(9),
             fee_schedule_version: 2,
             side: Side::Buy,

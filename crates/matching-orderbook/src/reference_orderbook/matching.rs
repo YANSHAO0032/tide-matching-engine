@@ -80,6 +80,9 @@ impl ReferenceOrderBook {
         &mut self,
         incoming: &mut IncomingOrder,
     ) -> Result<Option<(OrderId, Price, Qty)>, RejectReason> {
+        if incoming.original_order().stp_mode != matching_domain::StpMode::None {
+            return Err(RejectReason::InvalidOrderCombination);
+        }
         if self.has_iceberg_maker(incoming.original_order().side) {
             return self
                 .execute_slice_fills(incoming, true)
@@ -123,6 +126,9 @@ impl ReferenceOrderBook {
         &mut self,
         incoming: &mut IncomingOrder,
     ) -> Result<Vec<(OrderId, Price, Qty)>, RejectReason> {
+        if incoming.original_order().stp_mode != matching_domain::StpMode::None {
+            return Err(RejectReason::InvalidOrderCombination);
+        }
         if self.has_iceberg_maker(incoming.original_order().side) {
             return self.execute_slice_fills(incoming, false);
         }

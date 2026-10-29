@@ -211,6 +211,8 @@ mod tests {
                 trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
                 order_id: id,
                 user_id: UserId::new(4),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
                 reservation_id: ReservationId::new(1),
                 fee_schedule_version: 2,
                 side: matching_domain::Side::Buy,

@@ -8,6 +8,8 @@ fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(100).unwrap(),
         qty: Qty::try_new(qty).unwrap(),
@@ -288,6 +290,8 @@ fn quote_dust_stops_before_unexecuted_maker_quantity_validation() {
     let input = MarketByQuote {
         order_id: OrderId::new(3),
         user_id: UserId::new(3),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side: Side::Buy,
         quote_budget: matching_domain::QuoteBudget::try_new(1).unwrap(),
         market_protection: None,
@@ -400,7 +404,7 @@ fn legacy_trade_only_paths_keep_refresh_fifo_and_visible_depth() {
             book.rest(order(2, maker_side, 2)).unwrap();
             let input = order(3, side, 6);
             let trades = match mode {
-                0 => book.place_limit_gtc(input, &ids()).unwrap(),
+                0 => book.place_limit_gtc(input, &ids()).unwrap().to_vec(),
                 1 => book
                     .execute_fill_trades(&mut IncomingOrder::new(input), &ids())
                     .unwrap(),
@@ -409,18 +413,23 @@ fn legacy_trade_only_paths_keep_refresh_fifo_and_visible_depth() {
                         MarketByBase {
                             order_id: input.order_id,
                             user_id: input.user_id,
+                            stp_key: matching_domain::StpKey::new(0),
+                            stp_mode: matching_domain::StpMode::None,
                             side,
                             qty: input.qty,
                             market_protection: None,
                         },
                         &ids(),
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .to_vec(),
                 3 => book
                     .execute_market_by_quote(
                         MarketByQuote {
                             order_id: input.order_id,
                             user_id: input.user_id,
+                            stp_key: matching_domain::StpKey::new(0),
+                            stp_mode: matching_domain::StpMode::None,
                             side,
                             quote_budget: matching_domain::QuoteBudget::try_new(600).unwrap(),
                             market_protection: None,

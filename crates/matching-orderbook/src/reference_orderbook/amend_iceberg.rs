@@ -55,6 +55,9 @@ impl ReferenceOrderBook {
         }
         let mut slice = self.plan_slices(SliceRequest {
             id: p.order_id,
+            user_id: original.user_id,
+            stp_key: original.stp_key,
+            stp_mode: original.stp_mode,
             side: p.side,
             remaining: p.new_remaining.get(),
             limit: Some(p.new_price),
@@ -78,7 +81,8 @@ impl ReferenceOrderBook {
             .position(|e| e.original_order().order_id == p.order_id)
             .expect("virtual iceberg");
         slice.orders.remove(position);
-        if slice.remaining > 0 {
+        let preserve_order = original.stp_mode != matching_domain::StpMode::None;
+        if slice.remaining > 0 && !slice.taker_terminal {
             if slice.next_priority >= u128::MAX - PRIORITY_GUARD {
                 return Err(RejectReason::PrioritySpaceExhaustion);
             }
@@ -104,12 +108,16 @@ impl ReferenceOrderBook {
         for mut event in slice.events {
             if let EngineEvent::Trade(trade) = &mut event {
                 trade.trade_id = *ids.next().expect("planned TradeId");
-                events.push(event);
+                if preserve_order {
+                    order_events.push(event);
+                } else {
+                    events.push(event);
+                }
             } else {
                 order_events.push(event);
             }
         }
-        if count > 0 {
+        if count > 0 && !slice.taker_terminal {
             order_events.push(if slice.remaining == 0 {
                 EngineEvent::OrderFilled {
                     order_id: p.order_id,

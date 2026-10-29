@@ -202,7 +202,9 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
         batch.push(reduction(base + 8));
         batch.push(reduction(old));
         batch.push(Command::Place(input(base + 5000, Side::Buy, 99, 12)));
-        batch.push(Command::Place(input(base + 5001, Side::Sell, 99, 18)));
+        let mut stp_place = input(base + 5001, Side::Sell, 99, 18);
+        stp_place.stp_mode = matching_domain::StpMode::CancelMaker;
+        batch.push(Command::Place(stp_place));
         batch.push(Command::Rest(
             input(base + 5002, Side::Sell, 112, 12),
             gtd(now + 5),
@@ -238,6 +240,11 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
             Side::Buy,
             now + 20,
         )));
+        batch.push(Command::Trigger(PriceReference {
+            kind: PriceReferenceKind::LastTrade,
+            source_seq: block * 10_000 + 2,
+            price: Price::try_new(121).unwrap(),
+        }));
         batch.push(Command::MassCancel(ShardCancelScope::User {
             user_id: UserId::new(5),
         }));
@@ -292,6 +299,10 @@ struct Coverage {
     mass_canceled: usize,
     /// 成功匹配空集合的批量撤单次数。
     mass_cancel_empty: usize,
+    /// 实际触发自成交防护的撤单事件次数。
+    stp_canceled: usize,
+    /// 止损子订单实际触发的次数。
+    triggered: usize,
 }
 
 impl Coverage {
@@ -346,6 +357,28 @@ impl Coverage {
             .iter()
             .filter(|e| matches!(e, EngineEvent::Trade(_)))
             .count();
+        self.stp_canceled += result
+            .outcome
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    EngineEvent::OrderCanceled {
+                        reason: matching_domain::CancelReason::SelfTradePreventionMaker
+                            | matching_domain::CancelReason::SelfTradePreventionTaker
+                            | matching_domain::CancelReason::SelfTradePreventionBoth,
+                        ..
+                    }
+                )
+            })
+            .count();
+        self.triggered += result
+            .outcome
+            .events()
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::StopTriggered { .. }))
+            .count();
         if let Outcome::Expired(Ok(expired)) = &result.outcome {
             self.expired += expired.len();
         }
@@ -364,6 +397,8 @@ impl Coverage {
                 && self.references > 0
                 && self.mass_canceled > 0
                 && self.mass_cancel_empty > 0
+                && self.stp_canceled > 0
+                && self.triggered > 0
         );
     }
 }

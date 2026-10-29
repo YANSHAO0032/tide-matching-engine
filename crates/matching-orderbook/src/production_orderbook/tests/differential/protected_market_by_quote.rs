@@ -13,6 +13,8 @@ fn quote(
     MarketByQuote {
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         quote_budget: QuoteBudget::try_new(budget).unwrap(),
         market_protection: protection,

@@ -19,6 +19,8 @@ fn order(id: u128, side: Side, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(100).unwrap(),
         qty: Qty::try_new(qty).unwrap(),
@@ -97,6 +99,8 @@ fn command(new_reservation: bool, side: Side, qty: u64, tif: TimeInForce) -> Can
         replacement: ReplacementOrder {
             market_id: expected.market_id,
             user_id: expected.user_id,
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             order_id: expected.new_order_id,
             side,
             price: Price::try_new(100).unwrap(),
@@ -432,6 +436,8 @@ fn cancel_replace_stop_limit_loses_stop_expiry_and_allocates_only_regular_priori
         StopOrder::Limit(StopLimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(5),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             reservation_id: state(1).reservation_id,
             fee_schedule_version: 1,
             side: Side::Buy,
@@ -952,6 +958,8 @@ fn cancel_replace_rejects_both_stop_market_old_modes_without_changing_stop_or_ex
             StopOrder::Market(matching_domain::StopMarketOrder {
                 order_id: OrderId::new(1),
                 user_id: UserId::new(5),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
                 reservation_id: state(1).reservation_id,
                 fee_schedule_version: 1,
                 side: Side::Buy,

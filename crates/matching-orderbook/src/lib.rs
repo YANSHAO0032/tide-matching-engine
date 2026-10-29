@@ -10,7 +10,13 @@
 mod amend_execution_context;
 /// 进入撮合流程但尚未挂单的最小运行态。
 pub mod incoming_order;
-pub use amend_execution_context::AmendExecutionContext;
+mod market_registry;
+mod trigger_registry_context;
+pub use amend_execution_context::{AmendExecutionContext, AmendRegistryContext};
+/// 资金接管后的市价订单及可选保护上下文。
+pub use market_registry::{MarketRegistryContext, MarketRegistryOrder, MarketRegistryResult};
+/// Stop 触发及预留归属预演所需的确定性上下文。
+pub use trigger_registry_context::TriggerRegistryContext;
 /// 参考簿与生产簿共享的只读市价计划数据；不含撮合算法。
 mod market_plan;
 /// 保存稳定槽位与后进先出空闲链表的 Arena 容器。

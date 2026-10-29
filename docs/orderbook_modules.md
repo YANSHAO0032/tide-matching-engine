@@ -87,13 +87,21 @@
 
 撤单替换领域输入位于 `matching-domain/src/cancel_replace.rs`，新预留的规范签名字节位于 `reservation_token.rs`。`matching-risk/src/reservation_transition.rs` 持有真实登记表及不可伪造的金融/归属计划，区分 ActiveOrder 与 PendingR2；订单终结不伪装成金融释放。两套簿各自规划、核对完整前态后提交，不共享过滤、撮合或提交算法。`tests/cancel_replace/` 固定约束和原子性；`tests/differential/cancel_replace/` 保存持续历史的完整混合磁带和独立性质断言。
 
+## 自成交防护
+
+领域模块 `matching-domain/src/stp.rs` 定义身份键、模式和纯决策函数。活动订单保存身份键与模式，止损触发的子订单和撤单替换的新订单携带各自输入的身份；改单沿用原订单身份。相同用户始终构成冲突，不同用户仅在非零身份键相同时构成冲突；实际动作只由 taker 的模式决定。`DecrementAndCancel` 当前在订单校验时拒绝；`StpMode` 的稳定 wire 数字尚未分配。
+
+参考簿独立扫描自身向量，生产簿沿价格档位和队列扫描；两者均先判断价格及保护边界，再处理冲突。报价预算不足以在当前价格成交一手时，该档不可执行，不触发防护撤单。`CancelMaker` 移除挂单全部余量并继续，`CancelTaker` 终结主动单，`CancelBoth` 先输出 maker 撤单再输出 taker 撤单。冰山撤单包含隐藏余量。报价预算主动单的撤单事件以 `OrderRemaining::Quote` 表示实际剩余预算，不把预算转换为基础数量。FOK 先在只读候选中模拟全部动作，不足时不提交；撤单替换的扫描排除旧订单。
+
+完整订单执行入口返回包含撤单与成交的原序事件；按基础数量执行的结果和限价 GTC 结果同时提供成交投影。仅能返回成交的底层逐笔接口在遇到启用防护的主动单时拒绝，以免丢失撤单事件。带登记表的下单、市价、改单、止损触发和撤单替换计划在候选副本中核验金融快照及订单归属，实际终结的身份迁入 PendingR2；这不是资金释放，也不会生成虚构的 `ReservationReleased`。
+
 ## 未触发止损订单
 
 未触发止损订单不进入常规价格档位、Arena 或常规订单索引。生产簿将它们放在独立 StopBook，档位键为触发价与来源：买方按触发价由低到高、卖方由高到低读取；同来源同价位按独立 StopPriority 的递增顺序读取。StopPriority 与常规 QueuePriority 使用相同的高水位保护规则，但维护完全独立的市场本地计数器。
 
 StopBook 同时保存订单位置索引与触发前到期索引。GTD 按 LogicalTime 到期，DAY 按交易时段到期；索引引用包含订单标识和止损价位位置，删除、取消或到期后会同步移除引用。参考簿故意使用 Vec 与稳定排序或扫描实现相同外部语义，避免复用生产 StopBook 算法。
 
-每个可触发参考来源保存最近价格和严格递增的来源序号。首次更新只建立基线；价格上升按低到高收集跨越区间内的买方止损，价格下降按高到低收集卖方止损。收集时先从 StopBook 和到期索引删除，再按内部先进先出顺序执行 child。每个 child 先经过本地 Trigger-R1；拒绝时产生 `StopTriggered`、`TriggeredOrderRejected` 与 `ReservationReleased`，不会产生 Trade 或第二个 `CommandRejected`。通过预检的 child 复用常规限价或市价撮合入口；child 成交会更新最近成交价并继续收集后续止损。预留、费率和保护的具体状态由调用方提供的本地、可重放验证器检查，不访问网络或本机时钟。
+每个可触发参考来源保存最近价格和严格递增的来源序号。首次更新只建立基线；价格上升按低到高收集跨越区间内的买方止损，价格下降按高到低收集卖方止损。收集时先从 StopBook 和到期索引删除，再按内部先进先出顺序执行 child。每个 child 先经过本地 Trigger-R1；拒绝时产生 `StopTriggered`、`TriggeredOrderRejected`，不会产生 Trade 或第二个 `CommandRejected`。旧的不含登记表入口仍暴露历史 `ReservationReleased` 事件；登记表入口遵循 PendingR2 契约，不产生该事件。通过预检的 child 复用常规限价或市价撮合入口；child 成交会更新最近成交价并继续收集后续止损。预留、费率和保护的具体状态由调用方提供的本地、可重放验证器检查，不访问网络或本机时钟。
 
 生产簿将止损容器、取消和到期入口放在 `production_orderbook/stop_orders.rs`，将参考价跨越、Trigger-R1、child 执行和级联队列放在 `production_orderbook/stop_trigger.rs`。参考簿以同名子模块实现对应职责，但保留其 Vec 扫描与稳定排序，绝不调用生产 StopBook 或生产撮合实现。两个根模块只保留订单簿状态、构造和共享查询，使订单类型边界与限价、市价、冰山模块保持一致。
 

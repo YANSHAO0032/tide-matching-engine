@@ -45,11 +45,17 @@ impl ProductionOrderBook {
         &mut self,
         incoming: MarketByBase,
         trade_ids: &[TradeId],
-    ) -> Result<Vec<TradeEvent>, RejectReason> {
+    ) -> Result<matching_domain::MarketByBaseExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming.stp_mode != matching_domain::StpMode::None {
+            return self
+                .execute_market_base_stp(incoming, None, trade_ids)
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
         if self.has_iceberg_maker(incoming.side) {
             return self
                 .execute_market_base_iceberg(incoming, None, trade_ids)
-                .map(Self::trades_only);
+                .map(matching_domain::MarketByBaseExecution::from_events);
         }
         let plan = self.preflight_market_by_base(&incoming)?;
 
@@ -76,7 +82,9 @@ impl ProductionOrderBook {
         assert_eq!(remaining, plan.remaining);
         assert_eq!(trades.len(), plan.trade_count);
 
-        Ok(trades)
+        Ok(matching_domain::MarketByBaseExecution::from_events(
+            trades.into_iter().map(EngineEvent::Trade).collect(),
+        ))
     }
 
     /// 按命令开始时固定的保护边界执行 MarketByBase。
@@ -91,6 +99,10 @@ impl ProductionOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming.stp_mode != matching_domain::StpMode::None {
+            return self.execute_market_base_stp(incoming, Some((context, math)), trade_ids);
+        }
         if self.has_iceberg_maker(incoming.side) {
             return self.execute_market_base_iceberg(incoming, Some((context, math)), trade_ids);
         }

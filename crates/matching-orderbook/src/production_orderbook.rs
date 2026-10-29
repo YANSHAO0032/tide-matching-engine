@@ -20,14 +20,18 @@ mod market_by_base;
 mod market_by_quote;
 mod mass_cancel;
 mod matching;
+mod reservation_place;
 mod resting;
 mod stop_orders;
 mod stop_trigger;
 
+pub use amend_candidate::ProductionAmendRegistryPlan;
 pub use cancel_replace::{ProductionCancelReplaceContext, ProductionCancelReplacePlan};
 pub use cancel_replace_view::ProductionBookWithout;
 use expiry::RegularExpiryIndex;
 pub use mass_cancel::ProductionMassCancelPlan;
+pub use reservation_place::{ProductionMarketPlan, ProductionPlaceOrder, ProductionPlacePlan};
+pub use stop_trigger::ProductionTriggerRegistryPlan;
 
 /// 指明已预检的余量将追加到既有档位还是新建档位。
 ///

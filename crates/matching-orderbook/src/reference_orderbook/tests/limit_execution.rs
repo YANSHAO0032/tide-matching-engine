@@ -10,6 +10,8 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(1),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(price).unwrap(),
         qty: Qty::try_new(qty).unwrap(),

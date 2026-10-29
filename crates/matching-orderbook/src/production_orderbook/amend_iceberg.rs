@@ -73,6 +73,57 @@ impl ProductionOrderBook {
             self.regular_expiry.insert(p.order_id, p.target_tif);
             return Ok(vec![event]);
         }
+        if p.old_price != p.new_price && iceberg.order().stp_mode != matching_domain::StpMode::None
+        {
+            let mut after = self.clone();
+            let shadow = after
+                .reservations
+                .get(&p.order_id)
+                .expect("planned shadow")
+                .clone();
+            after.cancel(p.order_id).expect("planned iceberg");
+            let accepted = iceberg.order().clone();
+            let mut incoming = accepted.clone();
+            incoming.qty = p.new_remaining;
+            let (matching_events, _) = after.execute_limit_stp(
+                incoming,
+                trade_ids,
+                None,
+                Some((plan.new_peak, accepted.qty)),
+                false,
+            )?;
+            let traded = matching_events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Trade(_)));
+            let terminal = matching_events.iter().any(|event| matches!(event, EngineEvent::OrderCanceled { order_id, .. } if *order_id == p.order_id));
+            let remaining = after
+                .order(p.order_id)
+                .map(|node| Qty::try_new(node.total_remaining()).expect("active iceberg residual"));
+            if let Some(index) = after.orders.get(&p.order_id).copied() {
+                after
+                    .arena
+                    .get_mut(index)
+                    .expect("iceberg residual")
+                    .replace_initial_gtc_with_tif(p.target_tif);
+                after.regular_expiry.insert(p.order_id, p.target_tif);
+                after.reservations.insert(p.order_id, shadow);
+            }
+            let mut events = vec![event];
+            events.extend(matching_events);
+            if traded && !terminal {
+                events.push(match remaining {
+                    Some(remaining) => EngineEvent::OrderPartiallyFilled {
+                        order_id: p.order_id,
+                        remaining,
+                    },
+                    None => EngineEvent::OrderFilled {
+                        order_id: p.order_id,
+                    },
+                });
+            }
+            *self = after;
+            return Ok(events);
+        }
         let fills = if p.old_price != p.new_price {
             Some(self.preflight_iceberg_plan(
                 p.side,

@@ -179,7 +179,9 @@ fn execute_constraints(
                 ConstraintCommand::Gtc(incoming) => {
                     let supplied = ids.take(reference.orders(opposite_side(incoming.side)).len());
                     let expected = place_reference(&mut reference, incoming.clone(), &supplied);
-                    let actual = production.place_limit_gtc(incoming.clone(), &supplied);
+                    let actual = production
+                        .place_limit_gtc(incoming.clone(), &supplied)
+                        .map(|execution| execution.to_vec());
                     let expected = expected.map(|placed| {
                         if placed.rested {
                             next_priority = next_priority.checked_add(1).unwrap();

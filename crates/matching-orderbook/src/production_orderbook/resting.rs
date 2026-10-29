@@ -48,6 +48,7 @@ impl ProductionOrderBook {
     /// 若调用方传入会价格交叉或价格相等的订单，或内部状态/提交顺序损坏，
     /// 方法会立即停止处理而不是将其伪装成另一种业务拒绝。
     pub fn rest(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
+        order.validate_stp_mode()?;
         // 1. 与价格交叉无关的全部可预期失败先预检。
         let plan = self.preflight_rest_common(&order)?;
 
@@ -71,6 +72,7 @@ impl ProductionOrderBook {
         now: LogicalTime,
         current_session_id: u64,
     ) -> Result<(), RejectReason> {
+        order.validate_stp_mode()?;
         Self::validate_resting_tif(tif, now, current_session_id)?;
         let plan = self.preflight_rest_common(&order)?;
         self.assert_rest_strictly_non_crossing(&plan);

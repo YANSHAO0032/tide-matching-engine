@@ -13,6 +13,8 @@ fn order(id: u128, user: u64, side: Side, price: u64, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(user),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         side,
         price: Price::try_new(price.try_into().unwrap()).unwrap(),
         qty: Qty::try_new(qty).unwrap(),
@@ -183,6 +185,8 @@ fn seed_unrelated_deterministic_state(book: &mut ReferenceOrderBook) {
         trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(92),
         user_id: UserId::new(92),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(92),
         fee_schedule_version: 1,
         side: Side::Buy,
@@ -364,6 +368,30 @@ fn amend_reprice_emits_amend_then_trades_then_order_events() {
     assert_eq!(book.orders[0].priority(), QueuePriority::new(2));
     assert_eq!(book.reservation_state(target.order_id).unwrap().version, 7);
     assert!(book.reservation_state(maker.order_id).is_none());
+}
+
+#[test]
+fn amend_reprice_cancel_taker_does_not_rest_and_keeps_maker() {
+    let mut book = ReferenceOrderBook::new();
+    let mut maker = order(1, 12, Side::Buy, 101, 3);
+    maker.stp_key = matching_domain::StpKey::new(7);
+    let mut target = order(2, 11, Side::Sell, 105, 5);
+    target.stp_key = matching_domain::StpKey::new(7);
+    target.stp_mode = matching_domain::StpMode::CancelTaker;
+    book.rest_with_reservation(maker.clone(), reservation(&maker, 2))
+        .unwrap();
+    book.rest_with_reservation(target.clone(), reservation(&target, 7))
+        .unwrap();
+    let mut command = amend(&target);
+    command.new_price = Some(Price::try_new(100).unwrap());
+    let events = book
+        .amend_regular_with_events(&command, LogicalTime::new(1), 9, &[])
+        .unwrap();
+    assert!(
+        matches!(events.as_slice(), [EngineEvent::OrderAmended { .. }, EngineEvent::OrderCanceled { order_id, remaining: matching_domain::OrderRemaining::Base(q), reason: matching_domain::CancelReason::SelfTradePreventionTaker }] if *order_id == target.order_id && q.get() == 5)
+    );
+    assert!(!book.contains_active_order(target.order_id));
+    assert!(book.contains_active_order(maker.order_id));
 }
 
 #[test]

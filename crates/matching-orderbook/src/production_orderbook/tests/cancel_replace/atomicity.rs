@@ -194,6 +194,8 @@ fn stop(id: u128, side: Side, qty: u64) -> StopOrder {
     StopOrder::Limit(StopLimitOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(5),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: reserve(id).reservation_id,
         fee_schedule_version: 1,
         side,

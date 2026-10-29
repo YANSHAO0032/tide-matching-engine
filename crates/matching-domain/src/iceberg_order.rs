@@ -42,6 +42,8 @@ mod tests {
         LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(2),
+            stp_key: crate::StpKey::new(0),
+            stp_mode: crate::StpMode::None,
             side: Side::Sell,
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(total).unwrap(),

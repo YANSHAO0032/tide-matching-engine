@@ -24,10 +24,14 @@ mod resting;
 mod stop_orders;
 mod stop_trigger;
 
+pub use amend_candidate::ReferenceAmendRegistryPlan;
 pub use cancel_replace::ReferenceCancelReplacePlan;
 pub use cancel_replace_view::ReferenceBookWithout;
 pub use mass_cancel::ReferenceMassCancelPlan;
-pub use reservation_place::{ReferencePlaceContext, ReferencePlaceOrder, ReferencePlacePlan};
+pub use reservation_place::{
+    ReferenceMarketPlan, ReferencePlaceContext, ReferencePlaceOrder, ReferencePlacePlan,
+};
+pub use stop_trigger::ReferenceTriggerRegistryPlan;
 
 /// 为优先级计数器保留不可分配的高位保护空间。
 ///

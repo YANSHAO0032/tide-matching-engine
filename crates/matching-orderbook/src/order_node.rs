@@ -258,6 +258,8 @@ mod tests {
             let original = LimitOrder {
                 order_id: OrderId::new(id),
                 user_id: UserId::new(id as u64),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
                 side,
                 price: Price::try_new(100).unwrap(),
                 qty: Qty::try_new(qty).unwrap(),
@@ -278,6 +280,8 @@ mod tests {
         let original = LimitOrder {
             order_id: OrderId::new(1),
             user_id: UserId::new(1),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             side: Side::Buy,
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(10).unwrap(),
@@ -301,6 +305,8 @@ mod tests {
         let original = LimitOrder {
             order_id: OrderId::new(11),
             user_id: UserId::new(1),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
             side: Side::Sell,
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(10).unwrap(),

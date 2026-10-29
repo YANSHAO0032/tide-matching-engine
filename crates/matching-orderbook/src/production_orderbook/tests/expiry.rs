@@ -11,6 +11,8 @@ fn stop_limit(id: u128, expiry: TriggerExpiry) -> StopOrder {
         trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
         order_id: OrderId::new(id),
         user_id: UserId::new(id as u64),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
         reservation_id: ReservationId::new(id + 1_000),
         fee_schedule_version: 1,
         side: Side::Buy,
