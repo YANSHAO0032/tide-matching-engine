@@ -96,20 +96,7 @@ impl ProductionOrderBook {
         current_session_id: u64,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        if self.contains_active_order(order.order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        Self::validate_resting_tif(tif, now, current_session_id)?;
-        let order_id = order.order_id;
-        let events = self.place_limit_gtc_with_events(order, trade_ids)?;
-        if let Some(index) = self.orders.get(&order_id).copied() {
-            let node = self.arena.get_mut(index).unwrap_or_else(|| {
-                panic!("ProductionOrderBook invariant violation: timed residual slot missing")
-            });
-            node.replace_initial_gtc_with_tif(tif);
-            self.regular_expiry.insert(order_id, tif);
-        }
-        Ok(events)
+        self.place_limit_timed_frozen(order, tif, now, current_session_id, trade_ids, None)
     }
 
     /// 使普通 GTD 挂单在到达给定逻辑时间后确定性到期。
@@ -182,5 +169,34 @@ impl ProductionOrderBook {
         );
         expired.sort_unstable_by_key(|entry| entry.order_id);
         Ok(expired)
+    }
+
+    /// 使用 root 冻结的价格带执行定期限价子单。
+    pub(super) fn place_limit_timed_frozen(
+        &mut self,
+        order: LimitOrder,
+        tif: TimeInForce,
+        now: LogicalTime,
+        current_session_id: u64,
+        trade_ids: &[TradeId],
+        frozen: Option<Option<(matching_domain::Price, matching_domain::Price)>>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        Self::validate_resting_tif(tif, now, current_session_id)?;
+        let order_id = order.order_id;
+        let events = match frozen {
+            Some(band) => self.place_limit_gtc_events_with_band(order, trade_ids, Some(band))?,
+            None => self.place_limit_gtc_with_events(order, trade_ids)?,
+        };
+        if let Some(index) = self.orders.get(&order_id).copied() {
+            let node = self.arena.get_mut(index).unwrap_or_else(|| {
+                panic!("ProductionOrderBook invariant violation: timed residual slot missing")
+            });
+            node.replace_initial_gtc_with_tif(tif);
+            self.regular_expiry.insert(order_id, tif);
+        }
+        Ok(events)
     }
 }

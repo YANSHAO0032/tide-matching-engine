@@ -789,3 +789,52 @@ fn amend_reservation_trigger_reject_market_and_fully_filled_child_clear_shadow()
         }
     }
 }
+
+#[test]
+fn amend_mismatched_market_math_fail_stops_before_mutation() {
+    let keys = RiskKeySet::new(2, []).unwrap();
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = ReferenceOrderBook::new();
+    let input = order(1, Side::Buy, 100, 10);
+    p.rest_with_reservation(input.clone(), state(&input))
+        .unwrap();
+    r.rest_with_reservation(input.clone(), state(&input))
+        .unwrap();
+    let configured = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: matching_domain::PriceReferenceKind::MarkPrice,
+        max_deviation_bps: 500,
+    };
+    p.set_price_band_config(Some((config, configured))).unwrap();
+    r.set_price_band_config(Some((config, configured))).unwrap();
+    let mut cmd = command(&input);
+    cmd.new_qty = Some(Qty::try_new(8).unwrap());
+    let context = AmendExecutionContext {
+        market_math: MarketMath::try_new(0, 0, 0, 2, 1).unwrap(),
+        ..context(&keys)
+    };
+    let before_p = production_snapshot(&p);
+    let before_r = r.clone();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.amend_with_context(
+            &cmd,
+            LogicalTime::new(1),
+            9,
+            &[],
+            &context
+        )))
+        .is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.amend_with_context(
+            &cmd,
+            LogicalTime::new(1),
+            9,
+            &[],
+            &context
+        )))
+        .is_err()
+    );
+    assert_eq!(production_snapshot(&p), before_p);
+    assert_eq!(r, before_r);
+}

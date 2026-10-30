@@ -59,7 +59,11 @@ fn market_by_base_empty_both_sides() {
 
         assert_failure_atomic(&mut book, |book| {
             let trades = book
-                .execute_market_by_base(market(100, side, 10), &[])
+                .execute_market_by_base(
+                    market(100, side, 10),
+                    &[],
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                )
                 .unwrap();
 
             assert!(trades.is_empty());
@@ -89,7 +93,11 @@ fn market_by_base_partial_both_sides() {
         };
 
         let trades = book
-            .execute_market_by_base(market(100, taker_side, 3), &[TradeId::new(500)])
+            .execute_market_by_base(
+                market(100, taker_side, 3),
+                &[TradeId::new(500)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            )
             .unwrap();
 
         assert_eq!(trades.len(), 1);
@@ -149,6 +157,7 @@ fn market_by_base_multi_level_fifo_both_sides() {
             .execute_market_by_base(
                 market(100, taker_side, 10),
                 &[TradeId::new(501), TradeId::new(502), TradeId::new(503)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
             )
             .unwrap();
 
@@ -215,7 +224,11 @@ fn market_by_base_discards_remainder() {
 
         // 需要 10，但盘口仅有 3。
         let trades = book
-            .execute_market_by_base(market(100, taker_side, 10), &[TradeId::new(600)])
+            .execute_market_by_base(
+                market(100, taker_side, 10),
+                &[TradeId::new(600)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            )
             .unwrap();
 
         assert_eq!(trades.len(), 1);
@@ -243,7 +256,11 @@ fn market_by_base_duplicate_is_atomic() {
         assert_failure_atomic(&mut book, |book| {
             // 重复标识符与 TradeId 不足同时成立。
             // DuplicateOrderId 必须优先返回。
-            let result = book.execute_market_by_base(market(1, taker_side, 5), &[]);
+            let result = book.execute_market_by_base(
+                market(1, taker_side, 5),
+                &[],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            );
 
             assert_eq!(result, Err(RejectReason::DuplicateOrderId));
         });
@@ -261,8 +278,11 @@ fn market_by_base_insufficient_trade_ids_is_atomic() {
         // 需要两笔成交，但只提供一个 TradeId。
         assert_failure_atomic(&mut book, |book| {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let _ =
-                    book.execute_market_by_base(market(100, taker_side, 10), &[TradeId::new(700)]);
+                let _ = book.execute_market_by_base(
+                    market(100, taker_side, 10),
+                    &[TradeId::new(700)],
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                );
             }));
 
             assert!(result.is_err());
@@ -282,6 +302,7 @@ fn market_by_base_ignores_extra_trade_ids() {
         .execute_market_by_base(
             market(100, Side::Buy, 3),
             &[TradeId::new(800), TradeId::new(801), TradeId::new(802)],
+            &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
         )
         .unwrap();
 
@@ -306,7 +327,11 @@ fn market_by_base_works_with_exhausted_priority_allocator() {
         assert_eq!(book.next_queue_priority(), 1);
 
         let trades = book
-            .execute_market_by_base(market(100, taker_side, 5), &[TradeId::new(900)])
+            .execute_market_by_base(
+                market(100, taker_side, 5),
+                &[TradeId::new(900)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            )
             .unwrap();
 
         assert_eq!(trades.len(), 1);

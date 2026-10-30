@@ -24,6 +24,55 @@ struct ProtectedMarketByBasePlan {
 }
 
 impl ReferenceOrderBook {
+    /// 市价按基础币数量立即成交。
+    ///
+    /// - 活动重复标识符在任何状态变更前拒绝。
+    /// - TradeId 不足在任何状态变更前触发不变量断言（测试/参考簿故障时停止处理）。
+    /// - 挂单按价格优先、同价先进先出选择。
+    /// - 市价吃单方剩余量不挂簿。
+    /// - 不分配 QueuePriority。
+    pub fn execute_market_by_base(
+        &mut self,
+        incoming: MarketByBase,
+        trade_ids: &[TradeId],
+        math: &MarketMath,
+    ) -> Result<matching_domain::MarketByBaseExecution, RejectReason> {
+        let mut candidate = self.clone();
+        let execution = candidate.execute_market_by_base_inner(incoming, trade_ids, math)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(execution)
+    }
+
+    /// 参考簿专用：按命令开始时固定的保护边界执行 MarketByBase。
+    ///
+    /// 先完整预检，再提交成交；保护终止不消耗 TradeId。
+    /// 不自动挂单吃单方；冰山挂单补量分配新优先级。
+    pub fn execute_market_by_base_with_protection(
+        &mut self,
+        incoming: MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let events = candidate
+            .execute_market_by_base_with_protection_inner(incoming, context, math, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(events)
+    }
+
     /// 只读预检 MarketByBase。
     ///
     /// 返回完成本次撮合需要的 TradeId 数量。
@@ -73,19 +122,141 @@ impl ReferenceOrderBook {
         Ok(required_trade_ids)
     }
 
-    /// 市价按基础币数量立即成交。
-    ///
-    /// - 活动重复标识符在任何状态变更前拒绝。
-    /// - TradeId 不足在任何状态变更前触发不变量断言（测试/参考簿故障时停止处理）。
-    /// - 挂单按价格优先、同价先进先出选择。
-    /// - 市价吃单方剩余量不挂簿。
-    /// - 不分配 QueuePriority。
-    pub fn execute_market_by_base(
+    fn preflight_protected_market_by_base_plan(
+        &self,
+        incoming: &MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+    ) -> Result<ProtectedMarketByBasePlan, RejectReason> {
+        // 1. 重复标识符优先于保护计算。
+        if self.contains_active_order(incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+
+        // 2. 使用带来源的命令开始保护辅助函数。
+        //    只计算一次，错误原样传播。
+        let effective = effective_protection_at_command_start_with_source(
+            incoming.market_protection.as_ref(),
+            context,
+            incoming.side,
+            math,
+        )?;
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let mut remaining = incoming.qty.get();
+        let mut fills = Vec::new();
+        let mut stop = None;
+
+        // 3. 只读扫描，复用参考簿的价格/先进先出排序。
+        for maker in self.orders(maker_side) {
+            if remaining == 0 {
+                break;
+            }
+
+            let maker_remaining = maker.remaining();
+
+            if maker_remaining == 0 {
+                continue;
+            }
+
+            let maker_price = maker.original_order().price;
+
+            // 4. 判断当前挂单是否位于有效保护边界内。
+            if !maker_price_within_protection(
+                incoming.side,
+                maker_price,
+                effective.map(|(price, _)| price),
+            ) {
+                let (effective_worst_price, source) =
+                    effective.expect("out-of-bound maker requires protection");
+
+                stop = Some(ProtectionBoundaryStop {
+                    next_price: maker_price,
+                    effective_worst_price,
+                    source,
+                });
+
+                // 首个越界挂单不计入成交计划。
+                break;
+            }
+
+            let fill_lots = remaining.min(maker_remaining);
+
+            let qty = Qty::try_new(fill_lots).expect("positive remaining and maker quantity");
+
+            remaining = remaining
+                .checked_sub(fill_lots)
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+
+            fills.push((maker.original_order().order_id, qty));
+        }
+
+        Ok(ProtectedMarketByBasePlan { fills, stop })
+    }
+
+    pub(super) fn execute_market_by_base_inner(
         &mut self,
         incoming: MarketByBase,
         trade_ids: &[TradeId],
+        math: &MarketMath,
     ) -> Result<matching_domain::MarketByBaseExecution, RejectReason> {
         incoming.validate_stp_mode()?;
+        if incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
+        }
+        if let Some((config, configured_math)) = self.price_band_config() {
+            assert_eq!(*math, configured_math, "市场数值配置不一致");
+            let reference = self
+                .reference_prices
+                .latest(config.reference_kind)
+                .ok_or(RejectReason::ReferencePriceUnavailable)?
+                .price;
+            let (lower, upper) = config.bounds(reference, math.tick_size())?;
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: reference,
+                market_band_worst: Some(if incoming.side == Side::Buy {
+                    upper
+                } else {
+                    lower
+                }),
+            };
+            return self
+                .execute_market_by_base_with_protection(incoming, &context, math, trade_ids)
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
+        if incoming
+            .market_protection
+            .as_ref()
+            .is_some_and(|p| p.max_slippage_bps.is_some())
+        {
+            return Err(RejectReason::ReferencePriceUnavailable);
+        }
+        if let Some(worst) = incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.worst_price)
+        {
+            if worst.get() % math.tick_size() != 0 {
+                return Err(RejectReason::InvalidTick);
+            }
+            return self
+                .slice_market_base_with_boundary(
+                    incoming,
+                    Some(math),
+                    Some((worst, matching_domain::ProtectionSource::User)),
+                    trade_ids,
+                )
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
         if self.has_iceberg_maker(incoming.side)
             || incoming.stp_mode != matching_domain::StpMode::None
         {
@@ -174,11 +345,31 @@ impl ReferenceOrderBook {
         ))
     }
 
-    /// 参考簿专用：按命令开始时固定的保护边界执行 MarketByBase。
-    ///
-    /// 先完整预检，再提交成交；保护终止不消耗 TradeId。
-    /// 不自动挂单吃单方；冰山挂单补量分配新优先级。
-    pub fn execute_market_by_base_with_protection(
+    fn execute_market_by_base_with_protection_inner(
+        &mut self,
+        incoming: MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if let Some((_, configured_math)) = self.price_band_config() {
+            assert_eq!(*math, configured_math, "市场数值配置不一致");
+        }
+        let mut effective_context = context.clone();
+        if let Some((lower, upper)) = self.price_band_bounds()? {
+            effective_context.market_band_worst = Some(if incoming.side == Side::Buy {
+                upper
+            } else {
+                lower
+            });
+        }
+        let context = &effective_context;
+        self.execute_market_by_base_with_frozen_protection(incoming, context, math, trade_ids)
+    }
+
+    /// 使用根命令已冻结的保护上下文，不重新读取市场参考价。
+    pub(super) fn execute_market_by_base_with_frozen_protection(
         &mut self,
         incoming: MarketByBase,
         context: &CommandStartProtectionContext,
@@ -266,81 +457,5 @@ impl ReferenceOrderBook {
 
         // 不将未成交的吃单方余量挂入参考簿。
         Ok(events)
-    }
-
-    fn preflight_protected_market_by_base_plan(
-        &self,
-        incoming: &MarketByBase,
-        context: &CommandStartProtectionContext,
-        math: &MarketMath,
-    ) -> Result<ProtectedMarketByBasePlan, RejectReason> {
-        // 1. 重复标识符优先于保护计算。
-        if self.contains_active_order(incoming.order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-
-        // 2. 使用带来源的命令开始保护辅助函数。
-        //    只计算一次，错误原样传播。
-        let effective = effective_protection_at_command_start_with_source(
-            incoming.market_protection.as_ref(),
-            context,
-            incoming.side,
-            math,
-        )?;
-
-        let maker_side = match incoming.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        };
-
-        let mut remaining = incoming.qty.get();
-        let mut fills = Vec::new();
-        let mut stop = None;
-
-        // 3. 只读扫描，复用参考簿的价格/先进先出排序。
-        for maker in self.orders(maker_side) {
-            if remaining == 0 {
-                break;
-            }
-
-            let maker_remaining = maker.remaining();
-
-            if maker_remaining == 0 {
-                continue;
-            }
-
-            let maker_price = maker.original_order().price;
-
-            // 4. 判断当前挂单是否位于有效保护边界内。
-            if !maker_price_within_protection(
-                incoming.side,
-                maker_price,
-                effective.map(|(price, _)| price),
-            ) {
-                let (effective_worst_price, source) =
-                    effective.expect("out-of-bound maker requires protection");
-
-                stop = Some(ProtectionBoundaryStop {
-                    next_price: maker_price,
-                    effective_worst_price,
-                    source,
-                });
-
-                // 首个越界挂单不计入成交计划。
-                break;
-            }
-
-            let fill_lots = remaining.min(maker_remaining);
-
-            let qty = Qty::try_new(fill_lots).expect("positive remaining and maker quantity");
-
-            remaining = remaining
-                .checked_sub(fill_lots)
-                .ok_or(RejectReason::ArithmeticOverflow)?;
-
-            fills.push((maker.original_order().order_id, qty));
-        }
-
-        Ok(ProtectedMarketByBasePlan { fills, stop })
     }
 }

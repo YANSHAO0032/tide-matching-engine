@@ -49,6 +49,22 @@ impl ReferenceOrderBook {
             .map_err(|reason| request.rejection(reason))
     }
 
+    /// 完整核对簿及登记表前态后，一次安装已验证的组合后态和有序事件。
+    ///
+    /// 首次真实写入后无撮合、资金校验、正常拒绝或回滚；漂移必须按不变量错误停止。
+    pub fn apply_cancel_replace(
+        &mut self,
+        registry: &mut ReservationRegistry,
+        plan: ReferenceCancelReplacePlan,
+    ) -> Result<Vec<EngineEvent>, ReservationApplyError> {
+        if *self != plan.before_book || *registry != plan.before_registry {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        *self = plan.after_book;
+        *registry = plan.after_registry;
+        Ok(plan.events)
+    }
+
     fn plan_cancel_replace_inner(
         &self,
         request: &CancelReplaceOrder,
@@ -172,21 +188,5 @@ impl ReferenceOrderBook {
             after_registry,
             events,
         })
-    }
-
-    /// 完整核对簿及登记表前态后，一次安装已验证的组合后态和有序事件。
-    ///
-    /// 首次真实写入后无撮合、资金校验、正常拒绝或回滚；漂移必须按不变量错误停止。
-    pub fn apply_cancel_replace(
-        &mut self,
-        registry: &mut ReservationRegistry,
-        plan: ReferenceCancelReplacePlan,
-    ) -> Result<Vec<EngineEvent>, ReservationApplyError> {
-        if *self != plan.before_book || *registry != plan.before_registry {
-            return Err(ReservationApplyError::StateChanged);
-        }
-        *self = plan.after_book;
-        *registry = plan.after_registry;
-        Ok(plan.events)
     }
 }

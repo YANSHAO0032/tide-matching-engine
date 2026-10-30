@@ -39,6 +39,8 @@ impl ReferenceOrderBook {
             return Err(RejectReason::DuplicateOrderId);
         }
 
+        self.validate_band_price(order.price)?;
+
         if self.best_crossing_maker(order).is_some() {
             return Err(RejectReason::PostOnlyWouldCross);
         }
@@ -84,12 +86,19 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        order.validate_stp_mode()?;
-        if self.has_iceberg_maker(order.side) || order.stp_mode != matching_domain::StpMode::None {
-            return self.iceberg_immediate(order, math, trade_ids, false);
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
         }
-        let plan = self.preflight_limit_immediate(&order, math)?;
-        Ok(self.commit_limit_immediate(order, plan, trade_ids))
+        let mut candidate = self.clone();
+        let execution = candidate.place_limit_ioc_inner(order, math, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    matching_domain::EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(execution)
     }
 
     /// 仅当只读计划能成交全部数量时，执行限价 FOK。
@@ -109,15 +118,19 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        order.validate_stp_mode()?;
-        if self.has_iceberg_maker(order.side) || order.stp_mode != matching_domain::StpMode::None {
-            return self.iceberg_immediate(order, math, trade_ids, true);
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
         }
-        let plan = self.preflight_limit_immediate(&order, math)?;
-        if plan.remaining != 0 {
-            return Err(RejectReason::FokInsufficientLiquidity);
-        }
-        Ok(self.commit_limit_immediate(order, plan, trade_ids))
+        let mut candidate = self.clone();
+        let execution = candidate.place_limit_fok_inner(order, math, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    matching_domain::EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(execution)
     }
 
     /// 独立扫描按价格稳定排序的 Vec 位置，不使用生产簿的计划或
@@ -224,5 +237,44 @@ impl ReferenceOrderBook {
         self.orders.retain(|maker| maker.remaining() != 0);
         self.retain_active_reservations();
         LimitImmediateExecution::new(order.order_id, trades, canceled_remaining)
+    }
+
+    fn place_limit_ioc_inner(
+        &mut self,
+        order: LimitOrder,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<LimitImmediateExecution, RejectReason> {
+        order.validate_stp_mode()?;
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        self.validate_band_price(order.price)?;
+        if self.has_iceberg_maker(order.side) || order.stp_mode != matching_domain::StpMode::None {
+            return self.iceberg_immediate(order, math, trade_ids, false);
+        }
+        let plan = self.preflight_limit_immediate(&order, math)?;
+        Ok(self.commit_limit_immediate(order, plan, trade_ids))
+    }
+
+    fn place_limit_fok_inner(
+        &mut self,
+        order: LimitOrder,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<LimitImmediateExecution, RejectReason> {
+        order.validate_stp_mode()?;
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        self.validate_band_price(order.price)?;
+        if self.has_iceberg_maker(order.side) || order.stp_mode != matching_domain::StpMode::None {
+            return self.iceberg_immediate(order, math, trade_ids, true);
+        }
+        let plan = self.preflight_limit_immediate(&order, math)?;
+        if plan.remaining != 0 {
+            return Err(RejectReason::FokInsufficientLiquidity);
+        }
+        Ok(self.commit_limit_immediate(order, plan, trade_ids))
     }
 }

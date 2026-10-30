@@ -459,3 +459,255 @@ fn child_trades_trigger_follow_up_stops_in_fifo_order_and_match_reference() {
 fn repeated_input_produces_identical_cascade_event_order() {
     assert_eq!(run_cascade().0, run_cascade().0);
 }
+
+#[test]
+fn triggered_market_uses_new_band_reference_in_both_books() {
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = ReferenceOrderBook::new();
+    let maker = order(10, Side::Sell, 106, 1);
+    p.rest(maker.clone()).unwrap();
+    r.rest(maker).unwrap();
+    let stop = stop_market(11, Side::Buy, 105);
+    p.place_stop(stop.clone(), LogicalTime::new(1), 1).unwrap();
+    r.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    p.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::LastTrade,
+        max_deviation_bps: 0,
+    };
+    p.set_price_band_config(Some((config, math()))).unwrap();
+    r.set_price_band_config(Some((config, math()))).unwrap();
+    let pe = p
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(pe, re);
+    assert!(pe.iter().any(|event| matches!(event, EngineEvent::MarketProtectionTriggered { next_price, effective_worst_price, .. } if next_price.get() == 106 && effective_worst_price.get() == 105)));
+}
+
+#[test]
+fn triggered_market_uses_other_configured_reference_in_both_books() {
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = ReferenceOrderBook::new();
+    let maker = order(10, Side::Sell, 106, 1);
+    p.rest(maker.clone()).unwrap();
+    r.rest(maker).unwrap();
+    let stop = stop_market(11, Side::Buy, 105);
+    p.place_stop(stop.clone(), LogicalTime::new(1), 1).unwrap();
+    r.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    let mark = PriceReference {
+        kind: PriceReferenceKind::MarkPrice,
+        source_seq: 1,
+        price: Price::try_new(100).unwrap(),
+    };
+    p.trigger_stops(mark, LogicalTime::new(1), 1, &math(), &[], |_| Ok(()))
+        .unwrap();
+    r.trigger_stops(mark, LogicalTime::new(1), 1, &math(), &[], |_| Ok(()))
+        .unwrap();
+    p.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::MarkPrice,
+        max_deviation_bps: 0,
+    };
+    p.set_price_band_config(Some((config, math()))).unwrap();
+    r.set_price_band_config(Some((config, math()))).unwrap();
+    let pe = p
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops(
+            last_trade(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(pe, re);
+    assert!(pe.iter().any(|event| matches!(event, EngineEvent::MarketProtectionTriggered { next_price, effective_worst_price, .. } if next_price.get() == 106 && effective_worst_price.get() == 100)));
+}
+
+#[test]
+fn stop_limit_descendant_uses_frozen_band_after_last_trade_changes() {
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = ReferenceOrderBook::new();
+    let maker = order(10, Side::Sell, 105, 1);
+    p.rest(maker.clone()).unwrap();
+    r.rest(maker).unwrap();
+    for stop in [
+        stop_market(11, Side::Buy, 110),
+        stop_limit(12, Side::Sell, 108, 115),
+    ] {
+        p.place_stop(stop.clone(), LogicalTime::new(1), 1).unwrap();
+        r.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    }
+    p.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::LastTrade,
+        max_deviation_bps: 500,
+    };
+    p.set_price_band_config(Some((config, math()))).unwrap();
+    r.set_price_band_config(Some((config, math()))).unwrap();
+    let pe = p
+        .trigger_stops(
+            last_trade(2, 110),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[TradeId::new(1)],
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops(
+            last_trade(2, 110),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[TradeId::new(1)],
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(pe, re);
+    assert!(!pe.iter().any(|event| matches!(event, EngineEvent::TriggeredOrderRejected { order_id, .. } if *order_id == OrderId::new(12))));
+    assert!(p.order(OrderId::new(12)).is_some());
+}
+
+#[test]
+fn stop_market_descendant_uses_frozen_band_after_last_trade_changes() {
+    let mut p = ProductionOrderBook::new(policy());
+    let mut r = ReferenceOrderBook::new();
+    for maker in [order(9, Side::Buy, 104, 1), order(10, Side::Sell, 105, 1)] {
+        p.rest(maker.clone()).unwrap();
+        r.rest(maker).unwrap();
+    }
+    for stop in [
+        stop_market(11, Side::Buy, 110),
+        stop_market(12, Side::Sell, 108),
+    ] {
+        p.place_stop(stop.clone(), LogicalTime::new(1), 1).unwrap();
+        r.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    }
+    p.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::LastTrade,
+        max_deviation_bps: 500,
+    };
+    p.set_price_band_config(Some((config, math()))).unwrap();
+    r.set_price_band_config(Some((config, math()))).unwrap();
+    let pe = p
+        .trigger_stops(
+            last_trade(2, 110),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[TradeId::new(1)],
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops(
+            last_trade(2, 110),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[TradeId::new(1)],
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(pe, re);
+    assert!(pe.iter().any(|event| matches!(event, EngineEvent::MarketProtectionTriggered { order_id, next_price, effective_worst_price, .. } if *order_id == OrderId::new(12) && next_price.get() == 104 && effective_worst_price.get() == 105)));
+    assert!(p.order(OrderId::new(9)).is_some());
+}

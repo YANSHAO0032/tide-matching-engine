@@ -46,6 +46,26 @@ impl ReferenceOrder {
         }
     }
 
+    /// 根据已验证的冰山余量构造运行态，同时保留原始输入。
+    pub(crate) fn iceberg(
+        original: LimitOrder,
+        remaining: u64,
+        peak: Qty,
+        priority: QueuePriority,
+    ) -> Self {
+        let visible = remaining.min(peak.get());
+        Self {
+            original,
+            remaining: visible,
+            hidden_remaining: remaining
+                .checked_sub(visible)
+                .expect("visible bounded by total"),
+            peak_size: Some(peak),
+            priority,
+            tif: TimeInForce::Gtc,
+        }
+    }
+
     /// 用已通过改单预检的总目标与剩余量重建普通挂单运行态。
     ///
     /// 该构造器只服务于失去优先级的普通改单路径；调用方必须已确认
@@ -70,25 +90,6 @@ impl ReferenceOrder {
         }
     }
 
-    /// 根据已验证的冰山余量构造运行态，同时保留原始输入。
-    pub(crate) fn iceberg(
-        original: LimitOrder,
-        remaining: u64,
-        peak: Qty,
-        priority: QueuePriority,
-    ) -> Self {
-        let visible = remaining.min(peak.get());
-        Self {
-            original,
-            remaining: visible,
-            hidden_remaining: remaining
-                .checked_sub(visible)
-                .expect("visible bounded by total"),
-            peak_size: Some(peak),
-            priority,
-            tif: TimeInForce::Gtc,
-        }
-    }
     /// 从只读计划重建冰山运行态，同时保存独立的可见片和时效。
     pub(crate) fn amended_iceberg(
         original: LimitOrder,
@@ -110,24 +111,63 @@ impl ReferenceOrder {
             tif,
         }
     }
+
+    /// 借用不可变的原始订单载荷。
+    pub fn original_order(&self) -> &LimitOrder {
+        &self.original
+    }
+
+    /// 返回当前可见剩余量；订单总剩余量见 `total_remaining`。
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
     /// 公开深度只统计当前可见片的数量。
     pub fn visible_remaining(&self) -> u64 {
         self.remaining
     }
+
     /// 尚未公开、等待后续补量的隐藏数量。
     pub fn hidden_remaining(&self) -> u64 {
         self.hidden_remaining
     }
+
     /// 包含全部可见片和隐藏片的剩余基础资产数量。
     pub fn total_remaining(&self) -> u64 {
         self.remaining
             .checked_add(self.hidden_remaining)
             .expect("reference total invariant")
     }
+
     /// 配置的显示上限；普通订单没有该上限。
     pub fn peak_size(&self) -> Option<Qty> {
         self.peak_size
     }
+
+    /// 返回该订单获得的市场本地队列优先级。
+    pub fn priority(&self) -> QueuePriority {
+        self.priority
+    }
+
+    /// 返回挂单的存活期元数据。
+    pub fn time_in_force(&self) -> TimeInForce {
+        self.tif
+    }
+
+    /// 扣减一次成交数量。
+    ///
+    /// 超量扣减返回 ArithmeticOverflow，
+    /// 且不会修改原始订单或当前剩余量。
+    pub fn apply_fill(&mut self, qty: Qty) -> Result<(), RejectReason> {
+        let next_remaining = self
+            .remaining
+            .checked_sub(qty.get())
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        // checked_sub 成功后，才提交新的运行态
+        self.remaining = next_remaining;
+        Ok(())
+    }
+
     /// 调用方须预先检查优先级分配和同价档数量聚合。
     pub(crate) fn refresh(&mut self, priority: QueuePriority) -> Qty {
         let visible = self
@@ -140,26 +180,6 @@ impl ReferenceOrder {
         self.remaining = visible;
         self.priority = priority;
         Qty::try_new(visible).expect("positive refresh")
-    }
-
-    /// 借用不可变的原始订单载荷。
-    pub fn original_order(&self) -> &LimitOrder {
-        &self.original
-    }
-
-    /// 返回当前可见剩余量；订单总剩余量见 `total_remaining`。
-    pub fn remaining(&self) -> u64 {
-        self.remaining
-    }
-
-    /// 返回该订单获得的市场本地队列优先级。
-    pub fn priority(&self) -> QueuePriority {
-        self.priority
-    }
-
-    /// 返回挂单的存活期元数据。
-    pub fn time_in_force(&self) -> TimeInForce {
-        self.tif
     }
 
     /// 在新到订单余量已按既有 GTC 路径完成挂单后写入其已预检的存活期。
@@ -198,20 +218,6 @@ impl ReferenceOrder {
         self.original = original;
         self.remaining = remaining.get();
         self.tif = tif;
-    }
-
-    /// 扣减一次成交数量。
-    ///
-    /// 超量扣减返回 ArithmeticOverflow，
-    /// 且不会修改原始订单或当前剩余量。
-    pub fn apply_fill(&mut self, qty: Qty) -> Result<(), RejectReason> {
-        let next_remaining = self
-            .remaining
-            .checked_sub(qty.get())
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        // checked_sub 成功后，才提交新的运行态
-        self.remaining = next_remaining;
-        Ok(())
     }
 }
 

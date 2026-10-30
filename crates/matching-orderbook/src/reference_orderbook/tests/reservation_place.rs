@@ -576,3 +576,35 @@ fn pending_r2_gtc_trade_math_failure_precedes_every_binding_or_book_write() {
         assert_eq!(registry, before_registry);
     }
 }
+
+#[test]
+fn registry_place_advances_last_trade_only_when_plan_commits() {
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Sell, 1), state(1))
+        .unwrap();
+    let mut registry = ReservationRegistry::new([state(1), state(9)]).unwrap();
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let ids = [TradeId::new(1)];
+    let plan = book
+        .plan_place_with_registry(
+            limit(9, Side::Buy, 1, TimeInForce::Gtc),
+            state(9),
+            &registry,
+            context(&math, &ids),
+        )
+        .unwrap();
+    assert!(
+        book.reference_prices
+            .latest(matching_domain::PriceReferenceKind::LastTrade)
+            .is_none()
+    );
+    book.apply_place_with_registry(&mut registry, plan).unwrap();
+    assert_eq!(
+        book.reference_prices
+            .latest(matching_domain::PriceReferenceKind::LastTrade)
+            .unwrap()
+            .price
+            .get(),
+        100
+    );
+}

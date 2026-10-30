@@ -184,6 +184,8 @@ enum Command {
     Iceberg(IcebergOrder),
     Stop(StopOrder),
     Place(LimitOrder),
+    Band(Option<matching_domain::PriceBandConfig>),
+    Market(matching_domain::MarketByBase),
     CancelReplace {
         request: Box<CancelReplaceOrder>,
         expected: Box<ExpectedReplacementReservation>,
@@ -230,6 +232,8 @@ struct Record {
     state: State,
     /// 完整金融快照与私有归属的结构相等包含所有 PendingR2 历史。
     registry: ReservationRegistry,
+    /// 命令后的市场价格带配置及数值规则。
+    band: Option<(matching_domain::PriceBandConfig, MarketMath)>,
 }
 
 /// 旧入口没有统一登记表接管接口；测试驱动仅登记独立输入中的新预留。
@@ -324,6 +328,12 @@ impl Harness {
         let r = reference_state(&self.r, self.clock.now());
         let p = production_state(&self.p, self.clock.now());
         assert_eq!(r, p, "step={} 全业务投影", self.step);
+        assert_eq!(
+            self.r.price_band_config(),
+            self.p.price_band_config(),
+            "step={} 市场价格带配置",
+            self.step
+        );
         assert_eq!(self.rr, self.pr, "step={} 完整金融及归属历史", self.step);
         assert_eq!(self.known_r, self.known_p);
         let shadows = self.r.test_reservations();
@@ -367,6 +377,7 @@ impl Harness {
         let ids = self.trades.take(TRADE_CAPACITY);
         let incoming = match command {
             Command::Rest(o, _) | Command::Place(o) => Some(shadow(o.order_id.get())),
+            Command::Market(o) => Some(shadow(o.order_id.get())),
             Command::Iceberg(o) => Some(shadow(o.order().order_id.get())),
             Command::Stop(o) => Some(shadow(o.order_id().get())),
             _ => None,
@@ -433,6 +444,28 @@ impl Harness {
                     incoming.clone().unwrap(),
                     &ids,
                 )),
+            ),
+            Command::Band(config) => (
+                Outcome::Unit(
+                    self.r
+                        .set_price_band_config(config.map(|band| (band, math))),
+                ),
+                Outcome::Unit(
+                    self.p
+                        .set_price_band_config(config.map(|band| (band, math))),
+                ),
+            ),
+            Command::Market(o) => (
+                Outcome::Events(
+                    self.r
+                        .execute_market_by_base(o.clone(), &ids, &math)
+                        .map(|execution| execution.events().to_vec()),
+                ),
+                Outcome::Events(
+                    self.p
+                        .execute_market_by_base(o.clone(), &ids, &math)
+                        .map(|execution| execution.events().to_vec()),
+                ),
             ),
             Command::CancelReplace { request, expected } => {
                 let rplan = self.r.plan_cancel_replace(
@@ -637,6 +670,7 @@ impl Harness {
             outcome: actual,
             state,
             registry: self.pr.clone(),
+            band: self.p.price_band_config(),
         }
     }
 }

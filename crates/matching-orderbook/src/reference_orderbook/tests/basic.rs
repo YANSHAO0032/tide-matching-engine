@@ -27,6 +27,7 @@ fn book(orders: Vec<ReferenceOrder>) -> ReferenceOrderBook {
         stop_orders: Vec::new(),
         next_stop_priority: 0,
         reference_prices: Default::default(),
+        price_band: None,
     }
 }
 
@@ -323,6 +324,7 @@ fn priority_guard_allows_last_safe_rest_then_rejects() {
         stop_orders: Vec::new(),
         next_stop_priority: 0,
         reference_prices: Default::default(),
+        price_band: None,
     };
 
     // 临界点前的最后一次成功挂单。
@@ -354,6 +356,7 @@ fn duplicate_id_takes_precedence_over_priority_exhaustion() {
         stop_orders: Vec::new(),
         next_stop_priority: 0,
         reference_prices: Default::default(),
+        price_band: None,
     };
 
     book.rest(candidate(1, Side::Buy, 90, 10)).unwrap();

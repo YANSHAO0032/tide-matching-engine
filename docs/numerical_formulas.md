@@ -237,7 +237,7 @@ H=\min(H_r,H_s).
 
 ## 市价保护边界
 
-设命令开始时固定的参考价格原始值为 $`r\gt 0`$，tick 原始步长为 $`t\gt 0`$，滑点参数为 $`b`$，并令基点分母为：
+设命令开始时固定的参考价格原始值为 $`r\gt 0`$，tick 原始步长为 $`t\gt 0`$，滑点或价格带偏离参数为 $`b`$，并令基点分母为：
 
 ```math
 D=10\,000, \qquad 0\leq b\leq 9\,999.
@@ -268,6 +268,8 @@ P_{\mathrm{bps,sell}}
 \left\lceil\frac{r(D-b)}{D}\right\rceil
 \right).
 ```
+
+市场价格带以相同计算得到上界 $`P_{\mathrm{band,upper}}=P_{\mathrm{bps,buy}}`$ 和下界 $`P_{\mathrm{band,lower}}=P_{\mathrm{bps,sell}}`$。限价必须处于包含两个端点的区间内；若下界大于上界，区间内没有合法 tick 价格。非法的滑点或价格带偏离基点统一以 `InvalidSlippageBps = 3007` 拒绝。
 
 对非负整数 $`a`$ 与正整数 $`d`$，向上除法以商 $`q`$ 和余数 $`u`$ 表示：
 

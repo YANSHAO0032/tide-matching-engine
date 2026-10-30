@@ -37,27 +37,6 @@ impl ReferenceOrderBook {
             .position(|source| std::ptr::eq(source, maker))
     }
 
-    /// 规划下一笔成交，返回源 Vec 索引和成交数量。
-    ///
-    /// 不修改订单簿，索引仅供内部使用。
-    fn plan_next_fill(
-        &self,
-        incoming: &IncomingOrder,
-    ) -> Result<Option<(usize, Qty)>, RejectReason> {
-        if incoming.remaining() == 0 {
-            return Ok(None);
-        }
-        let Some(maker_index) = self.best_crossing_maker_index(incoming.original_order()) else {
-            return Ok(None);
-        };
-        // 计算双方当前最多能够成交的数量
-        let maker_remaining = self.orders[maker_index].remaining();
-        let fill_lots = incoming.remaining().min(maker_remaining);
-
-        let fill_qty = Qty::try_new(fill_lots)?;
-        Ok(Some((maker_index, fill_qty)))
-    }
-
     /// 返回下一笔成交的挂单与数量，但不修改双方运行态。
     ///
     /// 与内部 `plan_next_fill` 共用价格/先进先出选择逻辑进行只读预览；
@@ -167,5 +146,26 @@ impl ReferenceOrderBook {
             qty,
             maker_side,
         }))
+    }
+
+    /// 规划下一笔成交，返回源 Vec 索引和成交数量。
+    ///
+    /// 不修改订单簿，索引仅供内部使用。
+    fn plan_next_fill(
+        &self,
+        incoming: &IncomingOrder,
+    ) -> Result<Option<(usize, Qty)>, RejectReason> {
+        if incoming.remaining() == 0 {
+            return Ok(None);
+        }
+        let Some(maker_index) = self.best_crossing_maker_index(incoming.original_order()) else {
+            return Ok(None);
+        };
+        // 计算双方当前最多能够成交的数量
+        let maker_remaining = self.orders[maker_index].remaining();
+        let fill_lots = incoming.remaining().min(maker_remaining);
+
+        let fill_qty = Qty::try_new(fill_lots)?;
+        Ok(Some((maker_index, fill_qty)))
     }
 }

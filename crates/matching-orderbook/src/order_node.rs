@@ -104,6 +104,26 @@ impl OrderNode {
         self.peak_size
     }
 
+    /// 返回市场内排队优先级；它不替代链表定义的先进先出顺序。
+    pub fn priority(&self) -> QueuePriority {
+        self.priority
+    }
+
+    /// 返回挂单的存活期元数据。
+    pub fn time_in_force(&self) -> TimeInForce {
+        self.tif
+    }
+
+    /// 返回本档位前驱槽位；不能据此推断槽位仍在 Arena 中存活。
+    pub fn prev(&self) -> Option<OrderIndex> {
+        self.prev
+    }
+
+    /// 返回本档位后继槽位；不能据此验证整条链或成员归属。
+    pub fn next(&self) -> Option<OrderIndex> {
+        self.next
+    }
+
     /// 完成优先级预检后，替换已全部成交且已脱离链表的可见片。
     /// 调用方已从价档聚合中扣除旧可见量；节点仍保存该旧值，
     /// 直到此处用新可见片的数量替换。
@@ -139,16 +159,6 @@ impl OrderNode {
         );
 
         self.remaining = new_remaining;
-    }
-
-    /// 返回市场内排队优先级；它不替代链表定义的先进先出顺序。
-    pub fn priority(&self) -> QueuePriority {
-        self.priority
-    }
-
-    /// 返回挂单的存活期元数据。
-    pub fn time_in_force(&self) -> TimeInForce {
-        self.tif
     }
 
     /// 在新到订单余量已按既有 GTC 路径完成挂单后写入其已预检的存活期。
@@ -188,16 +198,6 @@ impl OrderNode {
         self.order = order;
         self.remaining = remaining.get();
         self.tif = tif;
-    }
-
-    /// 返回本档位前驱槽位；不能据此推断槽位仍在 Arena 中存活。
-    pub fn prev(&self) -> Option<OrderIndex> {
-        self.prev
-    }
-
-    /// 返回本档位后继槽位；不能据此验证整条链或成员归属。
-    pub fn next(&self) -> Option<OrderIndex> {
-        self.next
     }
 
     /// 冰山同价非增暴露改单只写入已校验的显示片与隐藏片，保留链接及优先级。

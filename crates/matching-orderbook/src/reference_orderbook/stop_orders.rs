@@ -39,22 +39,6 @@ impl ReferenceOrderBook {
         Ok(priority)
     }
 
-    /// 判断标识是否被常规订单或未触发止损订单占用。
-    pub(crate) fn contains_active_order(&self, order_id: OrderId) -> bool {
-        self.orders
-            .iter()
-            .any(|order| order.original_order().order_id == order_id)
-            || self
-                .stop_orders
-                .iter()
-                .any(|entry| entry.order.order_id() == order_id)
-    }
-
-    /// 读取下一次独立 StopPriority。
-    pub fn next_stop_priority(&self) -> u128 {
-        self.next_stop_priority
-    }
-
     /// 登记未触发止损订单；参考实现使用 Vec 扫描，独立于生产 StopBook。
     pub fn place_stop(
         &mut self,
@@ -113,6 +97,22 @@ impl ReferenceOrderBook {
             .push(ReferenceStopOrder { order, priority });
         self.next_stop_priority = next;
         Ok(priority)
+    }
+
+    /// 判断标识是否被常规订单或未触发止损订单占用。
+    pub(crate) fn contains_active_order(&self, order_id: OrderId) -> bool {
+        self.orders
+            .iter()
+            .any(|order| order.original_order().order_id == order_id)
+            || self
+                .stop_orders
+                .iter()
+                .any(|entry| entry.order.order_id() == order_id)
+    }
+
+    /// 读取下一次独立 StopPriority。
+    pub fn next_stop_priority(&self) -> u128 {
+        self.next_stop_priority
     }
 
     /// 查询一张未触发止损订单。

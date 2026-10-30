@@ -147,6 +147,12 @@ impl ProductionOrderBook {
             context.trade_ids,
             context.execution,
         )?;
+        after_book.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
         let mut after_registry = registry.clone();
         if let Some(token) = &amend.reservation_adjustment {
             let state = self
@@ -230,6 +236,12 @@ impl ProductionOrderBook {
         trade_ids: &[TradeId],
         context: &crate::AmendExecutionContext<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if let Some((_, configured_math)) = self.price_band_config() {
+            assert_eq!(
+                configured_math, context.market_math,
+                "市场价格带数值配置不一致"
+            );
+        }
         let candidate = self.build_amend_plan(amend, now, current_session_id)?;
         self.preflight_amend_numeric(amend, &candidate, context)?;
         let (regular, peak) = match &candidate {
@@ -280,6 +292,40 @@ impl ProductionOrderBook {
         if let Some(state) = self.reservations.get_mut(&amend.order_id) {
             *state = planned;
         }
+        Ok(events)
+    }
+
+    /// 以生产 Arena/价档计划执行常规改单；所有业务拒绝先于首次结构写入。
+    ///
+    /// 目标数量为包含已成交量的绝对总量，必须严格大于已成交量。同价减量
+    /// 保留队列位置；增量或改价失去优先级，只有实际挂单才分配新优先级。
+    /// 所有成交事件位于 OrderAmended 之后、订单生命周期事件之前。
+    ///
+    /// 接受关联本地预留快照的普通限价单及冰山；未触发止损使用独立入口。
+    /// 这是由调用方完成市场数值和资金覆盖校验后的低层簿接口，缺少核验上下文时显式拒绝令牌。
+    /// 需要市场步长、本金、资金覆盖或验签的命令必须调用 `amend_with_context`；本接口成功时保留活动
+    /// 订单的预留内容和版本，完全成交终结时删除预留。
+    ///
+    /// # 不变量断言
+    ///
+    /// 调用方提供的 TradeId 不足时，在首次结构写入前停止处理；多余标识符不使用。
+    pub fn amend_regular_with_events(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let events =
+            candidate.amend_regular_with_events_inner(amend, now, current_session_id, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
         Ok(events)
     }
 
@@ -349,135 +395,6 @@ impl ProductionOrderBook {
             }
         }
         Ok(())
-    }
-
-    /// 以生产 Arena/价档计划执行常规改单；所有业务拒绝先于首次结构写入。
-    ///
-    /// 目标数量为包含已成交量的绝对总量，必须严格大于已成交量。同价减量
-    /// 保留队列位置；增量或改价失去优先级，只有实际挂单才分配新优先级。
-    /// 所有成交事件位于 OrderAmended 之后、订单生命周期事件之前。
-    ///
-    /// 接受关联本地预留快照的普通限价单及冰山；未触发止损使用独立入口。
-    /// 这是由调用方完成市场数值和资金覆盖校验后的低层簿接口，缺少核验上下文时显式拒绝令牌。
-    /// 需要市场步长、本金、资金覆盖或验签的命令必须调用 `amend_with_context`；本接口成功时保留活动
-    /// 订单的预留内容和版本，完全成交终结时删除预留。
-    ///
-    /// # 不变量断言
-    ///
-    /// 调用方提供的 TradeId 不足时，在首次结构写入前停止处理；多余标识符不使用。
-    pub fn amend_regular_with_events(
-        &mut self,
-        amend: &AmendOrder,
-        now: LogicalTime,
-        current_session_id: u64,
-        trade_ids: &[TradeId],
-    ) -> Result<Vec<EngineEvent>, RejectReason> {
-        let plan = match self.build_amend_plan(amend, now, current_session_id)? {
-            ProductionAmendPlan::Regular(plan) => plan,
-            ProductionAmendPlan::Iceberg(plan) => {
-                return self.commit_iceberg_amend(plan, amend, trade_ids);
-            }
-            ProductionAmendPlan::Stop(_) => {
-                return Err(RejectReason::InvalidOrderCombination);
-            }
-        };
-        if amend.reservation_adjustment.is_some() {
-            return Err(RejectReason::InvalidReservation);
-        }
-        let index = self.orders[&plan.order_id];
-        let mut amended = self
-            .arena
-            .get(index)
-            .expect("candidate slot exists")
-            .original_order()
-            .clone();
-        amended.price = plan.new_price;
-        amended.qty = Qty::try_new(
-            plan.already_filled
-                .checked_add(plan.new_remaining.get())
-                .ok_or(RejectReason::ArithmeticOverflow)?,
-        )?;
-        let event = EngineEvent::OrderAmended {
-            order_id: plan.order_id,
-            old_price: Some(plan.old_price),
-            new_price: Some(plan.new_price),
-            old_quantity: AmendedQuantity::BaseRemaining(plan.old_remaining),
-            new_quantity: AmendedQuantity::BaseRemaining(plan.new_remaining),
-            priority_retained: matches!(plan.kind, RegularAmendKind::InPlaceReduce),
-        };
-        match plan.kind {
-            RegularAmendKind::InPlaceReduce => {
-                // 同价减量不会增加聚合，也不分配优先级；候选已校验正余量与时效。
-                self.commit_amend_reduce(index, amended, plan);
-                Ok(vec![event])
-            }
-            RegularAmendKind::RequeueSamePrice => {
-                let rest = self.preflight_amend_rest(
-                    plan,
-                    plan.new_remaining,
-                    self.next_queue_priority(),
-                )?;
-                // 写屏障：绝对数量、时效、优先级和删除旧单后的价档容量已全部预检。
-                let shadow = self
-                    .reservations
-                    .remove(&plan.order_id)
-                    .expect("candidate shadow exists");
-                self.cancel(plan.order_id).expect("candidate order exists");
-                self.commit_amend_rest(amended, plan.new_remaining, plan.target_tif, rest);
-                self.reservations.insert(plan.order_id, shadow);
-                Ok(vec![event])
-            }
-            RegularAmendKind::RepriceAndMatch => {
-                if amended.stp_mode != matching_domain::StpMode::None {
-                    let mut after = self.clone();
-                    let shadow = after
-                        .reservations
-                        .get(&plan.order_id)
-                        .expect("candidate shadow exists")
-                        .clone();
-                    after.cancel(plan.order_id).expect("candidate order exists");
-                    let mut incoming = amended.clone();
-                    incoming.qty = plan.new_remaining;
-                    let (matching_events, _) =
-                        after.execute_limit_stp(incoming, trade_ids, None, None, false)?;
-                    let traded = matching_events
-                        .iter()
-                        .any(|event| matches!(event, EngineEvent::Trade(_)));
-                    let terminal = matching_events.iter().any(|event| matches!(event, EngineEvent::OrderCanceled { order_id, .. } if *order_id == plan.order_id));
-                    let residual = after.order(plan.order_id).map(|node| {
-                        Qty::try_new(node.total_remaining()).expect("active residual is positive")
-                    });
-                    if let Some(index) = after.orders.get(&plan.order_id).copied() {
-                        let node = after
-                            .arena
-                            .get_mut(index)
-                            .expect("planned reprice residual");
-                        let remaining = Qty::try_new(node.total_remaining())?;
-                        node.amend_regular_in_place(amended, remaining, TimeInForce::Gtc);
-                        node.replace_initial_gtc_with_tif(plan.target_tif);
-                        after.regular_expiry.insert(plan.order_id, plan.target_tif);
-                        after.reservations.insert(plan.order_id, shadow);
-                    }
-                    let mut events = vec![event];
-                    events.extend(matching_events);
-                    if traded && !terminal {
-                        events.push(match residual {
-                            Some(remaining) => EngineEvent::OrderPartiallyFilled {
-                                order_id: plan.order_id,
-                                remaining,
-                            },
-                            None => EngineEvent::OrderFilled {
-                                order_id: plan.order_id,
-                            },
-                        });
-                    }
-                    *self = after;
-                    return Ok(events);
-                }
-                let commit = self.preflight_amend_reprice(plan, amended, trade_ids)?;
-                Ok(self.commit_amend_reprice(commit, event, trade_ids))
-            }
-        }
     }
 
     /// 同价减量只改载荷、余量和到期引用，保持槽位、链接及优先级。
@@ -709,11 +626,22 @@ impl ProductionOrderBook {
     ) -> Result<ProductionAmendPlan, RejectReason> {
         if let Some(node) = self.order(amend.order_id) {
             let reservation = self.reservation_snapshot(amend)?;
-            return Self::build_regular_plan(node, amend, now, current_session_id, reservation);
+            let plan = Self::build_regular_plan(node, amend, now, current_session_id, reservation)?;
+            self.validate_band_price(amend.new_price.unwrap_or(node.original_order().price))?;
+            return Ok(plan);
         }
         if let Some((stop, priority)) = self.stop_book.get(amend.order_id) {
             let reservation = self.reservation_snapshot(amend)?;
-            return Self::build_stop_plan(stop, priority, amend, reservation);
+            let plan = Self::build_stop_plan(stop, priority, amend, reservation)?;
+            match stop {
+                matching_domain::StopOrder::Limit(child) => {
+                    self.validate_band_price(amend.new_price.unwrap_or(child.price))?
+                }
+                matching_domain::StopOrder::Market(_) => {
+                    self.price_band_bounds()?;
+                }
+            }
+            return Ok(plan);
         }
         Err(RejectReason::OrderNotFound)
     }
@@ -884,5 +812,120 @@ impl ProductionOrderBook {
             target_expiry,
             reservation,
         }))
+    }
+
+    fn amend_regular_with_events_inner(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let plan = match self.build_amend_plan(amend, now, current_session_id)? {
+            ProductionAmendPlan::Regular(plan) => plan,
+            ProductionAmendPlan::Iceberg(plan) => {
+                return self.commit_iceberg_amend(plan, amend, trade_ids);
+            }
+            ProductionAmendPlan::Stop(_) => {
+                return Err(RejectReason::InvalidOrderCombination);
+            }
+        };
+        if amend.reservation_adjustment.is_some() {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let index = self.orders[&plan.order_id];
+        let mut amended = self
+            .arena
+            .get(index)
+            .expect("candidate slot exists")
+            .original_order()
+            .clone();
+        amended.price = plan.new_price;
+        amended.qty = Qty::try_new(
+            plan.already_filled
+                .checked_add(plan.new_remaining.get())
+                .ok_or(RejectReason::ArithmeticOverflow)?,
+        )?;
+        let event = EngineEvent::OrderAmended {
+            order_id: plan.order_id,
+            old_price: Some(plan.old_price),
+            new_price: Some(plan.new_price),
+            old_quantity: AmendedQuantity::BaseRemaining(plan.old_remaining),
+            new_quantity: AmendedQuantity::BaseRemaining(plan.new_remaining),
+            priority_retained: matches!(plan.kind, RegularAmendKind::InPlaceReduce),
+        };
+        match plan.kind {
+            RegularAmendKind::InPlaceReduce => {
+                // 同价减量不会增加聚合，也不分配优先级；候选已校验正余量与时效。
+                self.commit_amend_reduce(index, amended, plan);
+                Ok(vec![event])
+            }
+            RegularAmendKind::RequeueSamePrice => {
+                let rest = self.preflight_amend_rest(
+                    plan,
+                    plan.new_remaining,
+                    self.next_queue_priority(),
+                )?;
+                // 写屏障：绝对数量、时效、优先级和删除旧单后的价档容量已全部预检。
+                let shadow = self
+                    .reservations
+                    .remove(&plan.order_id)
+                    .expect("candidate shadow exists");
+                self.cancel(plan.order_id).expect("candidate order exists");
+                self.commit_amend_rest(amended, plan.new_remaining, plan.target_tif, rest);
+                self.reservations.insert(plan.order_id, shadow);
+                Ok(vec![event])
+            }
+            RegularAmendKind::RepriceAndMatch => {
+                if amended.stp_mode != matching_domain::StpMode::None {
+                    let mut after = self.clone();
+                    let shadow = after
+                        .reservations
+                        .get(&plan.order_id)
+                        .expect("candidate shadow exists")
+                        .clone();
+                    after.cancel(plan.order_id).expect("candidate order exists");
+                    let mut incoming = amended.clone();
+                    incoming.qty = plan.new_remaining;
+                    let (matching_events, _) =
+                        after.execute_limit_stp(incoming, trade_ids, None, None, false)?;
+                    let traded = matching_events
+                        .iter()
+                        .any(|event| matches!(event, EngineEvent::Trade(_)));
+                    let terminal = matching_events.iter().any(|event| matches!(event, EngineEvent::OrderCanceled { order_id, .. } if *order_id == plan.order_id));
+                    let residual = after.order(plan.order_id).map(|node| {
+                        Qty::try_new(node.total_remaining()).expect("active residual is positive")
+                    });
+                    if let Some(index) = after.orders.get(&plan.order_id).copied() {
+                        let node = after
+                            .arena
+                            .get_mut(index)
+                            .expect("planned reprice residual");
+                        let remaining = Qty::try_new(node.total_remaining())?;
+                        node.amend_regular_in_place(amended, remaining, TimeInForce::Gtc);
+                        node.replace_initial_gtc_with_tif(plan.target_tif);
+                        after.regular_expiry.insert(plan.order_id, plan.target_tif);
+                        after.reservations.insert(plan.order_id, shadow);
+                    }
+                    let mut events = vec![event];
+                    events.extend(matching_events);
+                    if traded && !terminal {
+                        events.push(match residual {
+                            Some(remaining) => EngineEvent::OrderPartiallyFilled {
+                                order_id: plan.order_id,
+                                remaining,
+                            },
+                            None => EngineEvent::OrderFilled {
+                                order_id: plan.order_id,
+                            },
+                        });
+                    }
+                    *self = after;
+                    return Ok(events);
+                }
+                let commit = self.preflight_amend_reprice(plan, amended, trade_ids)?;
+                Ok(self.commit_amend_reprice(commit, event, trade_ids))
+            }
+        }
     }
 }

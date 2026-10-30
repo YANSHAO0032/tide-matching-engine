@@ -103,6 +103,15 @@ fn amend_reprice_cancel_maker_then_fill_matches_reference_event_order() {
     assert!(
         matches!(actual.as_slice(), [EngineEvent::OrderAmended { .. }, EngineEvent::OrderCanceled { order_id, .. }, EngineEvent::Trade(trade), EngineEvent::OrderFilled { .. }] if *order_id == own.order_id && trade.maker_order_id == external.order_id)
     );
+    assert_eq!(
+        production
+            .reference_prices
+            .latest(matching_domain::PriceReferenceKind::LastTrade)
+            .unwrap()
+            .price
+            .get(),
+        101
+    );
     valid(&production);
 }
 
@@ -656,4 +665,30 @@ fn amend_regular_iceberg_trade_ids_and_refresh_priority_fail_before_unlink() {
         assert_eq!(snapshot(&book), before);
         valid(&book);
     }
+}
+
+#[test]
+fn amend_with_missing_band_reference_keeps_order_unchanged() {
+    let mut book = ProductionOrderBook::new(policy());
+    let input = order(1, Side::Buy, 100, 5);
+    rest(&mut book, &input);
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    book.set_price_band_config(Some((
+        matching_domain::PriceBandConfig {
+            reference_kind: PriceReferenceKind::MarkPrice,
+            max_deviation_bps: 500,
+        },
+        math,
+    )))
+    .unwrap();
+    let mut amend = command(&input);
+    amend.new_qty = Some(Qty::try_new(4).unwrap());
+    book.arena.reset_slot_accesses();
+    let before = book.clone();
+    assert_eq!(
+        book.amend_regular_with_events(&amend, LogicalTime::new(1), 9, &[]),
+        Err(RejectReason::ReferencePriceUnavailable)
+    );
+    book.arena.reset_slot_accesses();
+    assert_eq!(book, before);
 }

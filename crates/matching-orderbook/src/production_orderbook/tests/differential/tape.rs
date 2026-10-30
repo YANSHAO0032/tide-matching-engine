@@ -420,10 +420,16 @@ fn execute_tape(commands: &[Command], mut on_record: impl FnMut(StepRecord)) {
             // TradeId 由固定命令序列明确提供，不使用参考簿推导结果。
             // ========================================================
             Command::MarketByBase(candidate, supplied_trade_ids) => {
-                let reference_result =
-                    reference.execute_market_by_base(candidate.clone(), supplied_trade_ids);
-                let production_result =
-                    production.execute_market_by_base(candidate.clone(), supplied_trade_ids);
+                let reference_result = reference.execute_market_by_base(
+                    candidate.clone(),
+                    supplied_trade_ids,
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                );
+                let production_result = production.execute_market_by_base(
+                    candidate.clone(),
+                    supplied_trade_ids,
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                );
 
                 match (reference_result, production_result) {
                     (Ok(reference_trades), Ok(production_trades)) => {

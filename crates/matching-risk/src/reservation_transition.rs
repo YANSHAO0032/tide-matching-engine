@@ -105,41 +105,6 @@ pub struct ReservationRegistry {
 }
 
 impl ReservationRegistry {
-    /// 核验真实活动绑定和签名，冻结同单资金调整，不改变登记表。
-    pub fn plan_amend_adjustment(
-        &self,
-        keys: &RiskKeySet,
-        expected: &ExpectedAmendReservation,
-        token: &matching_domain::ReservationAdjustmentToken,
-    ) -> Result<PlannedAmendAdjustment, RejectReason> {
-        let before = self
-            .get(expected.reservation_id)
-            .ok_or(RejectReason::InvalidReservation)?;
-        if self.bindings.get(&expected.reservation_id)
-            != Some(&ReservationBinding::ActiveOrder(expected.order_id))
-        {
-            return Err(RejectReason::InvalidReservation);
-        }
-        let verified = verify_amend_reservation(keys, before, expected, token)?;
-        let mut after = before.clone();
-        after.apply_verified_adjustment(&verified)?;
-        Ok(PlannedAmendAdjustment {
-            before: self.clone(),
-            after,
-        })
-    }
-
-    /// 检查完整金融前态后应用已验签的同单调整。
-    pub fn apply_amend_adjustment(
-        &mut self,
-        plan: PlannedAmendAdjustment,
-    ) -> Result<(), ReservationApplyError> {
-        if *self != plan.before {
-            return Err(ReservationApplyError::StateChanged);
-        }
-        self.states.insert(plan.after.reservation_id, plan.after);
-        Ok(())
-    }
     /// 从已接管状态及释放历史建立唯一身份边界。
     ///
     /// 该实例持有实际状态，调用方必须保留其释放历史，不能每次仅从活动订单重建。
@@ -186,6 +151,7 @@ impl ReservationRegistry {
         registry.validate_bindings(&registry.bindings)?;
         Ok(registry)
     }
+
     /// 读取实际持有的预留状态。
     pub fn get(&self, id: ReservationId) -> Option<&ReservationState> {
         self.states.get(&id)
@@ -194,6 +160,42 @@ impl ReservationRegistry {
     /// 查询归属是否等待后置资金处理；这不表示已扣减或已释放资金。
     pub fn is_pending_r2(&self, id: ReservationId) -> bool {
         self.bindings.get(&id) == Some(&ReservationBinding::PendingR2)
+    }
+
+    /// 核验真实活动绑定和签名，冻结同单资金调整，不改变登记表。
+    pub fn plan_amend_adjustment(
+        &self,
+        keys: &RiskKeySet,
+        expected: &ExpectedAmendReservation,
+        token: &matching_domain::ReservationAdjustmentToken,
+    ) -> Result<PlannedAmendAdjustment, RejectReason> {
+        let before = self
+            .get(expected.reservation_id)
+            .ok_or(RejectReason::InvalidReservation)?;
+        if self.bindings.get(&expected.reservation_id)
+            != Some(&ReservationBinding::ActiveOrder(expected.order_id))
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let verified = verify_amend_reservation(keys, before, expected, token)?;
+        let mut after = before.clone();
+        after.apply_verified_adjustment(&verified)?;
+        Ok(PlannedAmendAdjustment {
+            before: self.clone(),
+            after,
+        })
+    }
+
+    /// 检查完整金融前态后应用已验签的同单调整。
+    pub fn apply_amend_adjustment(
+        &mut self,
+        plan: PlannedAmendAdjustment,
+    ) -> Result<(), ReservationApplyError> {
+        if *self != plan.before {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        self.states.insert(plan.after.reservation_id, plan.after);
+        Ok(())
     }
 
     /// 核对按订单索引的键及活动订单归属快照，拒绝遗漏、重复或状态漂移。
@@ -324,6 +326,36 @@ impl ReservationRegistry {
             })
     }
 
+    /// 仅消费已证明计划，不产生事件；新预留版本从零开始。
+    ///
+    /// 延续旧预留时推进一次金融版本；改用新预留时旧金融状态完整保留，仅归属等待后置资金处理。
+    ///
+    /// 返回的状态漂移是必须停止处理的不变量错误，不能映射为删除旧单后的正常拒绝。
+    pub fn apply_transition(
+        &mut self,
+        plan: PlannedReservationTransition,
+    ) -> Result<(), ReservationApplyError> {
+        if self.get(plan.before.reservation_id) != Some(&plan.before)
+            || self.bindings.get(&plan.before.reservation_id)
+                != Some(&ReservationBinding::ActiveOrder(plan.before.order_id))
+            || self.active_order_exists(plan.active.order_id)
+            || (plan.pending_r2.is_some() && self.states.contains_key(&plan.active.reservation_id))
+        {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        // 所有不变量核对均在首次改动之前；提交不再返回正常业务拒绝。
+        if let Some(pending) = plan.pending_r2 {
+            self.bindings
+                .insert(pending.reservation_id, ReservationBinding::PendingR2);
+        }
+        self.bindings.insert(
+            plan.active.reservation_id,
+            ReservationBinding::ActiveOrder(plan.active.order_id),
+        );
+        self.states.insert(plan.active.reservation_id, plan.active);
+        Ok(())
+    }
+
     fn plan_inner(
         &self,
         keys: &RiskKeySet,
@@ -427,35 +459,6 @@ impl ReservationRegistry {
         self.bindings
             .values()
             .any(|binding| *binding == ReservationBinding::ActiveOrder(order_id))
-    }
-    /// 仅消费已证明计划，不产生事件；新预留版本从零开始。
-    ///
-    /// 延续旧预留时推进一次金融版本；改用新预留时旧金融状态完整保留，仅归属等待后置资金处理。
-    ///
-    /// 返回的状态漂移是必须停止处理的不变量错误，不能映射为删除旧单后的正常拒绝。
-    pub fn apply_transition(
-        &mut self,
-        plan: PlannedReservationTransition,
-    ) -> Result<(), ReservationApplyError> {
-        if self.get(plan.before.reservation_id) != Some(&plan.before)
-            || self.bindings.get(&plan.before.reservation_id)
-                != Some(&ReservationBinding::ActiveOrder(plan.before.order_id))
-            || self.active_order_exists(plan.active.order_id)
-            || (plan.pending_r2.is_some() && self.states.contains_key(&plan.active.reservation_id))
-        {
-            return Err(ReservationApplyError::StateChanged);
-        }
-        // 所有不变量核对均在首次改动之前；提交不再返回正常业务拒绝。
-        if let Some(pending) = plan.pending_r2 {
-            self.bindings
-                .insert(pending.reservation_id, ReservationBinding::PendingR2);
-        }
-        self.bindings.insert(
-            plan.active.reservation_id,
-            ReservationBinding::ActiveOrder(plan.active.order_id),
-        );
-        self.states.insert(plan.active.reservation_id, plan.active);
-        Ok(())
     }
 }
 

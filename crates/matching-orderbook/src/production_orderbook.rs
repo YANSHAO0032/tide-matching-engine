@@ -20,6 +20,7 @@ mod market_by_base;
 mod market_by_quote;
 mod mass_cancel;
 mod matching;
+mod price_band;
 mod reservation_place;
 mod resting;
 mod stop_orders;
@@ -120,6 +121,11 @@ pub struct ProductionOrderBook {
     regular_expiry: RegularExpiryIndex,
     /// 各参考来源的最近已接受价格和序号。
     reference_prices: PriceReferenceState,
+    /// 启用价格带时固定的市场配置与数值规则。
+    price_band: Option<(
+        matching_domain::PriceBandConfig,
+        matching_domain::MarketMath,
+    )>,
 }
 
 impl ProductionOrderBook {
@@ -136,6 +142,7 @@ impl ProductionOrderBook {
             stop_priority_allocator: StopPriorityAllocator::new(policy),
             regular_expiry: RegularExpiryIndex::default(),
             reference_prices: PriceReferenceState::default(),
+            price_band: None,
         }
     }
 
@@ -176,26 +183,6 @@ impl ProductionOrderBook {
         Some(node)
     }
 
-    /// 在任何订单簿写入前核对候选预留身份及既有影子状态。
-    fn validate_new_reservation(
-        &self,
-        order_id: OrderId,
-        user_id: matching_domain::UserId,
-        state: &ReservationState,
-    ) -> Result<(), RejectReason> {
-        if self.contains_active_order(order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        if state.status != matching_risk::ReservationStatus::Active
-            || state.order_id != order_id
-            || state.user_id != user_id
-            || self.reservations.contains_key(&order_id)
-        {
-            return Err(RejectReason::InvalidReservation);
-        }
-        Ok(())
-    }
-
     /// 按订单身份只读查询已登记的本地预留快照。
     pub fn reservation_state(&self, order_id: OrderId) -> Option<&ReservationState> {
         self.reservations.get(&order_id)
@@ -214,6 +201,26 @@ impl ProductionOrderBook {
     /// 判断标识是否被常规订单或未触发止损订单占用。
     pub(crate) fn contains_active_order(&self, order_id: OrderId) -> bool {
         self.orders.contains_key(&order_id) || self.stop_book.contains(order_id)
+    }
+
+    /// 在任何订单簿写入前核对候选预留身份及既有影子状态。
+    fn validate_new_reservation(
+        &self,
+        order_id: OrderId,
+        user_id: matching_domain::UserId,
+        state: &ReservationState,
+    ) -> Result<(), RejectReason> {
+        if self.contains_active_order(order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if state.status != matching_risk::ReservationStatus::Active
+            || state.order_id != order_id
+            || state.user_id != user_id
+            || self.reservations.contains_key(&order_id)
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        Ok(())
     }
 }
 
