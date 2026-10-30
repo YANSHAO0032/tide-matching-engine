@@ -22,6 +22,7 @@ mod market_by_quote_preflight;
 mod next_fill_execution;
 mod next_fill_planner;
 mod post_only_preflight;
+mod price_band;
 mod property;
 mod protected_market_by_base;
 mod protected_market_by_quote_execution;

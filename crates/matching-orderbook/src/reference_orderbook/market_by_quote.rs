@@ -14,6 +14,62 @@ use matching_domain::{
 };
 
 impl ReferenceOrderBook {
+    /// 按报价币预算执行市价订单。
+    ///
+    /// 所有可预期失败都发生在首笔状态变更前：
+    /// 1. 只读规划整个挂单成交序列；
+    /// 2. 检查调用方 TradeId 数量；
+    /// 3. 按计划逐笔提交，不重新计算本金。
+    ///
+    /// 市价吃单方不挂簿；冰山挂单补量仍分配 QueuePriority。
+    pub fn execute_market_by_quote(
+        &mut self,
+        incoming: MarketByQuote,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<MarketByQuoteExecution, RejectReason> {
+        let mut candidate = self.clone();
+        let execution = candidate.execute_market_by_quote_inner(incoming, math, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(execution)
+    }
+
+    /// 参考簿受保护 MarketByQuote 执行。
+    ///
+    /// 完整只读预检、TradeId 数量校验及事件容量准备
+    /// 必须先于任何订单簿状态变更。
+    ///
+    /// 使用预检计划中的挂单、价格、数量和本金；
+    /// 不重新计算保护边界或成交名义额。
+    ///
+    /// 保护终结事件不消耗 TradeId。
+    /// 市价吃单方的未使用报价预算不重新挂簿。
+    pub fn execute_market_by_quote_with_protection(
+        &mut self,
+        incoming: MarketByQuote,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        let mut candidate = self.clone();
+        let execution = candidate
+            .execute_market_by_quote_with_protection_inner(incoming, context, math, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(execution)
+    }
+
     /// 只读规划 MarketByQuote。
     ///
     /// - 重复活动 OrderId 优先拒绝；
@@ -245,21 +301,68 @@ impl ReferenceOrderBook {
         })
     }
 
-    /// 按报价币预算执行市价订单。
-    ///
-    /// 所有可预期失败都发生在首笔状态变更前：
-    /// 1. 只读规划整个挂单成交序列；
-    /// 2. 检查调用方 TradeId 数量；
-    /// 3. 按计划逐笔提交，不重新计算本金。
-    ///
-    /// 市价吃单方不挂簿；冰山挂单补量仍分配 QueuePriority。
-    pub fn execute_market_by_quote(
+    pub(super) fn execute_market_by_quote_inner(
         &mut self,
         incoming: MarketByQuote,
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<MarketByQuoteExecution, RejectReason> {
         incoming.validate_stp_mode()?;
+        if incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
+        }
+        if let Some((config, band_math)) = self.price_band_config() {
+            assert_eq!(*math, band_math, "市场数值配置不一致");
+            let reference = self
+                .reference_prices
+                .latest(config.reference_kind)
+                .ok_or(RejectReason::ReferencePriceUnavailable)?
+                .price;
+            let (lower, upper) = config.bounds(reference, band_math.tick_size())?;
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: reference,
+                market_band_worst: Some(if incoming.side == Side::Buy {
+                    upper
+                } else {
+                    lower
+                }),
+            };
+            let execution =
+                self.execute_market_by_quote_with_protection(incoming, &context, math, trade_ids)?;
+            return Ok(MarketByQuoteExecution::from_events(
+                execution.events().to_vec(),
+                execution.spent_quote(),
+                execution.unused_quote(),
+            ));
+        }
+        if incoming
+            .market_protection
+            .as_ref()
+            .is_some_and(|p| p.max_slippage_bps.is_some())
+        {
+            return Err(RejectReason::ReferencePriceUnavailable);
+        }
+        if let Some(worst) = incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.worst_price)
+        {
+            if worst.get() % math.tick_size() != 0 {
+                return Err(RejectReason::InvalidTick);
+            }
+            let (events, spent, unused) = self.slice_market_quote_with_boundary(
+                incoming,
+                math,
+                Some((worst, matching_domain::ProtectionSource::User)),
+                trade_ids,
+            )?;
+            return Ok(MarketByQuoteExecution::from_events(events, spent, unused));
+        }
         if self.has_iceberg_maker(incoming.side)
             || incoming.stp_mode != matching_domain::StpMode::None
         {
@@ -368,17 +471,31 @@ impl ReferenceOrderBook {
         ))
     }
 
-    /// 参考簿受保护 MarketByQuote 执行。
-    ///
-    /// 完整只读预检、TradeId 数量校验及事件容量准备
-    /// 必须先于任何订单簿状态变更。
-    ///
-    /// 使用预检计划中的挂单、价格、数量和本金；
-    /// 不重新计算保护边界或成交名义额。
-    ///
-    /// 保护终结事件不消耗 TradeId。
-    /// 市价吃单方的未使用报价预算不重新挂簿。
-    pub fn execute_market_by_quote_with_protection(
+    fn execute_market_by_quote_with_protection_inner(
+        &mut self,
+        incoming: MarketByQuote,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if let Some((_, configured_math)) = self.price_band_config() {
+            assert_eq!(*math, configured_math, "市场数值配置不一致");
+        }
+        let mut effective_context = context.clone();
+        if let Some((lower, upper)) = self.price_band_bounds()? {
+            effective_context.market_band_worst = Some(if incoming.side == Side::Buy {
+                upper
+            } else {
+                lower
+            });
+        }
+        let context = &effective_context;
+        self.execute_market_by_quote_with_frozen_protection(incoming, context, math, trade_ids)
+    }
+
+    /// 使用根命令已冻结的保护上下文，不重新读取市场参考价。
+    pub(super) fn execute_market_by_quote_with_frozen_protection(
         &mut self,
         incoming: MarketByQuote,
         context: &CommandStartProtectionContext,

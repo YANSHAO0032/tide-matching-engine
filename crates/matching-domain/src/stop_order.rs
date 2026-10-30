@@ -95,10 +95,6 @@ pub enum StopOrder {
 }
 
 impl StopOrder {
-    /// 在写入 StopBook 前拒绝尚未冻结 child 执行规则的自成交模式。
-    pub fn validate_stp_mode(&self) -> Result<(), crate::RejectReason> {
-        self.stp_mode().submission_rejection().map_or(Ok(()), Err)
-    }
     /// 返回本单所属的触发来源。
     pub fn trigger_reference(&self) -> crate::PriceReferenceKind {
         match self {
@@ -114,6 +110,7 @@ impl StopOrder {
             Self::Market(order) => order.market_protection.as_ref(),
         }
     }
+
     /// 返回不依赖容器位置的订单标识符。
     pub fn order_id(&self) -> OrderId {
         match self {
@@ -179,6 +176,11 @@ impl StopOrder {
             Self::Limit(order) => order.reservation_id,
             Self::Market(order) => order.reservation_id,
         }
+    }
+
+    /// 在写入 StopBook 前拒绝尚未冻结 child 执行规则的自成交模式。
+    pub fn validate_stp_mode(&self) -> Result<(), crate::RejectReason> {
+        self.stp_mode().submission_rejection().map_or(Ok(()), Err)
     }
 }
 

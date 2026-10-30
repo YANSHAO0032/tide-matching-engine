@@ -420,6 +420,7 @@ fn legacy_trade_only_paths_keep_refresh_fifo_and_visible_depth() {
                             market_protection: None,
                         },
                         &ids(),
+                        &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
                     )
                     .unwrap()
                     .to_vec(),

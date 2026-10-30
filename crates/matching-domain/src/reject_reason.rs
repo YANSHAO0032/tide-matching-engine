@@ -28,11 +28,15 @@ pub enum RejectReason {
     PostOnlyWouldCross = 2015,
     /// 限价和数量约束下的可执行流动性不足以完整成交 FOK。
     FokInsufficientLiquidity = 2016,
+    /// 限价订单的价格超出市场价格带。
+    PriceBandExceeded = 3001,
+    /// 市场价格带引用的价格当前不可用。
+    ReferencePriceUnavailable = 3002,
     /// 订单需要有效保护边界，但用户和市场均未提供可用边界。
     MarketProtectionRequired = 3005,
     /// 下一笔候选挂单成交将越过有效保护边界。
     MarketProtectionExceeded = 3006,
-    /// 市价滑点参数不在 0..=9_999 的稳定合法范围内。
+    /// 用户滑点或市场价格带偏离基点不在 0..=9_999 的稳定合法范围内。
     InvalidSlippageBps = 3007,
     /// 静态开市参考或不允许的来源被用来驱动止损触发。
     InvalidReferencePriceSource = 3003,

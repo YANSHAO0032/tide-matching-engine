@@ -128,7 +128,7 @@ impl ReferenceOrderBook {
                     )?
                 } else {
                     after_book
-                        .execute_market_by_base(order, context.trade_ids)?
+                        .execute_market_by_base(order, context.trade_ids, context.math)?
                         .events()
                         .to_vec()
                 };
@@ -170,6 +170,12 @@ impl ReferenceOrderBook {
                 )?;
             }
         }
+        after_book.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
         let mut terminal = vec![&state];
         for maker in &self.orders {
             let id = maker.original_order().order_id;
@@ -250,6 +256,9 @@ impl ReferenceOrderBook {
         request: ReferencePlaceOrder,
         context: ReferencePlaceContext<'_>,
     ) -> Result<ReferencePlacePreflight, RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*context.math, configured, "市场数值配置不一致");
+        }
         let accepted = match &request {
             ReferencePlaceOrder::Limit { order, .. } => order.clone(),
             ReferencePlaceOrder::Iceberg { order, .. } => order.order().clone(),
@@ -299,6 +308,7 @@ impl ReferenceOrderBook {
             .math
             .trade_notional(accepted.price, accepted.qty)
             .map_err(Self::reject_quote_math_error)?;
+        self.validate_band_price(accepted.price)?;
 
         let mut after = self.clone();
         let events = match request {
@@ -361,6 +371,12 @@ impl ReferenceOrderBook {
             }
         })?;
 
+        after.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
         let mut terminal_makers = Vec::new();
         // 源 Vec 的顺序确定，不按 HashMap 的迭代顺序生成业务计划。
         for maker in &self.orders {

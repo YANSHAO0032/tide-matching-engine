@@ -55,6 +55,8 @@ struct ProductionSnapshot {
     regular_expiry: RegularExpiryIndex,
     /// 价格保护参考价状态快照。
     reference_prices: PriceReferenceState,
+    /// 价格带配置和市场数值规则的冻结快照。
+    price_band: Option<(matching_domain::PriceBandConfig, MarketMath)>,
 }
 
 impl ProductionSnapshot {
@@ -70,6 +72,7 @@ impl ProductionSnapshot {
             stop_priority_allocator: book.stop_priority_allocator.clone(),
             regular_expiry: book.regular_expiry.clone(),
             reference_prices: book.reference_prices.clone(),
+            price_band: book.price_band,
         }
     }
 }
@@ -137,6 +140,8 @@ struct ProductionStandardReplace {
     residual_slot: Option<OrderIndex>,
     /// 提交后仍有活动新订单时绑定给它的金融预留快照。
     active_reservation: ReservationState,
+    /// 逐笔实际成交后已预检的参考价状态。
+    reference_after: PriceReferenceState,
 }
 
 impl ProductionOrderBook {
@@ -156,6 +161,116 @@ impl ProductionOrderBook {
             .map_err(|reason| request.rejection(reason))
     }
 
+    /// 完整核对真实簿和登记表前态后，提交已冻结的旧单删除、资金后态、片成交及余量。
+    ///
+    /// 漂移在首次写入前返回不变量错误；首次写入后仅有断言保护的确定性提交，
+    /// 不运行正常业务拒绝、资金验签、重新撮合或回滚，不发出提前资金释放。
+    pub fn apply_cancel_replace(
+        &mut self,
+        registry: &mut ReservationRegistry,
+        plan: ProductionCancelReplacePlan,
+    ) -> Result<Vec<EngineEvent>, ReservationApplyError> {
+        if ProductionSnapshot::capture(self) != plan.before || *registry != plan.before_registry {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        let ProductionCancelReplacePlan {
+            before: _,
+            before_registry: _,
+            after_registry,
+            commit,
+        } = plan;
+        let plan = match commit {
+            ProductionReplaceCommit::Stp { after_book, events } => {
+                *self = *after_book;
+                *registry = after_registry;
+                return Ok(events);
+            }
+            ProductionReplaceCommit::Standard(plan) => *plan,
+        };
+        self.reference_prices = plan.reference_after.clone();
+        match plan.old_location {
+            OldLocation::Regular(index) => {
+                assert_eq!(self.orders.get(&plan.old_id), Some(&index));
+                self.cancel(plan.old_id)
+                    .expect("preflighted production old regular identity");
+            }
+            OldLocation::Stop(priority) => {
+                let (_, actual) = self
+                    .cancel_stop(plan.old_id)
+                    .expect("preflighted production old Stop identity");
+                assert_eq!(actual, priority);
+            }
+        }
+        *registry = after_registry;
+        let mut events = vec![EngineEvent::OrderCanceled {
+            order_id: plan.old_id,
+            remaining: OrderRemaining::Base(plan.old_remaining),
+            reason: CancelReason::CancelReplace,
+        }];
+        events.extend(self.commit_iceberg_plan(
+            &plan.fills,
+            plan.accepted.side,
+            plan.accepted.order_id,
+            &plan.trade_ids,
+        ));
+        if plan.peak.is_some() && !plan.fills.fills.is_empty() {
+            events.push(if plan.fills.base_remaining == 0 {
+                EngineEvent::OrderFilled {
+                    order_id: plan.accepted.order_id,
+                }
+            } else {
+                EngineEvent::OrderPartiallyFilled {
+                    order_id: plan.accepted.order_id,
+                    remaining: Qty::try_new(plan.fills.base_remaining)
+                        .expect("positive frozen iceberg residual"),
+                }
+            });
+        }
+        if plan.tif == TimeInForce::Ioc && plan.fills.base_remaining > 0 {
+            events.push(EngineEvent::OrderCanceled {
+                order_id: plan.accepted.order_id,
+                remaining: OrderRemaining::Base(
+                    Qty::try_new(plan.fills.base_remaining).expect("positive frozen IOC residual"),
+                ),
+                reason: CancelReason::IocRemainder,
+            });
+        }
+        if let Some(rest) = plan.residual {
+            self.assert_rest_strictly_non_crossing(&rest);
+            if let Some(peak) = plan.peak {
+                self.commit_iceberg_rest(
+                    IcebergOrder::try_new(plan.accepted.clone(), peak)
+                        .expect("validated production iceberg"),
+                    plan.fills.base_remaining,
+                    rest,
+                );
+            } else {
+                let mut residual = plan.accepted.clone();
+                residual.qty = Qty::try_new(plan.fills.base_remaining)
+                    .expect("positive frozen Limit residual");
+                self.commit_rest_timed(residual, plan.tif, rest);
+                self.arena
+                    .get_mut(self.orders[&plan.accepted.order_id])
+                    .expect("committed residual node")
+                    .amend_regular_in_place(
+                        plan.accepted.clone(),
+                        Qty::try_new(plan.fills.base_remaining).expect("positive residual"),
+                        plan.tif,
+                    );
+            }
+            assert!(
+                self.reservations
+                    .insert(plan.accepted.order_id, plan.active_reservation)
+                    .is_none()
+            );
+            assert_eq!(
+                self.orders.get(&plan.accepted.order_id).copied(),
+                plan.residual_slot
+            );
+        }
+        Ok(events)
+    }
+
     fn plan_cancel_replace_inner(
         &self,
         request: &CancelReplaceOrder,
@@ -164,6 +279,9 @@ impl ProductionOrderBook {
         keys: &RiskKeySet,
         context: ProductionCancelReplaceContext<'_>,
     ) -> Result<ProductionCancelReplacePlan, RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*context.math, configured, "市场数值配置不一致");
+        }
         let (old_location, old_user, old_remaining) = if let Some(old) =
             self.order(request.old_order_id)
         {
@@ -227,6 +345,7 @@ impl ProductionOrderBook {
             price: replacement.price,
             qty: replacement.qty,
         };
+        self.validate_band_price(accepted.price)?;
         let (tif, flags, peak) = match replacement.kind {
             ReplacementOrderKind::Limit { tif, flags } => (tif, flags, None),
             ReplacementOrderKind::Iceberg {
@@ -309,6 +428,12 @@ impl ProductionOrderBook {
                 }
             };
             let mut total = matching_domain::QuoteAmount::new(0);
+            after_book.reference_prices =
+                self.reference_prices
+                    .plan_trade_prices(matching_events.iter().filter_map(|event| match event {
+                        EngineEvent::Trade(trade) => Some(trade.price),
+                        _ => None,
+                    }))?;
             for event in &matching_events {
                 if let EngineEvent::Trade(trade) = event {
                     total = total.checked_add(
@@ -470,6 +595,9 @@ impl ProductionOrderBook {
                 .chain(residual.map(|_| (accepted.order_id, &active_reservation))),
         )?;
         let trade_ids = context.trade_ids[..fills.fills.len()].to_vec();
+        let reference_after = self
+            .reference_prices
+            .plan_trade_prices(fills.fills.iter().map(|fill| fill.price))?;
         Ok(ProductionCancelReplacePlan {
             before: ProductionSnapshot::capture(self),
             before_registry: registry.clone(),
@@ -486,116 +614,8 @@ impl ProductionOrderBook {
                 residual,
                 residual_slot,
                 active_reservation,
+                reference_after,
             })),
         })
-    }
-
-    /// 完整核对真实簿和登记表前态后，提交已冻结的旧单删除、资金后态、片成交及余量。
-    ///
-    /// 漂移在首次写入前返回不变量错误；首次写入后仅有断言保护的确定性提交，
-    /// 不运行正常业务拒绝、资金验签、重新撮合或回滚，不发出提前资金释放。
-    pub fn apply_cancel_replace(
-        &mut self,
-        registry: &mut ReservationRegistry,
-        plan: ProductionCancelReplacePlan,
-    ) -> Result<Vec<EngineEvent>, ReservationApplyError> {
-        if ProductionSnapshot::capture(self) != plan.before || *registry != plan.before_registry {
-            return Err(ReservationApplyError::StateChanged);
-        }
-        let ProductionCancelReplacePlan {
-            before: _,
-            before_registry: _,
-            after_registry,
-            commit,
-        } = plan;
-        let plan = match commit {
-            ProductionReplaceCommit::Stp { after_book, events } => {
-                *self = *after_book;
-                *registry = after_registry;
-                return Ok(events);
-            }
-            ProductionReplaceCommit::Standard(plan) => *plan,
-        };
-        match plan.old_location {
-            OldLocation::Regular(index) => {
-                assert_eq!(self.orders.get(&plan.old_id), Some(&index));
-                self.cancel(plan.old_id)
-                    .expect("preflighted production old regular identity");
-            }
-            OldLocation::Stop(priority) => {
-                let (_, actual) = self
-                    .cancel_stop(plan.old_id)
-                    .expect("preflighted production old Stop identity");
-                assert_eq!(actual, priority);
-            }
-        }
-        *registry = after_registry;
-        let mut events = vec![EngineEvent::OrderCanceled {
-            order_id: plan.old_id,
-            remaining: OrderRemaining::Base(plan.old_remaining),
-            reason: CancelReason::CancelReplace,
-        }];
-        events.extend(self.commit_iceberg_plan(
-            &plan.fills,
-            plan.accepted.side,
-            plan.accepted.order_id,
-            &plan.trade_ids,
-        ));
-        if plan.peak.is_some() && !plan.fills.fills.is_empty() {
-            events.push(if plan.fills.base_remaining == 0 {
-                EngineEvent::OrderFilled {
-                    order_id: plan.accepted.order_id,
-                }
-            } else {
-                EngineEvent::OrderPartiallyFilled {
-                    order_id: plan.accepted.order_id,
-                    remaining: Qty::try_new(plan.fills.base_remaining)
-                        .expect("positive frozen iceberg residual"),
-                }
-            });
-        }
-        if plan.tif == TimeInForce::Ioc && plan.fills.base_remaining > 0 {
-            events.push(EngineEvent::OrderCanceled {
-                order_id: plan.accepted.order_id,
-                remaining: OrderRemaining::Base(
-                    Qty::try_new(plan.fills.base_remaining).expect("positive frozen IOC residual"),
-                ),
-                reason: CancelReason::IocRemainder,
-            });
-        }
-        if let Some(rest) = plan.residual {
-            self.assert_rest_strictly_non_crossing(&rest);
-            if let Some(peak) = plan.peak {
-                self.commit_iceberg_rest(
-                    IcebergOrder::try_new(plan.accepted.clone(), peak)
-                        .expect("validated production iceberg"),
-                    plan.fills.base_remaining,
-                    rest,
-                );
-            } else {
-                let mut residual = plan.accepted.clone();
-                residual.qty = Qty::try_new(plan.fills.base_remaining)
-                    .expect("positive frozen Limit residual");
-                self.commit_rest_timed(residual, plan.tif, rest);
-                self.arena
-                    .get_mut(self.orders[&plan.accepted.order_id])
-                    .expect("committed residual node")
-                    .amend_regular_in_place(
-                        plan.accepted.clone(),
-                        Qty::try_new(plan.fills.base_remaining).expect("positive residual"),
-                        plan.tif,
-                    );
-            }
-            assert!(
-                self.reservations
-                    .insert(plan.accepted.order_id, plan.active_reservation)
-                    .is_none()
-            );
-            assert_eq!(
-                self.orders.get(&plan.accepted.order_id).copied(),
-                plan.residual_slot
-            );
-        }
-        Ok(events)
     }
 }

@@ -133,6 +133,12 @@ impl ReferenceOrderBook {
             context.trade_ids,
             context.execution,
         )?;
+        after_book.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
         let mut after_registry = registry.clone();
         if let Some(token) = &amend.reservation_adjustment {
             let state = self
@@ -216,6 +222,12 @@ impl ReferenceOrderBook {
         trade_ids: &[TradeId],
         context: &crate::AmendExecutionContext<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if let Some((_, configured_math)) = self.price_band_config() {
+            assert_eq!(
+                configured_math, context.market_math,
+                "市场价格带数值配置不一致"
+            );
+        }
         let candidate = self.build_amend_plan(amend, now, current_session_id)?;
         self.preflight_amend_numeric(amend, &candidate, context)?;
         let planned = context.prepare(
@@ -238,6 +250,40 @@ impl ReferenceOrderBook {
         if let Some(state) = self.reservations.get_mut(&amend.order_id) {
             *state = planned;
         }
+        Ok(events)
+    }
+
+    /// 以参考 Vec 路径提交一张常规限价订单的改单。
+    ///
+    /// 目标数量为包含已成交量的绝对总量，必须严格大于已成交量。同价减量
+    /// 保留队列位置；增量或改价失去优先级，只有实际挂单才分配新优先级。
+    /// 所有成交事件位于 OrderAmended 之后、订单生命周期事件之前。
+    ///
+    /// 接受关联本地预留快照的普通限价单及冰山；未触发止损使用独立入口。
+    /// 这是由调用方完成市场数值和资金覆盖校验后的低层簿接口，缺少核验上下文时显式拒绝令牌。
+    /// 需要市场步长、本金、资金覆盖或验签的命令必须调用 `amend_with_context`；本接口成功时保留活动
+    /// 订单的预留内容和版本，完全成交终结时删除预留。
+    ///
+    /// # 不变量断言
+    ///
+    /// 调用方提供的 TradeId 不足时，在首次结构写入前停止处理；多余标识符不使用。
+    pub fn amend_regular_with_events(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let events =
+            candidate.amend_regular_with_events_inner(amend, now, current_session_id, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
         Ok(events)
     }
 
@@ -317,83 +363,6 @@ impl ReferenceOrderBook {
             }
         }
         Ok(())
-    }
-
-    /// 以参考 Vec 路径提交一张常规限价订单的改单。
-    ///
-    /// 目标数量为包含已成交量的绝对总量，必须严格大于已成交量。同价减量
-    /// 保留队列位置；增量或改价失去优先级，只有实际挂单才分配新优先级。
-    /// 所有成交事件位于 OrderAmended 之后、订单生命周期事件之前。
-    ///
-    /// 接受关联本地预留快照的普通限价单及冰山；未触发止损使用独立入口。
-    /// 这是由调用方完成市场数值和资金覆盖校验后的低层簿接口，缺少核验上下文时显式拒绝令牌。
-    /// 需要市场步长、本金、资金覆盖或验签的命令必须调用 `amend_with_context`；本接口成功时保留活动
-    /// 订单的预留内容和版本，完全成交终结时删除预留。
-    ///
-    /// # 不变量断言
-    ///
-    /// 调用方提供的 TradeId 不足时，在首次结构写入前停止处理；多余标识符不使用。
-    pub fn amend_regular_with_events(
-        &mut self,
-        amend: &AmendOrder,
-        now: LogicalTime,
-        current_session_id: u64,
-        trade_ids: &[TradeId],
-    ) -> Result<Vec<EngineEvent>, RejectReason> {
-        let plan = match self.build_amend_plan(amend, now, current_session_id)? {
-            ReferenceAmendPlan::Regular(plan) => plan,
-            ReferenceAmendPlan::Iceberg(plan) => {
-                return self.commit_iceberg_amend(plan, amend, trade_ids);
-            }
-            ReferenceAmendPlan::Stop(_) => {
-                return Err(RejectReason::InvalidOrderCombination);
-            }
-        };
-        // 当前阶段不能静默忽略已签名的预留调整授权。
-        if amend.reservation_adjustment.is_some() {
-            return Err(RejectReason::InvalidReservation);
-        }
-        let reservation = self
-            .reservations
-            .get(&plan.order_id)
-            .cloned()
-            .ok_or(RejectReason::InvalidReservation)?;
-        let index = self
-            .orders
-            .iter()
-            .position(|order| order.original_order().order_id == plan.order_id)
-            .ok_or(RejectReason::OrderNotFound)?;
-        let original = self.orders[index].original_order().clone();
-        let amended = Self::amended_payload(&original, plan)?;
-        let amended_event = Self::amended_event(plan);
-
-        match plan.kind {
-            RegularAmendKind::InPlaceReduce => {
-                let order = &mut self.orders[index];
-                order.amend_regular_in_place(amended, plan.new_remaining, plan.target_tif);
-                Ok(vec![amended_event])
-            }
-            RegularAmendKind::RequeueSamePrice => {
-                // 与既有挂单预检顺序一致，先只读验证优先级，再检查目标档聚合。
-                if self.next_priority >= u128::MAX - super::PRIORITY_GUARD {
-                    return Err(RejectReason::PrioritySpaceExhaustion);
-                }
-                Self::preflight_amend_level(&self.orders, plan, plan.new_remaining)?;
-                let priority = self.allocate_amend_priority()?;
-                let replacement = ReferenceOrder::amended_regular(
-                    amended,
-                    plan.new_remaining,
-                    priority,
-                    plan.target_tif,
-                );
-                self.orders.remove(index);
-                self.orders.push(replacement);
-                Ok(vec![amended_event])
-            }
-            RegularAmendKind::RepriceAndMatch => {
-                self.commit_reprice_plan(plan, amended, reservation, amended_event, trade_ids)
-            }
-        }
     }
 
     /// 独立扫描删除旧单后的目标档，保证新余量与档位数量均可表示。
@@ -592,7 +561,10 @@ impl ReferenceOrderBook {
             .find(|entry| entry.original_order().order_id == amend.order_id)
         {
             let reservation = self.reservation_snapshot(amend)?;
-            return Self::build_regular_plan(order, amend, now, current_session_id, reservation);
+            let plan =
+                Self::build_regular_plan(order, amend, now, current_session_id, reservation)?;
+            self.validate_band_price(amend.new_price.unwrap_or(order.original_order().price))?;
+            return Ok(plan);
         }
         if let Some(stop) = self
             .stop_orders
@@ -600,7 +572,16 @@ impl ReferenceOrderBook {
             .find(|entry| entry.order.order_id() == amend.order_id)
         {
             let reservation = self.reservation_snapshot(amend)?;
-            return Self::build_stop_plan(stop, amend, reservation);
+            let plan = Self::build_stop_plan(stop, amend, reservation)?;
+            match &stop.order {
+                matching_domain::StopOrder::Limit(child) => {
+                    self.validate_band_price(amend.new_price.unwrap_or(child.price))?
+                }
+                matching_domain::StopOrder::Market(_) => {
+                    self.price_band_bounds()?;
+                }
+            }
+            return Ok(plan);
         }
         Err(RejectReason::OrderNotFound)
     }
@@ -784,6 +765,69 @@ impl ReferenceOrderBook {
             TimeInForce::Day { session_id } if session_id == current_session_id => Ok(()),
             TimeInForce::Day { .. } => Err(RejectReason::InvalidSession),
             TimeInForce::Ioc | TimeInForce::Fok => Err(RejectReason::InvalidOrderCombination),
+        }
+    }
+
+    fn amend_regular_with_events_inner(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let plan = match self.build_amend_plan(amend, now, current_session_id)? {
+            ReferenceAmendPlan::Regular(plan) => plan,
+            ReferenceAmendPlan::Iceberg(plan) => {
+                return self.commit_iceberg_amend(plan, amend, trade_ids);
+            }
+            ReferenceAmendPlan::Stop(_) => {
+                return Err(RejectReason::InvalidOrderCombination);
+            }
+        };
+        // 当前阶段不能静默忽略已签名的预留调整授权。
+        if amend.reservation_adjustment.is_some() {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let reservation = self
+            .reservations
+            .get(&plan.order_id)
+            .cloned()
+            .ok_or(RejectReason::InvalidReservation)?;
+        let index = self
+            .orders
+            .iter()
+            .position(|order| order.original_order().order_id == plan.order_id)
+            .ok_or(RejectReason::OrderNotFound)?;
+        let original = self.orders[index].original_order().clone();
+        let amended = Self::amended_payload(&original, plan)?;
+        let amended_event = Self::amended_event(plan);
+
+        match plan.kind {
+            RegularAmendKind::InPlaceReduce => {
+                let order = &mut self.orders[index];
+                order.amend_regular_in_place(amended, plan.new_remaining, plan.target_tif);
+                Ok(vec![amended_event])
+            }
+            RegularAmendKind::RequeueSamePrice => {
+                // 与既有挂单预检顺序一致，先只读验证优先级，再检查目标档聚合。
+                if self.next_priority >= u128::MAX - super::PRIORITY_GUARD {
+                    return Err(RejectReason::PrioritySpaceExhaustion);
+                }
+                Self::preflight_amend_level(&self.orders, plan, plan.new_remaining)?;
+                let priority = self.allocate_amend_priority()?;
+                let replacement = ReferenceOrder::amended_regular(
+                    amended,
+                    plan.new_remaining,
+                    priority,
+                    plan.target_tif,
+                );
+                self.orders.remove(index);
+                self.orders.push(replacement);
+                Ok(vec![amended_event])
+            }
+            RegularAmendKind::RepriceAndMatch => {
+                self.commit_reprice_plan(plan, amended, reservation, amended_event, trade_ids)
+            }
         }
     }
 }

@@ -35,6 +35,8 @@ impl ReferenceOrderBook {
             return Err(RejectReason::DuplicateOrderId);
         }
 
+        self.validate_band_price(order.price)?;
+
         if self.next_priority >= u128::MAX - PRIORITY_GUARD {
             return Err(RejectReason::PrioritySpaceExhaustion);
         }

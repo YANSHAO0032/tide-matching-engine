@@ -123,6 +123,7 @@ impl ReferenceOrderBook {
             stop_orders: self.stop_orders.clone(),
             next_stop_priority: self.next_stop_priority,
             reference_prices: self.reference_prices.clone(),
+            price_band: self.price_band,
         };
         let mut remaining = request.remaining;
         let mut unused = request.budget.unwrap_or(QuoteAmount::new(0));
@@ -481,7 +482,16 @@ impl ReferenceOrderBook {
         order: LimitOrder,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        self.place_sliced_gtc(order, None, None, trade_ids)
+        let mut candidate = self.clone();
+        let events = candidate.place_sliced_gtc(order, None, None, trade_ids, None)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(events)
     }
 
     /// 以提交总量主动尝试成交，余量按可见片挂入订单簿。
@@ -494,12 +504,25 @@ impl ReferenceOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        self.place_sliced_gtc(
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
+        }
+        let mut candidate = self.clone();
+        let events = candidate.place_sliced_gtc(
             order.order().clone(),
             Some(order.peak_size()),
             Some(math),
             trade_ids,
-        )
+            None,
+        )?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(events)
     }
 
     fn place_sliced_gtc(
@@ -508,9 +531,19 @@ impl ReferenceOrderBook {
         peak: Option<Qty>,
         math: Option<&MarketMath>,
         trade_ids: &[TradeId],
+        frozen: Option<Option<(Price, Price)>>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         order.validate_stp_mode()?;
         self.check_duplicate(order.order_id)?;
+        if let Some(band) = frozen {
+            if let Some((lower, upper)) = band
+                && (order.price < lower || order.price > upper)
+            {
+                return Err(RejectReason::PriceBandExceeded);
+            }
+        } else {
+            self.validate_band_price(order.price)?;
+        }
         if let Some(math) = math {
             math.trade_notional(order.price, order.qty)
                 .map_err(Self::reject_quote_math_error)?;
@@ -527,6 +560,7 @@ impl ReferenceOrderBook {
             stop_orders: self.stop_orders.clone(),
             next_stop_priority: self.next_stop_priority,
             reference_prices: self.reference_prices.clone(),
+            price_band: self.price_band,
         };
         if plan.remaining != 0 && !plan.taker_terminal {
             let priority = virtual_book.allocate_slice_priority()?;
@@ -563,6 +597,9 @@ impl ReferenceOrderBook {
         order: IcebergOrder,
         math: &MarketMath,
     ) -> Result<(), RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
+        }
         self.preflight_post_only(order.order())?;
         math.trade_notional(order.order().price, order.order().qty)
             .map_err(Self::reject_quote_math_error)?;
@@ -631,20 +668,7 @@ impl ReferenceOrderBook {
         } else {
             (None, None)
         };
-        let plan = self.plan_slices(SliceRequest {
-            id: incoming.order_id,
-            user_id: incoming.user_id,
-            stp_key: incoming.stp_key,
-            stp_mode: incoming.stp_mode,
-            side: incoming.side,
-            remaining: incoming.qty.get(),
-            limit: None,
-            budget: None,
-            math,
-            protection: boundary,
-            one_fill: false,
-        })?;
-        Ok(self.commit_slices(plan, ids))
+        self.slice_market_base_with_boundary(incoming, math, boundary, ids)
     }
 
     pub(super) fn slice_market_quote(
@@ -665,6 +689,53 @@ impl ReferenceOrderBook {
         } else {
             None
         };
+        self.slice_market_quote_with_boundary(incoming, math, boundary, ids)
+    }
+
+    /// 使用 root 已冻结的价格带执行止损限价子单。
+    pub(super) fn place_limit_gtc_frozen(
+        &mut self,
+        order: LimitOrder,
+        trade_ids: &[TradeId],
+        band: Option<(Price, Price)>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        self.place_sliced_gtc(order, None, None, trade_ids, Some(band))
+    }
+
+    /// 使用真实已校验的冻结边界独立预演市价单。
+    pub(super) fn slice_market_base_with_boundary(
+        &mut self,
+        incoming: MarketByBase,
+        math: Option<&MarketMath>,
+        boundary: Option<(Price, ProtectionSource)>,
+        ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        self.check_duplicate(incoming.order_id)?;
+        let plan = self.plan_slices(SliceRequest {
+            id: incoming.order_id,
+            user_id: incoming.user_id,
+            stp_key: incoming.stp_key,
+            stp_mode: incoming.stp_mode,
+            side: incoming.side,
+            remaining: incoming.qty.get(),
+            limit: None,
+            budget: None,
+            math,
+            protection: boundary,
+            one_fill: false,
+        })?;
+        Ok(self.commit_slices(plan, ids))
+    }
+
+    /// 以冻结保护边界独立预演报价预算市价单。
+    pub(super) fn slice_market_quote_with_boundary(
+        &mut self,
+        incoming: MarketByQuote,
+        math: &MarketMath,
+        boundary: Option<(Price, ProtectionSource)>,
+        ids: &[TradeId],
+    ) -> Result<(Vec<EngineEvent>, QuoteAmount, QuoteAmount), RejectReason> {
+        self.check_duplicate(incoming.order_id)?;
         let plan = self.plan_slices(SliceRequest {
             id: incoming.order_id,
             user_id: incoming.user_id,

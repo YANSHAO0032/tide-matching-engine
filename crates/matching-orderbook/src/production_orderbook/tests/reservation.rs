@@ -328,9 +328,13 @@ fn market_base_and_quote_full_fills_clear_shadow_state() {
         };
         match path {
             0 => assert_eq!(
-                book.execute_market_by_base(base, &[TradeId::new(1)])
-                    .unwrap()
-                    .len(),
+                book.execute_market_by_base(
+                    base,
+                    &[TradeId::new(1)],
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap()
+                )
+                .unwrap()
+                .len(),
                 1
             ),
             1 => assert_eq!(

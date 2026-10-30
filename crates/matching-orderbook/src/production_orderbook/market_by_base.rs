@@ -45,46 +45,18 @@ impl ProductionOrderBook {
         &mut self,
         incoming: MarketByBase,
         trade_ids: &[TradeId],
+        math: &MarketMath,
     ) -> Result<matching_domain::MarketByBaseExecution, RejectReason> {
-        incoming.validate_stp_mode()?;
-        if incoming.stp_mode != matching_domain::StpMode::None {
-            return self
-                .execute_market_base_stp(incoming, None, trade_ids)
-                .map(matching_domain::MarketByBaseExecution::from_events);
-        }
-        if self.has_iceberg_maker(incoming.side) {
-            return self
-                .execute_market_base_iceberg(incoming, None, trade_ids)
-                .map(matching_domain::MarketByBaseExecution::from_events);
-        }
-        let plan = self.preflight_market_by_base(&incoming)?;
-
-        assert!(
-            trade_ids.len() >= plan.trade_count,
-            "ProductionOrderBook invariant violation: \
-         insufficient TradeIds for MarketByBase: required={}, provided={}",
-            plan.trade_count,
-            trade_ids.len(),
-        );
-
-        let mut remaining = incoming.qty.get();
-        let mut trades = Vec::with_capacity(plan.trade_count);
-
-        for trade_id in trade_ids.iter().copied().take(plan.trade_count) {
-            trades.push(self.commit_market_by_base_fill(
-                incoming.order_id,
-                incoming.side,
-                &mut remaining,
-                trade_id,
-            ));
-        }
-
-        assert_eq!(remaining, plan.remaining);
-        assert_eq!(trades.len(), plan.trade_count);
-
-        Ok(matching_domain::MarketByBaseExecution::from_events(
-            trades.into_iter().map(EngineEvent::Trade).collect(),
-        ))
+        let mut candidate = self.clone();
+        let execution = candidate.execute_market_by_base_inner(incoming, trade_ids, math)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        Ok(execution)
     }
 
     /// 按命令开始时固定的保护边界执行 MarketByBase。
@@ -99,116 +71,16 @@ impl ProductionOrderBook {
         math: &MarketMath,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        incoming.validate_stp_mode()?;
-        if incoming.stp_mode != matching_domain::StpMode::None {
-            return self.execute_market_base_stp(incoming, Some((context, math)), trade_ids);
-        }
-        if self.has_iceberg_maker(incoming.side) {
-            return self.execute_market_base_iceberg(incoming, Some((context, math)), trade_ids);
-        }
-        // 1. 全量只读预检。
-        let plan = self.preflight_protected_market_by_base_plan(&incoming, context, math)?;
-
-        // 2. 在首次状态变更前校验 TradeId。
-        // 延续当前生产簿的触发不变量断言并停止处理契约。
-        assert!(
-            trade_ids.len() >= plan.fills.len(),
-            "insufficient TradeIds for protected MarketByBase: \
-         required={}, provided={}",
-            plan.fills.len(),
-            trade_ids.len(),
-        );
-
-        // 3. 预先为 Trade + 可选保护事件分配全部容量。
-        let event_count = plan
-            .fills
-            .len()
-            .checked_add(usize::from(plan.stop.is_some()))
-            .expect("protected MarketByBase event count overflow");
-
-        let mut events = Vec::with_capacity(event_count);
-
-        let maker_side = match incoming.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        };
-
-        let mut remaining = incoming.qty.get();
-
-        // 4. 严格按照预检计划提交。
-        for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
-            // 当前全市场最优挂单价格必须等于计划价格。
-            let best_price = self
-                .best_price(maker_side)
-                .expect("preflighted protected maker side became empty");
-
-            assert_eq!(best_price, fill.maker_price);
-
-            // 必须选择最优价档的先进先出头节点。
-            let levels = match maker_side {
-                Side::Buy => &self.bids,
-                Side::Sell => &self.asks,
-            };
-
-            let level = levels
-                .get(&best_price)
-                .expect("preflighted protected level missing");
-
-            let head_slot = level
-                .head()
-                .expect("preflighted protected FIFO head missing");
-
-            let maker = self
-                .arena
-                .get(head_slot)
-                .expect("preflighted protected Arena node missing");
-
-            assert_eq!(maker.original_order().order_id, fill.maker_order_id);
-            assert_eq!(maker.original_order().side, maker_side);
-            assert_eq!(maker.original_order().price, fill.maker_price);
-
-            assert_eq!(self.orders.get(&fill.maker_order_id), Some(&head_slot));
-
-            // 计划数量必须与当前可执行数量完全一致。
-            assert!(remaining > 0);
-            assert!(maker.remaining() > 0);
-            assert_eq!(fill.qty.get(), remaining.min(maker.remaining()));
-
-            // 5. 复用已验收的生产簿单笔提交。
-            //    本次调用内部完成：
-            //    - 挂单部分成交 / 全部成交
-            //    - PriceLevel 聚合与先进先出更新
-            //    - Arena 槽位释放
-            //    - OrderId 索引 / 空价档清理
-            //    - 吃单方剩余量扣减
-            let trade = self.commit_market_by_base_fill(
-                incoming.order_id,
-                incoming.side,
-                &mut remaining,
-                trade_id,
-            );
-
-            assert_eq!(trade.maker_order_id, fill.maker_order_id);
-            assert_eq!(trade.price, fill.maker_price);
-            assert_eq!(trade.qty, fill.qty);
-
-            events.push(EngineEvent::Trade(trade));
-        }
-
-        assert_eq!(remaining, plan.remaining);
-
-        // 6. 所有 Trade 之后最多追加一个保护事件。
-        if let Some(stop) = plan.stop {
-            events.push(EngineEvent::MarketProtectionTriggered {
-                order_id: incoming.order_id,
-                next_price: stop.next_price,
-                effective_worst_price: stop.effective_worst_price,
-                source: stop.source,
-            });
-        }
-
-        assert_eq!(events.len(), event_count);
-
+        let mut candidate = self.clone();
+        let events = candidate
+            .execute_market_by_base_with_protection_inner(incoming, context, math, trade_ids)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
         Ok(events)
     }
 
@@ -569,5 +441,251 @@ impl ProductionOrderBook {
             stop,
             remaining,
         })
+    }
+
+    pub(super) fn execute_market_by_base_inner(
+        &mut self,
+        incoming: MarketByBase,
+        trade_ids: &[TradeId],
+        math: &MarketMath,
+    ) -> Result<matching_domain::MarketByBaseExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
+        }
+        if let Some((_, configured_math)) = self.price_band_config() {
+            assert_eq!(*math, configured_math, "市场数值配置不一致");
+        }
+        self.price_band_bounds()?;
+        if let Some((config, _)) = self.price_band_config() {
+            let reference = self
+                .reference_prices
+                .latest(config.reference_kind)
+                .ok_or(RejectReason::ReferencePriceUnavailable)?
+                .price;
+            let (lower, upper) = config.bounds(reference, math.tick_size())?;
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: reference,
+                market_band_worst: Some(if incoming.side == Side::Buy {
+                    upper
+                } else {
+                    lower
+                }),
+            };
+            return self
+                .execute_market_by_base_with_protection(incoming, &context, math, trade_ids)
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
+        if incoming
+            .market_protection
+            .as_ref()
+            .is_some_and(|p| p.max_slippage_bps.is_some())
+        {
+            return Err(RejectReason::ReferencePriceUnavailable);
+        }
+        if let Some(worst) = incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.worst_price)
+        {
+            if worst.get() % math.tick_size() != 0 {
+                return Err(RejectReason::InvalidTick);
+            }
+            return self
+                .execute_market_base_with_boundary(
+                    incoming,
+                    Some(math),
+                    Some((worst, matching_domain::ProtectionSource::User)),
+                    trade_ids,
+                )
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
+        if incoming.stp_mode != matching_domain::StpMode::None {
+            return self
+                .execute_market_base_stp(incoming, None, trade_ids)
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
+        if self.has_iceberg_maker(incoming.side) {
+            return self
+                .execute_market_base_iceberg(incoming, None, trade_ids)
+                .map(matching_domain::MarketByBaseExecution::from_events);
+        }
+        let plan = self.preflight_market_by_base(&incoming)?;
+
+        assert!(
+            trade_ids.len() >= plan.trade_count,
+            "ProductionOrderBook invariant violation: \
+         insufficient TradeIds for MarketByBase: required={}, provided={}",
+            plan.trade_count,
+            trade_ids.len(),
+        );
+
+        let mut remaining = incoming.qty.get();
+        let mut trades = Vec::with_capacity(plan.trade_count);
+
+        for trade_id in trade_ids.iter().copied().take(plan.trade_count) {
+            trades.push(self.commit_market_by_base_fill(
+                incoming.order_id,
+                incoming.side,
+                &mut remaining,
+                trade_id,
+            ));
+        }
+
+        assert_eq!(remaining, plan.remaining);
+        assert_eq!(trades.len(), plan.trade_count);
+
+        Ok(matching_domain::MarketByBaseExecution::from_events(
+            trades.into_iter().map(EngineEvent::Trade).collect(),
+        ))
+    }
+
+    fn execute_market_by_base_with_protection_inner(
+        &mut self,
+        incoming: MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if let Some((_, configured_math)) = self.price_band_config() {
+            assert_eq!(*math, configured_math, "市场数值配置不一致");
+        }
+        let mut effective_context = context.clone();
+        if let Some((lower, upper)) = self.price_band_bounds()? {
+            effective_context.market_band_worst = Some(if incoming.side == Side::Buy {
+                upper
+            } else {
+                lower
+            });
+        }
+        let context = &effective_context;
+        self.execute_market_by_base_with_frozen_protection(incoming, context, math, trade_ids)
+    }
+
+    /// 使用根命令已冻结的保护上下文，不重新读取市场参考价。
+    pub(super) fn execute_market_by_base_with_frozen_protection(
+        &mut self,
+        incoming: MarketByBase,
+        context: &CommandStartProtectionContext,
+        math: &MarketMath,
+        trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming.stp_mode != matching_domain::StpMode::None {
+            return self.execute_market_base_stp(incoming, Some((context, math)), trade_ids);
+        }
+        if self.has_iceberg_maker(incoming.side) {
+            return self.execute_market_base_iceberg(incoming, Some((context, math)), trade_ids);
+        }
+        // 1. 全量只读预检。
+        let plan = self.preflight_protected_market_by_base_plan(&incoming, context, math)?;
+
+        // 2. 在首次状态变更前校验 TradeId。
+        // 延续当前生产簿的触发不变量断言并停止处理契约。
+        assert!(
+            trade_ids.len() >= plan.fills.len(),
+            "insufficient TradeIds for protected MarketByBase: \
+         required={}, provided={}",
+            plan.fills.len(),
+            trade_ids.len(),
+        );
+
+        // 3. 预先为 Trade + 可选保护事件分配全部容量。
+        let event_count = plan
+            .fills
+            .len()
+            .checked_add(usize::from(plan.stop.is_some()))
+            .expect("protected MarketByBase event count overflow");
+
+        let mut events = Vec::with_capacity(event_count);
+
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let mut remaining = incoming.qty.get();
+
+        // 4. 严格按照预检计划提交。
+        for (fill, trade_id) in plan.fills.iter().zip(trade_ids.iter().copied()) {
+            // 当前全市场最优挂单价格必须等于计划价格。
+            let best_price = self
+                .best_price(maker_side)
+                .expect("preflighted protected maker side became empty");
+
+            assert_eq!(best_price, fill.maker_price);
+
+            // 必须选择最优价档的先进先出头节点。
+            let levels = match maker_side {
+                Side::Buy => &self.bids,
+                Side::Sell => &self.asks,
+            };
+
+            let level = levels
+                .get(&best_price)
+                .expect("preflighted protected level missing");
+
+            let head_slot = level
+                .head()
+                .expect("preflighted protected FIFO head missing");
+
+            let maker = self
+                .arena
+                .get(head_slot)
+                .expect("preflighted protected Arena node missing");
+
+            assert_eq!(maker.original_order().order_id, fill.maker_order_id);
+            assert_eq!(maker.original_order().side, maker_side);
+            assert_eq!(maker.original_order().price, fill.maker_price);
+
+            assert_eq!(self.orders.get(&fill.maker_order_id), Some(&head_slot));
+
+            // 计划数量必须与当前可执行数量完全一致。
+            assert!(remaining > 0);
+            assert!(maker.remaining() > 0);
+            assert_eq!(fill.qty.get(), remaining.min(maker.remaining()));
+
+            // 5. 复用已验收的生产簿单笔提交。
+            //    本次调用内部完成：
+            //    - 挂单部分成交 / 全部成交
+            //    - PriceLevel 聚合与先进先出更新
+            //    - Arena 槽位释放
+            //    - OrderId 索引 / 空价档清理
+            //    - 吃单方剩余量扣减
+            let trade = self.commit_market_by_base_fill(
+                incoming.order_id,
+                incoming.side,
+                &mut remaining,
+                trade_id,
+            );
+
+            assert_eq!(trade.maker_order_id, fill.maker_order_id);
+            assert_eq!(trade.price, fill.maker_price);
+            assert_eq!(trade.qty, fill.qty);
+
+            events.push(EngineEvent::Trade(trade));
+        }
+
+        assert_eq!(remaining, plan.remaining);
+
+        // 6. 所有 Trade 之后最多追加一个保护事件。
+        if let Some(stop) = plan.stop {
+            events.push(EngineEvent::MarketProtectionTriggered {
+                order_id: incoming.order_id,
+                next_price: stop.next_price,
+                effective_worst_price: stop.effective_worst_price,
+                source: stop.source,
+            });
+        }
+
+        assert_eq!(events.len(), event_count);
+
+        Ok(events)
     }
 }

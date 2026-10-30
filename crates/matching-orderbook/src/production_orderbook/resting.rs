@@ -49,6 +49,10 @@ impl ProductionOrderBook {
     /// 方法会立即停止处理而不是将其伪装成另一种业务拒绝。
     pub fn rest(&mut self, order: LimitOrder) -> Result<(), RejectReason> {
         order.validate_stp_mode()?;
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        self.validate_band_price(order.price)?;
         // 1. 与价格交叉无关的全部可预期失败先预检。
         let plan = self.preflight_rest_common(&order)?;
 
@@ -74,6 +78,10 @@ impl ProductionOrderBook {
     ) -> Result<(), RejectReason> {
         order.validate_stp_mode()?;
         Self::validate_resting_tif(tif, now, current_session_id)?;
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        self.validate_band_price(order.price)?;
         let plan = self.preflight_rest_common(&order)?;
         self.assert_rest_strictly_non_crossing(&plan);
         self.commit_rest_timed(order, tif, plan);

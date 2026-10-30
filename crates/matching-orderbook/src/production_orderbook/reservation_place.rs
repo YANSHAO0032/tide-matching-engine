@@ -89,7 +89,7 @@ impl ProductionOrderBook {
                     )?
                 } else {
                     after_book
-                        .execute_market_by_base(order, context.trade_ids)?
+                        .execute_market_by_base(order, context.trade_ids, context.math)?
                         .events()
                         .to_vec()
                 };
@@ -131,6 +131,12 @@ impl ProductionOrderBook {
                 )?;
             }
         }
+        after_book.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
         let mut ids = self
             .orders
             .keys()
@@ -188,6 +194,9 @@ impl ProductionOrderBook {
         registry: &ReservationRegistry,
         context: ProductionCancelReplaceContext<'_>,
     ) -> Result<ProductionPlacePlan, RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*context.math, configured, "市场数值配置不一致");
+        }
         let accepted = match &request {
             ProductionPlaceOrder::Limit { order, .. } => order.clone(),
             ProductionPlaceOrder::Iceberg { order, .. } => order.order().clone(),
@@ -200,6 +209,7 @@ impl ProductionOrderBook {
                 .chain(std::iter::once((accepted.order_id, &state))),
         )?;
         accepted.validate_stp_mode()?;
+        self.validate_band_price(accepted.price)?;
         if accepted.price.get() % context.math.tick_size() != 0 {
             return Err(RejectReason::InvalidTick);
         }
@@ -270,6 +280,12 @@ impl ProductionOrderBook {
                 )?;
             }
         }
+        after_book.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
         let mut ids = self
             .orders
             .keys()

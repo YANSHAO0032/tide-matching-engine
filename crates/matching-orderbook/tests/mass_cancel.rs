@@ -1006,3 +1006,65 @@ fn user_market_and_market_scopes_only_remove_matching_identities() {
     assert!(production.reservation_state(OrderId::new(30)).is_none());
     assert!(production.reservation_state(OrderId::new(40)).is_none());
 }
+
+#[test]
+fn stop_registry_rejects_conflicting_market_math_before_mutation() {
+    let mut reference = ReferenceOrderBook::new();
+    let mut production = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let configured = math();
+    let input_math = matching_domain::MarketMath::try_new(0, 0, 0, 2, 1).unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::LastTrade,
+        max_deviation_bps: 100,
+    };
+    reference
+        .set_price_band_config(Some((config, configured)))
+        .unwrap();
+    production
+        .set_price_band_config(Some((config, configured)))
+        .unwrap();
+    let state = state(1, 1, 1);
+    let registry = ReservationRegistry::new([state.clone()]).unwrap();
+    let stop = base_stop(1, 1, TriggerExpiry::Gtc);
+    reference
+        .place_stop_with_reservation(stop.clone(), LogicalTime::new(1), 1, state.clone())
+        .unwrap();
+    production
+        .place_stop_with_reservation(stop, LogicalTime::new(1), 1, state)
+        .unwrap();
+    let before_r = reference.clone();
+    let before_p = production.clone();
+    let before_registry = registry.clone();
+    let input = matching_domain::PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: 1,
+        price: Price::try_new(10).unwrap(),
+    };
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &input_math,
+        trade_ids: &[],
+    };
+    assert!(
+        std::panic::catch_unwind(|| reference.plan_trigger_stops_with_registry(
+            input,
+            context(),
+            &registry,
+            |_| Ok(())
+        ))
+        .is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(|| production.plan_trigger_stops_with_registry(
+            input,
+            context(),
+            &registry,
+            |_| Ok(())
+        ))
+        .is_err()
+    );
+    assert_eq!(reference, before_r);
+    assert_eq!(production, before_p);
+    assert_eq!(registry, before_registry);
+}

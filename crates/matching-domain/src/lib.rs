@@ -35,6 +35,8 @@ pub mod order_flags;
 pub mod order_state;
 /// 订单类型标签。
 pub mod order_type;
+/// 市场价格带配置与确定性边界计算。
+pub mod price_band;
 pub mod price_reference;
 /// 市场本地先进先出优先级值对象。
 pub mod queue_priority;
@@ -106,6 +108,8 @@ pub use order_flags::OrderFlags;
 pub use order_state::OrderState;
 /// 订单类型标签。
 pub use order_type::OrderType;
+/// 价格带配置与双侧边界。
+pub use price_band::PriceBandConfig;
 pub use price_reference::{PriceReference, PriceReferenceKind, PriceReferenceState};
 /// 市场本地先进先出优先级值。
 pub use queue_priority::QueuePriority;

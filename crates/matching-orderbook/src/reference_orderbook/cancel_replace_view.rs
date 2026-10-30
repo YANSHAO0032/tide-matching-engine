@@ -51,6 +51,7 @@ impl ReferenceOrderBook {
             next_priority: self.next_priority,
             next_stop_priority: self.next_stop_priority,
             reference_prices: self.reference_prices.clone(),
+            price_band: self.price_band,
         };
         Ok(ReferenceBookWithout {
             excluded_order_id: old_order_id,

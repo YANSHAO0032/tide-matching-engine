@@ -37,6 +37,11 @@ pub struct PriceReferenceState {
 }
 
 impl PriceReferenceState {
+    /// 返回一个来源已接受的最新更新。
+    pub fn latest(&self, kind: PriceReferenceKind) -> Option<PriceReference> {
+        self.latest.get(&kind).copied()
+    }
+
     /// 接受一个严格递增的同来源更新，并返回更新前的价格。
     ///
     /// 首次更新没有前值，调用方应只建立基线而不据此推断价格跨越。
@@ -53,11 +58,6 @@ impl PriceReferenceState {
         Ok(previous)
     }
 
-    /// 返回一个来源已接受的最新更新。
-    pub fn latest(&self, kind: PriceReferenceKind) -> Option<PriceReference> {
-        self.latest.get(&kind).copied()
-    }
-
     /// 为内部真实成交产生下一条最近成交价参考。
     pub fn next_last_trade(&self, price: Price) -> Result<PriceReference, RejectReason> {
         let source_seq = match self.latest(PriceReferenceKind::LastTrade) {
@@ -72,6 +72,21 @@ impl PriceReferenceState {
             source_seq,
             price,
         })
+    }
+
+    /// 在副本中按真实成交顺序预演最近成交价及其序号，不修改当前状态。
+    ///
+    /// 序号空间不足时返回算术溢出；调用方必须在订单簿首次写入之前完成预演。
+    pub fn plan_trade_prices(
+        &self,
+        prices: impl IntoIterator<Item = Price>,
+    ) -> Result<Self, RejectReason> {
+        let mut planned = self.clone();
+        for price in prices {
+            let next = planned.next_last_trade(price)?;
+            planned.advance(next)?;
+        }
+        Ok(planned)
     }
 }
 
@@ -105,5 +120,35 @@ mod tests {
             }),
             Ok(Some(Price::try_new(100).unwrap()))
         );
+    }
+
+    #[test]
+    fn trade_reference_plan_preserves_original_and_rejects_overflow() {
+        let mut state = PriceReferenceState::default();
+        state
+            .advance(PriceReference {
+                kind: PriceReferenceKind::LastTrade,
+                source_seq: u64::MAX - 1,
+                price: Price::try_new(10).unwrap(),
+            })
+            .unwrap();
+        let before = state.clone();
+        assert_eq!(
+            state.plan_trade_prices([Price::try_new(11).unwrap(), Price::try_new(12).unwrap()]),
+            Err(RejectReason::ArithmeticOverflow)
+        );
+        assert_eq!(state, before);
+        let planned = state
+            .plan_trade_prices([Price::try_new(11).unwrap()])
+            .unwrap();
+        assert_eq!(
+            planned
+                .latest(PriceReferenceKind::LastTrade)
+                .unwrap()
+                .price
+                .get(),
+            11
+        );
+        assert_eq!(state, before);
     }
 }

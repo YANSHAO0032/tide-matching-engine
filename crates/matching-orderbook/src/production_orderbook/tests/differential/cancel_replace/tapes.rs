@@ -1,7 +1,7 @@
 //! 固定种子连续混合磁带；区块只清理活动簿，不重置登记历史、时钟或身份源。
 use super::*;
 
-const GENERATOR: &str = "cancel-replace-mixed-v1-ChaCha";
+const GENERATOR: &str = "cancel-replace-protection-mixed-v2-ChaCha";
 const SEED_100K: [u8; 32] = [0xC3; 32];
 const SEED_A: [u8; 32] = [0x49; 32];
 const SEED_B: [u8; 32] = [0xB6; 32];
@@ -74,6 +74,11 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
                 price: Price::try_new(100).unwrap(),
             }));
         }
+        let band = matching_domain::PriceBandConfig {
+            reference_kind: PriceReferenceKind::MarkPrice,
+            max_deviation_bps: 500,
+        };
+        batch.push(Command::Band(Some(band)));
         // 独立来源命令：冰山旧单转 FOK 全成，两个止损旧单转普通/冰山实际挂单。
         batch.push(replacement(
             (base + 1, base + 50, base + 1, 3),
@@ -84,6 +89,7 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
             18,
             limit(TimeInForce::Fok, false),
         ));
+        batch.push(Command::Band(None));
         batch.push(replacement(
             (base + 2, base + 51, base + 2, 3),
             base + 51,
@@ -223,6 +229,25 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
         {
             batch.push(Command::Cancel(OrderId::new(id)));
         }
+        batch.push(Command::Rest(
+            input(base + 6100, Side::Sell, 100, 1),
+            TimeInForce::Gtc,
+        ));
+        batch.push(Command::Rest(
+            input(base + 6101, Side::Sell, 106, 1),
+            TimeInForce::Gtc,
+        ));
+        batch.push(Command::Band(Some(band)));
+        batch.push(Command::Market(matching_domain::MarketByBase {
+            order_id: OrderId::new(base + 6102),
+            user_id: UserId::new(5),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::CancelMaker,
+            side: Side::Buy,
+            qty: Qty::try_new(1).unwrap(),
+            market_protection: None,
+        }));
+        batch.push(Command::Band(None));
         // 在不影响撤单替换主链的尾部重新放入不同容器，再验证批量撤单的原序差分。
         batch.push(Command::Rest(
             input(base + 6000, Side::Buy, 80, 6),
@@ -242,7 +267,7 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
         )));
         batch.push(Command::Trigger(PriceReference {
             kind: PriceReferenceKind::LastTrade,
-            source_seq: block * 10_000 + 2,
+            source_seq: block * 10_000 + 9_000,
             price: Price::try_new(121).unwrap(),
         }));
         batch.push(Command::MassCancel(ShardCancelScope::User {
@@ -303,6 +328,8 @@ struct Coverage {
     stp_canceled: usize,
     /// 止损子订单实际触发的次数。
     triggered: usize,
+    /// 价格保护终止事件次数。
+    protected: usize,
 }
 
 impl Coverage {
@@ -379,6 +406,12 @@ impl Coverage {
             .iter()
             .filter(|event| matches!(event, EngineEvent::StopTriggered { .. }))
             .count();
+        self.protected += result
+            .outcome
+            .events()
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::MarketProtectionTriggered { .. }))
+            .count();
         if let Outcome::Expired(Ok(expired)) = &result.outcome {
             self.expired += expired.len();
         }
@@ -399,6 +432,8 @@ impl Coverage {
                 && self.mass_cancel_empty > 0
                 && self.stp_canceled > 0
                 && self.triggered > 0
+                && self.protected > 0,
+            "覆盖不足：{self:?}"
         );
     }
 }

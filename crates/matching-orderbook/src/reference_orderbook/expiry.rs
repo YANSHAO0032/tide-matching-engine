@@ -34,29 +34,7 @@ impl ReferenceOrderBook {
         current_session_id: u64,
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        if self.contains_active_order(order.order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        match tif {
-            TimeInForce::Gtc => {}
-            TimeInForce::Gtd { expire_at } if expire_at > now => {}
-            TimeInForce::Gtd { .. } => return Err(RejectReason::InvalidExpireTime),
-            TimeInForce::Day { session_id } if session_id == current_session_id => {}
-            TimeInForce::Day { .. } => return Err(RejectReason::InvalidSession),
-            TimeInForce::Ioc | TimeInForce::Fok => {
-                return Err(RejectReason::InvalidOrderCombination);
-            }
-        }
-        let order_id = order.order_id;
-        let events = self.place_limit_gtc_with_events(order, trade_ids)?;
-        if let Some(resting) = self
-            .orders
-            .iter_mut()
-            .find(|entry| entry.original_order().order_id == order_id)
-        {
-            resting.replace_initial_gtc_with_tif(tif);
-        }
-        Ok(events)
+        self.place_limit_timed_frozen(order, tif, now, current_session_id, trade_ids, None)
     }
 
     /// 以独立扫描方式挂入普通 DAY/GTD/GTC 订单。
@@ -67,6 +45,7 @@ impl ReferenceOrderBook {
         now: LogicalTime,
         current_session_id: u64,
     ) -> Result<(), RejectReason> {
+        order.validate_stp_mode()?;
         match tif {
             TimeInForce::Gtc => {}
             TimeInForce::Gtd { expire_at } if expire_at > now => {}
@@ -80,6 +59,7 @@ impl ReferenceOrderBook {
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
+        self.validate_band_price(order.price)?;
         if self.next_priority >= u128::MAX - PRIORITY_GUARD {
             return Err(RejectReason::PrioritySpaceExhaustion);
         }
@@ -184,5 +164,43 @@ impl ReferenceOrderBook {
         );
         expired.sort_unstable_by_key(|entry| entry.order_id);
         Ok(expired)
+    }
+
+    /// 使用 root 冻结的价格带执行定期限价子单。
+    pub(super) fn place_limit_timed_frozen(
+        &mut self,
+        order: LimitOrder,
+        tif: TimeInForce,
+        now: LogicalTime,
+        current_session_id: u64,
+        trade_ids: &[TradeId],
+        frozen: Option<Option<(matching_domain::Price, matching_domain::Price)>>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        match tif {
+            TimeInForce::Gtc => {}
+            TimeInForce::Gtd { expire_at } if expire_at > now => {}
+            TimeInForce::Gtd { .. } => return Err(RejectReason::InvalidExpireTime),
+            TimeInForce::Day { session_id } if session_id == current_session_id => {}
+            TimeInForce::Day { .. } => return Err(RejectReason::InvalidSession),
+            TimeInForce::Ioc | TimeInForce::Fok => {
+                return Err(RejectReason::InvalidOrderCombination);
+            }
+        }
+        let order_id = order.order_id;
+        let events = match frozen {
+            Some(band) => self.place_limit_gtc_frozen(order, trade_ids, band)?,
+            None => self.place_limit_gtc_with_events(order, trade_ids)?,
+        };
+        if let Some(resting) = self
+            .orders
+            .iter_mut()
+            .find(|entry| entry.original_order().order_id == order_id)
+        {
+            resting.replace_initial_gtc_with_tif(tif);
+        }
+        Ok(events)
     }
 }

@@ -580,8 +580,20 @@ fn unprotected_market_orders_preserve_stp_events_and_reference_parity() {
                 qty: Qty::try_new(3).unwrap(),
                 market_protection: None,
             };
-            let pe = p.execute_market_by_base(taker.clone(), &[]).unwrap();
-            let re = r.execute_market_by_base(taker, &[]).unwrap();
+            let pe = p
+                .execute_market_by_base(
+                    taker.clone(),
+                    &[],
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                )
+                .unwrap();
+            let re = r
+                .execute_market_by_base(
+                    taker,
+                    &[],
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                )
+                .unwrap();
             assert_eq!(pe, re);
             assert!(
                 matches!(pe.events(), [EngineEvent::OrderCanceled { remaining: OrderRemaining::Base(q), reason: CancelReason::SelfTradePreventionTaker, .. }] if q.get() == 3)

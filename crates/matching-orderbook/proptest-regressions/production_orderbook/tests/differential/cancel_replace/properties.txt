@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1c496a32a53d308acacca8ad70e72116cc113bd089a49dd2f39c6209203b1ef2 # shrinks to buy = false, old_kind = 0, transition = 0, mode = 1, qty = 2
+cc e43ddce8f782f817691d65b41271305191bfada7b3d7062e073f37941be49623 # shrinks to buy = false, old_kind = 0, iceberg = false, transition = 0, liquid = 2, requested = 1
+cc 80436eee62416afe63a1626fddd055cf1779776a2ca39e55ae52b859a9558f17 # shrinks to buy = false, qty = 2

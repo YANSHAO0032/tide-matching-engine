@@ -352,3 +352,48 @@ fn cancel_replace_differential_fixed_partial_regular_and_replenished_iceberg_old
         }
     }
 }
+
+#[test]
+fn cancel_replace_band_rejection_keeps_old_and_registry() {
+    let mut h = Harness::new();
+    initialize(&mut h, 0, Side::Sell);
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::MarkPrice,
+        max_deviation_bps: 500,
+    };
+    h.r.set_price_band_config(Some((config, math()))).unwrap();
+    h.p.set_price_band_config(Some((config, math()))).unwrap();
+    let command = replacement(
+        (1, 9, 1, 3),
+        41,
+        0,
+        Side::Buy,
+        110,
+        12,
+        limit(TimeInForce::Fok, false),
+    );
+    let Command::CancelReplace { request, .. } = &command else {
+        unreachable!()
+    };
+    let rejection = h.run(&command);
+    assert_eq!(
+        rejection.outcome,
+        Outcome::CancelReplace(Err(
+            request.rejection(RejectReason::ReferencePriceUnavailable)
+        ))
+    );
+    let reference = PriceReference {
+        kind: PriceReferenceKind::MarkPrice,
+        source_seq: 1,
+        price: Price::try_new(100).unwrap(),
+    };
+    assert_eq!(
+        h.r.collect_triggered_stops(reference),
+        h.p.collect_triggered_stops(reference)
+    );
+    let rejection = h.run(&command);
+    assert_eq!(
+        rejection.outcome,
+        Outcome::CancelReplace(Err(request.rejection(RejectReason::PriceBandExceeded)))
+    );
+}

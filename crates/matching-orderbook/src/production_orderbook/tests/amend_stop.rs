@@ -1592,3 +1592,57 @@ fn amend_stop_root_protection_freezes_for_children_already_in_first_batch() {
         }
     }
 }
+
+#[test]
+fn stop_limit_amend_requires_band_reference_without_mutation() {
+    let mut pair = Pair::new();
+    pair.place(stop(1, Side::Buy, 120, TriggerExpiry::Gtc));
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::MarkPrice,
+        max_deviation_bps: 500,
+    };
+    pair.reference
+        .set_price_band_config(Some((config, math)))
+        .unwrap();
+    pair.production
+        .set_price_band_config(Some((config, math)))
+        .unwrap();
+    let mut patch = amend(1);
+    patch.new_price = Some(Price::try_new(102).unwrap());
+    assert_eq!(
+        pair.run(&patch),
+        Err(RejectReason::ReferencePriceUnavailable)
+    );
+}
+
+#[test]
+fn stop_limit_amend_rejects_outside_band_atomically() {
+    let mut pair = Pair::new();
+    pair.place(stop(1, Side::Buy, 120, TriggerExpiry::Gtc));
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let config = matching_domain::PriceBandConfig {
+        reference_kind: PriceReferenceKind::MarkPrice,
+        max_deviation_bps: 500,
+    };
+    pair.reference
+        .set_price_band_config(Some((config, math)))
+        .unwrap();
+    pair.production
+        .set_price_band_config(Some((config, math)))
+        .unwrap();
+    let reference = matching_domain::PriceReference {
+        kind: PriceReferenceKind::MarkPrice,
+        source_seq: 1,
+        price: Price::try_new(100).unwrap(),
+    };
+    assert_eq!(
+        pair.reference.collect_triggered_stops(reference),
+        pair.production.collect_triggered_stops(reference)
+    );
+    for value in [94, 106] {
+        let mut patch = amend(1);
+        patch.new_price = Some(Price::try_new(value).unwrap());
+        assert_eq!(pair.run(&patch), Err(RejectReason::PriceBandExceeded));
+    }
+}

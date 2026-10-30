@@ -139,6 +139,36 @@ pub(crate) struct StopReplacementPlan {
 }
 
 impl StopBook {
+    /// 创建空的 StopBook。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 判断标识是否属于一个未触发止损订单。
+    pub fn contains(&self, order_id: OrderId) -> bool {
+        self.locations.contains_key(&order_id)
+    }
+
+    /// 查询未触发订单及其 StopPriority。
+    pub fn get(&self, order_id: OrderId) -> Option<(&StopOrder, StopPriority)> {
+        let entry = self.entry(order_id)?;
+        Some((&entry.order, entry.priority))
+    }
+
+    /// 以规定的触发顺序返回一侧订单快照。
+    pub fn ordered(&self, side: Side) -> Vec<(&StopOrder, StopPriority)> {
+        let mut result = Vec::new();
+        match side {
+            Side::Buy => self.buy_stops.values().for_each(|entries| {
+                result.extend(entries.iter().map(|entry| (&entry.order, entry.priority)));
+            }),
+            Side::Sell => self.sell_stops.values().rev().for_each(|entries| {
+                result.extend(entries.iter().map(|entry| (&entry.order, entry.priority)));
+            }),
+        }
+        result
+    }
+
     /// 构造替换计划，不修改容器、到期索引或优先级分配器。
     pub(crate) fn plan_replacement(
         &self,
@@ -255,16 +285,6 @@ impl StopBook {
         debug_assert!(self.validate().is_ok());
     }
 
-    /// 创建空的 StopBook。
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 判断标识是否属于一个未触发止损订单。
-    pub fn contains(&self, order_id: OrderId) -> bool {
-        self.locations.contains_key(&order_id)
-    }
-
     /// 校验并加入一个未触发止损订单。
     pub fn insert(
         &mut self,
@@ -307,26 +327,6 @@ impl StopBook {
             .insert(expiry, ExpiryRef { order_id, location });
         debug_assert!(self.validate().is_ok());
         Ok(priority)
-    }
-
-    /// 查询未触发订单及其 StopPriority。
-    pub fn get(&self, order_id: OrderId) -> Option<(&StopOrder, StopPriority)> {
-        let entry = self.entry(order_id)?;
-        Some((&entry.order, entry.priority))
-    }
-
-    /// 以规定的触发顺序返回一侧订单快照。
-    pub fn ordered(&self, side: Side) -> Vec<(&StopOrder, StopPriority)> {
-        let mut result = Vec::new();
-        match side {
-            Side::Buy => self.buy_stops.values().for_each(|entries| {
-                result.extend(entries.iter().map(|entry| (&entry.order, entry.priority)));
-            }),
-            Side::Sell => self.sell_stops.values().rev().for_each(|entries| {
-                result.extend(entries.iter().map(|entry| (&entry.order, entry.priority)));
-            }),
-        }
-        result
     }
 
     /// 按一次实际价格跨越的方向、价格和 FIFO 顺序终结未触发订单。

@@ -36,6 +36,7 @@ mod limit_gtc;
 mod market_by_base;
 mod market_by_quote;
 mod matching;
+mod price_band;
 mod query;
 mod reservation;
 mod resting;

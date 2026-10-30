@@ -10,11 +10,14 @@
 
 模块根文件保存状态字段、构造、基础查询和跨功能使用的内部类型。业务方法按职责移动到子模块；功能独用的计划类型与使用它的实现放在一起。
 
+同一实现块优先保留已有公开入口的阅读顺序；新增加的内部辅助方法集中放在已有方法之后，并按所属功能归组。基础结构优先展示构造和查询，相近的读写及链表操作相邻排列。调整顺序不改变方法签名、注释或执行行为。
+
 ## 实现入口
 
 | 职责 | 生产簿 | 参考簿 |
 |---|---|---|
 | 类型、构造与基础查询 | [production_orderbook.rs](../crates/matching-orderbook/src/production_orderbook.rs) | [reference_orderbook.rs](../crates/matching-orderbook/src/reference_orderbook.rs) |
+| 价格带配置、边界与静态校验 | [price_band.rs](../crates/matching-orderbook/src/production_orderbook/price_band.rs) | [price_band.rs](../crates/matching-orderbook/src/reference_orderbook/price_band.rs) |
 | 挂单、取消 | [resting.rs](../crates/matching-orderbook/src/production_orderbook/resting.rs) | [resting.rs](../crates/matching-orderbook/src/reference_orderbook/resting.rs) |
 | 单笔与连续撮合 | [matching.rs](../crates/matching-orderbook/src/production_orderbook/matching.rs) | [matching.rs](../crates/matching-orderbook/src/reference_orderbook/matching.rs) |
 | 限价执行策略 | [limit_execution.rs](../crates/matching-orderbook/src/production_orderbook/limit_execution.rs) | [limit_execution.rs](../crates/matching-orderbook/src/reference_orderbook/limit_execution.rs) |
@@ -86,6 +89,12 @@
 批量撤单使用领域层的 `ShardCancelScope`，只按活动订单关联预留快照中的 `user_id`、`market_id` 与持久化的 `origin_session_id` 过滤；后者不是 DAY 的交易时段。两个订单簿各自扫描其真实活动容器，统一按 `OrderId` 升序冻结目标，在不可变计划中预演活动预留归属到 `PendingR2` 的迁移，并仅在订单簿和登记表前态未漂移时一次安装后态。Regular、冰山和未触发 Stop 均走该路径；取消会复用各自已有的容器及到期引用清理，既不触发 Stop child，也不补量冰山或分配/回退任何优先级。每个目标只产生 `OrderCanceled { reason: MassCancel }`；基础数量订单携带 `OrderRemaining::Base`，未触发的报价预算 StopMarket 携带当前 `OrderRemaining::Quote`。这只是当前执行单元的本地语义，不包含跨分片协调、围栏或真实 R2 资金释放。
 
 撤单替换领域输入位于 `matching-domain/src/cancel_replace.rs`，新预留的规范签名字节位于 `reservation_token.rs`。`matching-risk/src/reservation_transition.rs` 持有真实登记表及不可伪造的金融/归属计划，区分 ActiveOrder 与 PendingR2；订单终结不伪装成金融释放。两套簿各自规划、核对完整前态后提交，不共享过滤、撮合或提交算法。`tests/cancel_replace/` 固定约束和原子性；`tests/differential/cancel_replace/` 保存持续历史的完整混合磁带和独立性质断言。
+
+## 市场价格带
+
+`PriceBandConfig` 固定价格来源和最大偏离基点，两种订单簿分别保存配置及对应的市场数值规则。双侧边界复用用户滑点保护的整数计算；非法基点统一返回 `InvalidSlippageBps = 3007`。限价候选必须位于包含端点的上下界之间；缺少配置来源参考价时返回 `ReferencePriceUnavailable`。市价撮合在命令开始冻结价格带，按方向与用户保护取更严格边界，并在第一个越界挂单之前停止；相等时允许成交。用户和市场边界同时绑定时来源为 `Both`，否则记录实际生效的一方。
+
+普通成交更新 LastTrade，当前命令仍使用开始时冻结的价格带。参考价更新触发 Stop 时，相同配置来源使用该更新后的价格，不同来源使用原有配置参考；同一个根命令中的子单沿用冻结的上下界。未实现完整市场状态机，PreOpen 重校验与 Open/Resume 引导约束尚待后续实现。
 
 ## 自成交防护
 

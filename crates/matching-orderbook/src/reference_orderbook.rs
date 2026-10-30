@@ -19,6 +19,7 @@ mod market_by_base;
 mod market_by_quote;
 mod mass_cancel;
 mod matching;
+mod price_band;
 mod reservation_place;
 mod resting;
 mod stop_orders;
@@ -55,32 +56,17 @@ pub struct ReferenceOrderBook {
     next_stop_priority: u128,
     /// 各参考来源的最近已接受价格和序号。
     reference_prices: PriceReferenceState,
+    /// 当前市场价格带配置及已验证市场数值规则。
+    price_band: Option<(
+        matching_domain::PriceBandConfig,
+        matching_domain::MarketMath,
+    )>,
 }
 
 impl ReferenceOrderBook {
     /// 创建不含挂单且优先级从零开始的单市场参考订单簿。
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// 在参考 Vec 变更前核对候选预留身份及既有影子状态。
-    fn validate_new_reservation(
-        &self,
-        order_id: OrderId,
-        user_id: matching_domain::UserId,
-        state: &ReservationState,
-    ) -> Result<(), RejectReason> {
-        if self.contains_active_order(order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        if state.status != matching_risk::ReservationStatus::Active
-            || state.order_id != order_id
-            || state.user_id != user_id
-            || self.reservations.contains_key(&order_id)
-        {
-            return Err(RejectReason::InvalidReservation);
-        }
-        Ok(())
     }
 
     /// 按订单身份只读查询已登记的本地预留快照。
@@ -91,20 +77,6 @@ impl ReferenceOrderBook {
     /// 读取下一次实际挂单或冰山补量将使用的队列优先级，不推进分配器。
     pub fn next_queue_priority(&self) -> u128 {
         self.next_priority
-    }
-
-    /// 批量成交只清除已终结身份，未触发止损仍拥有同一预留。
-    fn retain_active_reservations(&mut self) {
-        let orders = &self.orders;
-        let stops = &self.stop_orders;
-        self.reservations.retain(|order_id, _| {
-            orders
-                .iter()
-                .any(|order| order.original_order().order_id == *order_id)
-                || stops
-                    .iter()
-                    .any(|entry| entry.order.order_id() == *order_id)
-        });
     }
 
     /// 返回指定侧按价格优先、同价先进先出排列的只读视图
@@ -135,6 +107,40 @@ impl ReferenceOrderBook {
     ///
     pub fn best(&self, side: Side) -> Option<&ReferenceOrder> {
         self.orders(side).into_iter().next()
+    }
+
+    /// 在参考 Vec 变更前核对候选预留身份及既有影子状态。
+    fn validate_new_reservation(
+        &self,
+        order_id: OrderId,
+        user_id: matching_domain::UserId,
+        state: &ReservationState,
+    ) -> Result<(), RejectReason> {
+        if self.contains_active_order(order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        if state.status != matching_risk::ReservationStatus::Active
+            || state.order_id != order_id
+            || state.user_id != user_id
+            || self.reservations.contains_key(&order_id)
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        Ok(())
+    }
+
+    /// 批量成交只清除已终结身份，未触发止损仍拥有同一预留。
+    fn retain_active_reservations(&mut self) {
+        let orders = &self.orders;
+        let stops = &self.stop_orders;
+        self.reservations.retain(|order_id, _| {
+            orders
+                .iter()
+                .any(|order| order.original_order().order_id == *order_id)
+                || stops
+                    .iter()
+                    .any(|entry| entry.order.order_id() == *order_id)
+        });
     }
 
     fn reject_quote_math_error(error: MathError) -> RejectReason {

@@ -19,11 +19,6 @@ pub struct OrderArena {
 }
 
 impl OrderArena {
-    /// 冻结提交屏障需要的全部槽位与空闲栈；测试访问计数不属于业务状态。
-    pub(crate) fn state_snapshot(&self) -> (Vec<Option<OrderNode>>, Vec<OrderIndex>) {
-        (self.slots.clone(), self.free.clone())
-    }
-
     /// 创建没有槽位和空闲链表条目的空 Arena。
     pub fn new() -> Self {
         Self::default()
@@ -79,6 +74,17 @@ impl OrderArena {
         self.slots.get(position)?.as_ref()
     }
 
+    /// 仅供库内部在完成局部不变量预检后维护节点运行态。
+    ///
+    /// `None` 同时表示越界或已释放槽位；此访问不修复链接，也不验证
+    /// 节点属于某个 PriceLevel。
+    pub(crate) fn get_mut(&mut self, index: OrderIndex) -> Option<&mut OrderNode> {
+        let position = usize::try_from(index.get()).ok()?;
+        #[cfg(test)]
+        self.record_slot_access();
+        self.slots.get_mut(position)?.as_mut()
+    }
+
     /// 取走节点并将其槽位登记到空闲链表。
     ///
     /// 仅成功删除时登记一次，不压缩槽位。
@@ -99,29 +105,9 @@ impl OrderArena {
         Some(node)
     }
 
-    /// 仅供库内部在完成局部不变量预检后维护节点运行态。
-    ///
-    /// `None` 同时表示越界或已释放槽位；此访问不修复链接，也不验证
-    /// 节点属于某个 PriceLevel。
-    pub(crate) fn get_mut(&mut self, index: OrderIndex) -> Option<&mut OrderNode> {
-        let position = usize::try_from(index.get()).ok()?;
-        #[cfg(test)]
-        self.record_slot_access();
-        self.slots.get_mut(position)?.as_mut()
-    }
-
-    /// 记录一次真实槽位读取或写入，仅用于 O(1) 访问路径测试。
-    ///
-    /// 计数溢出是测试诊断失败，不能改变生产错误语义。
-    #[cfg(test)]
-    fn record_slot_access(&self) {
-        let next = self
-            .slot_accesses
-            .get()
-            .checked_add(1)
-            .expect("OrderArena slot access counter overflow");
-
-        self.slot_accesses.set(next);
+    /// 冻结提交屏障需要的全部槽位与空闲栈；测试访问计数不属于业务状态。
+    pub(crate) fn state_snapshot(&self) -> (Vec<Option<OrderNode>>, Vec<OrderIndex>) {
+        (self.slots.clone(), self.free.clone())
     }
 
     /// 只读验证下一次 `insert` 是否可执行。
@@ -155,6 +141,20 @@ impl OrderArena {
         OrderIndex::try_from_usize(self.slots.len())?;
 
         Ok(())
+    }
+
+    /// 记录一次真实槽位读取或写入，仅用于 O(1) 访问路径测试。
+    ///
+    /// 计数溢出是测试诊断失败，不能改变生产错误语义。
+    #[cfg(test)]
+    fn record_slot_access(&self) {
+        let next = self
+            .slot_accesses
+            .get()
+            .checked_add(1)
+            .expect("OrderArena slot access counter overflow");
+
+        self.slot_accesses.set(next);
     }
 }
 

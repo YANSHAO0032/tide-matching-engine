@@ -48,7 +48,11 @@ fn market_by_base_empty_book_both_sides() {
         let before = snapshot(&book);
 
         let trades = book
-            .execute_market_by_base(market(100, side, 10), &[])
+            .execute_market_by_base(
+                market(100, side, 10),
+                &[],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            )
             .unwrap();
 
         assert!(trades.is_empty());
@@ -64,7 +68,11 @@ fn market_by_base_partially_fills_maker_both_sides() {
         let priority_before = book.next_priority;
 
         let trades = book
-            .execute_market_by_base(market(100, taker_side, 3), &[TradeId::new(500)])
+            .execute_market_by_base(
+                market(100, taker_side, 3),
+                &[TradeId::new(500)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            )
             .unwrap();
 
         assert_eq!(trades.len(), 1);
@@ -99,6 +107,7 @@ fn market_by_base_respects_price_priority_and_fifo() {
             .execute_market_by_base(
                 market(100, taker_side, 10),
                 &[TradeId::new(501), TradeId::new(502), TradeId::new(503)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
             )
             .unwrap();
 
@@ -140,7 +149,11 @@ fn market_by_base_discards_unfilled_taker_remainder() {
         let priority_before = book.next_priority;
 
         let trades = book
-            .execute_market_by_base(market(100, taker_side, 10), &[TradeId::new(600)])
+            .execute_market_by_base(
+                market(100, taker_side, 10),
+                &[TradeId::new(600)],
+                &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            )
             .unwrap();
 
         assert_eq!(trades.len(), 1);
@@ -158,7 +171,11 @@ fn market_by_base_duplicate_id_is_failure_atomic() {
 
     let before = snapshot(&book);
 
-    let result = book.execute_market_by_base(market(1, Side::Buy, 5), &[]);
+    let result = book.execute_market_by_base(
+        market(1, Side::Buy, 5),
+        &[],
+        &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+    );
 
     assert_eq!(result, Err(RejectReason::DuplicateOrderId));
     assert_eq!(snapshot(&book), before);
@@ -174,7 +191,11 @@ fn market_by_base_insufficient_trade_ids_preserves_state() {
 
     // 需要两笔成交，却只提供一个 TradeId。
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = book.execute_market_by_base(market(100, Side::Buy, 10), &[TradeId::new(700)]);
+        let _ = book.execute_market_by_base(
+            market(100, Side::Buy, 10),
+            &[TradeId::new(700)],
+            &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+        );
     }));
 
     assert!(result.is_err());

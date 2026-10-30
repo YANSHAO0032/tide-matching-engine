@@ -56,4 +56,4 @@ Stop 按 LastTrade、MarkPrice、IndexPrice 分区；StaticOpening 不可触发�
 
 固定边界、生成式失败性质和完整混合差分逐命令比较原序结果/事件、所有普通与 Stop 载荷、真实 FIFO、深度、到期引用、两个 allocator、来源价格/序号和完整预留。固定 seed 100k 及两组各双次 10k 比较完整逐步 transcript；状态投影用于本地测试，不是 durable digest。实现入口见[模块说明](orderbook_modules.md)，执行顺序见[逻辑流程](logic_flows.md)。
 
-当前不包含 MarketState/KillSwitch/路由 fencing、完整 PriceBand/PreOpen、账户与 Settlement、WAL/快照/HA、durable envelope 或完整命令去重。改价重新撮合沿用订单的 STP 身份和模式；带登记表入口会规划终结订单的 PendingR2 归属。独立新身份替换见[原子撤单替换与预留归属](cancel_replace.md)；不能将旧窄 Amend/Cancel/expiry API 的 shadow 清理解释成已完成 R2。完整 Amend 上下文同时拒绝 Released 或固定费率漂移的 shadow，包括无调整令牌分支。止损 root reference update 一次冻结更新后参考作为全级联用户保护上下文，后代成交只更新触发检测状态；完整市场价格带配置仍由后续接入。
+当前不包含 MarketState/KillSwitch/路由 fencing、PreOpen 重校验、账户与 Settlement、WAL/快照/HA、durable envelope 或完整命令去重。改单候选按配置的价格带检查；改价重新撮合沿用订单的 STP 身份和模式，带登记表入口会规划终结订单的 PendingR2 归属。独立新身份替换见[原子撤单替换与预留归属](cancel_replace.md)；不能将旧窄 Amend/Cancel/expiry API 的 shadow 清理解释成已完成 R2。完整 Amend 上下文同时拒绝 Released 或固定费率漂移的 shadow，包括无调整令牌分支。止损 root reference update 一次冻结更新后参考作为全级联用户保护上下文，后代成交只更新触发检测状态。

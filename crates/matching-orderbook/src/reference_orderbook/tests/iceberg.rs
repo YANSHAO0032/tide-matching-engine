@@ -285,7 +285,11 @@ fn reference_iceberg_all_market_paths_use_replenished_fifo_liquidity() {
             let mut book = seeded(opposite(side));
             let actual = match path {
                 0 => book
-                    .execute_market_by_base(base(side, 10), &ids())
+                    .execute_market_by_base(
+                        base(side, 10),
+                        &ids(),
+                        &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                    )
                     .unwrap()
                     .into_iter()
                     .map(EngineEvent::Trade)
@@ -367,7 +371,11 @@ fn reference_iceberg_trade_id_shortage_is_atomic_after_multiple_refresh_plans() 
                     .place_limit_gtc_with_events(order(3, Side::Buy, 100, 10), &[TradeId::new(1)]);
             }
             2 => {
-                let _ = book.execute_market_by_base(base(Side::Buy, 10), &[TradeId::new(1)]);
+                let _ = book.execute_market_by_base(
+                    base(Side::Buy, 10),
+                    &[TradeId::new(1)],
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                );
             }
             3 => {
                 let _ = book.execute_market_by_quote(
@@ -403,7 +411,11 @@ fn reference_iceberg_priority_failure_is_atomic_across_full_command() {
                 .place_limit_fok(order(3, Side::Buy, 100, 10), &math(), &ids())
                 .map(|_| ()),
             2 => book
-                .execute_market_by_base(base(Side::Buy, 10), &ids())
+                .execute_market_by_base(
+                    base(Side::Buy, 10),
+                    &ids(),
+                    &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+                )
                 .map(|_| ()),
             3 => book
                 .execute_market_by_quote(quote(Side::Buy, 1000), &math(), &ids())

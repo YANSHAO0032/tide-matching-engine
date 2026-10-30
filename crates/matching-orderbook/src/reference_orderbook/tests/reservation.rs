@@ -330,9 +330,13 @@ fn market_base_quote_and_bulk_immediate_full_fills_clear_shadow_state() {
                     market_protection: None,
                 };
                 assert_eq!(
-                    book.execute_market_by_base(taker, &[TradeId::new(1)])
-                        .unwrap()
-                        .len(),
+                    book.execute_market_by_base(
+                        taker,
+                        &[TradeId::new(1)],
+                        &matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap()
+                    )
+                    .unwrap()
+                    .len(),
                     1
                 );
             }

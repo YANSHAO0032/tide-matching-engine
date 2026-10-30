@@ -156,7 +156,24 @@ impl ReferenceOrderBook {
         trade_ids: &[TradeId],
         mut trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if let Some((_, configured_math)) = self.price_band {
+            assert_eq!(&configured_math, math, "市场数值配置不一致");
+        }
         self.preflight_last_trade_sequence_capacity(reference, trade_ids.len())?;
+        let band = self
+            .price_band
+            .map(|(config, configured_math)| {
+                let price = if config.reference_kind == reference.kind {
+                    Some(reference.price)
+                } else {
+                    self.reference_prices
+                        .latest(config.reference_kind)
+                        .map(|r| r.price)
+                }
+                .ok_or(RejectReason::ReferencePriceUnavailable)?;
+                config.bounds(price, configured_math.tick_size())
+            })
+            .transpose();
         // 参考更新是本次 root 的显式输入：使用新值一次冻结整个级联的保护上下文。
         let protection_context = matching_domain::market_order::CommandStartProtectionContext {
             reference_price_at_command_start: reference.price,
@@ -170,19 +187,47 @@ impl ReferenceOrderBook {
             events.push(triggered);
             let validation = self
                 .validate_triggered_child_tif(&order, now, current_session_id)
+                .and_then(|()| band.as_ref().map(|_| ()).map_err(|reason| *reason))
+                .and_then(|()| match (&order, &band) {
+                    (StopOrder::Limit(stop), Ok(Some((lower, upper))))
+                        if stop.price < *lower || stop.price > *upper =>
+                    {
+                        Err(RejectReason::PriceBandExceeded)
+                    }
+                    _ => Ok(()),
+                })
                 .and_then(|()| trigger_r1(&order));
             if let Err(reason) = validation {
                 Self::append_trigger_rejection(&mut events, &order, reason);
                 continue;
             }
 
+            let mut child_context = protection_context.clone();
+            child_context.market_band_worst = band.as_ref().ok().and_then(|bounds| {
+                bounds.map(|(lower, upper)| match &order {
+                    StopOrder::Limit(stop) => {
+                        if stop.side == matching_domain::Side::Buy {
+                            upper
+                        } else {
+                            lower
+                        }
+                    }
+                    StopOrder::Market(stop) => {
+                        if stop.side == matching_domain::Side::Buy {
+                            upper
+                        } else {
+                            lower
+                        }
+                    }
+                })
+            });
             let mut child_events = match self.execute_triggered_child(
                 &order,
                 math,
                 &trade_ids[used_trade_ids..],
                 now,
                 current_session_id,
-                &protection_context,
+                (&child_context, band.as_ref().ok().copied().flatten()),
             ) {
                 Ok(events) => events,
                 Err(reason) => {
@@ -292,10 +337,14 @@ impl ReferenceOrderBook {
         trade_ids: &[TradeId],
         now: LogicalTime,
         session: u64,
-        context: &matching_domain::market_order::CommandStartProtectionContext,
+        protection: (
+            &matching_domain::market_order::CommandStartProtectionContext,
+            Option<(matching_domain::Price, matching_domain::Price)>,
+        ),
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let (context, frozen_band) = protection;
         match order {
-            StopOrder::Limit(stop) => self.place_limit_timed_with_events(
+            StopOrder::Limit(stop) => self.place_limit_timed_frozen(
                 matching_domain::LimitOrder {
                     order_id: stop.order_id,
                     user_id: stop.user_id,
@@ -309,6 +358,7 @@ impl ReferenceOrderBook {
                 now,
                 session,
                 trade_ids,
+                Some(frozen_band),
             ),
             StopOrder::Market(stop) => match stop.quantity {
                 StopMarketQuantity::Base(qty) => {
@@ -322,6 +372,7 @@ impl ReferenceOrderBook {
                         market_protection: stop.market_protection.clone(),
                     };
                     if stop.market_protection.is_some()
+                        || context.market_band_worst.is_some()
                         || stop.stp_mode != matching_domain::StpMode::None
                     {
                         let unprotected =
@@ -330,16 +381,18 @@ impl ReferenceOrderBook {
                                     .reference_price_at_command_start,
                                 market_band_worst: None,
                             };
-                        let context = if stop.market_protection.is_some() {
+                        let context = if stop.market_protection.is_some()
+                            || context.market_band_worst.is_some()
+                        {
                             context
                         } else {
                             &unprotected
                         };
-                        self.execute_market_by_base_with_protection(
+                        self.execute_market_by_base_with_frozen_protection(
                             incoming, context, math, trade_ids,
                         )
                     } else {
-                        self.execute_market_by_base(incoming, trade_ids)
+                        self.execute_market_by_base_inner(incoming, trade_ids, math)
                             .map(|trades| trades.into_iter().map(EngineEvent::Trade).collect())
                     }
                 }
@@ -354,6 +407,7 @@ impl ReferenceOrderBook {
                         market_protection: stop.market_protection.clone(),
                     };
                     if stop.market_protection.is_some()
+                        || context.market_band_worst.is_some()
                         || stop.stp_mode != matching_domain::StpMode::None
                     {
                         let unprotected =
@@ -362,17 +416,19 @@ impl ReferenceOrderBook {
                                     .reference_price_at_command_start,
                                 market_band_worst: None,
                             };
-                        let context = if stop.market_protection.is_some() {
+                        let context = if stop.market_protection.is_some()
+                            || context.market_band_worst.is_some()
+                        {
                             context
                         } else {
                             &unprotected
                         };
-                        self.execute_market_by_quote_with_protection(
+                        self.execute_market_by_quote_with_frozen_protection(
                             incoming, context, math, trade_ids,
                         )
                         .map(|execution| execution.events().to_vec())
                     } else {
-                        self.execute_market_by_quote(incoming, math, trade_ids)
+                        self.execute_market_by_quote_inner(incoming, math, trade_ids)
                             .map(|execution| {
                                 execution
                                     .trades()
