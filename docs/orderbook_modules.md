@@ -2,6 +2,8 @@
 
 订单簿提供两套独立实现：生产簿使用价格索引、订单索引、Arena 和档位链表；参考簿使用 Vec 与排序。两者遵守相同业务契约，通过差分测试比较每条命令的原序事件、订单、深度和适用不变量。
 
+分片线程、显式路由、进程内序号、查询和关闭的当前实现及未暴露能力见 [单写者分片运行时](runtime.md)。
+
 ## 文件与模块的关系
 
 [库入口](../crates/matching-orderbook/src/lib.rs) 声明两个公开模块，并重新导出 `ProductionOrderBook` 和 `ReferenceOrderBook`。各自的 `.rs` 文件是父模块入口，同名目录保存由 `mod` 声明加载的子模块。
@@ -17,6 +19,7 @@
 | 职责 | 生产簿 | 参考簿 |
 |---|---|---|
 | 类型、构造与基础查询 | [production_orderbook.rs](../crates/matching-orderbook/src/production_orderbook.rs) | [reference_orderbook.rs](../crates/matching-orderbook/src/reference_orderbook.rs) |
+| 可信市场绑定与预留快照 | [market_binding.rs](../crates/matching-orderbook/src/production_orderbook/market_binding.rs) | 当前未提供对应绑定入口 |
 | 价格带配置、边界与静态校验 | [price_band.rs](../crates/matching-orderbook/src/production_orderbook/price_band.rs) | [price_band.rs](../crates/matching-orderbook/src/reference_orderbook/price_band.rs) |
 | 挂单、取消 | [resting.rs](../crates/matching-orderbook/src/production_orderbook/resting.rs) | [resting.rs](../crates/matching-orderbook/src/reference_orderbook/resting.rs) |
 | 单笔与连续撮合 | [matching.rs](../crates/matching-orderbook/src/production_orderbook/matching.rs) | [matching.rs](../crates/matching-orderbook/src/reference_orderbook/matching.rs) |

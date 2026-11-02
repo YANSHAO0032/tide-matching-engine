@@ -259,6 +259,7 @@ fn generate(seed: [u8; 32], length: usize) -> Vec<Command> {
     commands
 }
 
+/// 记录混合命令磁带实际覆盖的行为。
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Coverage {
     /// 已执行的总命令数。

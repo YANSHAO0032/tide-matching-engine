@@ -397,3 +397,203 @@ fn cancel_replace_band_rejection_keeps_old_and_registry() {
         Outcome::CancelReplace(Err(request.rejection(RejectReason::PriceBandExceeded)))
     );
 }
+
+#[test]
+fn cancel_replace_cursor_rejects_overflow_before_state_changes() {
+    let mut h = Harness::new();
+    initialize(&mut h, 0, Side::Buy);
+    for id in [2, 3] {
+        h.run(&Command::Rest(
+            input(id, Side::Sell, 100, 1),
+            TimeInForce::Gtc,
+        ));
+    }
+    let Command::CancelReplace { request, expected } = replacement(
+        (1, 9, 1, 3),
+        41,
+        0,
+        Side::Buy,
+        100,
+        2,
+        limit(TimeInForce::Gtc, false),
+    ) else {
+        unreachable!()
+    };
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let before = super::super::super::amend_stop::production_snapshot(&h.p);
+    let registry_before = h.pr.clone();
+    let cursor_before = cursor.clone();
+    let result = h.p.cancel_replace_with_cursor(
+        &request,
+        &expected,
+        &mut h.pr,
+        &h.keys,
+        ProductionCancelReplaceContext {
+            math: &math(),
+            now: h.clock.now(),
+            current_session_id: SESSION,
+            trade_ids: &[],
+        },
+        &mut cursor,
+    );
+    assert_eq!(result.unwrap_err().reason, RejectReason::ArithmeticOverflow);
+    assert_eq!(
+        super::super::super::amend_stop::production_snapshot(&h.p),
+        before
+    );
+    assert_eq!(h.pr, registry_before);
+    assert_eq!(cursor, cursor_before);
+}
+
+#[test]
+fn cancel_replace_cursor_matches_legacy_standard_plan() {
+    let mut h = Harness::new();
+    initialize(&mut h, 0, Side::Buy);
+    for id in [2, 3] {
+        h.run(&Command::Rest(
+            input(id, Side::Sell, 100, 1),
+            TimeInForce::Gtc,
+        ));
+    }
+    let Command::CancelReplace { request, expected } = replacement(
+        (1, 9, 1, 3),
+        41,
+        0,
+        Side::Buy,
+        100,
+        2,
+        limit(TimeInForce::Gtc, false),
+    ) else {
+        unreachable!()
+    };
+    let mut prior = h.p.clone();
+    let mut prior_registry = h.pr.clone();
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut ids_cursor = cursor.clone();
+    let ids = [
+        ids_cursor.next_trade_id().unwrap(),
+        ids_cursor.next_trade_id().unwrap(),
+    ];
+    let math = math();
+    let context = ProductionCancelReplaceContext {
+        math: &math,
+        now: h.clock.now(),
+        current_session_id: SESSION,
+        trade_ids: &ids,
+    };
+    let plan = prior
+        .plan_cancel_replace(&request, &expected, &prior_registry, &h.keys, context)
+        .unwrap();
+    let prior_events = prior
+        .apply_cancel_replace(&mut prior_registry, plan)
+        .unwrap();
+    let context = ProductionCancelReplaceContext {
+        math: &math,
+        now: h.clock.now(),
+        current_session_id: SESSION,
+        trade_ids: &ids,
+    };
+    let result =
+        h.p.cancel_replace_with_cursor(
+            &request,
+            &expected,
+            &mut h.pr,
+            &h.keys,
+            context,
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(result, prior_events);
+    assert_eq!(
+        super::super::super::amend_stop::production_snapshot(&h.p),
+        super::super::super::amend_stop::production_snapshot(&prior)
+    );
+    assert_eq!(h.pr, prior_registry);
+    assert_eq!(cursor, ids_cursor);
+}
+
+#[test]
+fn cancel_replace_cursor_matches_legacy_stp_plan() {
+    let mut h = Harness::new();
+    initialize(&mut h, 0, Side::Buy);
+    for id in [2, 3] {
+        h.run(&Command::Rest(
+            input(id, Side::Sell, 100, 1),
+            TimeInForce::Gtc,
+        ));
+    }
+    let Command::CancelReplace {
+        mut request,
+        expected,
+    } = replacement(
+        (1, 9, 1, 3),
+        41,
+        0,
+        Side::Buy,
+        100,
+        2,
+        limit(TimeInForce::Gtc, false),
+    )
+    else {
+        unreachable!()
+    };
+    request.replacement.stp_mode = matching_domain::StpMode::CancelMaker;
+    let mut prior = h.p.clone();
+    let mut prior_registry = h.pr.clone();
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut ids_cursor = cursor.clone();
+    let ids = [
+        ids_cursor.next_trade_id().unwrap(),
+        ids_cursor.next_trade_id().unwrap(),
+    ];
+    let math = math();
+    let context = ProductionCancelReplaceContext {
+        math: &math,
+        now: h.clock.now(),
+        current_session_id: SESSION,
+        trade_ids: &ids,
+    };
+    let plan = prior
+        .plan_cancel_replace(&request, &expected, &prior_registry, &h.keys, context)
+        .unwrap();
+    let prior_events = prior
+        .apply_cancel_replace(&mut prior_registry, plan)
+        .unwrap();
+    let context = ProductionCancelReplaceContext {
+        math: &math,
+        now: h.clock.now(),
+        current_session_id: SESSION,
+        trade_ids: &ids,
+    };
+    let result =
+        h.p.cancel_replace_with_cursor(
+            &request,
+            &expected,
+            &mut h.pr,
+            &h.keys,
+            context,
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(result, prior_events);
+    assert_eq!(
+        super::super::super::amend_stop::production_snapshot(&h.p),
+        super::super::super::amend_stop::production_snapshot(&prior)
+    );
+    assert_eq!(h.pr, prior_registry);
+    assert_eq!(cursor.next_index(), 0);
+}

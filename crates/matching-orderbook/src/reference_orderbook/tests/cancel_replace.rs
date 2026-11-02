@@ -1101,3 +1101,123 @@ fn cancel_replace_schema_preflight_notional_precedes_invalid_token() {
 fn cancel_replace_schema_preflight_notional_precedes_post_only_cross() {
     assert_schema_precedes_transition(4);
 }
+
+#[test]
+fn cancel_replace_cursor_two_trades_and_overflow_are_atomic() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Buy, 5), state(1))
+        .unwrap();
+    for id in [2, 3] {
+        book.rest_with_reservation(order(id, Side::Sell, 1), state(id))
+            .unwrap();
+    }
+    let mut registry = ReservationRegistry::new([state(1), state(2), state(3)]).unwrap();
+    let original = book.clone();
+    let original_registry = registry.clone();
+    let request = command(false, Side::Buy, 2, TimeInForce::Gtc);
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let initial = cursor.clone();
+    let rejected = book
+        .cancel_replace_with_cursor(
+            &request,
+            &expected(),
+            &mut registry,
+            &keys(),
+            context(&math, &[]),
+            &mut cursor,
+        )
+        .unwrap_err();
+    assert_eq!(rejected.reason, RejectReason::ArithmeticOverflow);
+    assert_eq!(book, original);
+    assert_eq!(registry, original_registry);
+    assert_eq!(cursor, initial);
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut generator = cursor.clone();
+    let ids = [
+        generator.next_trade_id().unwrap(),
+        generator.next_trade_id().unwrap(),
+    ];
+    let mut old = original;
+    let mut old_registry = original_registry;
+    let plan = old
+        .plan_cancel_replace(
+            &request,
+            &expected(),
+            &old_registry,
+            &keys(),
+            context(&math, &ids),
+        )
+        .unwrap();
+    let expected_events = old.apply_cancel_replace(&mut old_registry, plan).unwrap();
+    let events = book
+        .cancel_replace_with_cursor(
+            &request,
+            &expected(),
+            &mut registry,
+            &keys(),
+            context(&math, &[]),
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(events, expected_events);
+    assert_eq!(book, old);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor, generator);
+}
+
+#[test]
+fn cancel_replace_cursor_stp_cancellation_does_not_consume_identity() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Buy, 5), state(1))
+        .unwrap();
+    book.rest_with_reservation(order(2, Side::Sell, 1), state(2))
+        .unwrap();
+    let mut registry = ReservationRegistry::new([state(1), state(2)]).unwrap();
+    let mut old = book.clone();
+    let mut old_registry = registry.clone();
+    let mut request = command(false, Side::Buy, 1, TimeInForce::Gtc);
+    request.replacement.stp_mode = matching_domain::StpMode::CancelMaker;
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let old_plan = old
+        .plan_cancel_replace(
+            &request,
+            &expected(),
+            &old_registry,
+            &keys(),
+            context(&math, &[]),
+        )
+        .unwrap();
+    let expected_events = old
+        .apply_cancel_replace(&mut old_registry, old_plan)
+        .unwrap();
+    let events = book
+        .cancel_replace_with_cursor(
+            &request,
+            &expected(),
+            &mut registry,
+            &keys(),
+            context(&math, &[]),
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(events, expected_events);
+    assert_eq!(book, old);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor.next_index(), 0);
+}

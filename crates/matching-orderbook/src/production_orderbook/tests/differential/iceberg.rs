@@ -4,25 +4,41 @@ use super::*;
 use matching_domain::market_order::ProtectedMarketByQuoteExecution;
 use matching_domain::{IcebergOrder, LimitImmediateExecution};
 
+/// 冰山混合场景使用的差分命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum IceCommand {
+    /// 提交冰山订单。
     Iceberg(IcebergOrder),
+    /// 提交只挂单冰山订单。
     IcebergPostOnly(IcebergOrder),
+    /// 执行限价 GTC 订单。
     Gtc(LimitOrder),
+    /// 执行限价 IOC 订单。
     Ioc(LimitOrder),
+    /// 执行限价 FOK 订单。
     Fok(LimitOrder),
+    /// 提交只挂单限价订单。
     PostOnly(LimitOrder),
+    /// 执行受保护的基础数量市价单。
     ProtectedBase(MarketByBase),
+    /// 执行受保护的报价预算市价单。
     ProtectedQuote(MarketByQuote),
+    /// 取消指定订单。
     Cancel(OrderId),
 }
 
+/// 冰山场景执行后的可比较结果。
 #[derive(Debug, PartialEq, Eq)]
 enum IceOutcome {
+    /// 记录原序业务事件或拒绝。
     Events(Result<Vec<EngineEvent>, RejectReason>),
+    /// 记录立即执行结果或拒绝。
     Immediate(Result<LimitImmediateExecution, RejectReason>),
+    /// 记录只挂单提交结果或拒绝。
     PostOnly(Result<(), RejectReason>),
+    /// 记录报价预算执行结果或拒绝。
     Quote(Result<ProtectedMarketByQuoteExecution, RejectReason>),
+    /// 记录取消结果或拒绝。
     Cancel(Result<IceOrder, RejectReason>),
 }
 
@@ -47,6 +63,7 @@ impl IceOutcome {
     }
 }
 
+/// 差分观察到的冰山订单状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IceOrder {
     /// 不随成交扣减改变的原始限价订单载荷。
@@ -63,6 +80,7 @@ struct IceOrder {
     priority: QueuePriority,
 }
 
+/// 冰山差分测试的状态投影。
 #[derive(Debug, PartialEq, Eq)]
 struct IceState {
     /// 只含可见数量的整簿业务观察。

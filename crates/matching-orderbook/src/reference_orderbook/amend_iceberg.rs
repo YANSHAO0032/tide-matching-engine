@@ -3,9 +3,7 @@ use super::amend_candidate::IcebergAmendPlan;
 use super::iceberg::SliceRequest;
 use super::{PRIORITY_GUARD, ReferenceOrderBook};
 use crate::ReferenceOrder;
-use matching_domain::{
-    AmendOrder, AmendedQuantity, EngineEvent, Qty, QueuePriority, RejectReason, TradeId,
-};
+use matching_domain::{AmendOrder, AmendedQuantity, EngineEvent, Qty, QueuePriority, RejectReason};
 
 impl ReferenceOrderBook {
     /// 参考模型只在虚拟 Vec 中规划；成功前不改真实订单或分配器。
@@ -13,7 +11,7 @@ impl ReferenceOrderBook {
         &mut self,
         plan: IcebergAmendPlan,
         amend: &AmendOrder,
-        trade_ids: &[TradeId],
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         if amend.reservation_adjustment.is_some() {
             return Err(RejectReason::InvalidReservation);
@@ -71,10 +69,7 @@ impl ReferenceOrderBook {
             .iter()
             .filter(|e| matches!(e, EngineEvent::Trade(_)))
             .count();
-        assert!(
-            trade_ids.len() >= count,
-            "insufficient TradeIds for reference iceberg Amend"
-        );
+        let trade_ids = source.reserve(count)?;
         let position = slice
             .orders
             .iter()

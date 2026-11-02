@@ -711,3 +711,250 @@ fn stop_market_descendant_uses_frozen_band_after_last_trade_changes() {
     assert!(pe.iter().any(|event| matches!(event, EngineEvent::MarketProtectionTriggered { order_id, next_price, effective_worst_price, .. } if *order_id == OrderId::new(12) && next_price.get() == 104 && effective_worst_price.get() == 105)));
     assert!(p.order(OrderId::new(9)).is_some());
 }
+
+#[test]
+fn stop_cursor_overflow_discards_complete_root_and_keeps_cursor() {
+    use matching_domain::{ClusterId, ShardId, TradeIdCursor};
+    let mut p = ProductionOrderBook::new(policy());
+    p.rest(order(10, Side::Sell, 105, 2)).unwrap();
+    p.place_stop(stop_market(11, Side::Buy, 102), LogicalTime::new(1), 1)
+        .unwrap();
+    p.place_stop(stop_market(12, Side::Buy, 103), LogicalTime::new(1), 1)
+        .unwrap();
+    p.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let before = p.clone();
+    let mut cursor =
+        TradeIdCursor::with_next_index(ClusterId(1), ShardId(2), 5, u64::from(u32::MAX)).unwrap();
+    let saved = cursor.clone();
+    assert_eq!(
+        p.trigger_stops_with_cursor(
+            last_trade(2, 104),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &mut cursor,
+            |_| Ok(())
+        ),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(p, before);
+    assert_eq!(cursor, saved);
+}
+
+#[test]
+fn stop_cursor_cascade_matches_slice_and_keeps_root_trade_indices() {
+    use matching_domain::{ClusterId, ShardId, TradeIdCursor};
+    let mut book = ProductionOrderBook::new(policy());
+    book.rest(order(10, Side::Sell, 105, 2)).unwrap();
+    book.place_stop(stop_market(11, Side::Buy, 102), LogicalTime::new(1), 1)
+        .unwrap();
+    book.place_stop(stop_market(12, Side::Buy, 105), LogicalTime::new(1), 1)
+        .unwrap();
+    book.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut direct = book.clone();
+    let mut id_generator = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+    let ids = [
+        id_generator.next_trade_id().unwrap(),
+        id_generator.next_trade_id().unwrap(),
+    ];
+    let expected = direct
+        .trigger_stops(
+            last_trade(2, 104),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &ids,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+    let actual = book
+        .trigger_stops_with_cursor(
+            last_trade(2, 104),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book.arena.state_snapshot(), direct.arena.state_snapshot());
+    assert_eq!(book.bids, direct.bids);
+    assert_eq!(book.asks, direct.asks);
+    assert_eq!(book.orders, direct.orders);
+    assert_eq!(book.stop_book, direct.stop_book);
+    assert_eq!(book.reference_prices, direct.reference_prices);
+    assert_eq!(book.next_queue_priority(), direct.next_queue_priority());
+    assert_eq!(cursor.next_index(), 2);
+}
+
+#[test]
+fn stop_cursor_limit_and_quote_match_slice_events() {
+    use matching_domain::{ClusterId, ShardId, TradeIdCursor};
+    for quote in [false, true] {
+        let mut book = ProductionOrderBook::new(policy());
+        book.rest(order(10, Side::Sell, 105, 2)).unwrap();
+        let mut child = if quote {
+            stop_market(11, Side::Buy, 102)
+        } else {
+            stop_limit(11, Side::Buy, 102, 105)
+        };
+        if let StopOrder::Market(ref mut order) = child {
+            order.quantity =
+                StopMarketQuantity::Quote(matching_domain::QuoteBudget::try_new(105).unwrap());
+        }
+        book.place_stop(child, LogicalTime::new(1), 1).unwrap();
+        book.trigger_stops(
+            last_trade(1, 100),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+        let mut direct = book.clone();
+        let mut id_generator = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+        let ids = [id_generator.next_trade_id().unwrap()];
+        let expected = direct
+            .trigger_stops(
+                last_trade(2, 104),
+                LogicalTime::new(1),
+                1,
+                &math(),
+                &ids,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+        let actual = book
+            .trigger_stops_with_cursor(
+                last_trade(2, 104),
+                LogicalTime::new(1),
+                1,
+                &math(),
+                &mut cursor,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(book.arena.state_snapshot(), direct.arena.state_snapshot());
+        assert_eq!(book.stop_book, direct.stop_book);
+        assert_eq!(cursor.next_index(), 1);
+    }
+}
+
+#[test]
+fn stop_quote_cursor_iceberg_events_match_slice() {
+    use matching_domain::{ClusterId, IcebergOrder, QuoteBudget, ShardId, TradeIdCursor};
+    let mut book = ProductionOrderBook::new(policy());
+    let ice =
+        IcebergOrder::try_new(order(10, Side::Sell, 105, 3), Qty::try_new(1).unwrap()).unwrap();
+    book.place_iceberg_post_only(ice, &math()).unwrap();
+    let mut stop = stop_market(11, Side::Buy, 102);
+    if let StopOrder::Market(ref mut order) = stop {
+        order.quantity = StopMarketQuantity::Quote(QuoteBudget::try_new(315).unwrap());
+    }
+    book.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    book.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut direct = book.clone();
+    let mut id_generator = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+    let ids = [
+        id_generator.next_trade_id().unwrap(),
+        id_generator.next_trade_id().unwrap(),
+        id_generator.next_trade_id().unwrap(),
+    ];
+    let expected = direct
+        .trigger_stops(
+            last_trade(2, 104),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &ids,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+    let actual = book
+        .trigger_stops_with_cursor(
+            last_trade(2, 104),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn failed_stop_child_does_not_consume_trade_identity() {
+    use matching_domain::{ClusterId, ShardId, TradeIdCursor};
+    let policy = QueuePriorityPolicy::try_with_synthetic_ceiling(1024, Some(2)).unwrap();
+    let mut book = ProductionOrderBook::new(policy);
+    book.rest(order(10, Side::Sell, 105, 1)).unwrap();
+    book.rest(order(13, Side::Sell, 105, 1)).unwrap();
+    let mut first = stop_limit(11, Side::Buy, 102, 105);
+    if let StopOrder::Limit(ref mut stop) = first {
+        stop.qty = Qty::try_new(3).unwrap();
+    }
+    book.place_stop(first, LogicalTime::new(1), 1).unwrap();
+    book.place_stop(stop_market(12, Side::Buy, 103), LogicalTime::new(1), 1)
+        .unwrap();
+    book.trigger_stops(
+        last_trade(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math(),
+        &[],
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+    let events = book
+        .trigger_stops_with_cursor(
+            last_trade(2, 104),
+            LogicalTime::new(1),
+            1,
+            &math(),
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Trade(trade) => Some(trade.trade_id),
+            _ => None,
+        })
+        .collect();
+    let mut expected = TradeIdCursor::new(ClusterId(1), ShardId(2), 5);
+    assert_eq!(ids, vec![expected.next_trade_id().unwrap()]);
+    assert_eq!(cursor.next_index(), 1);
+}

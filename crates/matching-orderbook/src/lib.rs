@@ -67,3 +67,6 @@ pub use stop_priority_allocator::{StopPriorityAllocator, StopPriorityInitError};
 pub use production_orderbook::{
     ProductionBookWithout, ProductionMassCancelPlan, ProductionOrderBook,
 };
+
+/// 命令内成交身份来源的内部适配。
+pub(crate) mod trade_id_source;

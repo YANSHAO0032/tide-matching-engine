@@ -30,3 +30,4 @@ mod protected_market_by_quote_preflight;
 mod reservation;
 mod reservation_place;
 mod stp;
+mod trade_cursor;

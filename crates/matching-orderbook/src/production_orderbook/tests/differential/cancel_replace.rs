@@ -180,30 +180,51 @@ fn replacement(
 /// 所有命令均在回放之前生成，身份、签名及可信预留需求属于输入磁带。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
+    /// 挂入指定有效期的订单。
     Rest(LimitOrder, TimeInForce),
+    /// 提交冰山订单。
     Iceberg(IcebergOrder),
+    /// 登记未触发止损订单。
     Stop(StopOrder),
+    /// 提交普通限价单。
     Place(LimitOrder),
+    /// 更新市场价格带配置。
     Band(Option<matching_domain::PriceBandConfig>),
+    /// 执行基础数量市价单。
     Market(matching_domain::MarketByBase),
+    /// 原子撤销旧单并提交新单。
     CancelReplace {
+        /// 原子撤单替换命令载荷。
         request: Box<CancelReplaceOrder>,
+        /// 可信调用方计算的新单预留需求。
         expected: Box<ExpectedReplacementReservation>,
     },
+    /// 修改现有订单。
     Amend(Box<AmendOrder>),
+    /// 取消指定订单。
     Cancel(OrderId),
+    /// 按作用范围批量撤单。
     MassCancel(ShardCancelScope),
+    /// 推进逻辑时间。
     AdvanceTime(LogicalTime),
+    /// 终结指定交易时段。
     EndSession(u64),
+    /// 更新价格参考。
     Reference(PriceReference),
+    /// 更新参考并执行止损级联。
     Trigger(PriceReference),
 }
 
+/// 差分测试记录的命令执行结果。
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
+    /// 记录不携带业务事件的执行结果。
     Unit(Result<(), RejectReason>),
+    /// 记录原序业务事件或拒绝。
     Events(Result<Vec<EngineEvent>, RejectReason>),
+    /// 记录撤单替换事件或拒绝。
     CancelReplace(Result<Vec<EngineEvent>, CancelReplaceRejection>),
+    /// 记录到期订单列表或拒绝。
     Expired(Result<Vec<ExpiredOrder>, RejectReason>),
 }
 
@@ -224,6 +245,7 @@ impl Outcome {
     }
 }
 
+/// 保存单次命令结果及其状态观察。
 #[derive(Debug, PartialEq, Eq)]
 struct Record {
     /// 单条命令在两个独立模型中的可观察执行结果。
@@ -284,6 +306,7 @@ fn terminalize(
         .unwrap();
 }
 
+/// 持有独立模型并驱动差分比较的测试夹具。
 struct Harness {
     /// 独立参考订单簿。
     r: ReferenceOrderBook,

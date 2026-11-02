@@ -44,7 +44,7 @@ pub struct ReferencePlaceContext<'a> {
     pub now: LogicalTime,
     /// 当前交易时段身份。
     pub current_session_id: u64,
-    /// 足以覆盖完整预演的、由调用方分配的成交身份。
+    /// 旧切片入口由调用方提供的成交身份；游标入口不读取此字段。
     pub trade_ids: &'a [TradeId],
 }
 
@@ -105,107 +105,7 @@ impl ReferenceOrderBook {
         registry: &ReservationRegistry,
         context: crate::MarketRegistryContext<'_>,
     ) -> Result<ReferenceMarketPlan, RejectReason> {
-        let (id, user) = match &request {
-            crate::MarketRegistryOrder::Base(order) => (order.order_id, order.user_id),
-            crate::MarketRegistryOrder::Quote(order) => (order.order_id, order.user_id),
-        };
-        self.validate_new_reservation(id, user, &state)?;
-        registry.validate_order_bindings(
-            self.reservations
-                .iter()
-                .map(|(id, state)| (*id, state))
-                .chain(std::iter::once((id, &state))),
-        )?;
-        let mut after_book = self.clone();
-        let (events, quote_amounts) = match request {
-            crate::MarketRegistryOrder::Base(order) => {
-                let events = if let Some(protection) = context.protection {
-                    after_book.execute_market_by_base_with_protection(
-                        order,
-                        protection,
-                        context.math,
-                        context.trade_ids,
-                    )?
-                } else {
-                    after_book
-                        .execute_market_by_base(order, context.trade_ids, context.math)?
-                        .events()
-                        .to_vec()
-                };
-                (events, None)
-            }
-            crate::MarketRegistryOrder::Quote(order) => {
-                if let Some(protection) = context.protection {
-                    let execution = after_book.execute_market_by_quote_with_protection(
-                        order,
-                        protection,
-                        context.math,
-                        context.trade_ids,
-                    )?;
-                    (
-                        execution.events().to_vec(),
-                        Some((execution.spent_quote(), execution.unused_quote())),
-                    )
-                } else {
-                    let execution = after_book.execute_market_by_quote(
-                        order,
-                        context.math,
-                        context.trade_ids,
-                    )?;
-                    (
-                        execution.events().to_vec(),
-                        Some((execution.spent_quote(), execution.unused_quote())),
-                    )
-                }
-            }
-        };
-        let mut total = matching_domain::QuoteAmount::new(0);
-        for event in &events {
-            if let EngineEvent::Trade(trade) = event {
-                total = total.checked_add(
-                    context
-                        .math
-                        .trade_notional(trade.price, trade.qty)
-                        .map_err(Self::reject_quote_math_error)?,
-                )?;
-            }
-        }
-        after_book.reference_prices =
-            self.reference_prices
-                .plan_trade_prices(events.iter().filter_map(|event| match event {
-                    EngineEvent::Trade(trade) => Some(trade.price),
-                    _ => None,
-                }))?;
-        let mut terminal = vec![&state];
-        for maker in &self.orders {
-            let id = maker.original_order().order_id;
-            if !after_book.contains_active_order(id) {
-                terminal.push(
-                    self.reservations
-                        .get(&id)
-                        .ok_or(RejectReason::InvalidReservation)?,
-                );
-            }
-        }
-        let transition = registry.plan_binding_transitions(terminal, [])?;
-        let mut after_registry = registry.clone();
-        after_registry
-            .apply_binding_transition(transition)
-            .expect("fresh market binding plan");
-        after_registry.validate_order_bindings(
-            after_book
-                .reservations
-                .iter()
-                .map(|(id, state)| (*id, state)),
-        )?;
-        Ok(ReferenceMarketPlan {
-            before_book: self.clone(),
-            before_registry: registry.clone(),
-            after_book,
-            after_registry,
-            events,
-            quote_amounts,
-        })
+        self.plan_market_registry_inner(request, state, registry, context, None)
     }
 
     /// 校验前态并提交市价结果与预留归属。
@@ -256,160 +156,7 @@ impl ReferenceOrderBook {
         request: ReferencePlaceOrder,
         context: ReferencePlaceContext<'_>,
     ) -> Result<ReferencePlacePreflight, RejectReason> {
-        if let Some((_, configured)) = self.price_band_config() {
-            assert_eq!(*context.math, configured, "市场数值配置不一致");
-        }
-        let accepted = match &request {
-            ReferencePlaceOrder::Limit { order, .. } => order.clone(),
-            ReferencePlaceOrder::Iceberg { order, .. } => order.order().clone(),
-        };
-        self.check_duplicate(accepted.order_id)?;
-        if self.reservations.contains_key(&accepted.order_id) {
-            return Err(RejectReason::InvalidReservation);
-        }
-        if accepted.price.get() % context.math.tick_size() != 0 {
-            return Err(RejectReason::InvalidTick);
-        }
-        if !accepted.qty.get().is_multiple_of(context.math.lot_size()) {
-            return Err(RejectReason::InvalidLot);
-        }
-        match &request {
-            ReferencePlaceOrder::Limit {
-                time_in_force,
-                post_only,
-                ..
-            } => {
-                if *post_only && *time_in_force != TimeInForce::Gtc {
-                    return Err(RejectReason::InvalidOrderCombination);
-                }
-                match time_in_force {
-                    TimeInForce::Gtd { expire_at } if *expire_at <= context.now => {
-                        return Err(RejectReason::InvalidExpireTime);
-                    }
-                    TimeInForce::Day { session_id }
-                        if *session_id != context.current_session_id =>
-                    {
-                        return Err(RejectReason::InvalidSession);
-                    }
-                    _ => {}
-                }
-            }
-            ReferencePlaceOrder::Iceberg { order, .. } => {
-                if !order
-                    .peak_size()
-                    .get()
-                    .is_multiple_of(context.math.lot_size())
-                {
-                    return Err(RejectReason::InvalidLot);
-                }
-            }
-        }
-        context
-            .math
-            .trade_notional(accepted.price, accepted.qty)
-            .map_err(Self::reject_quote_math_error)?;
-        self.validate_band_price(accepted.price)?;
-
-        let mut after = self.clone();
-        let events = match request {
-            ReferencePlaceOrder::Limit {
-                order,
-                time_in_force,
-                post_only,
-            } => {
-                if post_only {
-                    if time_in_force != TimeInForce::Gtc {
-                        return Err(RejectReason::InvalidOrderCombination);
-                    }
-                    after.place_limit_post_only(order)?;
-                    Vec::new()
-                } else {
-                    match time_in_force {
-                        TimeInForce::Ioc => after
-                            .place_limit_ioc(order, context.math, context.trade_ids)?
-                            .events()
-                            .to_vec(),
-                        TimeInForce::Fok => after
-                            .place_limit_fok(order, context.math, context.trade_ids)?
-                            .events()
-                            .to_vec(),
-                        TimeInForce::Gtc | TimeInForce::Day { .. } | TimeInForce::Gtd { .. } => {
-                            after.place_limit_timed_with_events(
-                                order,
-                                time_in_force,
-                                context.now,
-                                context.current_session_id,
-                                context.trade_ids,
-                            )?
-                        }
-                    }
-                }
-            }
-            ReferencePlaceOrder::Iceberg { order, post_only } => {
-                if post_only {
-                    after.place_iceberg_post_only(order, context.math)?;
-                    Vec::new()
-                } else {
-                    after.place_iceberg(order, context.math, context.trade_ids)?
-                }
-            }
-        };
-
-        // 既有普通 GTC 窄入口不接收数值规则；本边界在真实提交前统一核对
-        // 预演得到的逐笔本金及整单累计本金，不复写其撮合选择或补量过程。
-        events.iter().try_fold(0u128, |total, event| {
-            if let EngineEvent::Trade(trade) = event {
-                let notional = context
-                    .math
-                    .trade_notional(trade.price, trade.qty)
-                    .map_err(Self::reject_quote_math_error)?;
-                total
-                    .checked_add(notional.get())
-                    .ok_or(RejectReason::ArithmeticOverflow)
-            } else {
-                Ok(total)
-            }
-        })?;
-
-        after.reference_prices =
-            self.reference_prices
-                .plan_trade_prices(events.iter().filter_map(|event| match event {
-                    EngineEvent::Trade(trade) => Some(trade.price),
-                    _ => None,
-                }))?;
-        let mut terminal_makers = Vec::new();
-        // 源 Vec 的顺序确定，不按 HashMap 的迭代顺序生成业务计划。
-        for maker in &self.orders {
-            let id = maker.original_order().order_id;
-            if !after.contains_active_order(id) {
-                terminal_makers.push(
-                    self.reservations
-                        .get(&id)
-                        .ok_or(RejectReason::InvalidReservation)?
-                        .clone(),
-                );
-            }
-        }
-        if let Some(resting) = after
-            .orders
-            .iter_mut()
-            .find(|order| order.original_order().order_id == accepted.order_id)
-            && resting.peak_size().is_none()
-        {
-            // 保留接收绝对总量，避免把入簿前的成交量丢给后续改单。
-            resting.amend_regular_in_place(
-                accepted.clone(),
-                Qty::try_new(resting.total_remaining())?,
-                resting.time_in_force(),
-            );
-        }
-        Ok(ReferencePlacePreflight {
-            before: self.clone(),
-            after,
-            accepted,
-            terminal_makers,
-            events,
-        })
+        self.preflight_place_inner(request, context, None)
     }
 
     /// 将已完成的下单预演与真实登记表中的新到金融快照组合，不再撮合或校验数值。
@@ -480,5 +227,447 @@ impl ReferenceOrderBook {
         registry.apply_binding_transition(plan.bindings)?;
         *self = plan.after;
         Ok(plan.events)
+    }
+    /// 在候选簿及登记表中规划下单，成功后同时安装游标和状态。
+    pub fn place_with_registry_and_cursor(
+        &mut self,
+        request: ReferencePlaceOrder,
+        state: ReservationState,
+        registry: &mut ReservationRegistry,
+        context: ReferencePlaceContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let accepted = match &request {
+            ReferencePlaceOrder::Limit { order, .. } => order.clone(),
+            ReferencePlaceOrder::Iceberg { order, .. } => order.order().clone(),
+        };
+        self.validate_new_reservation(accepted.order_id, accepted.user_id, &state)?;
+        registry.validate_order_bindings(
+            self.reservations
+                .iter()
+                .map(|(id, state)| (*id, state))
+                .chain(std::iter::once((accepted.order_id, &state))),
+        )?;
+        let mut candidate_cursor = cursor.clone();
+        let preflight =
+            self.preflight_place_inner(request, context, Some(&mut candidate_cursor))?;
+        let plan = self.bind_place_preflight(preflight, state, registry)?;
+        let events = self
+            .apply_place_with_registry(registry, plan)
+            .expect("候选计划前态必须一致");
+        *cursor = candidate_cursor;
+        Ok(events)
+    }
+
+    pub(super) fn preflight_place_inner(
+        &self,
+        request: ReferencePlaceOrder,
+        context: ReferencePlaceContext<'_>,
+        mut cursor: Option<&mut matching_domain::TradeIdCursor>,
+    ) -> Result<ReferencePlacePreflight, RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*context.math, configured, "市场数值配置不一致");
+        }
+        let accepted = match &request {
+            ReferencePlaceOrder::Limit { order, .. } => order.clone(),
+            ReferencePlaceOrder::Iceberg { order, .. } => order.order().clone(),
+        };
+        self.check_duplicate(accepted.order_id)?;
+        if self.reservations.contains_key(&accepted.order_id) {
+            return Err(RejectReason::InvalidReservation);
+        }
+        if accepted.price.get() % context.math.tick_size() != 0 {
+            return Err(RejectReason::InvalidTick);
+        }
+        if !accepted.qty.get().is_multiple_of(context.math.lot_size()) {
+            return Err(RejectReason::InvalidLot);
+        }
+        match &request {
+            ReferencePlaceOrder::Limit {
+                time_in_force,
+                post_only,
+                ..
+            } => {
+                if *post_only && *time_in_force != TimeInForce::Gtc {
+                    return Err(RejectReason::InvalidOrderCombination);
+                }
+                match time_in_force {
+                    TimeInForce::Gtd { expire_at } if *expire_at <= context.now => {
+                        return Err(RejectReason::InvalidExpireTime);
+                    }
+                    TimeInForce::Day { session_id }
+                        if *session_id != context.current_session_id =>
+                    {
+                        return Err(RejectReason::InvalidSession);
+                    }
+                    _ => {}
+                }
+            }
+            ReferencePlaceOrder::Iceberg { order, .. } => {
+                if !order
+                    .peak_size()
+                    .get()
+                    .is_multiple_of(context.math.lot_size())
+                {
+                    return Err(RejectReason::InvalidLot);
+                }
+            }
+        }
+        context
+            .math
+            .trade_notional(accepted.price, accepted.qty)
+            .map_err(Self::reject_quote_math_error)?;
+        self.validate_band_price(accepted.price)?;
+
+        let mut after = self.clone();
+        let events = match request {
+            ReferencePlaceOrder::Limit {
+                order,
+                time_in_force,
+                post_only,
+            } => {
+                if post_only {
+                    if time_in_force != TimeInForce::Gtc {
+                        return Err(RejectReason::InvalidOrderCombination);
+                    }
+                    after.place_limit_post_only(order)?;
+                    Vec::new()
+                } else {
+                    match time_in_force {
+                        TimeInForce::Ioc => {
+                            if let Some(cursor) = cursor.as_deref_mut() {
+                                after
+                                    .place_limit_immediate_with_cursor(
+                                        order,
+                                        context.math,
+                                        false,
+                                        cursor,
+                                    )?
+                                    .events()
+                                    .to_vec()
+                            } else {
+                                after
+                                    .place_limit_ioc(order, context.math, context.trade_ids)?
+                                    .events()
+                                    .to_vec()
+                            }
+                        }
+                        TimeInForce::Fok => {
+                            if let Some(cursor) = cursor.as_deref_mut() {
+                                after
+                                    .place_limit_immediate_with_cursor(
+                                        order,
+                                        context.math,
+                                        true,
+                                        cursor,
+                                    )?
+                                    .events()
+                                    .to_vec()
+                            } else {
+                                after
+                                    .place_limit_fok(order, context.math, context.trade_ids)?
+                                    .events()
+                                    .to_vec()
+                            }
+                        }
+                        TimeInForce::Gtc | TimeInForce::Day { .. } | TimeInForce::Gtd { .. } => {
+                            if let Some(cursor) = cursor.as_deref_mut() {
+                                let order_id = order.order_id;
+                                let events = after.place_limit_gtc_with_cursor(order, cursor)?;
+                                if let Some(resting) = after
+                                    .orders
+                                    .iter_mut()
+                                    .find(|entry| entry.original_order().order_id == order_id)
+                                {
+                                    resting.replace_initial_gtc_with_tif(time_in_force);
+                                }
+                                events
+                            } else {
+                                after.place_limit_timed_with_events(
+                                    order,
+                                    time_in_force,
+                                    context.now,
+                                    context.current_session_id,
+                                    context.trade_ids,
+                                )?
+                            }
+                        }
+                    }
+                }
+            }
+            ReferencePlaceOrder::Iceberg { order, post_only } => {
+                if post_only {
+                    after.place_iceberg_post_only(order, context.math)?;
+                    Vec::new()
+                } else {
+                    if let Some(cursor) = cursor {
+                        after.place_iceberg_with_cursor(order, context.math, cursor)?
+                    } else {
+                        after.place_iceberg(order, context.math, context.trade_ids)?
+                    }
+                }
+            }
+        };
+
+        // 既有普通 GTC 窄入口不接收数值规则；本边界在真实提交前统一核对
+        // 预演得到的逐笔本金及整单累计本金，不复写其撮合选择或补量过程。
+        events.iter().try_fold(0u128, |total, event| {
+            if let EngineEvent::Trade(trade) = event {
+                let notional = context
+                    .math
+                    .trade_notional(trade.price, trade.qty)
+                    .map_err(Self::reject_quote_math_error)?;
+                total
+                    .checked_add(notional.get())
+                    .ok_or(RejectReason::ArithmeticOverflow)
+            } else {
+                Ok(total)
+            }
+        })?;
+
+        after.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        let mut terminal_makers = Vec::new();
+        // 源 Vec 的顺序确定，不按 HashMap 的迭代顺序生成业务计划。
+        for maker in &self.orders {
+            let id = maker.original_order().order_id;
+            if !after.contains_active_order(id) {
+                terminal_makers.push(
+                    self.reservations
+                        .get(&id)
+                        .ok_or(RejectReason::InvalidReservation)?
+                        .clone(),
+                );
+            }
+        }
+        if let Some(resting) = after
+            .orders
+            .iter_mut()
+            .find(|order| order.original_order().order_id == accepted.order_id)
+            && resting.peak_size().is_none()
+        {
+            // 保留接收绝对总量，避免把入簿前的成交量丢给后续改单。
+            resting.amend_regular_in_place(
+                accepted.clone(),
+                Qty::try_new(resting.total_remaining())?,
+                resting.time_in_force(),
+            );
+        }
+        Ok(ReferencePlacePreflight {
+            before: self.clone(),
+            after,
+            accepted,
+            terminal_makers,
+            events,
+        })
+    }
+    /// 在候选订单簿和登记表执行市价单，成功后提交根命令游标。
+    pub fn market_with_registry_and_cursor(
+        &mut self,
+        request: crate::MarketRegistryOrder,
+        state: ReservationState,
+        registry: &mut ReservationRegistry,
+        context: crate::MarketRegistryContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<crate::MarketRegistryResult, RejectReason> {
+        let mut planned_cursor = cursor.clone();
+        let plan = self.plan_market_registry_inner(
+            request,
+            state,
+            registry,
+            context,
+            Some(&mut planned_cursor),
+        )?;
+        let result = self
+            .apply_market_with_registry(registry, plan)
+            .expect("市价候选前态必须一致");
+        *cursor = planned_cursor;
+        Ok(result)
+    }
+
+    fn plan_market_registry_inner(
+        &self,
+        request: crate::MarketRegistryOrder,
+        state: ReservationState,
+        registry: &ReservationRegistry,
+        context: crate::MarketRegistryContext<'_>,
+        mut cursor: Option<&mut matching_domain::TradeIdCursor>,
+    ) -> Result<ReferenceMarketPlan, RejectReason> {
+        let (id, user) = match &request {
+            crate::MarketRegistryOrder::Base(order) => (order.order_id, order.user_id),
+            crate::MarketRegistryOrder::Quote(order) => (order.order_id, order.user_id),
+        };
+        self.validate_new_reservation(id, user, &state)?;
+        registry.validate_order_bindings(
+            self.reservations
+                .iter()
+                .map(|(id, state)| (*id, state))
+                .chain(std::iter::once((id, &state))),
+        )?;
+        let mut after_book = self.clone();
+        let (events, quote_amounts) = match request {
+            crate::MarketRegistryOrder::Base(order) => {
+                let events = if let Some(cursor) = cursor.as_deref_mut() {
+                    if let Some(protection) = context.protection {
+                        order.validate_stp_mode()?;
+                        if let Some((_, configured)) = after_book.price_band_config() {
+                            assert_eq!(*context.math, configured, "市场数值配置不一致");
+                        }
+                        let mut effective_context = protection.clone();
+                        if let Some((lower, upper)) = after_book.price_band_bounds()? {
+                            effective_context.market_band_worst =
+                                Some(if order.side == matching_domain::Side::Buy {
+                                    upper
+                                } else {
+                                    lower
+                                });
+                        }
+                        after_book.check_duplicate(order.order_id)?;
+                        let boundary = matching_domain::market_order::effective_protection_at_command_start_with_source(order.market_protection.as_ref(), &effective_context, order.side, context.math)?;
+                        let mut source =
+                            crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+                        let events = after_book.slice_market_base_with_source(
+                            order,
+                            Some(context.math),
+                            boundary,
+                            &mut source,
+                        )?;
+                        *cursor = source.into_cursor().expect("根命令游标");
+                        events
+                    } else {
+                        after_book
+                            .execute_market_by_base_with_cursor(order, context.math, cursor)?
+                            .events()
+                            .to_vec()
+                    }
+                } else if let Some(protection) = context.protection {
+                    after_book.execute_market_by_base_with_protection(
+                        order,
+                        protection,
+                        context.math,
+                        context.trade_ids,
+                    )?
+                } else {
+                    after_book
+                        .execute_market_by_base(order, context.trade_ids, context.math)?
+                        .events()
+                        .to_vec()
+                };
+                (events, None)
+            }
+            crate::MarketRegistryOrder::Quote(order) => {
+                if let Some(cursor) = cursor {
+                    if let Some(protection) = context.protection {
+                        order.validate_stp_mode()?;
+                        if let Some((_, configured)) = after_book.price_band_config() {
+                            assert_eq!(*context.math, configured, "市场数值配置不一致");
+                        }
+                        let mut effective_context = protection.clone();
+                        if let Some((lower, upper)) = after_book.price_band_bounds()? {
+                            effective_context.market_band_worst =
+                                Some(if order.side == matching_domain::Side::Buy {
+                                    upper
+                                } else {
+                                    lower
+                                });
+                        }
+                        after_book.check_duplicate(order.order_id)?;
+                        let boundary = matching_domain::market_order::effective_protection_at_command_start_with_source(order.market_protection.as_ref(), &effective_context, order.side, context.math)?;
+                        let mut source =
+                            crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+                        let (events, spent, unused) = after_book.slice_market_quote_with_source(
+                            order,
+                            context.math,
+                            boundary,
+                            &mut source,
+                        )?;
+                        *cursor = source.into_cursor().expect("根命令游标");
+                        (events, Some((spent, unused)))
+                    } else {
+                        let execution = after_book.execute_market_by_quote_with_cursor(
+                            order,
+                            context.math,
+                            cursor,
+                        )?;
+                        (
+                            execution.events().to_vec(),
+                            Some((execution.spent_quote(), execution.unused_quote())),
+                        )
+                    }
+                } else if let Some(protection) = context.protection {
+                    let execution = after_book.execute_market_by_quote_with_protection(
+                        order,
+                        protection,
+                        context.math,
+                        context.trade_ids,
+                    )?;
+                    (
+                        execution.events().to_vec(),
+                        Some((execution.spent_quote(), execution.unused_quote())),
+                    )
+                } else {
+                    let execution = after_book.execute_market_by_quote(
+                        order,
+                        context.math,
+                        context.trade_ids,
+                    )?;
+                    (
+                        execution.events().to_vec(),
+                        Some((execution.spent_quote(), execution.unused_quote())),
+                    )
+                }
+            }
+        };
+        let mut total = matching_domain::QuoteAmount::new(0);
+        for event in &events {
+            if let EngineEvent::Trade(trade) = event {
+                total = total.checked_add(
+                    context
+                        .math
+                        .trade_notional(trade.price, trade.qty)
+                        .map_err(Self::reject_quote_math_error)?,
+                )?;
+            }
+        }
+        after_book.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        let mut terminal = vec![&state];
+        for maker in &self.orders {
+            let id = maker.original_order().order_id;
+            if !after_book.contains_active_order(id) {
+                terminal.push(
+                    self.reservations
+                        .get(&id)
+                        .ok_or(RejectReason::InvalidReservation)?,
+                );
+            }
+        }
+        let transition = registry.plan_binding_transitions(terminal, [])?;
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("fresh market binding plan");
+        after_registry.validate_order_bindings(
+            after_book
+                .reservations
+                .iter()
+                .map(|(id, state)| (*id, state)),
+        )?;
+        Ok(ReferenceMarketPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+            quote_amounts,
+        })
     }
 }

@@ -227,6 +227,40 @@ impl ReservationRegistry {
         Ok(())
     }
 
+    /// 精确核验指定市场的活动订单绑定；其他市场仍保留在同一登记表。
+    /// 调用方必须从可信的分片市场归属提供 `market_id`，不能从待验证订单推断。
+    pub fn validate_market_order_bindings<'a>(
+        &self,
+        market_id: MarketId,
+        states: impl IntoIterator<Item = (OrderId, &'a ReservationState)>,
+    ) -> Result<(), RejectReason> {
+        self.validate_bindings(&self.bindings)?;
+        let mut seen = BTreeSet::new();
+        for (order_id, state) in states {
+            if state.market_id != market_id
+                || order_id != state.order_id
+                || state.status != ReservationStatus::Active
+                || self.get(state.reservation_id) != Some(state)
+                || self.bindings.get(&state.reservation_id)
+                    != Some(&ReservationBinding::ActiveOrder(order_id))
+                || !seen.insert(state.reservation_id)
+            {
+                return Err(RejectReason::InvalidReservation);
+            }
+        }
+        if self.bindings.iter().any(|(id, binding)| {
+            matches!(binding, ReservationBinding::ActiveOrder(_))
+                && self
+                    .states
+                    .get(id)
+                    .is_some_and(|state| state.market_id == market_id)
+                && !seen.contains(id)
+        }) {
+            return Err(RejectReason::InvalidReservation);
+        }
+        Ok(())
+    }
+
     /// 只读规划整批终结和恢复归属；同一预留只能出现在一个输入位置。
     ///
     /// 终结输入必须仍绑定活动订单；恢复输入必须等待后置资金处理，且只能使用

@@ -4,6 +4,12 @@
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {
+    /// 查询或命令指定的市场不存在于当前执行单元。
+    MarketNotFound = 1001,
+    /// 市场正在迁移，入口暂不接收该市场的变更。
+    MigrationInProgress = 1008,
+    /// 请求携带的路由版本或分片归属已经失效。
+    StaleRouteEpoch = 1009,
     /// 当前执行入口不支持该订单类型、有效期或标志组合。
     InvalidOrderCombination = 2001,
     /// 价格原始整数不是该字段要求的严格正值。
@@ -52,6 +58,8 @@ pub enum RejectReason {
     FeeScheduleMismatch = 4004,
     /// 所需带溢出检查的算术无法以目标整数类型精确表示。
     ArithmeticOverflow = 5001,
+    /// 有界入口容量已满，当前请求未进入业务执行。
+    EngineBusy = 5002,
     /// 市场本地优先级已进入不可分配的保护区。
     PrioritySpaceExhaustion = 5006,
 }
@@ -63,6 +71,7 @@ mod tests {
 
     #[test]
     fn reason_code_golden_tests() {
+        assert_eq!(RejectReason::MarketNotFound as u16, 1001);
         assert_eq!(RejectReason::InvalidOrderCombination as u16, 2001);
         assert_eq!(RejectReason::FokInsufficientLiquidity as u16, 2016);
         assert_eq!(RejectReason::InvalidPrice as u16, 2002);

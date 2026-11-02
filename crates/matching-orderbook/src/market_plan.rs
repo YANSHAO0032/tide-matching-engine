@@ -22,12 +22,12 @@ pub(crate) struct QuoteFillPlan {
 /// 完整的无保护 MarketByQuote 只读计划。
 ///
 /// `fills` 的顺序就是未来成交事件的顺序；`required_trade_ids` 是提交前
-/// TradeId 容量预检的显式契约，即使目前它与成交数量相同也不省略。
+/// 所需成交身份数量；旧切片入口据此检查容量，游标入口按真实成交计划分配。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MarketByQuotePlan {
     /// 按未来事件顺序排列的挂单成交计划。
     pub(crate) fills: Vec<QuoteFillPlan>,
-    /// 提交前必须提供的 TradeId 数量。
+    /// 计划所需的真实成交身份数量。
     pub(crate) required_trade_ids: usize,
     /// 计划使用的报价资产本金。
     pub(crate) spent_quote: QuoteAmount,

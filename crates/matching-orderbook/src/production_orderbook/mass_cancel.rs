@@ -29,8 +29,10 @@ impl ProductionOrderBook {
         scope: ShardCancelScope,
         registry: &ReservationRegistry,
     ) -> Result<ProductionMassCancelPlan, matching_domain::RejectReason> {
-        registry
-            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        self.validate_registry_bindings(
+            registry,
+            self.reservations.iter().map(|(id, state)| (*id, state)),
+        )?;
         let mut targets = self
             .active_remainders()?
             .into_iter()

@@ -677,4 +677,72 @@ impl ReferenceOrderBook {
             plan.unused_quote,
         ))
     }
+
+    /// 在候选参考簿中按实际成交分配根命令身份。
+    pub fn execute_market_by_quote_with_cursor(
+        &mut self,
+        incoming: MarketByQuote,
+        math: &MarketMath,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<MarketByQuoteExecution, RejectReason> {
+        incoming.validate_stp_mode()?;
+        if incoming
+            .market_protection
+            .as_ref()
+            .and_then(|p| p.max_slippage_bps)
+            .is_some_and(|bps| bps >= 10_000)
+        {
+            return Err(RejectReason::InvalidSlippageBps);
+        }
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let boundary = if let Some((config, configured_math)) = candidate.price_band_config() {
+            assert_eq!(*math, configured_math, "市场数值配置不一致");
+            let reference = candidate
+                .reference_prices
+                .latest(config.reference_kind)
+                .ok_or(RejectReason::ReferencePriceUnavailable)?
+                .price;
+            let (lower, upper) = config.bounds(reference, math.tick_size())?;
+            let context = CommandStartProtectionContext {
+                reference_price_at_command_start: reference,
+                market_band_worst: Some(if incoming.side == Side::Buy {
+                    upper
+                } else {
+                    lower
+                }),
+            };
+            matching_domain::market_order::effective_protection_at_command_start_with_source(
+                incoming.market_protection.as_ref(),
+                &context,
+                incoming.side,
+                math,
+            )?
+        } else if let Some(protection) = incoming.market_protection.as_ref() {
+            if protection.max_slippage_bps.is_some() {
+                return Err(RejectReason::ReferencePriceUnavailable);
+            }
+            if let Some(worst) = protection.worst_price {
+                if worst.get() % math.tick_size() != 0 {
+                    return Err(RejectReason::InvalidTick);
+                }
+                Some((worst, matching_domain::ProtectionSource::User))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (events, spent, unused) =
+            candidate.slice_market_quote_with_source(incoming, math, boundary, &mut source)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(MarketByQuoteExecution::from_events(events, spent, unused))
+    }
 }

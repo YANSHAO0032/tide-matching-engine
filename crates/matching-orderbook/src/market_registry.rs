@@ -23,7 +23,7 @@ pub enum MarketRegistryOrder {
 pub struct MarketRegistryContext<'a> {
     /// 市场数值配置。
     pub math: &'a MarketMath,
-    /// 调用方已分配的成交身份。
+    /// 旧切片入口由调用方提供的成交身份；游标入口不读取此字段。
     pub trade_ids: &'a [TradeId],
     /// 命令开始冻结的可选保护上下文。
     pub protection: Option<&'a CommandStartProtectionContext>,

@@ -5,16 +5,16 @@ use super::resting::commit_rest_target;
 use super::{ProductionOrderBook, RestPlan};
 use crate::OrderNode;
 use matching_domain::{
-    AmendOrder, AmendedQuantity, EngineEvent, IcebergOrder, Qty, RejectReason, Side, TradeId,
+    AmendOrder, AmendedQuantity, EngineEvent, IcebergOrder, Qty, RejectReason, Side,
 };
 
 impl ProductionOrderBook {
     /// 所有数量、成交、目标档和优先级失败均在删除原单之前完成。
-    pub(super) fn commit_iceberg_amend(
+    pub(super) fn commit_iceberg_amend_with_source(
         &mut self,
         plan: IcebergAmendPlan,
         amend: &AmendOrder,
-        trade_ids: &[TradeId],
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         if amend.reservation_adjustment.is_some() {
             return Err(RejectReason::InvalidReservation);
@@ -85,9 +85,9 @@ impl ProductionOrderBook {
             let accepted = iceberg.order().clone();
             let mut incoming = accepted.clone();
             incoming.qty = p.new_remaining;
-            let (matching_events, _) = after.execute_limit_stp(
+            let (matching_events, _) = after.execute_limit_stp_with_source(
                 incoming,
-                trade_ids,
+                source,
                 None,
                 Some((plan.new_peak, accepted.qty)),
                 false,
@@ -136,10 +136,13 @@ impl ProductionOrderBook {
         } else {
             None
         };
-        assert!(
-            trade_ids.len() >= fills.as_ref().map_or(0, |f| f.fills.len()),
-            "insufficient TradeIds for iceberg Amend"
-        );
+        let fill_count = fills.as_ref().map_or(0, |f| f.fills.len());
+        if let Some(remaining) = source.legacy_remaining() {
+            assert!(
+                remaining >= fill_count,
+                "insufficient TradeIds for iceberg Amend"
+            );
+        }
         let remaining = fills
             .as_ref()
             .map_or(p.new_remaining.get(), |f| f.base_remaining);
@@ -159,6 +162,7 @@ impl ProductionOrderBook {
         } else {
             None
         };
+        let trade_ids = source.reserve(fill_count)?;
         // 写屏障：全部片成交、补量分配及目标价档聚合均已冻结。
         let shadow = self
             .reservations
@@ -168,7 +172,7 @@ impl ProductionOrderBook {
         let mut events = vec![event];
         let mut order_events = Vec::new();
         if let Some(fills) = &fills {
-            for event in self.commit_iceberg_plan(fills, p.side, p.order_id, trade_ids) {
+            for event in self.commit_iceberg_plan(fills, p.side, p.order_id, &trade_ids) {
                 if matches!(event, EngineEvent::Trade(_)) {
                     events.push(event);
                 } else {

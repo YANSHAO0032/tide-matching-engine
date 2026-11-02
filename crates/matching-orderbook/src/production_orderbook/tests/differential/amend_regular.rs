@@ -46,18 +46,28 @@ fn amend(input: &LimitOrder) -> AmendOrder {
 /// 常规改单专用命令域；历史 GTC 随机生成器继续保持原来的可复现输入。
 #[derive(Clone, Debug)]
 enum Command {
+    /// 挂入指定有效期的订单。
     Rest(LimitOrder, TimeInForce, bool),
+    /// 提交普通限价单。
     Place(LimitOrder, TimeInForce),
+    /// 修改现有订单。
     Amend(Box<AmendOrder>),
+    /// 取消指定订单。
     Cancel(OrderId),
+    /// 推进逻辑时间。
     AdvanceTime(LogicalTime),
+    /// 终结指定交易时段。
     EndSession(u64),
 }
 
+/// 差分测试记录的命令执行结果。
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
+    /// 记录不携带业务事件的执行结果。
     Unit(Result<(), RejectReason>),
+    /// 记录原序业务事件或拒绝。
     Events(Result<Vec<EngineEvent>, RejectReason>),
+    /// 记录到期订单列表或拒绝。
     Expired(Result<Vec<ExpiredOrder>, RejectReason>),
 }
 
@@ -71,6 +81,7 @@ impl Outcome {
     }
 }
 
+/// 差分比较使用的状态投影。
 #[derive(Debug, PartialEq, Eq)]
 struct State {
     /// 可观察订单簿、深度与事件状态。
@@ -83,6 +94,7 @@ struct State {
     stop_next: u128,
 }
 
+/// 保存单次命令结果及其状态观察。
 #[derive(Debug, PartialEq, Eq)]
 struct Record {
     /// 单条命令的可观察成功或拒绝结果。
@@ -160,6 +172,7 @@ fn production_snapshot(book: &ProductionOrderBook) -> String {
     )
 }
 
+/// 持有独立模型并驱动差分比较的测试夹具。
 struct Harness {
     /// 独立参考订单簿。
     reference: ReferenceOrderBook,

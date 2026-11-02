@@ -86,6 +86,7 @@ pub(super) fn production_snapshot(book: &ProductionOrderBook) -> String {
     )
 }
 
+/// 供双模型测试比较的订单簿和关联状态。
 struct Pair {
     /// 独立参考订单簿。
     reference: ReferenceOrderBook,

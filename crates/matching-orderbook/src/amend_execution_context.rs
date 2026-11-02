@@ -31,7 +31,7 @@ pub struct AmendRegistryContext<'a> {
     pub now: matching_domain::LogicalTime,
     /// 当前交易时段。
     pub current_session_id: u64,
-    /// 本次真实成交所需的身份。
+    /// 旧切片入口所需的调用方成交身份；游标入口不读取此字段。
     pub trade_ids: &'a [matching_domain::TradeId],
     /// 固定的数值、签名和资金校验上下文。
     pub execution: &'a AmendExecutionContext<'a>,
