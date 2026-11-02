@@ -45,7 +45,7 @@ impl ReferenceOrderBook {
         keys: &RiskKeySet,
         context: ReferencePlaceContext<'_>,
     ) -> Result<ReferenceCancelReplacePlan, CancelReplaceRejection> {
-        self.plan_cancel_replace_inner(request, expected, registry, keys, context)
+        self.plan_cancel_replace_inner(request, expected, registry, keys, context, None)
             .map_err(|reason| request.rejection(reason))
     }
 
@@ -72,6 +72,7 @@ impl ReferenceOrderBook {
         registry: &ReservationRegistry,
         keys: &RiskKeySet,
         context: ReferencePlaceContext<'_>,
+        cursor: Option<&mut matching_domain::TradeIdCursor>,
     ) -> Result<ReferenceCancelReplacePlan, RejectReason> {
         // 旧活动位置和真实所有权先于新单结构及令牌检查，避免身份探测改变拒绝语义。
         let (old_user, old_remaining) = if let Some(old) = self
@@ -152,7 +153,7 @@ impl ReferenceOrderBook {
         after_book.reservations.remove(&request.old_order_id);
         // 普通下单与撤单替换共用完整只读预演；结构、时间、初始及逐笔本金、
         // 撮合、补量、余量挂单、优先级和终结挂单校验均先于资金过渡验证。
-        let place_preflight = after_book.preflight_place(place, context)?;
+        let place_preflight = after_book.preflight_place_inner(place, context, cursor)?;
         let transition = registry
             .plan_transition(keys, expected, &request.reservation_transition)
             .map_err(|rejection| rejection.reason)?;
@@ -188,5 +189,32 @@ impl ReferenceOrderBook {
             after_registry,
             events,
         })
+    }
+    /// 在候选簿、登记表与游标中原子执行撤单替换。
+    pub fn cancel_replace_with_cursor(
+        &mut self,
+        request: &CancelReplaceOrder,
+        expected: &ExpectedReplacementReservation,
+        registry: &mut ReservationRegistry,
+        keys: &RiskKeySet,
+        context: ReferencePlaceContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, CancelReplaceRejection> {
+        let mut planned_cursor = cursor.clone();
+        let plan = self
+            .plan_cancel_replace_inner(
+                request,
+                expected,
+                registry,
+                keys,
+                context,
+                Some(&mut planned_cursor),
+            )
+            .map_err(|reason| request.rejection(reason))?;
+        let events = self
+            .apply_cancel_replace(registry, plan)
+            .expect("候选撤单替换前态必须一致");
+        *cursor = planned_cursor;
+        Ok(events)
     }
 }

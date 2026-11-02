@@ -16,6 +16,7 @@ use matching_risk::RiskKeySet;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
+/// 供双模型测试比较的订单簿和关联状态。
 struct Pair {
     /// 待差分比较的生产订单簿。
     p: ProductionOrderBook,

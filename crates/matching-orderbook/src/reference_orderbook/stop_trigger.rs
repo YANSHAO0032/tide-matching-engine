@@ -41,44 +41,7 @@ impl ReferenceOrderBook {
         registry: &ReservationRegistry,
         trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
     ) -> Result<ReferenceTriggerRegistryPlan, RejectReason> {
-        registry
-            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
-        let mut after_book = self.clone();
-        let mut events = after_book.trigger_stops(
-            reference,
-            context.now,
-            context.current_session_id,
-            context.math,
-            context.trade_ids,
-            trigger_r1,
-        )?;
-        // 登记表边界只迁移归属，不执行真实 R2；旧窄接口的释放投影不能当成金融事实。
-        events.retain(|event| !matches!(event, EngineEvent::ReservationReleased { .. }));
-        let mut terminal = self
-            .reservations
-            .iter()
-            .filter(|(id, _)| !after_book.reservations.contains_key(id))
-            .collect::<Vec<_>>();
-        terminal.sort_unstable_by_key(|(id, _)| **id);
-        let transition =
-            registry.plan_binding_transitions(terminal.iter().map(|(_, state)| *state), [])?;
-        let mut after_registry = registry.clone();
-        after_registry
-            .apply_binding_transition(transition)
-            .expect("fresh trigger binding plan");
-        after_registry.validate_order_bindings(
-            after_book
-                .reservations
-                .iter()
-                .map(|(id, state)| (*id, state)),
-        )?;
-        Ok(ReferenceTriggerRegistryPlan {
-            before_book: self.clone(),
-            before_registry: registry.clone(),
-            after_book,
-            after_registry,
-            events,
-        })
+        self.plan_trigger_stops_registry_inner(reference, context, registry, trigger_r1, None)
     }
 
     /// 校验完整前态后一次安装触发级联及其预留归属。
@@ -458,5 +421,341 @@ impl ReferenceOrderBook {
             reservation_id: order.reservation_id(),
             reason: ReservationReleaseReason::TriggerRejected,
         });
+    }
+
+    /// 在候选簿中执行完整止损级联，成功后一起提交游标及订单簿。
+    pub fn trigger_stops_with_cursor(
+        &mut self,
+        reference: PriceReference,
+        now: LogicalTime,
+        current_session_id: u64,
+        math: &MarketMath,
+        cursor: &mut matching_domain::TradeIdCursor,
+        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let events = candidate.trigger_stops_with_source(
+            reference,
+            now,
+            current_session_id,
+            math,
+            &mut source,
+            trigger_r1,
+        )?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(events)
+    }
+
+    fn trigger_stops_with_source(
+        &mut self,
+        reference: PriceReference,
+        now: LogicalTime,
+        current_session_id: u64,
+        math: &MarketMath,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+        mut trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if let Some((_, configured_math)) = self.price_band {
+            assert_eq!(&configured_math, math, "市场数值配置不一致");
+        }
+        let band = self
+            .price_band
+            .map(|(config, configured_math)| {
+                let price = if config.reference_kind == reference.kind {
+                    Some(reference.price)
+                } else {
+                    self.reference_prices
+                        .latest(config.reference_kind)
+                        .map(|r| r.price)
+                }
+                .ok_or(RejectReason::ReferencePriceUnavailable)?;
+                config.bounds(price, configured_math.tick_size())
+            })
+            .transpose();
+        // 参考更新是本次 root 的显式输入：使用新值一次冻结整个级联的保护上下文。
+        let protection_context = matching_domain::market_order::CommandStartProtectionContext {
+            reference_price_at_command_start: reference.price,
+            market_band_worst: None,
+        };
+        let mut pending = VecDeque::from(self.collect_triggered_stops(reference)?);
+        let mut events = Vec::new();
+
+        while let Some((order, _priority, triggered, reservation)) = pending.pop_front() {
+            events.push(triggered);
+            let validation = self
+                .validate_triggered_child_tif(&order, now, current_session_id)
+                .and_then(|()| band.as_ref().map(|_| ()).map_err(|reason| *reason))
+                .and_then(|()| match (&order, &band) {
+                    (StopOrder::Limit(stop), Ok(Some((lower, upper))))
+                        if stop.price < *lower || stop.price > *upper =>
+                    {
+                        Err(RejectReason::PriceBandExceeded)
+                    }
+                    _ => Ok(()),
+                })
+                .and_then(|()| trigger_r1(&order));
+            if let Err(reason) = validation {
+                Self::append_trigger_rejection(&mut events, &order, reason);
+                continue;
+            }
+
+            let mut child_context = protection_context.clone();
+            child_context.market_band_worst = band.as_ref().ok().and_then(|bounds| {
+                bounds.map(|(lower, upper)| match &order {
+                    StopOrder::Limit(stop) => {
+                        if stop.side == matching_domain::Side::Buy {
+                            upper
+                        } else {
+                            lower
+                        }
+                    }
+                    StopOrder::Market(stop) => {
+                        if stop.side == matching_domain::Side::Buy {
+                            upper
+                        } else {
+                            lower
+                        }
+                    }
+                })
+            });
+            let mut child_source = source.clone();
+            let mut child_events = match self.execute_triggered_child_with_source(
+                &order,
+                math,
+                &mut child_source,
+                now,
+                current_session_id,
+                (&child_context, band.as_ref().ok().copied().flatten()),
+            ) {
+                Ok(events) => {
+                    *source = child_source;
+                    events
+                }
+                Err(reason) => {
+                    if child_source.cursor_exhausted() {
+                        return Err(RejectReason::ArithmeticOverflow);
+                    }
+                    Self::append_trigger_rejection(&mut events, &order, reason);
+                    continue;
+                }
+            };
+            // 独立检查参考 Vec 的真实挂单结果，不为拒绝或已终结 child 保留预留。
+            if self
+                .orders
+                .iter()
+                .any(|entry| entry.original_order().order_id == order.order_id())
+            {
+                if let StopOrder::Limit(stop) = &order {
+                    let entry = self
+                        .orders
+                        .iter_mut()
+                        .find(|entry| entry.original_order().order_id == stop.order_id)
+                        .expect("resting reference child");
+                    let mut original = entry.original_order().clone();
+                    original.qty = stop.qty;
+                    // 接续绝对目标，而不把已成交量混入新剩余量。
+                    entry.amend_regular_in_place(
+                        original,
+                        matching_domain::Qty::try_new(entry.total_remaining())
+                            .expect("positive child residual"),
+                        entry.time_in_force(),
+                    );
+                }
+                if let Some(reservation) = reservation {
+                    assert!(
+                        self.reservations
+                            .insert(order.order_id(), reservation)
+                            .is_none()
+                    );
+                }
+            }
+            for trade in child_events.iter().filter_map(|event| match event {
+                EngineEvent::Trade(trade) => Some(trade),
+                _ => None,
+            }) {
+                let last_trade = self.reference_prices.next_last_trade(trade.price)?;
+                // 成交仍更新 LastTrade 并驱动来源匹配与跨越，不能重写 root 保护参考。
+                pending.extend(self.collect_triggered_stops(last_trade)?);
+            }
+            events.append(&mut child_events);
+        }
+        Ok(events)
+    }
+
+    /// 使用同一根命令来源执行止损子单。
+    fn execute_triggered_child_with_source(
+        &mut self,
+        order: &StopOrder,
+        math: &MarketMath,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+        _now: LogicalTime,
+        _session: u64,
+        protection: (
+            &matching_domain::market_order::CommandStartProtectionContext,
+            Option<(matching_domain::Price, matching_domain::Price)>,
+        ),
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let (context, band) = protection;
+        match order {
+            StopOrder::Limit(stop) => {
+                let payload = matching_domain::LimitOrder {
+                    order_id: stop.order_id,
+                    user_id: stop.user_id,
+                    stp_key: stop.stp_key,
+                    stp_mode: stop.stp_mode,
+                    side: stop.side,
+                    price: stop.price,
+                    qty: stop.qty,
+                };
+                let events =
+                    self.place_sliced_gtc_with_source(payload, None, None, source, Some(band))?;
+                if let Some(resting) = self
+                    .orders
+                    .iter_mut()
+                    .find(|entry| entry.original_order().order_id == stop.order_id)
+                {
+                    resting.replace_initial_gtc_with_tif(stop.child_tif);
+                }
+                Ok(events)
+            }
+            StopOrder::Market(stop) => {
+                stop.stp_mode.submission_rejection().map_or(Ok(()), Err)?;
+                let protected =
+                    stop.market_protection.is_some() || context.market_band_worst.is_some();
+                let boundary = if protected {
+                    matching_domain::market_order::effective_protection_at_command_start_with_source(stop.market_protection.as_ref(), context, stop.side, math)?
+                } else {
+                    None
+                };
+                let events = match stop.quantity {
+                    StopMarketQuantity::Base(qty) => {
+                        let input = MarketByBase {
+                            order_id: stop.order_id,
+                            user_id: stop.user_id,
+                            stp_key: stop.stp_key,
+                            stp_mode: stop.stp_mode,
+                            side: stop.side,
+                            qty,
+                            market_protection: stop.market_protection.clone(),
+                        };
+                        self.slice_market_base_with_source(
+                            input,
+                            if protected || stop.stp_mode != matching_domain::StpMode::None {
+                                Some(math)
+                            } else {
+                                None
+                            },
+                            boundary,
+                            source,
+                        )
+                    }
+                    StopMarketQuantity::Quote(quote_budget) => {
+                        let input = MarketByQuote {
+                            order_id: stop.order_id,
+                            user_id: stop.user_id,
+                            stp_key: stop.stp_key,
+                            stp_mode: stop.stp_mode,
+                            side: stop.side,
+                            quote_budget,
+                            market_protection: stop.market_protection.clone(),
+                        };
+                        self.slice_market_quote_with_source(input, math, boundary, source)
+                            .map(|(events, _, _)| events)
+                    }
+                }?;
+                if !protected && stop.stp_mode == matching_domain::StpMode::None {
+                    Ok(events
+                        .into_iter()
+                        .filter(|event| matches!(event, EngineEvent::Trade(_)))
+                        .collect())
+                } else {
+                    Ok(events)
+                }
+            }
+        }
+    }
+    /// 在候选簿、登记表及根成交游标中原子执行止损级联。
+    pub fn trigger_stops_with_registry_and_cursor(
+        &mut self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        registry: &mut ReservationRegistry,
+        cursor: &mut matching_domain::TradeIdCursor,
+        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut planned_cursor = cursor.clone();
+        let plan = self.plan_trigger_stops_registry_inner(
+            reference,
+            context,
+            registry,
+            trigger_r1,
+            Some(&mut planned_cursor),
+        )?;
+        let events = self
+            .apply_trigger_stops_with_registry(registry, plan)
+            .expect("止损候选前态必须一致");
+        *cursor = planned_cursor;
+        Ok(events)
+    }
+
+    fn plan_trigger_stops_registry_inner(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        registry: &ReservationRegistry,
+        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+        cursor: Option<&mut matching_domain::TradeIdCursor>,
+    ) -> Result<ReferenceTriggerRegistryPlan, RejectReason> {
+        registry
+            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        let mut after_book = self.clone();
+        let mut events = if let Some(cursor) = cursor {
+            after_book.trigger_stops_with_cursor(
+                reference,
+                context.now,
+                context.current_session_id,
+                context.math,
+                cursor,
+                trigger_r1,
+            )?
+        } else {
+            after_book.trigger_stops(
+                reference,
+                context.now,
+                context.current_session_id,
+                context.math,
+                context.trade_ids,
+                trigger_r1,
+            )?
+        };
+        // 登记表边界只迁移归属，不执行真实 R2；旧窄接口的释放投影不能当成金融事实。
+        events.retain(|event| !matches!(event, EngineEvent::ReservationReleased { .. }));
+        let mut terminal = self
+            .reservations
+            .iter()
+            .filter(|(id, _)| !after_book.reservations.contains_key(id))
+            .collect::<Vec<_>>();
+        terminal.sort_unstable_by_key(|(id, _)| **id);
+        let transition =
+            registry.plan_binding_transitions(terminal.iter().map(|(_, state)| *state), [])?;
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("fresh trigger binding plan");
+        after_registry.validate_order_bindings(
+            after_book
+                .reservations
+                .iter()
+                .map(|(id, state)| (*id, state)),
+        )?;
+        Ok(ReferenceTriggerRegistryPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
     }
 }

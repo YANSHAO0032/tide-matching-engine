@@ -15,6 +15,9 @@ mod cancel_replace;
 mod cancel_replace_view;
 mod expiry;
 mod iceberg;
+mod market_binding;
+/// 可信市场绑定失败。
+pub use market_binding::MarketBindingError;
 mod limit_execution;
 mod market_by_base;
 mod market_by_quote;
@@ -41,6 +44,7 @@ pub use stop_trigger::ProductionTriggerRegistryPlan;
 /// 提交时的所有者状态没有发生意外漂移。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestTargetPlan {
+    /// 将余量追加到提交前已存在的价档。
     Existing {
         /// 提交前既有价档的先进先出尾节点。
         tail: OrderIndex,
@@ -53,6 +57,7 @@ enum RestTargetPlan {
         /// 提交后既有价档应具有的可见数量聚合值。
         total_after: u64,
     },
+    /// 将余量写入提交前尚不存在的新价档。
     New {
         /// 提交后新建价档应具有的节点数量。
         count_after: u32,
@@ -101,6 +106,8 @@ struct FillPlan {
 /// 限价单 IOC/FOK/PostOnly 与冰山。实际挂单及冰山补量时分配优先级；不包含完整资金和命令协议。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductionOrderBook {
+    /// 由分片配置绑定的可信市场；旧独立订单簿保持未绑定。
+    market_id: Option<matching_domain::MarketId>,
     /// 买侧价格档位；合法非空条目中的节点必须具有相同价格和买入方向。
     bids: BTreeMap<Price, PriceLevel>,
     /// 卖侧价格档位；合法非空条目中的节点必须具有相同价格和卖出方向。
@@ -132,6 +139,7 @@ impl ProductionOrderBook {
     /// 使用已验证的策略创建空簿，市场内优先级从零开始。
     pub fn new(policy: QueuePriorityPolicy) -> Self {
         Self {
+            market_id: None,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: HashMap::new(),
@@ -144,6 +152,11 @@ impl ProductionOrderBook {
             reference_prices: PriceReferenceState::default(),
             price_band: None,
         }
+    }
+
+    /// 查询订单簿绑定的可信市场。
+    pub fn market_id(&self) -> Option<matching_domain::MarketId> {
+        self.market_id
     }
 
     /// 查询指定簿侧的最优价格，空侧返回 None；方向不是新到订单方向。
@@ -212,6 +225,12 @@ impl ProductionOrderBook {
     ) -> Result<(), RejectReason> {
         if self.contains_active_order(order_id) {
             return Err(RejectReason::DuplicateOrderId);
+        }
+        if self
+            .market_id
+            .is_some_and(|market| market != state.market_id)
+        {
+            return Err(RejectReason::InvalidReservation);
         }
         if state.status != matching_risk::ReservationStatus::Active
             || state.order_id != order_id

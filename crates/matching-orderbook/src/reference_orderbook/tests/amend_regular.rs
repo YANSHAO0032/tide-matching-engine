@@ -9,6 +9,115 @@ use matching_domain::{
 use matching_risk::ReservationState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[test]
+fn amend_cursor_overflow_preserves_reference_book_and_cursor() {
+    let mut book = ReferenceOrderBook::new();
+    let target = order(1, 1, Side::Buy, 90, 2);
+    book.rest_with_reservation(target.clone(), reservation(&target, 1))
+        .unwrap();
+    book.rest(order(2, 2, Side::Sell, 100, 1)).unwrap();
+    book.rest(order(3, 3, Side::Sell, 100, 1)).unwrap();
+    let mut change = amend(&target);
+    change.new_price = Some(Price::try_new(100).unwrap());
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let before = book.clone();
+    let before_cursor = cursor.clone();
+    assert_eq!(
+        book.amend_regular_with_cursor(&change, LogicalTime::new(1), 9, &mut cursor),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(book, before);
+    assert_eq!(cursor, before_cursor);
+}
+
+#[test]
+fn amend_cursor_matches_legacy_events_and_reference_state() {
+    let mut book = ReferenceOrderBook::new();
+    let target = order(1, 1, Side::Buy, 90, 2);
+    book.rest_with_reservation(target.clone(), reservation(&target, 1))
+        .unwrap();
+    book.rest(order(2, 2, Side::Sell, 100, 1)).unwrap();
+    book.rest(order(3, 3, Side::Sell, 100, 1)).unwrap();
+    let mut change = amend(&target);
+    change.new_price = Some(Price::try_new(100).unwrap());
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut generator = cursor.clone();
+    let ids = [
+        generator.next_trade_id().unwrap(),
+        generator.next_trade_id().unwrap(),
+    ];
+    let mut legacy = book.clone();
+    let expected = legacy
+        .amend_regular_with_events(&change, LogicalTime::new(1), 9, &ids)
+        .unwrap();
+    let actual = book
+        .amend_regular_with_cursor(&change, LogicalTime::new(1), 9, &mut cursor)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, legacy);
+    assert_eq!(cursor, generator);
+}
+
+#[test]
+fn iceberg_amend_cursor_overflow_is_atomic_and_success_matches_legacy() {
+    let mut book = ReferenceOrderBook::new();
+    let target = order(1, 1, Side::Buy, 90, 2);
+    let iceberg =
+        matching_domain::IcebergOrder::try_new(target.clone(), Qty::try_new(1).unwrap()).unwrap();
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    book.place_iceberg_post_only_with_reservation(iceberg, &math, reservation(&target, 1))
+        .unwrap();
+    book.rest(order(2, 2, Side::Sell, 100, 1)).unwrap();
+    book.rest(order(3, 3, Side::Sell, 100, 1)).unwrap();
+    let mut change = amend(&target);
+    change.new_price = Some(Price::try_new(100).unwrap());
+    let before = book.clone();
+    let mut exhausted = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let initial = exhausted.clone();
+    assert_eq!(
+        book.amend_regular_with_cursor(&change, LogicalTime::new(1), 9, &mut exhausted),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(book, before);
+    assert_eq!(exhausted, initial);
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut generator = cursor.clone();
+    let ids = [
+        generator.next_trade_id().unwrap(),
+        generator.next_trade_id().unwrap(),
+    ];
+    let mut legacy = book.clone();
+    let expected = legacy
+        .amend_regular_with_events(&change, LogicalTime::new(1), 9, &ids)
+        .unwrap();
+    let actual = book
+        .amend_regular_with_cursor(&change, LogicalTime::new(1), 9, &mut cursor)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, legacy);
+    assert_eq!(cursor, generator);
+}
+
 fn order(id: u128, user: u64, side: Side, price: u64, qty: u64) -> LimitOrder {
     LimitOrder {
         order_id: OrderId::new(id),
@@ -116,6 +225,7 @@ fn amend(order: &LimitOrder) -> AmendOrder {
     }
 }
 
+/// 冻结测试关注的完整状态以比较前后变化。
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     /// 普通订单原始载荷、可见量、隐藏量、峰值、优先级和有效期的有序快照。

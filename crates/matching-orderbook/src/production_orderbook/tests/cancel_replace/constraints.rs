@@ -7,6 +7,7 @@ use super::*;
 use crate::ReferenceOrderBook;
 use crate::reference_orderbook::ReferencePlaceContext;
 
+/// 供双模型测试比较的订单簿和关联状态。
 struct Pair {
     /// 独立参考订单簿实例。
     reference: ReferenceOrderBook,

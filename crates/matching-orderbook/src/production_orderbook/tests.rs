@@ -57,3 +57,4 @@ struct LevelSnapshotEntry {
     /// 此档声明的可见基础数量聚合值。
     total_visible_qty: u64,
 }
+mod trade_cursor;

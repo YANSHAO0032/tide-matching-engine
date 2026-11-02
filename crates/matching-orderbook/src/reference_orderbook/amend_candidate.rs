@@ -89,7 +89,7 @@ pub(crate) struct StopAmendPlan {
     pub(crate) reservation: ReservationSnapshot,
 }
 
-/// 两类订单容器各自生成的只读改单计划。
+/// 三类订单容器各自生成的只读改单计划。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReferenceAmendPlan {
     /// 普通限价订单候选。
@@ -123,15 +123,26 @@ impl ReferenceOrderBook {
         registry: &matching_risk::ReservationRegistry,
         context: crate::AmendRegistryContext<'_>,
     ) -> Result<ReferenceAmendRegistryPlan, RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(context.trade_ids);
+        self.plan_amend_with_registry_source(amend, registry, context, &mut source)
+    }
+
+    fn plan_amend_with_registry_source(
+        &self,
+        amend: &AmendOrder,
+        registry: &matching_risk::ReservationRegistry,
+        context: crate::AmendRegistryContext<'_>,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+    ) -> Result<ReferenceAmendRegistryPlan, RejectReason> {
         registry
             .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
         let mut after_book = self.clone();
-        let events = after_book.amend_with_context(
+        let events = after_book.amend_with_context_source(
             amend,
             context.now,
             context.current_session_id,
-            context.trade_ids,
             context.execution,
+            source,
         )?;
         after_book.reference_prices =
             self.reference_prices
@@ -222,6 +233,19 @@ impl ReferenceOrderBook {
         trade_ids: &[TradeId],
         context: &crate::AmendExecutionContext<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(trade_ids);
+        self.amend_with_context_source(amend, now, current_session_id, context, &mut source)
+    }
+
+    /// 在候选参考簿上以共享成交身份来源执行完整资金校验的改单。
+    fn amend_with_context_source(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        context: &crate::AmendExecutionContext<'_>,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
         if let Some((_, configured_math)) = self.price_band_config() {
             assert_eq!(
                 configured_math, context.market_math,
@@ -245,7 +269,21 @@ impl ReferenceOrderBook {
         {
             self.amend_stop_with_events(&verified_amend, now, current_session_id)?
         } else {
-            self.amend_regular_with_events(&verified_amend, now, current_session_id, trade_ids)?
+            let mut candidate = self.clone();
+            let events = candidate.amend_regular_with_events_inner(
+                &verified_amend,
+                now,
+                current_session_id,
+                source,
+            )?;
+            candidate.reference_prices =
+                self.reference_prices
+                    .plan_trade_prices(events.iter().filter_map(|event| match event {
+                        EngineEvent::Trade(trade) => Some(trade.price),
+                        _ => None,
+                    }))?;
+            *self = candidate;
+            events
         };
         if let Some(state) = self.reservations.get_mut(&amend.order_id) {
             *state = planned;
@@ -275,8 +313,13 @@ impl ReferenceOrderBook {
         trade_ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let mut candidate = self.clone();
-        let events =
-            candidate.amend_regular_with_events_inner(amend, now, current_session_id, trade_ids)?;
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(trade_ids);
+        let events = candidate.amend_regular_with_events_inner(
+            amend,
+            now,
+            current_session_id,
+            &mut source,
+        )?;
         candidate.reference_prices =
             self.reference_prices
                 .plan_trade_prices(events.iter().filter_map(|event| match event {
@@ -436,7 +479,7 @@ impl ReferenceOrderBook {
         amended: LimitOrder,
         reservation: ReservationState,
         amended_event: EngineEvent,
-        trade_ids: &[TradeId],
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let mut slice = self.plan_slices(SliceRequest {
             id: plan.order_id,
@@ -456,10 +499,7 @@ impl ReferenceOrderBook {
             .iter()
             .filter(|event| matches!(event, EngineEvent::Trade(_)))
             .count();
-        assert!(
-            trade_ids.len() >= required_trade_ids,
-            "insufficient TradeIds for preflighted reference Amend reprice"
-        );
+        let trade_ids = source.reserve(required_trade_ids)?;
 
         let residual = if slice.remaining == 0 || slice.taker_terminal {
             None
@@ -773,12 +813,12 @@ impl ReferenceOrderBook {
         amend: &AmendOrder,
         now: LogicalTime,
         current_session_id: u64,
-        trade_ids: &[TradeId],
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let plan = match self.build_amend_plan(amend, now, current_session_id)? {
             ReferenceAmendPlan::Regular(plan) => plan,
             ReferenceAmendPlan::Iceberg(plan) => {
-                return self.commit_iceberg_amend(plan, amend, trade_ids);
+                return self.commit_iceberg_amend(plan, amend, source);
             }
             ReferenceAmendPlan::Stop(_) => {
                 return Err(RejectReason::InvalidOrderCombination);
@@ -826,8 +866,75 @@ impl ReferenceOrderBook {
                 Ok(vec![amended_event])
             }
             RegularAmendKind::RepriceAndMatch => {
-                self.commit_reprice_plan(plan, amended, reservation, amended_event, trade_ids)
+                self.commit_reprice_plan(plan, amended, reservation, amended_event, source)
             }
         }
+    }
+
+    /// 原子执行登记表改单，并仅在计划与资金归属均成功后推进成交游标。
+    pub fn amend_with_registry_and_cursor(
+        &mut self,
+        amend: &AmendOrder,
+        registry: &mut matching_risk::ReservationRegistry,
+        context: crate::AmendRegistryContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let plan = self.plan_amend_with_registry_source(amend, registry, context, &mut source)?;
+        let events = self
+            .apply_amend_with_registry(registry, plan)
+            .expect("新建改单计划前态必须一致");
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(events)
+    }
+
+    /// 使用真实成交游标执行完整改单，失败不改变簿或游标。
+    pub fn amend_with_context_and_cursor(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        context: &crate::AmendExecutionContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let events = candidate.amend_with_context_source(
+            amend,
+            now,
+            current_session_id,
+            context,
+            &mut source,
+        )?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(events)
+    }
+
+    /// 在独立候选中使用命令游标执行改单；失败时簿与游标均保持原状。
+    pub fn amend_regular_with_cursor(
+        &mut self,
+        amend: &AmendOrder,
+        now: LogicalTime,
+        current_session_id: u64,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let events = candidate.amend_regular_with_events_inner(
+            amend,
+            now,
+            current_session_id,
+            &mut source,
+        )?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(events)
     }
 }

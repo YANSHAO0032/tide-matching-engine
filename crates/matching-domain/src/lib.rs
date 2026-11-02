@@ -60,13 +60,15 @@ pub mod stp;
 pub mod time_in_force;
 /// 实际成交的最小载荷。
 pub mod trade_event;
+/// 根命令内按真实成交顺序生成成交身份。
+pub mod trade_id_cursor;
 /// 未触发 Stop 独立于 child TIF 的存活期。
 pub mod trigger_expiry;
 
-/// 对外公开的集群、市场、用户、订单、命令、成交和预留身份。
+/// 对外公开的集群、分片、市场、用户、订单、命令、成交和预留身份。
 pub use ids::{
-    AssetId, ClusterId, CommandId, MarketId, OrderId, OriginSessionId, ReservationId, TradeId,
-    UserId,
+    AssetId, ClusterId, CommandId, MarketId, OrderId, OriginSessionId, ReservationId, ShardId,
+    TradeId, UserId,
 };
 
 /// 改单载荷、数量模式及纯候选计算。
@@ -146,3 +148,6 @@ pub use market_order::{
     LimitGtcExecution, MarketByBase, MarketByBaseExecution, MarketByQuote, MarketByQuoteExecution,
     MarketProtection, ProtectionSource,
 };
+
+/// 根命令内的确定性成交身份游标。
+pub use trade_id_cursor::TradeIdCursor;

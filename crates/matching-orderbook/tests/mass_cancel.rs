@@ -1068,3 +1068,947 @@ fn stop_registry_rejects_conflicting_market_math_before_mutation() {
     assert_eq!(production, before_p);
     assert_eq!(registry, before_registry);
 }
+
+#[test]
+fn production_registry_place_cursor_overflow_is_atomic() {
+    use matching_domain::{ClusterId, RejectReason, ShardId, TradeIdCursor};
+    use matching_orderbook::production_orderbook::{
+        ProductionCancelReplaceContext, ProductionPlaceOrder,
+    };
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    for id in [1, 2] {
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        book.rest_with_reservation(maker, state(id, id as u64, 10))
+            .unwrap();
+    }
+    let mut registry =
+        ReservationRegistry::new([state(1, 1, 10), state(2, 2, 10), state(3, 3, 10)]).unwrap();
+    let mut taker = regular(3, 3);
+    taker.qty = Qty::try_new(2).unwrap();
+    let request = ProductionPlaceOrder::Limit {
+        order: taker,
+        time_in_force: TimeInForce::Gtc,
+        post_only: false,
+    };
+    let before_book = book.clone();
+    let before_registry = registry.clone();
+    let mut cursor =
+        TradeIdCursor::with_next_index(ClusterId(1), ShardId(1), 1, u64::from(u32::MAX)).unwrap();
+    let before_cursor = cursor.clone();
+    let math = math();
+    let result = book.place_with_registry_and_cursor(
+        request,
+        state(3, 3, 10),
+        &mut registry,
+        ProductionCancelReplaceContext {
+            math: &math,
+            now: LogicalTime::new(1),
+            current_session_id: 1,
+            trade_ids: &[],
+        },
+        &mut cursor,
+    );
+    assert_eq!(result, Err(RejectReason::ArithmeticOverflow));
+    assert_eq!(book, before_book);
+    assert_eq!(registry, before_registry);
+    assert_eq!(cursor, before_cursor);
+}
+
+#[test]
+fn reference_trigger_registry_cursor_stp_preserves_non_trade_sequence() {
+    let mut book = ReferenceOrderBook::new();
+    let maker_state = state(30, 1, 10);
+    let stop_state = state(10, 2, 10);
+    let mut registry = ReservationRegistry::new([maker_state.clone(), stop_state.clone()]).unwrap();
+    let mut maker = regular(30, 1);
+    maker.side = Side::Sell;
+    maker.stp_key = matching_domain::StpKey::new(7);
+    book.rest_with_reservation(maker, maker_state).unwrap();
+    let mut stop = quote_stop(10, 2);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.stp_key = matching_domain::StpKey::new(7);
+    child.stp_mode = matching_domain::StpMode::CancelTaker;
+    book.place_stop_with_reservation(stop, LogicalTime::new(1), 1, stop_state)
+        .unwrap();
+    let reference_price = |seq, price| matching_domain::PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: seq,
+        price: Price::try_new(price).unwrap(),
+    };
+    let math = math();
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &[],
+    };
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    book.trigger_stops_with_registry_and_cursor(
+        reference_price(1, 10),
+        context(),
+        &mut registry,
+        &mut cursor,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut old = book.clone();
+    let mut old_registry = registry.clone();
+    let plan = old
+        .plan_trigger_stops_with_registry(reference_price(2, 12), context(), &old_registry, |_| {
+            Ok(())
+        })
+        .unwrap();
+    let expected = old
+        .apply_trigger_stops_with_registry(&mut old_registry, plan)
+        .unwrap();
+    let actual = book
+        .trigger_stops_with_registry_and_cursor(
+            reference_price(2, 12),
+            context(),
+            &mut registry,
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, old);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor.next_index(), 0);
+}
+
+#[test]
+fn production_registry_market_cursor_overflow_is_atomic() {
+    use matching_domain::{ClusterId, MarketByBase, RejectReason, ShardId, TradeIdCursor};
+    use matching_orderbook::{MarketRegistryContext, MarketRegistryOrder};
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    for id in [1, 2] {
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        book.rest_with_reservation(maker, state(id, id as u64, 10))
+            .unwrap();
+    }
+    let mut registry =
+        ReservationRegistry::new([state(1, 1, 10), state(2, 2, 10), state(3, 3, 10)]).unwrap();
+    let request = MarketRegistryOrder::Base(MarketByBase {
+        order_id: OrderId(3),
+        user_id: matching_domain::UserId(3),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(2).unwrap(),
+        market_protection: None,
+    });
+    let before = book.clone();
+    let registry_before = registry.clone();
+    let mut cursor =
+        TradeIdCursor::with_next_index(ClusterId(1), ShardId(1), 1, u64::from(u32::MAX)).unwrap();
+    let cursor_before = cursor.clone();
+    let math = math();
+    let result = book.market_with_registry_and_cursor(
+        request,
+        state(3, 3, 10),
+        &mut registry,
+        MarketRegistryContext {
+            math: &math,
+            trade_ids: &[],
+            protection: None,
+        },
+        &mut cursor,
+    );
+    assert_eq!(result, Err(RejectReason::ArithmeticOverflow));
+    assert_eq!(book, before);
+    assert_eq!(registry, registry_before);
+    assert_eq!(cursor, cursor_before);
+}
+
+#[test]
+fn reference_trigger_registry_cursor_overflow_keeps_all_state() {
+    let mut book = ReferenceOrderBook::new();
+    let mut states = Vec::new();
+    for id in [30, 31] {
+        let state = state(id, id as u64, 10);
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        book.rest_with_reservation(maker, state.clone()).unwrap();
+        states.push(state);
+    }
+    let stop_state = state(10, 2, 10);
+    let mut stop = base_stop(10, 2, TriggerExpiry::Gtc);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.quantity = StopMarketQuantity::Base(Qty::try_new(2).unwrap());
+    child.side = Side::Buy;
+    child.stop_price = Price::try_new(12).unwrap();
+    book.place_stop_with_reservation(stop, LogicalTime::new(1), 1, stop_state.clone())
+        .unwrap();
+    states.push(stop_state);
+    let mut registry = ReservationRegistry::new(states).unwrap();
+    let price = |seq, value| matching_domain::PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: seq,
+        price: Price::try_new(value).unwrap(),
+    };
+    let math = math();
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &[],
+    };
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    book.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        context(),
+        &mut registry,
+        &mut cursor,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let before = book.clone();
+    let before_registry = registry.clone();
+    let before_cursor = cursor.clone();
+    assert_eq!(
+        book.trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            context(),
+            &mut registry,
+            &mut cursor,
+            |_| Ok(())
+        ),
+        Err(matching_domain::RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(book, before);
+    assert_eq!(registry, before_registry);
+    assert_eq!(cursor, before_cursor);
+}
+
+#[test]
+fn production_registry_place_cursor_matches_legacy_plan() {
+    use matching_domain::{ClusterId, ShardId, TradeIdCursor};
+    use matching_orderbook::production_orderbook::{
+        ProductionCancelReplaceContext, ProductionPlaceOrder,
+    };
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut maker = regular(1, 1);
+    maker.side = Side::Sell;
+    book.rest_with_reservation(maker, state(1, 1, 10)).unwrap();
+    let mut registry = ReservationRegistry::new([state(1, 1, 10), state(2, 2, 10)]).unwrap();
+    let mut legacy = book.clone();
+    let mut legacy_registry = registry.clone();
+    let order = regular(2, 2);
+    let request = ProductionPlaceOrder::Limit {
+        order,
+        time_in_force: TimeInForce::Gtc,
+        post_only: false,
+    };
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let mut expected_cursor = cursor.clone();
+    let ids = [expected_cursor.next_trade_id().unwrap()];
+    let math = math();
+    let context = ProductionCancelReplaceContext {
+        math: &math,
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        trade_ids: &ids,
+    };
+    let plan = legacy
+        .plan_place_with_registry(request.clone(), state(2, 2, 10), &legacy_registry, context)
+        .unwrap();
+    let expected = legacy
+        .apply_place_with_registry(&mut legacy_registry, plan)
+        .unwrap();
+    let context = ProductionCancelReplaceContext {
+        math: &math,
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        trade_ids: &[],
+    };
+    let actual = book
+        .place_with_registry_and_cursor(
+            request,
+            state(2, 2, 10),
+            &mut registry,
+            context,
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, legacy);
+    assert_eq!(registry, legacy_registry);
+    assert_eq!(cursor, expected_cursor);
+}
+
+#[test]
+fn production_registry_market_cursor_matches_legacy_plan() {
+    use matching_domain::{ClusterId, MarketByBase, ShardId, TradeIdCursor};
+    use matching_orderbook::{MarketRegistryContext, MarketRegistryOrder};
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut maker = regular(1, 1);
+    maker.side = Side::Sell;
+    book.rest_with_reservation(maker, state(1, 1, 10)).unwrap();
+    let mut registry = ReservationRegistry::new([state(1, 1, 10), state(2, 2, 10)]).unwrap();
+    let mut legacy = book.clone();
+    let mut legacy_registry = registry.clone();
+    let order = MarketByBase {
+        order_id: OrderId(2),
+        user_id: matching_domain::UserId(2),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(1).unwrap(),
+        market_protection: None,
+    };
+    let request = MarketRegistryOrder::Base(order);
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let mut expected_cursor = cursor.clone();
+    let ids = [expected_cursor.next_trade_id().unwrap()];
+    let math = math();
+    let context = MarketRegistryContext {
+        math: &math,
+        trade_ids: &ids,
+        protection: None,
+    };
+    let plan = legacy
+        .plan_market_with_registry(request.clone(), state(2, 2, 10), &legacy_registry, context)
+        .unwrap();
+    let expected = legacy
+        .apply_market_with_registry(&mut legacy_registry, plan)
+        .unwrap();
+    let context = MarketRegistryContext {
+        math: &math,
+        trade_ids: &[],
+        protection: None,
+    };
+    let actual = book
+        .market_with_registry_and_cursor(
+            request,
+            state(2, 2, 10),
+            &mut registry,
+            context,
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, legacy);
+    assert_eq!(registry, legacy_registry);
+    assert_eq!(cursor, expected_cursor);
+}
+
+#[test]
+fn production_registry_market_cursor_matches_legacy_protected_plan() {
+    use matching_domain::{ClusterId, MarketByBase, ShardId, TradeIdCursor};
+    use matching_orderbook::{MarketRegistryContext, MarketRegistryOrder};
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut maker = regular(1, 1);
+    maker.side = Side::Sell;
+    book.rest_with_reservation(maker, state(1, 1, 10)).unwrap();
+    let mut registry = ReservationRegistry::new([state(1, 1, 10), state(2, 2, 10)]).unwrap();
+    let mut legacy = book.clone();
+    let mut legacy_registry = registry.clone();
+    let order = MarketByBase {
+        order_id: OrderId(2),
+        user_id: matching_domain::UserId(2),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(1).unwrap(),
+        market_protection: None,
+    };
+    let request = MarketRegistryOrder::Base(order);
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let mut expected_cursor = cursor.clone();
+    let ids = [expected_cursor.next_trade_id().unwrap()];
+    let math = math();
+    let context = MarketRegistryContext {
+        math: &math,
+        trade_ids: &ids,
+        protection: None,
+    };
+    let plan = legacy
+        .plan_market_with_registry(request.clone(), state(2, 2, 10), &legacy_registry, context)
+        .unwrap();
+    let expected = legacy
+        .apply_market_with_registry(&mut legacy_registry, plan)
+        .unwrap();
+    let context = MarketRegistryContext {
+        math: &math,
+        trade_ids: &[],
+        protection: None,
+    };
+    let actual = book
+        .market_with_registry_and_cursor(
+            request,
+            state(2, 2, 10),
+            &mut registry,
+            context,
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, legacy);
+    assert_eq!(registry, legacy_registry);
+    assert_eq!(cursor, expected_cursor);
+}
+
+#[test]
+fn production_trigger_registry_cursor_overflow_keeps_all_state() {
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut states = Vec::new();
+    for id in [30, 31] {
+        let state = state(id, id as u64, 10);
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        book.rest_with_reservation(maker, state.clone()).unwrap();
+        states.push(state);
+    }
+    let stop_state = state(10, 2, 10);
+    let mut stop = base_stop(10, 2, TriggerExpiry::Gtc);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.quantity = StopMarketQuantity::Base(Qty::try_new(2).unwrap());
+    child.side = Side::Buy;
+    child.stop_price = Price::try_new(12).unwrap();
+    book.place_stop_with_reservation(stop, LogicalTime::new(1), 1, stop_state.clone())
+        .unwrap();
+    states.push(stop_state);
+    let mut registry = ReservationRegistry::new(states).unwrap();
+    let price = |seq, value| matching_domain::PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: seq,
+        price: Price::try_new(value).unwrap(),
+    };
+    let math = math();
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &[],
+    };
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    book.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        context(),
+        &mut registry,
+        &mut cursor,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let before = book.clone();
+    let before_registry = registry.clone();
+    let before_cursor = cursor.clone();
+    assert_eq!(
+        book.trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            context(),
+            &mut registry,
+            &mut cursor,
+            |_| Ok(())
+        ),
+        Err(matching_domain::RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(book, before);
+    assert_eq!(registry, before_registry);
+    assert_eq!(cursor, before_cursor);
+}
+
+#[test]
+fn trigger_registry_cursor_matches_legacy_events_and_reference() {
+    use matching_domain::{ClusterId, PriceReference, ShardId, TradeIdCursor};
+    let mut p = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut r = ReferenceOrderBook::new();
+    let mut states = Vec::new();
+    for id in [30, 31] {
+        let reservation = state(id, id as u64, 10);
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        p.rest_with_reservation(maker.clone(), reservation.clone())
+            .unwrap();
+        r.rest_with_reservation(maker, reservation.clone()).unwrap();
+        states.push(reservation);
+    }
+    let reservation = state(10, 2, 10);
+    let mut stop = base_stop(10, 2, TriggerExpiry::Gtc);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.quantity = StopMarketQuantity::Base(Qty::try_new(2).unwrap());
+    child.side = Side::Buy;
+    child.stop_price = Price::try_new(12).unwrap();
+    p.place_stop_with_reservation(stop.clone(), LogicalTime::new(1), 1, reservation.clone())
+        .unwrap();
+    r.place_stop_with_reservation(stop, LogicalTime::new(1), 1, reservation.clone())
+        .unwrap();
+    states.push(reservation);
+    let mut pr = ReservationRegistry::new(states).unwrap();
+    let mut rr = pr.clone();
+    let math = math();
+    let price = |seq, value| PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: seq,
+        price: Price::try_new(value).unwrap(),
+    };
+    let empty_context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &[],
+    };
+    let mut pc = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let mut rc = pc.clone();
+    p.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        empty_context(),
+        &mut pr,
+        &mut pc,
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        empty_context(),
+        &mut rr,
+        &mut rc,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut old_p = p.clone();
+    let mut old_r = r.clone();
+    let mut old_pr = pr.clone();
+    let mut old_rr = rr.clone();
+    let mut ids_cursor = pc.clone();
+    let ids = [
+        ids_cursor.next_trade_id().unwrap(),
+        ids_cursor.next_trade_id().unwrap(),
+    ];
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &ids,
+    };
+    let pp = old_p
+        .plan_trigger_stops_with_registry(price(2, 12), context(), &old_pr, |_| Ok(()))
+        .unwrap();
+    let rp = old_r
+        .plan_trigger_stops_with_registry(price(2, 12), context(), &old_rr, |_| Ok(()))
+        .unwrap();
+    let old_pe = old_p
+        .apply_trigger_stops_with_registry(&mut old_pr, pp)
+        .unwrap();
+    let old_re = old_r
+        .apply_trigger_stops_with_registry(&mut old_rr, rp)
+        .unwrap();
+    let pe = p
+        .trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            empty_context(),
+            &mut pr,
+            &mut pc,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            empty_context(),
+            &mut rr,
+            &mut rc,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(pe, re);
+    assert_eq!(pe, old_pe);
+    assert_eq!(re, old_re);
+    assert_eq!(p, old_p);
+    assert_eq!(r, old_r);
+    assert_eq!(pr, rr);
+    assert_eq!(pr, old_pr);
+    assert_eq!(rr, old_rr);
+    assert_eq!(pc, ids_cursor);
+    assert_eq!(rc, ids_cursor);
+}
+
+#[test]
+fn production_registry_market_cursor_protected_requires_band_reference() {
+    use matching_domain::{
+        ClusterId, MarketByBase, PriceBandConfig, RejectReason, ShardId, TradeIdCursor,
+    };
+    use matching_orderbook::{MarketRegistryContext, MarketRegistryOrder};
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let math = math();
+    book.set_price_band_config(Some((
+        PriceBandConfig {
+            reference_kind: PriceReferenceKind::MarkPrice,
+            max_deviation_bps: 100,
+        },
+        math,
+    )))
+    .unwrap();
+    let mut registry = ReservationRegistry::new([state(2, 2, 10)]).unwrap();
+    let order = MarketByBase {
+        order_id: OrderId(2),
+        user_id: matching_domain::UserId(2),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(1).unwrap(),
+        market_protection: None,
+    };
+    let protection = matching_domain::market_order::CommandStartProtectionContext {
+        reference_price_at_command_start: Price::try_new(10).unwrap(),
+        market_band_worst: None,
+    };
+    let before = book.clone();
+    let old_registry = registry.clone();
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let old_cursor = cursor.clone();
+    let context = MarketRegistryContext {
+        math: &math,
+        trade_ids: &[],
+        protection: Some(&protection),
+    };
+    let result = book.market_with_registry_and_cursor(
+        MarketRegistryOrder::Base(order),
+        state(2, 2, 10),
+        &mut registry,
+        context,
+        &mut cursor,
+    );
+    assert_eq!(result, Err(RejectReason::ReferencePriceUnavailable));
+    assert_eq!(book, before);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor, old_cursor);
+}
+
+#[test]
+fn production_registry_market_cursor_protected_rejects_mismatched_math_before_mutation() {
+    use matching_domain::{ClusterId, MarketByBase, PriceBandConfig, ShardId, TradeIdCursor};
+    use matching_orderbook::{MarketRegistryContext, MarketRegistryOrder};
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let configured = math();
+    book.set_price_band_config(Some((
+        PriceBandConfig {
+            reference_kind: PriceReferenceKind::MarkPrice,
+            max_deviation_bps: 100,
+        },
+        configured,
+    )))
+    .unwrap();
+    let mut registry = ReservationRegistry::new([state(2, 2, 10)]).unwrap();
+    let order = MarketByBase {
+        order_id: OrderId(2),
+        user_id: matching_domain::UserId(2),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(1).unwrap(),
+        market_protection: None,
+    };
+    let protection = matching_domain::market_order::CommandStartProtectionContext {
+        reference_price_at_command_start: Price::try_new(10).unwrap(),
+        market_band_worst: None,
+    };
+    let before = book.clone();
+    let old_registry = registry.clone();
+    let mut cursor = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let old_cursor = cursor.clone();
+    let other_math = matching_domain::MarketMath::try_new(0, 0, 0, 2, 1).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        book.market_with_registry_and_cursor(
+            MarketRegistryOrder::Base(order),
+            state(2, 2, 10),
+            &mut registry,
+            MarketRegistryContext {
+                math: &other_math,
+                trade_ids: &[],
+                protection: Some(&protection),
+            },
+            &mut cursor,
+        )
+    }));
+    assert!(result.is_err());
+    assert_eq!(book, before);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor, old_cursor);
+}
+
+#[test]
+fn trigger_registry_cursor_protected_matches_legacy_events_and_reference() {
+    use matching_domain::{ClusterId, PriceReference, ShardId, TradeIdCursor};
+    let mut p = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut r = ReferenceOrderBook::new();
+    let mut states = Vec::new();
+    for id in [30, 31] {
+        let reservation = state(id, id as u64, 10);
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        p.rest_with_reservation(maker.clone(), reservation.clone())
+            .unwrap();
+        r.rest_with_reservation(maker, reservation.clone()).unwrap();
+        states.push(reservation);
+    }
+    let reservation = state(10, 2, 10);
+    let mut stop = base_stop(10, 2, TriggerExpiry::Gtc);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.quantity = StopMarketQuantity::Base(Qty::try_new(2).unwrap());
+    child.side = Side::Buy;
+    child.stop_price = Price::try_new(12).unwrap();
+    child.market_protection = Some(matching_domain::MarketProtection {
+        max_slippage_bps: None,
+        worst_price: Some(Price::try_new(10).unwrap()),
+    });
+    p.place_stop_with_reservation(stop.clone(), LogicalTime::new(1), 1, reservation.clone())
+        .unwrap();
+    r.place_stop_with_reservation(stop, LogicalTime::new(1), 1, reservation.clone())
+        .unwrap();
+    states.push(reservation);
+    let mut pr = ReservationRegistry::new(states).unwrap();
+    let mut rr = pr.clone();
+    let math = math();
+    let price = |seq, value| PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: seq,
+        price: Price::try_new(value).unwrap(),
+    };
+    let empty_context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &[],
+    };
+    let mut pc = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let mut rc = pc.clone();
+    p.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        empty_context(),
+        &mut pr,
+        &mut pc,
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        empty_context(),
+        &mut rr,
+        &mut rc,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut old_p = p.clone();
+    let mut old_r = r.clone();
+    let mut old_pr = pr.clone();
+    let mut old_rr = rr.clone();
+    let mut ids_cursor = pc.clone();
+    let ids = [
+        ids_cursor.next_trade_id().unwrap(),
+        ids_cursor.next_trade_id().unwrap(),
+    ];
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &ids,
+    };
+    let pp = old_p
+        .plan_trigger_stops_with_registry(price(2, 12), context(), &old_pr, |_| Ok(()))
+        .unwrap();
+    let rp = old_r
+        .plan_trigger_stops_with_registry(price(2, 12), context(), &old_rr, |_| Ok(()))
+        .unwrap();
+    let old_pe = old_p
+        .apply_trigger_stops_with_registry(&mut old_pr, pp)
+        .unwrap();
+    let old_re = old_r
+        .apply_trigger_stops_with_registry(&mut old_rr, rp)
+        .unwrap();
+    let pe = p
+        .trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            empty_context(),
+            &mut pr,
+            &mut pc,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            empty_context(),
+            &mut rr,
+            &mut rc,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(pe, re);
+    assert_eq!(pe, old_pe);
+    assert_eq!(re, old_re);
+    assert_eq!(p, old_p);
+    assert_eq!(r, old_r);
+    assert_eq!(pr, rr);
+    assert_eq!(pr, old_pr);
+    assert_eq!(rr, old_rr);
+    assert_eq!(pc, ids_cursor);
+    assert_eq!(rc, ids_cursor);
+}
+
+#[test]
+fn trigger_registry_cursor_stp_matches_legacy_events_and_reference() {
+    use matching_domain::{ClusterId, PriceReference, ShardId, TradeIdCursor};
+    let mut p = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut r = ReferenceOrderBook::new();
+    let mut states = Vec::new();
+    for id in [30, 31] {
+        let reservation = state(id, id as u64, 10);
+        let mut maker = regular(id, id as u64);
+        maker.side = Side::Sell;
+        maker.qty = Qty::try_new(1).unwrap();
+        if id == 30 {
+            maker.stp_key = matching_domain::StpKey::new(7);
+        }
+        p.rest_with_reservation(maker.clone(), reservation.clone())
+            .unwrap();
+        r.rest_with_reservation(maker, reservation.clone()).unwrap();
+        states.push(reservation);
+    }
+    let reservation = state(10, 2, 10);
+    let mut stop = base_stop(10, 2, TriggerExpiry::Gtc);
+    let StopOrder::Market(ref mut child) = stop else {
+        unreachable!()
+    };
+    child.quantity = StopMarketQuantity::Base(Qty::try_new(2).unwrap());
+    child.side = Side::Buy;
+    child.stop_price = Price::try_new(12).unwrap();
+    child.stp_key = matching_domain::StpKey::new(7);
+    child.stp_mode = matching_domain::StpMode::CancelMaker;
+    p.place_stop_with_reservation(stop.clone(), LogicalTime::new(1), 1, reservation.clone())
+        .unwrap();
+    r.place_stop_with_reservation(stop, LogicalTime::new(1), 1, reservation.clone())
+        .unwrap();
+    states.push(reservation);
+    let mut pr = ReservationRegistry::new(states).unwrap();
+    let mut rr = pr.clone();
+    let math = math();
+    let price = |seq, value| PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        source_seq: seq,
+        price: Price::try_new(value).unwrap(),
+    };
+    let empty_context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &[],
+    };
+    let mut pc = TradeIdCursor::new(ClusterId(1), ShardId(2), 3);
+    let mut rc = pc.clone();
+    p.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        empty_context(),
+        &mut pr,
+        &mut pc,
+        |_| Ok(()),
+    )
+    .unwrap();
+    r.trigger_stops_with_registry_and_cursor(
+        price(1, 10),
+        empty_context(),
+        &mut rr,
+        &mut rc,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut old_p = p.clone();
+    let mut old_r = r.clone();
+    let mut old_pr = pr.clone();
+    let mut old_rr = rr.clone();
+    let mut ids_cursor = pc.clone();
+    let ids = [ids_cursor.next_trade_id().unwrap()];
+    let context = || matching_orderbook::TriggerRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 1,
+        math: &math,
+        trade_ids: &ids,
+    };
+    let pp = old_p
+        .plan_trigger_stops_with_registry(price(2, 12), context(), &old_pr, |_| Ok(()))
+        .unwrap();
+    let rp = old_r
+        .plan_trigger_stops_with_registry(price(2, 12), context(), &old_rr, |_| Ok(()))
+        .unwrap();
+    let old_pe = old_p
+        .apply_trigger_stops_with_registry(&mut old_pr, pp)
+        .unwrap();
+    let old_re = old_r
+        .apply_trigger_stops_with_registry(&mut old_rr, rp)
+        .unwrap();
+    let pe = p
+        .trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            empty_context(),
+            &mut pr,
+            &mut pc,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let re = r
+        .trigger_stops_with_registry_and_cursor(
+            price(2, 12),
+            empty_context(),
+            &mut rr,
+            &mut rc,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(pe.iter().any(|event| matches!(
+        event,
+        EngineEvent::OrderCanceled {
+            reason: matching_domain::CancelReason::SelfTradePreventionMaker,
+            ..
+        }
+    )));
+    assert_eq!(
+        pe.iter()
+            .filter(|event| matches!(event, EngineEvent::Trade(_)))
+            .count(),
+        1
+    );
+    assert_eq!(pe, re);
+    assert_eq!(pe, old_pe);
+    assert_eq!(re, old_re);
+    assert_eq!(p, old_p);
+    assert_eq!(r, old_r);
+    assert_eq!(pr, rr);
+    assert_eq!(pr, old_pr);
+    assert_eq!(rr, old_rr);
+    assert_eq!(pc, ids_cursor);
+    assert_eq!(rc, ids_cursor);
+}

@@ -3,6 +3,11 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClusterId(pub u16);
 
+/// 分片身份；与成交身份中的 16 位分片字段一致。
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShardId(pub u16);
+
 /// 市场身份；其有效范围和路由语义由上层市场目录定义。
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,6 +84,7 @@ macro_rules! impl_id {
 }
 
 impl_id!(ClusterId, u16);
+impl_id!(ShardId, u16);
 impl_id!(MarketId, u32);
 impl_id!(AssetId, u32);
 impl_id!(UserId, u64);
@@ -134,6 +140,7 @@ mod tests {
     }
 
     test_id!(cluster_id_behavior, ClusterId, u16);
+    test_id!(shard_id_behavior, ShardId, u16);
     test_id!(market_id_behavior, MarketId, u32);
     test_id!(asset_id_behavior, AssetId, u32);
     test_id!(user_id_behavior, UserId, u64);

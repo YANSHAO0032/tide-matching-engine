@@ -121,6 +121,7 @@ fn valid(book: &ProductionOrderBook) {
     assert_eq!(book.validate_stop_book(), Ok(()));
 }
 
+/// 冻结测试关注的完整状态以比较前后变化。
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     /// 买方价格档与其队列顺序快照。
@@ -691,4 +692,46 @@ fn amend_with_missing_band_reference_keeps_order_unchanged() {
     );
     book.arena.reset_slot_accesses();
     assert_eq!(book, before);
+}
+
+#[test]
+fn amend_reprice_cursor_overflow_is_atomic_and_matches_legacy() {
+    let mut book = ProductionOrderBook::new(policy());
+    let maker1 = order(1, Side::Buy, 101, 1);
+    let maker2 = order(2, Side::Buy, 101, 1);
+    let target = order(3, Side::Sell, 105, 2);
+    for input in [&maker1, &maker2, &target] {
+        rest(&mut book, input);
+    }
+    let mut amend = command(&target);
+    amend.new_price = Some(Price::try_new(100).unwrap());
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let before = book.clone();
+    let old_cursor = cursor.clone();
+    assert_eq!(
+        book.amend_regular_with_cursor(&amend, LogicalTime::new(1), 9, &mut cursor),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(book, before);
+    assert_eq!(cursor, old_cursor);
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut legacy = before;
+    let mut ids = cursor.clone();
+    let ids = [ids.next_trade_id().unwrap(), ids.next_trade_id().unwrap()];
+    assert_eq!(
+        book.amend_regular_with_cursor(&amend, LogicalTime::new(1), 9, &mut cursor),
+        legacy.amend_regular_with_events(&amend, LogicalTime::new(1), 9, &ids)
+    );
+    assert_eq!(book, legacy);
+    assert_eq!(cursor.next_index(), 2);
 }

@@ -838,3 +838,66 @@ fn amend_mismatched_market_math_fail_stops_before_mutation() {
     assert_eq!(production_snapshot(&p), before_p);
     assert_eq!(r, before_r);
 }
+
+#[test]
+fn contextual_amend_cursor_matches_legacy_for_signed_change() {
+    let signing = SigningKey::from_bytes(&[7; 32]);
+    let keys = RiskKeySet::new(2, [(31, signing.verifying_key())]).unwrap();
+    let (mut book, _, input, mut cmd) = setup(0);
+    cmd.reservation_adjustment = Some(token(&input, &signing));
+    let mut legacy = book.clone();
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    assert_eq!(
+        book.amend_with_context_and_cursor(
+            &cmd,
+            LogicalTime::new(1),
+            9,
+            &context(&keys),
+            &mut cursor
+        ),
+        legacy.amend_with_context(&cmd, LogicalTime::new(1), 9, &[], &context(&keys))
+    );
+    assert_eq!(book, legacy);
+    assert_eq!(cursor.next_index(), 0);
+}
+
+#[test]
+fn registry_amend_cursor_matches_legacy_signed_change() {
+    let signing = SigningKey::from_bytes(&[7; 32]);
+    let keys = RiskKeySet::new(2, [(31, signing.verifying_key())]).unwrap();
+    let (mut book, _, input, mut cmd) = setup(0);
+    cmd.reservation_adjustment = Some(token(&input, &signing));
+    let mut registry =
+        matching_risk::ReservationRegistry::new(book.reservations.values().cloned()).unwrap();
+    let mut old_book = book.clone();
+    let mut old_registry = registry.clone();
+    let execution = context(&keys);
+    let context = || crate::AmendRegistryContext {
+        now: LogicalTime::new(1),
+        current_session_id: 9,
+        trade_ids: &[],
+        execution: &execution,
+    };
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let old_plan = old_book
+        .plan_amend_with_registry(&cmd, &old_registry, context())
+        .unwrap();
+    let old_events = old_book
+        .apply_amend_with_registry(&mut old_registry, old_plan)
+        .unwrap();
+    assert_eq!(
+        book.amend_with_registry_and_cursor(&cmd, &mut registry, context(), &mut cursor),
+        Ok(old_events)
+    );
+    assert_eq!(book, old_book);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor.next_index(), 0);
+}

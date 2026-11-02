@@ -1,3 +1,7 @@
 disallowed-methods = [
     { path = "std::sync::mpsc::channel", reason = "Unbounded channels violate the bounded-queue requirement; use a bounded channel with an explicit backpressure policy." },
+    { path = "crossbeam_queue::SegQueue::new", reason = "Unbounded queues violate the bounded-queue requirement; use an ArrayQueue with an explicit capacity and backpressure policy." },
+]
+disallowed-types = [
+    { path = "crossbeam_queue::SegQueue", reason = "Unbounded queues violate the bounded-queue requirement; use an ArrayQueue with an explicit capacity and backpressure policy." },
 ]

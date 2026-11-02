@@ -277,4 +277,45 @@ impl ReferenceOrderBook {
         }
         Ok(self.commit_limit_immediate(order, plan, trade_ids))
     }
+
+    /// 在候选簿中规划立即执行，按实际成交推进根命令游标。
+    pub fn place_limit_immediate_with_cursor(
+        &mut self,
+        order: LimitOrder,
+        math: &MarketMath,
+        fok: bool,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<LimitImmediateExecution, RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
+        }
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        order.validate_stp_mode()?;
+        if candidate.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        candidate.validate_band_price(order.price)?;
+        let execution = if candidate.has_iceberg_maker(order.side)
+            || order.stp_mode != matching_domain::StpMode::None
+        {
+            candidate.iceberg_immediate_with_source(order, math, &mut source, fok)?
+        } else {
+            let plan = candidate.preflight_limit_immediate(&order, math)?;
+            if fok && plan.remaining != 0 {
+                return Err(RejectReason::FokInsufficientLiquidity);
+            }
+            let ids = source.reserve(plan.fills.len())?;
+            candidate.commit_limit_immediate(order, plan, &ids)
+        };
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    matching_domain::EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(execution)
+    }
 }

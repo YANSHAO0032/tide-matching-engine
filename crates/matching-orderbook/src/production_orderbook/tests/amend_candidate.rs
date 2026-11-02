@@ -40,6 +40,7 @@ fn amend(order_id: OrderId, user_id: UserId, new_qty: Qty) -> AmendOrder {
     }
 }
 
+/// 冻结订单簿内部状态以检查失败原子性。
 #[derive(Debug, PartialEq, Eq)]
 struct BookSnapshot {
     /// 买方价格档与其队列顺序快照。

@@ -26,6 +26,7 @@ fn ids() -> Vec<TradeId> {
 }
 
 type LevelState = (Price, Option<OrderIndex>, Option<OrderIndex>, u32, u64);
+/// 冰山测试使用的订单簿状态快照。
 #[derive(Debug, PartialEq, Eq)]
 struct BookState {
     /// 买侧价格档及其链表、聚合数量投影。

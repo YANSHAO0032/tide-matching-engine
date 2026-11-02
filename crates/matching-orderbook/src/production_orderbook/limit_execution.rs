@@ -442,4 +442,72 @@ impl ProductionOrderBook {
             canceled,
         ))
     }
+
+    /// 对完整根限价命令在候选簿中逐笔生成成交身份；失败不提交状态或游标。
+    pub fn place_limit_gtc_with_cursor(
+        &mut self,
+        order: LimitOrder,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<matching_domain::EngineEvent>, RejectReason> {
+        order.validate_stp_mode()?;
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        self.validate_band_price(order.price)?;
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let (events, _) =
+            candidate.execute_limit_stp_with_source(order, &mut source, None, None, false)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    matching_domain::EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *cursor = source.into_cursor().expect("命令游标来源必须存在");
+        *self = candidate;
+        Ok(events)
+    }
+
+    /// 在候选簿中执行 IOC 或 FOK，按实际成交推进根命令身份游标。
+    pub fn place_limit_immediate_with_cursor(
+        &mut self,
+        order: LimitOrder,
+        math: &MarketMath,
+        fill_or_kill: bool,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<LimitImmediateExecution, RejectReason> {
+        order.validate_stp_mode()?;
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        self.validate_band_price(order.price)?;
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
+        }
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let execution = if fill_or_kill {
+            candidate.place_fok_stp_with_source(order, math, &mut source)?
+        } else {
+            let id = order.order_id;
+            let (events, canceled) = candidate.execute_limit_stp_with_source(
+                order,
+                &mut source,
+                Some(math),
+                None,
+                true,
+            )?;
+            LimitImmediateExecution::from_events(id, events, canceled)
+        };
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(execution.events().iter().filter_map(|event| match event {
+                    matching_domain::EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *cursor = source.into_cursor().expect("命令游标来源必须存在");
+        *self = candidate;
+        Ok(execution)
+    }
 }

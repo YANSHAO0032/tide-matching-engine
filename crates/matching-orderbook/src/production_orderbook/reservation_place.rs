@@ -66,57 +66,149 @@ impl ProductionOrderBook {
         registry: &ReservationRegistry,
         context: crate::MarketRegistryContext<'_>,
     ) -> Result<ProductionMarketPlan, RejectReason> {
+        self.plan_market_with_registry_inner(request, state, registry, context, None)
+    }
+
+    fn plan_market_with_registry_inner(
+        &self,
+        request: crate::MarketRegistryOrder,
+        state: ReservationState,
+        registry: &ReservationRegistry,
+        context: crate::MarketRegistryContext<'_>,
+        cursor: Option<&mut matching_domain::TradeIdCursor>,
+    ) -> Result<ProductionMarketPlan, RejectReason> {
         let (id, user) = match &request {
             crate::MarketRegistryOrder::Base(order) => (order.order_id, order.user_id),
             crate::MarketRegistryOrder::Quote(order) => (order.order_id, order.user_id),
         };
         self.validate_new_reservation(id, user, &state)?;
-        registry.validate_order_bindings(
+        self.validate_registry_bindings(
+            registry,
             self.reservations
                 .iter()
                 .map(|(id, state)| (*id, state))
                 .chain(std::iter::once((id, &state))),
         )?;
         let mut after_book = self.clone();
-        let (events, quote_amounts) = match request {
-            crate::MarketRegistryOrder::Base(order) => {
-                let events = if let Some(protection) = context.protection {
-                    after_book.execute_market_by_base_with_protection(
-                        order,
-                        protection,
-                        context.math,
-                        context.trade_ids,
-                    )?
-                } else {
-                    after_book
-                        .execute_market_by_base(order, context.trade_ids, context.math)?
-                        .events()
-                        .to_vec()
-                };
-                (events, None)
+        let (events, quote_amounts) = if let Some(cursor) = cursor {
+            match request {
+                crate::MarketRegistryOrder::Base(order) => {
+                    let events = if let Some(protection) = context.protection {
+                        order.validate_stp_mode()?;
+                        if let Some((_, configured)) = after_book.price_band_config() {
+                            assert_eq!(*context.math, configured, "市场数值配置不一致");
+                        }
+                        let mut frozen = protection.clone();
+                        if let Some((lower, upper)) = after_book.price_band_bounds()? {
+                            frozen.market_band_worst =
+                                Some(if order.side == matching_domain::Side::Buy {
+                                    upper
+                                } else {
+                                    lower
+                                });
+                        }
+                        let boundary = matching_domain::market_order::effective_protection_at_command_start_with_source(order.market_protection.as_ref(), &frozen, order.side, context.math)?;
+                        let mut source =
+                            crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+                        let events = after_book.execute_market_base_with_boundary_source(
+                            order,
+                            Some(context.math),
+                            boundary,
+                            &mut source,
+                        )?;
+                        *cursor = source.into_cursor().expect("游标来源");
+                        events
+                    } else {
+                        after_book
+                            .execute_market_by_base_with_cursor(order, context.math, cursor)?
+                            .events()
+                            .to_vec()
+                    };
+                    (events, None)
+                }
+                crate::MarketRegistryOrder::Quote(order) => {
+                    if let Some(protection) = context.protection {
+                        order.validate_stp_mode()?;
+                        if let Some((_, configured)) = after_book.price_band_config() {
+                            assert_eq!(*context.math, configured, "市场数值配置不一致");
+                        }
+                        let mut frozen = protection.clone();
+                        if let Some((lower, upper)) = after_book.price_band_bounds()? {
+                            frozen.market_band_worst =
+                                Some(if order.side == matching_domain::Side::Buy {
+                                    upper
+                                } else {
+                                    lower
+                                });
+                        }
+                        let boundary = matching_domain::market_order::effective_protection_at_command_start_with_source(order.market_protection.as_ref(), &frozen, order.side, context.math)?;
+                        let mut source =
+                            crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+                        let execution = after_book.execute_market_quote_with_boundary_source(
+                            order,
+                            context.math,
+                            boundary,
+                            &mut source,
+                        )?;
+                        *cursor = source.into_cursor().expect("游标来源");
+                        (
+                            execution.events().to_vec(),
+                            Some((execution.spent_quote(), execution.unused_quote())),
+                        )
+                    } else {
+                        let execution = after_book.execute_market_by_quote_with_cursor(
+                            order,
+                            context.math,
+                            cursor,
+                        )?;
+                        (
+                            execution.events().to_vec(),
+                            Some((execution.spent_quote(), execution.unused_quote())),
+                        )
+                    }
+                }
             }
-            crate::MarketRegistryOrder::Quote(order) => {
-                if let Some(protection) = context.protection {
-                    let execution = after_book.execute_market_by_quote_with_protection(
-                        order,
-                        protection,
-                        context.math,
-                        context.trade_ids,
-                    )?;
-                    (
-                        execution.events().to_vec(),
-                        Some((execution.spent_quote(), execution.unused_quote())),
-                    )
-                } else {
-                    let execution = after_book.execute_market_by_quote(
-                        order,
-                        context.math,
-                        context.trade_ids,
-                    )?;
-                    (
-                        execution.events().to_vec(),
-                        Some((execution.spent_quote(), execution.unused_quote())),
-                    )
+        } else {
+            match request {
+                crate::MarketRegistryOrder::Base(order) => {
+                    let events = if let Some(protection) = context.protection {
+                        after_book.execute_market_by_base_with_protection(
+                            order,
+                            protection,
+                            context.math,
+                            context.trade_ids,
+                        )?
+                    } else {
+                        after_book
+                            .execute_market_by_base(order, context.trade_ids, context.math)?
+                            .events()
+                            .to_vec()
+                    };
+                    (events, None)
+                }
+                crate::MarketRegistryOrder::Quote(order) => {
+                    if let Some(protection) = context.protection {
+                        let execution = after_book.execute_market_by_quote_with_protection(
+                            order,
+                            protection,
+                            context.math,
+                            context.trade_ids,
+                        )?;
+                        (
+                            execution.events().to_vec(),
+                            Some((execution.spent_quote(), execution.unused_quote())),
+                        )
+                    } else {
+                        let execution = after_book.execute_market_by_quote(
+                            order,
+                            context.math,
+                            context.trade_ids,
+                        )?;
+                        (
+                            execution.events().to_vec(),
+                            Some((execution.spent_quote(), execution.unused_quote())),
+                        )
+                    }
                 }
             }
         };
@@ -157,7 +249,8 @@ impl ProductionOrderBook {
         after_registry
             .apply_binding_transition(transition)
             .expect("fresh market binding plan");
-        after_registry.validate_order_bindings(
+        self.validate_registry_bindings(
+            &after_registry,
             after_book
                 .reservations
                 .iter()
@@ -194,6 +287,17 @@ impl ProductionOrderBook {
         registry: &ReservationRegistry,
         context: ProductionCancelReplaceContext<'_>,
     ) -> Result<ProductionPlacePlan, RejectReason> {
+        self.plan_place_with_registry_inner(request, state, registry, context, None)
+    }
+
+    fn plan_place_with_registry_inner(
+        &self,
+        request: ProductionPlaceOrder,
+        state: ReservationState,
+        registry: &ReservationRegistry,
+        context: ProductionCancelReplaceContext<'_>,
+        mut cursor: Option<&mut matching_domain::TradeIdCursor>,
+    ) -> Result<ProductionPlacePlan, RejectReason> {
         if let Some((_, configured)) = self.price_band_config() {
             assert_eq!(*context.math, configured, "市场数值配置不一致");
         }
@@ -202,7 +306,8 @@ impl ProductionOrderBook {
             ProductionPlaceOrder::Iceberg { order, .. } => order.order().clone(),
         };
         self.validate_new_reservation(accepted.order_id, accepted.user_id, &state)?;
-        registry.validate_order_bindings(
+        self.validate_registry_bindings(
+            registry,
             self.reservations
                 .iter()
                 .map(|(id, state)| (*id, state))
@@ -234,22 +339,55 @@ impl ProductionOrderBook {
                     after_book.place_limit_post_only(order)?;
                     Vec::new()
                 } else {
-                    match time_in_force {
-                        TimeInForce::Ioc => after_book
-                            .place_limit_ioc(order, context.math, context.trade_ids)?
-                            .events()
-                            .to_vec(),
-                        TimeInForce::Fok => after_book
-                            .place_limit_fok(order, context.math, context.trade_ids)?
-                            .events()
-                            .to_vec(),
-                        _ => after_book.place_limit_timed_with_events(
-                            order,
-                            time_in_force,
-                            context.now,
-                            context.current_session_id,
-                            context.trade_ids,
-                        )?,
+                    if let Some(cursor) = cursor.as_deref_mut() {
+                        match time_in_force {
+                            TimeInForce::Ioc | TimeInForce::Fok => after_book
+                                .place_limit_immediate_with_cursor(
+                                    order,
+                                    context.math,
+                                    time_in_force == TimeInForce::Fok,
+                                    cursor,
+                                )?
+                                .events()
+                                .to_vec(),
+                            _ => {
+                                Self::validate_resting_tif(
+                                    time_in_force,
+                                    context.now,
+                                    context.current_session_id,
+                                )?;
+                                let id = order.order_id;
+                                let events =
+                                    after_book.place_limit_gtc_with_cursor(order, cursor)?;
+                                if let Some(index) = after_book.orders.get(&id).copied() {
+                                    after_book
+                                        .arena
+                                        .get_mut(index)
+                                        .expect("planned residual")
+                                        .replace_initial_gtc_with_tif(time_in_force);
+                                    after_book.regular_expiry.insert(id, time_in_force);
+                                }
+                                events
+                            }
+                        }
+                    } else {
+                        match time_in_force {
+                            TimeInForce::Ioc => after_book
+                                .place_limit_ioc(order, context.math, context.trade_ids)?
+                                .events()
+                                .to_vec(),
+                            TimeInForce::Fok => after_book
+                                .place_limit_fok(order, context.math, context.trade_ids)?
+                                .events()
+                                .to_vec(),
+                            _ => after_book.place_limit_timed_with_events(
+                                order,
+                                time_in_force,
+                                context.now,
+                                context.current_session_id,
+                                context.trade_ids,
+                            )?,
+                        }
                     }
                 }
             }
@@ -265,7 +403,11 @@ impl ProductionOrderBook {
                     after_book.place_iceberg_post_only(order, context.math)?;
                     Vec::new()
                 } else {
-                    after_book.place_iceberg(order, context.math, context.trade_ids)?
+                    if let Some(cursor) = cursor {
+                        after_book.place_iceberg_with_cursor(order, context.math, cursor)?
+                    } else {
+                        after_book.place_iceberg(order, context.math, context.trade_ids)?
+                    }
                 }
             }
         };
@@ -321,7 +463,8 @@ impl ProductionOrderBook {
         after_registry
             .apply_binding_transition(transition)
             .expect("fresh placement binding plan");
-        after_registry.validate_order_bindings(
+        self.validate_registry_bindings(
+            &after_registry,
             after_book
                 .reservations
                 .iter()
@@ -348,5 +491,53 @@ impl ProductionOrderBook {
         *self = plan.after_book;
         *registry = plan.after_registry;
         Ok(plan.events)
+    }
+
+    /// 在候选簿、登记表和游标中预演市价，成功时原子提交。
+    pub fn market_with_registry_and_cursor(
+        &mut self,
+        request: crate::MarketRegistryOrder,
+        state: ReservationState,
+        registry: &mut ReservationRegistry,
+        context: crate::MarketRegistryContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<crate::MarketRegistryResult, RejectReason> {
+        let mut candidate = cursor.clone();
+        let plan = self.plan_market_with_registry_inner(
+            request,
+            state,
+            registry,
+            context,
+            Some(&mut candidate),
+        )?;
+        let result = self
+            .apply_market_with_registry(registry, plan)
+            .expect("fresh market plan");
+        *cursor = candidate;
+        Ok(result)
+    }
+
+    /// 在候选簿、登记表与游标上预演下单，全部成功后一次安装。
+    pub fn place_with_registry_and_cursor(
+        &mut self,
+        request: ProductionPlaceOrder,
+        state: ReservationState,
+        registry: &mut ReservationRegistry,
+        context: ProductionCancelReplaceContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = cursor.clone();
+        let plan = self.plan_place_with_registry_inner(
+            request,
+            state,
+            registry,
+            context,
+            Some(&mut candidate),
+        )?;
+        let events = self
+            .apply_place_with_registry(registry, plan)
+            .expect("fresh placement plan");
+        *cursor = candidate;
+        Ok(events)
     }
 }

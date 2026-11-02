@@ -10,6 +10,6 @@ pub struct TriggerRegistryContext<'a> {
     pub current_session_id: u64,
     /// 当前市场的数值规则。
     pub math: &'a MarketMath,
-    /// 已分配的真实成交身份。
+    /// 旧切片入口由调用方提供的成交身份；游标入口不读取此字段。
     pub trade_ids: &'a [TradeId],
 }

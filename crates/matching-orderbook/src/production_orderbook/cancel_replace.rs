@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 /// 调用方固定的真实市场数值、逻辑时间、时段和成交身份。
 ///
 /// 资金需求与费率由独立的 `ExpectedReplacementReservation` 提供，不能从令牌猜测。
-/// 成交身份沿用正常生产撮合的调用方契约：容量不足在首次写入前停止处理。
+/// 旧切片入口由调用方提供足量成交身份；游标入口在候选状态按真实成交生成。
 pub struct ProductionCancelReplaceContext<'a> {
     /// 实际市场价格、数量和本金规则。
     pub math: &'a MarketMath,
@@ -28,13 +28,15 @@ pub struct ProductionCancelReplaceContext<'a> {
     pub now: LogicalTime,
     /// 当前实际交易时段身份。
     pub current_session_id: u64,
-    /// 调用方已分配的原序成交身份；本入口不分配全局身份。
+    /// 旧切片入口由调用方提供的原序成交身份；游标入口不读取此字段。
     pub trade_ids: &'a [TradeId],
 }
 
 /// 提交前完整物理业务快照，不是持久化快照格式。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductionSnapshot {
+    /// 簿已绑定的可信市场身份。
+    market_id: Option<matching_domain::MarketId>,
     /// 买方价格档及其 intrusive FIFO 链的完整快照。
     bids: BTreeMap<Price, PriceLevel>,
     /// 卖方价格档及其 intrusive FIFO 链的完整快照。
@@ -73,10 +75,12 @@ impl ProductionSnapshot {
             regular_expiry: book.regular_expiry.clone(),
             reference_prices: book.reference_prices.clone(),
             price_band: book.price_band,
+            market_id: book.market_id,
         }
     }
 }
 
+/// 撤单替换计划中旧订单所在的实际容器及位置。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OldLocation {
     /// 旧单位于普通订单簿的 Arena 槽位。
@@ -132,7 +136,7 @@ struct ProductionStandardReplace {
     tif: TimeInForce,
     /// 真实生产索引与 FIFO 扫描冻结的冰山成交片计划。
     fills: IcebergPlan,
-    /// 与冻结成交片一一对应的调用方成交身份。
+    /// 与冻结成交片一一对应的成交身份，来自旧切片或命令游标。
     trade_ids: Vec<TradeId>,
     /// 新单尚有余量时冻结的实际挂单计划。
     residual: Option<RestPlan>,
@@ -157,7 +161,7 @@ impl ProductionOrderBook {
         keys: &RiskKeySet,
         context: ProductionCancelReplaceContext<'_>,
     ) -> Result<ProductionCancelReplacePlan, CancelReplaceRejection> {
-        self.plan_cancel_replace_inner(request, expected, registry, keys, context)
+        self.plan_cancel_replace_inner(request, expected, registry, keys, context, None)
             .map_err(|reason| request.rejection(reason))
     }
 
@@ -278,6 +282,7 @@ impl ProductionOrderBook {
         registry: &ReservationRegistry,
         keys: &RiskKeySet,
         context: ProductionCancelReplaceContext<'_>,
+        mut cursor: Option<&mut matching_domain::TradeIdCursor>,
     ) -> Result<ProductionCancelReplacePlan, RejectReason> {
         if let Some((_, configured)) = self.price_band_config() {
             assert_eq!(*context.math, configured, "市场数值配置不一致");
@@ -332,8 +337,10 @@ impl ProductionOrderBook {
         {
             return Err(RejectReason::InvalidReservation);
         }
-        registry
-            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        self.validate_registry_bindings(
+            registry,
+            self.reservations.iter().map(|(id, state)| (*id, state)),
+        )?;
 
         let replacement = &request.replacement;
         let accepted = LimitOrder {
@@ -403,28 +410,60 @@ impl ProductionOrderBook {
                     after_book.place_iceberg_post_only(iceberg, context.math)?;
                     Vec::new()
                 } else {
-                    after_book.place_iceberg(iceberg, context.math, context.trade_ids)?
+                    if let Some(cursor) = cursor.as_deref_mut() {
+                        after_book.place_iceberg_with_cursor(iceberg, context.math, cursor)?
+                    } else {
+                        after_book.place_iceberg(iceberg, context.math, context.trade_ids)?
+                    }
                 }
             } else if flags.post_only {
                 after_book.place_limit_post_only(accepted.clone())?;
                 Vec::new()
             } else {
-                match tif {
-                    TimeInForce::Ioc => after_book
-                        .place_limit_ioc(accepted.clone(), context.math, context.trade_ids)?
-                        .events()
-                        .to_vec(),
-                    TimeInForce::Fok => after_book
-                        .place_limit_fok(accepted.clone(), context.math, context.trade_ids)?
-                        .events()
-                        .to_vec(),
-                    _ => after_book.place_limit_timed_with_events(
-                        accepted.clone(),
-                        tif,
-                        context.now,
-                        context.current_session_id,
-                        context.trade_ids,
-                    )?,
+                if let Some(cursor) = cursor.as_deref_mut() {
+                    match tif {
+                        TimeInForce::Ioc | TimeInForce::Fok => after_book
+                            .place_limit_immediate_with_cursor(
+                                accepted.clone(),
+                                context.math,
+                                tif == TimeInForce::Fok,
+                                cursor,
+                            )?
+                            .events()
+                            .to_vec(),
+                        _ => {
+                            let events =
+                                after_book.place_limit_gtc_with_cursor(accepted.clone(), cursor)?;
+                            if let Some(index) = after_book.orders.get(&accepted.order_id).copied()
+                            {
+                                after_book
+                                    .arena
+                                    .get_mut(index)
+                                    .expect("replacement residual")
+                                    .replace_initial_gtc_with_tif(tif);
+                                after_book.regular_expiry.insert(accepted.order_id, tif);
+                            }
+                            events
+                        }
+                    }
+                } else {
+                    match tif {
+                        TimeInForce::Ioc => after_book
+                            .place_limit_ioc(accepted.clone(), context.math, context.trade_ids)?
+                            .events()
+                            .to_vec(),
+                        TimeInForce::Fok => after_book
+                            .place_limit_fok(accepted.clone(), context.math, context.trade_ids)?
+                            .events()
+                            .to_vec(),
+                        _ => after_book.place_limit_timed_with_events(
+                            accepted.clone(),
+                            tif,
+                            context.now,
+                            context.current_session_id,
+                            context.trade_ids,
+                        )?,
+                    }
                 }
             };
             let mut total = matching_domain::QuoteAmount::new(0);
@@ -489,7 +528,8 @@ impl ProductionOrderBook {
             after_registry
                 .apply_binding_transition(bindings)
                 .expect("fresh replacement bindings");
-            after_registry.validate_order_bindings(
+            self.validate_registry_bindings(
+                &after_registry,
                 after_book
                     .reservations
                     .iter()
@@ -515,10 +555,12 @@ impl ProductionOrderBook {
         if tif == TimeInForce::Fok && fills.base_remaining != 0 {
             return Err(RejectReason::FokInsufficientLiquidity);
         }
-        assert!(
-            context.trade_ids.len() >= fills.fills.len(),
-            "insufficient TradeIds before CancelReplace commit"
-        );
+        if cursor.is_none() {
+            assert!(
+                context.trade_ids.len() >= fills.fills.len(),
+                "insufficient TradeIds before CancelReplace commit"
+            );
+        }
         let residual =
             if fills.base_remaining > 0 && !matches!(tif, TimeInForce::Ioc | TimeInForce::Fok) {
                 let mut visible = accepted.clone();
@@ -587,14 +629,21 @@ impl ProductionOrderBook {
         after_registry
             .apply_binding_transition(bindings)
             .expect("fresh production terminal binding batch");
-        after_registry.validate_order_bindings(
+        self.validate_registry_bindings(
+            &after_registry,
             self.reservations
                 .iter()
                 .filter(|(id, _)| **id != request.old_order_id && !terminal_ids.contains(id))
                 .map(|(id, state)| (*id, state))
                 .chain(residual.map(|_| (accepted.order_id, &active_reservation))),
         )?;
-        let trade_ids = context.trade_ids[..fills.fills.len()].to_vec();
+        let trade_ids = if let Some(cursor) = cursor {
+            (0..fills.fills.len())
+                .map(|_| cursor.next_trade_id())
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            context.trade_ids[..fills.fills.len()].to_vec()
+        };
         let reference_after = self
             .reference_prices
             .plan_trade_prices(fills.fills.iter().map(|fill| fill.price))?;
@@ -617,5 +666,33 @@ impl ProductionOrderBook {
                 reference_after,
             })),
         })
+    }
+
+    /// 在候选游标与预留计划上执行撤单替换，仅完整提交后推进游标。
+    pub fn cancel_replace_with_cursor(
+        &mut self,
+        request: &CancelReplaceOrder,
+        expected: &ExpectedReplacementReservation,
+        registry: &mut ReservationRegistry,
+        keys: &RiskKeySet,
+        context: ProductionCancelReplaceContext<'_>,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, CancelReplaceRejection> {
+        let mut candidate = cursor.clone();
+        let plan = self
+            .plan_cancel_replace_inner(
+                request,
+                expected,
+                registry,
+                keys,
+                context,
+                Some(&mut candidate),
+            )
+            .map_err(|reason| request.rejection(reason))?;
+        let events = self
+            .apply_cancel_replace(registry, plan)
+            .expect("fresh replacement plan");
+        *cursor = candidate;
+        Ok(events)
     }
 }

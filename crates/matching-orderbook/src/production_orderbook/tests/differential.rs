@@ -48,9 +48,13 @@ use tape::{
 /// 保护市价与 IOC/FOK/PostOnly 使用各自的命令结构和独立执行适配。
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    /// 提交普通限价单。
     Place(LimitOrder),
+    /// 取消指定订单。
     Cancel(OrderId),
+    /// 执行基础数量市价单。
     MarketByBase(MarketByBase, Vec<TradeId>),
+    /// 执行报价预算市价单。
     MarketByQuote(MarketByQuote, Vec<TradeId>),
 }
 
@@ -115,9 +119,13 @@ struct ObservedBook {
 /// 将两套实现的不同返回类型收敛到同一个命令执行记录。
 #[derive(Debug, PartialEq, Eq)]
 enum CommandOutcome {
+    /// 提交普通限价单。
     Place(Result<Vec<TradeEvent>, RejectReason>),
+    /// 记录取消结果或拒绝。
     Cancel(Result<ObservedOrder, RejectReason>),
+    /// 记录基础数量市价成交结果或拒绝。
     MarketByBase(Result<Vec<TradeEvent>, RejectReason>),
+    /// 记录报价预算市价执行结果或拒绝。
     MarketByQuote(Result<MarketByQuoteExecution, RejectReason>),
 }
 

@@ -15,6 +15,7 @@ use matching_domain::{
 };
 use matching_risk::ReservationState;
 
+/// 参考模型独立扫描成交片时使用的输入条件。
 pub(super) struct SliceRequest<'a> {
     /// 正在执行的订单标识符。
     pub id: OrderId,
@@ -40,6 +41,7 @@ pub(super) struct SliceRequest<'a> {
     pub one_fill: bool,
 }
 
+/// 参考模型预演所得的挂单、成交及预算后态。
 pub(super) struct SlicePlan {
     /// 提交后按参考模型顺序保存的全部挂单。
     pub(super) orders: Vec<ReferenceOrder>,
@@ -400,80 +402,8 @@ impl ReferenceOrderBook {
         ids: &[TradeId],
         fok: bool,
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        self.check_duplicate(order.order_id)?;
-        math.trade_notional(order.price, order.qty)
-            .map_err(Self::reject_quote_math_error)?;
-        let mut plan = self.plan_limit_slices(&order, Some(math), order.qty.get(), false)?;
-        if fok && plan.taker_terminal {
-            let terminal = plan
-                .events
-                .last()
-                .cloned()
-                .expect("terminal plan has cancellation");
-            let maker_cancel = if matches!(
-                terminal,
-                EngineEvent::OrderCanceled {
-                    reason: CancelReason::SelfTradePreventionBoth,
-                    ..
-                }
-            ) {
-                plan.events
-                    .iter()
-                    .rev()
-                    .find(|event| {
-                        matches!(
-                            event,
-                            EngineEvent::OrderCanceled {
-                                reason: CancelReason::SelfTradePreventionMaker,
-                                ..
-                            }
-                        )
-                    })
-                    .cloned()
-            } else {
-                None
-            };
-            plan.orders = self.orders.clone();
-            plan.next_priority = self.next_priority;
-            plan.events.clear();
-            if let Some(EngineEvent::OrderCanceled { order_id, .. }) = maker_cancel {
-                let index = plan
-                    .orders
-                    .iter()
-                    .position(|maker| maker.original_order().order_id == order_id)
-                    .expect("planned STP maker remains active");
-                let maker = plan.orders.remove(index);
-                plan.events.push(EngineEvent::OrderCanceled {
-                    order_id,
-                    remaining: OrderRemaining::Base(Qty::try_new(maker.total_remaining())?),
-                    reason: CancelReason::SelfTradePreventionMaker,
-                });
-            }
-            let reason = match terminal {
-                EngineEvent::OrderCanceled { reason, .. } => reason,
-                _ => unreachable!("terminal cancellation"),
-            };
-            plan.events.push(EngineEvent::OrderCanceled {
-                order_id: order.order_id,
-                remaining: OrderRemaining::Base(order.qty),
-                reason,
-            });
-            plan.remaining = order.qty.get();
-        }
-        if fok && plan.remaining != 0 && !plan.taker_terminal {
-            return Err(RejectReason::FokInsufficientLiquidity);
-        }
-        let canceled = if plan.remaining == 0 || plan.taker_terminal {
-            None
-        } else {
-            Some(Qty::try_new(plan.remaining)?)
-        };
-        let events = self.commit_slices(plan, ids);
-        Ok(LimitImmediateExecution::from_events(
-            order.order_id,
-            events,
-            canceled,
-        ))
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(ids);
+        self.iceberg_immediate_with_source(order, math, &mut source, fok)
     }
 
     /// 撮合普通 GTC 并保留冰山挂单的完整生命周期事件，最后挂入余量。
@@ -533,62 +463,8 @@ impl ReferenceOrderBook {
         trade_ids: &[TradeId],
         frozen: Option<Option<(Price, Price)>>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        order.validate_stp_mode()?;
-        self.check_duplicate(order.order_id)?;
-        if let Some(band) = frozen {
-            if let Some((lower, upper)) = band
-                && (order.price < lower || order.price > upper)
-            {
-                return Err(RejectReason::PriceBandExceeded);
-            }
-        } else {
-            self.validate_band_price(order.price)?;
-        }
-        if let Some(math) = math {
-            math.trade_notional(order.price, order.qty)
-                .map_err(Self::reject_quote_math_error)?;
-            if let Some(peak) = peak {
-                math.trade_notional(order.price, peak)
-                    .map_err(Self::reject_quote_math_error)?;
-            }
-        }
-        let mut plan = self.plan_limit_slices(&order, math, order.qty.get(), false)?;
-        let mut virtual_book = Self {
-            orders: plan.orders,
-            reservations: self.reservations.clone(),
-            next_priority: plan.next_priority,
-            stop_orders: self.stop_orders.clone(),
-            next_stop_priority: self.next_stop_priority,
-            reference_prices: self.reference_prices.clone(),
-            price_band: self.price_band,
-        };
-        if plan.remaining != 0 && !plan.taker_terminal {
-            let priority = virtual_book.allocate_slice_priority()?;
-            let mut payload = order.clone();
-            payload.qty = Qty::try_new(plan.remaining)?;
-            let resting = if let Some(peak) = peak {
-                ReferenceOrder::iceberg(order.clone(), plan.remaining, peak, priority)
-            } else {
-                ReferenceOrder::new(payload, priority)
-            };
-            virtual_book.check_visible_aggregate(&order, resting.remaining())?;
-            virtual_book.orders.push(resting);
-        }
-        plan.orders = virtual_book.orders;
-        plan.next_priority = virtual_book.next_priority;
-        if peak.is_some() && !plan.taker_terminal && plan.remaining != order.qty.get() {
-            plan.events.push(if plan.remaining == 0 {
-                EngineEvent::OrderFilled {
-                    order_id: order.order_id,
-                }
-            } else {
-                EngineEvent::OrderPartiallyFilled {
-                    order_id: order.order_id,
-                    remaining: Qty::try_new(plan.remaining)?,
-                }
-            });
-        }
-        Ok(self.commit_slices(plan, trade_ids))
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(trade_ids);
+        self.place_sliced_gtc_with_source(order, peak, math, &mut source, frozen)
     }
 
     /// 包括等价的交叉在改簿前拒绝；只有实际挂单才分配优先级。
@@ -710,6 +586,152 @@ impl ReferenceOrderBook {
         boundary: Option<(Price, ProtectionSource)>,
         ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(ids);
+        self.slice_market_base_with_source(incoming, math, boundary, &mut source)
+    }
+
+    /// 以冻结保护边界独立预演报价预算市价单。
+    pub(super) fn slice_market_quote_with_boundary(
+        &mut self,
+        incoming: MarketByQuote,
+        math: &MarketMath,
+        boundary: Option<(Price, ProtectionSource)>,
+        ids: &[TradeId],
+    ) -> Result<(Vec<EngineEvent>, QuoteAmount, QuoteAmount), RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(ids);
+        self.slice_market_quote_with_source(incoming, math, boundary, &mut source)
+    }
+
+    /// 在候选参考簿中按真实成交顺序分配根命令成交身份。
+    pub fn place_limit_gtc_with_cursor(
+        &mut self,
+        order: LimitOrder,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let events =
+            candidate.place_sliced_gtc_with_source(order, None, None, &mut source, None)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(events)
+    }
+
+    /// 以根命令游标执行冰山吃单；失败时保留原订单簿和游标。
+    pub fn place_iceberg_with_cursor(
+        &mut self,
+        order: IcebergOrder,
+        math: &MarketMath,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if let Some((_, configured)) = self.price_band_config() {
+            assert_eq!(*math, configured, "市场数值配置不一致");
+        }
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let events = candidate.place_sliced_gtc_with_source(
+            order.order().clone(),
+            Some(order.peak_size()),
+            Some(math),
+            &mut source,
+            None,
+        )?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *self = candidate;
+        *cursor = source.into_cursor().expect("游标来源");
+        Ok(events)
+    }
+
+    pub(super) fn place_sliced_gtc_with_source(
+        &mut self,
+        order: LimitOrder,
+        peak: Option<Qty>,
+        math: Option<&MarketMath>,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+        frozen: Option<Option<(Price, Price)>>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        order.validate_stp_mode()?;
+        self.check_duplicate(order.order_id)?;
+        if let Some(band) = frozen {
+            if let Some((lower, upper)) = band
+                && (order.price < lower || order.price > upper)
+            {
+                return Err(RejectReason::PriceBandExceeded);
+            }
+        } else {
+            self.validate_band_price(order.price)?;
+        }
+        if let Some(math) = math {
+            math.trade_notional(order.price, order.qty)
+                .map_err(Self::reject_quote_math_error)?;
+            if let Some(peak) = peak {
+                math.trade_notional(order.price, peak)
+                    .map_err(Self::reject_quote_math_error)?;
+            }
+        }
+        let mut plan = self.plan_limit_slices(&order, math, order.qty.get(), false)?;
+        let mut virtual_book = Self {
+            orders: plan.orders,
+            reservations: self.reservations.clone(),
+            next_priority: plan.next_priority,
+            stop_orders: self.stop_orders.clone(),
+            next_stop_priority: self.next_stop_priority,
+            reference_prices: self.reference_prices.clone(),
+            price_band: self.price_band,
+        };
+        if plan.remaining != 0 && !plan.taker_terminal {
+            let priority = virtual_book.allocate_slice_priority()?;
+            let mut payload = order.clone();
+            payload.qty = Qty::try_new(plan.remaining)?;
+            let resting = if let Some(peak) = peak {
+                ReferenceOrder::iceberg(order.clone(), plan.remaining, peak, priority)
+            } else {
+                ReferenceOrder::new(payload, priority)
+            };
+            virtual_book.check_visible_aggregate(&order, resting.remaining())?;
+            virtual_book.orders.push(resting);
+        }
+        plan.orders = virtual_book.orders;
+        plan.next_priority = virtual_book.next_priority;
+        if peak.is_some() && !plan.taker_terminal && plan.remaining != order.qty.get() {
+            plan.events.push(if plan.remaining == 0 {
+                EngineEvent::OrderFilled {
+                    order_id: order.order_id,
+                }
+            } else {
+                EngineEvent::OrderPartiallyFilled {
+                    order_id: order.order_id,
+                    remaining: Qty::try_new(plan.remaining)?,
+                }
+            });
+        }
+        let count = plan
+            .events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Trade(_)))
+            .count();
+        let trade_ids = source.reserve(count)?;
+        Ok(self.commit_slices(plan, &trade_ids))
+    }
+
+    pub(super) fn slice_market_base_with_source(
+        &mut self,
+        incoming: MarketByBase,
+        math: Option<&MarketMath>,
+        boundary: Option<(Price, ProtectionSource)>,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
         self.check_duplicate(incoming.order_id)?;
         let plan = self.plan_slices(SliceRequest {
             id: incoming.order_id,
@@ -724,16 +746,21 @@ impl ReferenceOrderBook {
             protection: boundary,
             one_fill: false,
         })?;
-        Ok(self.commit_slices(plan, ids))
+        let count = plan
+            .events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Trade(_)))
+            .count();
+        let ids = source.reserve(count)?;
+        Ok(self.commit_slices(plan, &ids))
     }
 
-    /// 以冻结保护边界独立预演报价预算市价单。
-    pub(super) fn slice_market_quote_with_boundary(
+    pub(super) fn slice_market_quote_with_source(
         &mut self,
         incoming: MarketByQuote,
         math: &MarketMath,
         boundary: Option<(Price, ProtectionSource)>,
-        ids: &[TradeId],
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
     ) -> Result<(Vec<EngineEvent>, QuoteAmount, QuoteAmount), RejectReason> {
         self.check_duplicate(incoming.order_id)?;
         let plan = self.plan_slices(SliceRequest {
@@ -751,6 +778,102 @@ impl ReferenceOrderBook {
         })?;
         let spent = plan.spent;
         let unused = plan.unused;
-        Ok((self.commit_slices(plan, ids), spent, unused))
+        let count = plan
+            .events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Trade(_)))
+            .count();
+        let ids = source.reserve(count)?;
+        Ok((self.commit_slices(plan, &ids), spent, unused))
+    }
+
+    /// 对立即执行计划中真实成交分配身份，保留旧业务事件顺序。
+    pub(super) fn iceberg_immediate_with_source(
+        &mut self,
+        order: LimitOrder,
+        math: &MarketMath,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+        fok: bool,
+    ) -> Result<LimitImmediateExecution, RejectReason> {
+        self.check_duplicate(order.order_id)?;
+        math.trade_notional(order.price, order.qty)
+            .map_err(Self::reject_quote_math_error)?;
+        let mut plan = self.plan_limit_slices(&order, Some(math), order.qty.get(), false)?;
+        if fok && plan.taker_terminal {
+            let terminal = plan
+                .events
+                .last()
+                .cloned()
+                .expect("terminal plan has cancellation");
+            let maker_cancel = if matches!(
+                terminal,
+                EngineEvent::OrderCanceled {
+                    reason: CancelReason::SelfTradePreventionBoth,
+                    ..
+                }
+            ) {
+                plan.events
+                    .iter()
+                    .rev()
+                    .find(|event| {
+                        matches!(
+                            event,
+                            EngineEvent::OrderCanceled {
+                                reason: CancelReason::SelfTradePreventionMaker,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+            plan.orders = self.orders.clone();
+            plan.next_priority = self.next_priority;
+            plan.events.clear();
+            if let Some(EngineEvent::OrderCanceled { order_id, .. }) = maker_cancel {
+                let index = plan
+                    .orders
+                    .iter()
+                    .position(|maker| maker.original_order().order_id == order_id)
+                    .expect("planned STP maker remains active");
+                let maker = plan.orders.remove(index);
+                plan.events.push(EngineEvent::OrderCanceled {
+                    order_id,
+                    remaining: OrderRemaining::Base(Qty::try_new(maker.total_remaining())?),
+                    reason: CancelReason::SelfTradePreventionMaker,
+                });
+            }
+            let reason = match terminal {
+                EngineEvent::OrderCanceled { reason, .. } => reason,
+                _ => unreachable!("terminal cancellation"),
+            };
+            plan.events.push(EngineEvent::OrderCanceled {
+                order_id: order.order_id,
+                remaining: OrderRemaining::Base(order.qty),
+                reason,
+            });
+            plan.remaining = order.qty.get();
+        }
+        if fok && plan.remaining != 0 && !plan.taker_terminal {
+            return Err(RejectReason::FokInsufficientLiquidity);
+        }
+        let canceled = if plan.remaining == 0 || plan.taker_terminal {
+            None
+        } else {
+            Some(Qty::try_new(plan.remaining)?)
+        };
+        let count = plan
+            .events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Trade(_)))
+            .count();
+        let ids = source.reserve(count)?;
+        let events = self.commit_slices(plan, &ids);
+        Ok(LimitImmediateExecution::from_events(
+            order.order_id,
+            events,
+            canceled,
+        ))
     }
 }

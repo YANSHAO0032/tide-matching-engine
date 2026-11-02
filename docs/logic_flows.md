@@ -1,6 +1,28 @@
 # 匹配引擎关键逻辑流程图
 
-本文件是项目关键逻辑流程图的长期入口。当前收录已验收的工程基础、订单簿和行为差分验证流程；后续经过验收的重要流程也应补入此文件。现有图不表示尚未实现的扩展订单规则、持久化或运行时能力。
+本文件是项目关键逻辑流程图的长期入口。当前收录已验收的工程基础、订单簿和行为差分验证流程；后续经过验收的重要流程也应补入此文件。现有图不表示尚未实现的扩展订单规则、持久化或运行时扩展能力。 图中涉及调用方提供 TradeId 切片及容量预检的描述针对既有切片入口；命令游标入口在候选状态按实际成交顺序生成身份。
+
+## 分片消息执行与关闭
+
+```mermaid
+flowchart TD
+    A[变更调用方提供命令身份和路由版本] --> B{是否使用显式路由器}
+    B -- 是 --> R[按路由表检查市场归属和版本]
+    B -- 否 --> C[有界入口检查配额和关闭状态]
+    R --> C
+    Q[查询或屏障请求] --> C
+    C --> D[唯一工作线程按队列顺序接收]
+    D --> E{消息类型}
+    E -- 变更 --> F[再次检查归属和路由版本]
+    F --> G[分配分片序号并创建命令成交游标]
+    G --> H[执行业务并返回结果]
+    E -- 查询 --> I[读取订单节点并回复]
+    E -- 屏障 --> J[回复已执行序号水位]
+    K[关闭外部准入] --> L[等待已接受消息和内部屏障]
+    L --> M[线程退出并按截止时间等待]
+```
+
+查询和屏障不分配分片序号；拒绝进入业务执行之前不分配序号，进入后发生业务拒绝仍保留序号。队列和回复句柄仅在进程内使用。当前实现、支持范围及未完成的持久化和登记表集成见 [单写者分片运行时](runtime.md)。
 
 ## 工程基础与本地质量门
 
@@ -145,6 +167,8 @@ ID 查找平均 O(1)，已知节点的局部链表删除为 O(1)；定位或删�
 
 ## 生产订单簿的完整 Limit GTC
 
+以下图示既有切片入口；命令游标入口在候选状态按真实成交顺序取号，不要求预置身份数组。
+
 ```text
 LimitOrder + caller-supplied TradeIds
                  |
@@ -190,6 +214,8 @@ return TradeEvents in actual matching order
 生产订单簿使用 BTreeMap 决定双侧价格优先，使用 `PriceLevel` 决定同价 FIFO，HashMap 只做单个 OrderId 定位。此 GTC 入口和基础 rest 不接受 MarketMath，调用方须先完成市场数值校验。入口内所有可预期的 `RejectReason` 在第一笔成交前结束；预检与提交发生分歧属于内部不变量损坏，按 fail-closed 处理。
 
 ## 市价订单的预检、保护与提交
+
+以下图示既有切片入口；命令游标入口在候选状态按真实成交顺序取号。
 
 ```text
 MarketByBase / MarketByQuote + caller-supplied TradeIds
@@ -238,7 +264,7 @@ end remaining market quantity or quote budget; never rest taker
 incoming gets no QueuePriority; maker refresh can allocate
 ```
 
-普通市价入口不解释用户保护参数；带保护入口使用调用方在命令开始时捕获的不可变 context，不自行读取行情或 LastTrade。两类入口都在首笔 mutation 前完成可预期拒绝、TradeId 检查和金额计划校验。每个候选先检查保护边界，再执行 Quote 预算反推；边界内但不足一个合法 lot 是正常 dust 终止，不产生零数量 Trade 或保护触发。保护触发只表示首个越界 maker 终结命令，不消耗 TradeId，也不把未用预算当作成交。当前结果不代表完整资金释放或生命周期 envelope 已实现。
+普通市价入口依据已配置价格带和用户保护确定命令开始时的边界；显式保护入口使用调用方提供的命令开始 context，并按市场价格带取更严格边界。既有切片入口预检 TradeId 数量；游标入口在候选状态只对实际成交取号，溢出时不安装候选状态。每个候选先检查保护边界，再执行 Quote 预算反推；边界内但不足一个合法 lot 是正常 dust 终止，不产生零数量 Trade 或保护触发。保护触发只表示首个越界 maker 终结命令，不消耗 TradeId，也不把未用预算当作成交。当前结果不代表完整资金释放或生命周期 envelope 已实现。
 
 ## 限价立即执行与只挂单
 
@@ -273,7 +299,7 @@ Limit GTC + PostOnly
                               此时才分配 priority
 ```
 
-只挂单入口沿用基础限价载荷，调用方须先完成市场 tick/lot 校验；拒绝交叉后才检查 priority、档位聚合与容量。成功挂单后允许被后续订单作为 maker 成交。IOC/FOK 的输入及逐笔本金全部预检，TradeId 不足在 mutation 前 panic。完整入口和取消载荷说明见 [限价订单执行约束](limit_execution.md)。
+只挂单入口沿用基础限价载荷，调用方须先完成市场 tick/lot 校验；拒绝交叉后才检查 priority、档位聚合与容量。成功挂单后允许被后续订单作为 maker 成交。IOC/FOK 的输入及逐笔本金全部预检；既有切片入口的 TradeId 不足在 mutation 前 panic，游标入口使用候选状态并显式报告编号溢出。完整入口和取消载荷说明见 [限价订单执行约束](limit_execution.md)。
 
 ## 冰山可见片成交与补量
 
@@ -351,7 +377,7 @@ for each command, in original tape order
 100k path: stream records only; no final-state-only shortcut
 ```
 
-Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。跨 shard TradeId、WAL/digest/crash 仍无实现证据。
+Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。命令游标已按 cluster、shard、shard_seq 和 trade_index 编码；序号尚未持久化，不宣称跨重启唯一性。WAL/digest/crash 仍无实现证据。
 
 ## 未触发止损订单与触发前到期
 
@@ -405,7 +431,7 @@ flowchart TD
     M --> N
 ```
 
-两模型分别构造与提交计划，资金检查不访问网络。完整上下文入口先验证实际 tick/lot 与本金，再准备预留副本；所有后续业务失败都不能修改原单或 reservation version。TradeId 容量不足在写屏障之前 fail-stop。低层改单入口以调用方已完成数值和资金校验为前提，不能代替图中的完整入口。
+两模型分别构造与提交计划，资金检查不访问网络。完整上下文入口先验证实际 tick/lot 与本金，再准备预留副本；所有后续业务失败都不能修改原单或 reservation version。既有切片入口在写屏障之前检查 TradeId 容量；游标入口在候选计划中分配成交身份，溢出不提交候选。低层改单入口以调用方已完成数值和资金校验为前提，不能代替图中的完整入口。
 
 ## 挂单修改的优先级选择
 

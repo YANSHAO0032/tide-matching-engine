@@ -19,13 +19,13 @@ StopMarket 两种计量模式的旧单，以及所有 Market/Stop replacement �
 
 Reference 的 `ReferenceBookWithout` 独立过滤自身 Vec 的完整 old 身份；Production 的 `ProductionBookWithout` 借用真实价格索引和 FIFO，所有片扫描显式携带同一个 excluded OrderId。普通旧单的可见量、价档贡献、FIFO，冰山的隐藏量和未来补量全部排除；StopLimit 仅从止损/到期逻辑视图排除，从不成为普通可执行流动性。
 
-两侧依次核对旧身份及 shadow/registry parity、replacement 结构、真实 MarketMath 的 tick/lot/峰值/精确本金、逻辑时间/session、BookWithout 的 FOK/PostOnly、逐笔与累计 checked 本金、补量、余量挂单、优先级、TradeId 容量及终结 maker shadow。随后才验证金融过渡，并预计算全部终结订单的绑定批次。资金需求来自可信调用者按实际资产、最大费用和安全量计算的 `ExpectedReplacementReservation`，不能复制 token 覆盖量作为需求。
+两侧依次核对旧身份及 shadow/registry parity、replacement 结构、真实 MarketMath 的 tick/lot/峰值/精确本金、逻辑时间/session、BookWithout 的 FOK/PostOnly、逐笔与累计 checked 本金、补量、余量挂单、优先级、成交身份及终结 maker shadow。旧切片入口检查 TradeId 容量，游标入口按真实成交计划分配。随后才验证金融过渡，并预计算全部终结订单的绑定批次。资金需求来自可信调用者按实际资产、最大费用和安全量计算的 `ExpectedReplacementReservation`，不能复制 token 覆盖量作为需求。
 
 replacement 自带 STP 身份和模式；扫描时排除旧订单，处理其他实际冲突挂单。启用市场价格带时，候选限价须符合配置参考价确定的双侧范围；市价保护不适用于当前仅限价的 replacement 类型。
 
 Reference 在可丢弃副本完成自身正常 Place 预演，真实 Apply 比较完整簿及 registry 前态后安装已验证后态。Production 使用自己的价格索引与 FIFO 规划；启用 STP 时在排除旧单的候选副本完成撮合和归属规划，再安装冻结后态。两套计划、maker 扫描、BookWithout 和提交不共享。
 
-Apply 前态漂移返回 `ReservationApplyError::StateChanged`，属于必须停止处理的不变量错误。首次真实写入后不再执行正常业务拒绝、重新验签或回滚。TradeId 不足沿用调用方契约，在首次写入前 fail-stop。普通旧单和全成 maker 的槽位释放顺序由生产计划预测并在提交核对。新单仅实际 rest 才取得新 QueuePriority；补量也使用新 priority。旧 QueuePriority/StopPriority 不转移或返还。
+Apply 前态漂移返回 `ReservationApplyError::StateChanged`，属于必须停止处理的不变量错误。首次真实写入后不再执行正常业务拒绝、重新验签或回滚。旧切片入口 TradeId 不足沿用调用方契约，在首次写入前 fail-stop；游标耗尽返回 `ArithmeticOverflow = 5001`，候选簿、登记表及游标均不提交。普通旧单和全成 maker 的槽位释放顺序由生产计划预测并在提交核对。新单仅实际 rest 才取得新 QueuePriority；补量也使用新 priority。旧 QueuePriority/StopPriority 不转移或返还。
 
 ## 金融状态与 PendingR2
 

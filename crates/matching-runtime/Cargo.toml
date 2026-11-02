@@ -5,3 +5,11 @@ edition.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+crossbeam-queue = "0.3.14"
+matching-domain = { path = "../matching-domain" }
+matching-orderbook = { path = "../matching-orderbook" }
+
+[dev-dependencies]
+matching-risk = { path = '../matching-risk' }

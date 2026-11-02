@@ -4,20 +4,31 @@
 use super::*;
 use matching_domain::{CancelReason, LimitImmediateExecution};
 
+/// 用于执行策略差分测试的命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConstraintCommand {
+    /// 执行限价 GTC 订单。
     Gtc(LimitOrder),
+    /// 取消指定订单。
     Cancel(OrderId),
+    /// 执行限价 IOC 订单。
     Ioc(LimitOrder),
+    /// 执行限价 FOK 订单。
     Fok(LimitOrder),
+    /// 提交只挂单限价订单。
     PostOnly(LimitOrder),
 }
 
+/// 执行策略命令的可比较结果。
 #[derive(Debug, PartialEq, Eq)]
 enum ConstraintOutcome {
+    /// 记录限价 GTC 执行结果或拒绝。
     Gtc(Result<Vec<TradeEvent>, RejectReason>),
+    /// 记录取消结果或拒绝。
     Cancel(Result<ObservedOrder, RejectReason>),
+    /// 记录立即执行结果或拒绝。
     Immediate(Result<LimitImmediateExecution, RejectReason>),
+    /// 记录只挂单提交结果或拒绝。
     PostOnly(Result<(), RejectReason>),
 }
 
@@ -32,6 +43,7 @@ impl ConstraintOutcome {
     }
 }
 
+/// 执行策略命令及其观察结果。
 #[derive(Debug, PartialEq, Eq)]
 struct ConstraintRecord {
     /// 当前执行约束命令的统一结果。

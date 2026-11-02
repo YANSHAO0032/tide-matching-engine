@@ -145,8 +145,11 @@ pub struct MarketProtection {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtectionSource {
+    /// 用户提供的保护边界单独生效。
     User = 1,
+    /// 市场价格带边界单独生效。
     MarketBand = 2,
+    /// 用户和市场边界同时约束成交。
     Both = 3,
 }
 

@@ -175,19 +175,32 @@ fn stop(id: u128, kind: u8, side: Side, expiry: TriggerExpiry) -> StopOrder {
 /// 所有命令和预留需求均在回放前构造，不从任一模型的执行结果生成另一方输入。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
+    /// 挂入指定有效期的订单。
     Rest(LimitOrder, TimeInForce),
+    /// 提交冰山订单。
     Iceberg(IcebergOrder),
+    /// 登记未触发止损订单。
     Stop(StopOrder),
+    /// 使用预留状态提交订单。
     ReservedPlace(LimitOrder),
+    /// 提交普通限价单。
     Place(LimitOrder, TimeInForce),
+    /// 修改现有订单。
     Amend {
+        /// 待执行的改单载荷。
         patch: Box<AmendOrder>,
+        /// 本次测试使用的命令身份。
         command_id: u128,
+        /// 调整后所需的资产预留量。
         required: u128,
     },
+    /// 取消指定订单。
     Cancel(OrderId),
+    /// 推进逻辑时间。
     AdvanceTime(LogicalTime),
+    /// 终结指定交易时段。
     EndSession(u64),
+    /// 更新价格参考。
     Reference(PriceReference),
 }
 
@@ -199,10 +212,14 @@ fn amend(patch: AmendOrder) -> Command {
     }
 }
 
+/// 差分测试记录的命令执行结果。
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
+    /// 记录不携带业务事件的执行结果。
     Unit(Result<(), RejectReason>),
+    /// 记录原序业务事件或拒绝。
     Events(Result<Vec<EngineEvent>, RejectReason>),
+    /// 记录到期订单列表或拒绝。
     Expired(Result<Vec<ExpiredOrder>, RejectReason>),
 }
 
@@ -222,6 +239,7 @@ impl Outcome {
     }
 }
 
+/// 差分观察的普通订单运行态。
 #[derive(Debug, PartialEq, Eq)]
 struct Regular {
     /// 订单创建时的完整普通限价载荷。
@@ -240,6 +258,7 @@ struct Regular {
     priority: QueuePriority,
 }
 
+/// 差分比较使用的状态投影。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct State {
     /// 双模型共享的可观察订单簿、深度与事件状态。
@@ -422,6 +441,7 @@ pub(super) fn invariants(state: &State, step: usize) {
     }
 }
 
+/// 保存单次命令结果及其状态观察。
 #[derive(Debug, PartialEq, Eq)]
 struct Record {
     /// 单条命令在两个独立模型中的可观察结果。
@@ -430,6 +450,7 @@ struct Record {
     state: State,
 }
 
+/// 持有独立模型并驱动差分比较的测试夹具。
 struct Harness {
     /// 独立参考订单簿。
     r: ReferenceOrderBook,

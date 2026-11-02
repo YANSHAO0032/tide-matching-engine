@@ -608,3 +608,258 @@ fn registry_place_advances_last_trade_only_when_plan_commits() {
         100
     );
 }
+
+#[test]
+fn registry_place_cursor_rejects_overflow_atomically() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Sell, 1), state(1))
+        .unwrap();
+    book.rest_with_reservation(order(2, Side::Sell, 1), state(2))
+        .unwrap();
+    let mut registry = ReservationRegistry::new([state(1), state(2), state(9)]).unwrap();
+    let before_book = book.clone();
+    let before_registry = registry.clone();
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let before_cursor = cursor.clone();
+    let result = book.place_with_registry_and_cursor(
+        limit(9, Side::Buy, 2, TimeInForce::Gtc),
+        state(9),
+        &mut registry,
+        context(&math, &[]),
+        &mut cursor,
+    );
+    assert_eq!(result, Err(RejectReason::ArithmeticOverflow));
+    assert_eq!(book, before_book);
+    assert_eq!(registry, before_registry);
+    assert_eq!(cursor, before_cursor);
+}
+
+#[test]
+fn registry_place_cursor_matches_legacy_plan_and_events() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Sell, 1), state(1))
+        .unwrap();
+    book.rest_with_reservation(order(2, Side::Sell, 1), state(2))
+        .unwrap();
+    let mut registry = ReservationRegistry::new([state(1), state(2), state(9)]).unwrap();
+    let mut old_book = book.clone();
+    let mut old_registry = registry.clone();
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let mut expected_cursor = cursor.clone();
+    let ids = [
+        expected_cursor.next_trade_id().unwrap(),
+        expected_cursor.next_trade_id().unwrap(),
+    ];
+    let request = limit(9, Side::Buy, 2, TimeInForce::Gtc);
+    let plan = old_book
+        .plan_place_with_registry(
+            request.clone(),
+            state(9),
+            &old_registry,
+            context(&math, &ids),
+        )
+        .unwrap();
+    let expected = old_book
+        .apply_place_with_registry(&mut old_registry, plan)
+        .unwrap();
+    let actual = book
+        .place_with_registry_and_cursor(
+            request,
+            state(9),
+            &mut registry,
+            context(&math, &[]),
+            &mut cursor,
+        )
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(book, old_book);
+    assert_eq!(registry, old_registry);
+    assert_eq!(cursor, expected_cursor);
+}
+
+#[test]
+fn registry_market_cursor_overflow_does_not_commit() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.rest_with_reservation(order(1, Side::Sell, 1), state(1))
+        .unwrap();
+    book.rest_with_reservation(order(2, Side::Sell, 1), state(2))
+        .unwrap();
+    let mut registry = ReservationRegistry::new([state(1), state(2), state(9)]).unwrap();
+    let before_book = book.clone();
+    let before_registry = registry.clone();
+    let mut cursor = matching_domain::TradeIdCursor::with_next_index(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+        u64::from(u32::MAX),
+    )
+    .unwrap();
+    let before_cursor = cursor.clone();
+    let request = crate::MarketRegistryOrder::Base(matching_domain::MarketByBase {
+        order_id: OrderId::new(9),
+        user_id: UserId::new(9),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(2).unwrap(),
+        market_protection: None,
+    });
+    let context = crate::MarketRegistryContext {
+        math: &math,
+        protection: None,
+        trade_ids: &[],
+    };
+    assert_eq!(
+        book.market_with_registry_and_cursor(
+            request,
+            state(9),
+            &mut registry,
+            context,
+            &mut cursor
+        ),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(book, before_book);
+    assert_eq!(registry, before_registry);
+    assert_eq!(cursor, before_cursor);
+}
+
+#[test]
+fn registry_market_cursor_matches_protected_legacy_events_and_state() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    for quote in [false, true] {
+        let mut book = ReferenceOrderBook::new();
+        book.rest_with_reservation(order(1, Side::Sell, 1), state(1))
+            .unwrap();
+        book.rest_with_reservation(order(2, Side::Sell, 1), state(2))
+            .unwrap();
+        let mut registry = ReservationRegistry::new([state(1), state(2), state(9)]).unwrap();
+        let mut old = book.clone();
+        let mut old_registry = registry.clone();
+        let mut cursor = matching_domain::TradeIdCursor::new(
+            matching_domain::ClusterId(1),
+            matching_domain::ShardId(2),
+            3,
+        );
+        let mut expected_cursor = cursor.clone();
+        let ids = [
+            expected_cursor.next_trade_id().unwrap(),
+            expected_cursor.next_trade_id().unwrap(),
+        ];
+        let protection = matching_domain::market_order::CommandStartProtectionContext {
+            reference_price_at_command_start: Price::try_new(100).unwrap(),
+            market_band_worst: Some(Price::try_new(100).unwrap()),
+        };
+        let make_context = |ids| crate::MarketRegistryContext {
+            math: &math,
+            protection: Some(&protection),
+            trade_ids: ids,
+        };
+        let request = if quote {
+            crate::MarketRegistryOrder::Quote(matching_domain::MarketByQuote {
+                order_id: OrderId::new(9),
+                user_id: UserId::new(9),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
+                side: Side::Buy,
+                quote_budget: matching_domain::QuoteBudget::try_new(200).unwrap(),
+                market_protection: None,
+            })
+        } else {
+            crate::MarketRegistryOrder::Base(matching_domain::MarketByBase {
+                order_id: OrderId::new(9),
+                user_id: UserId::new(9),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
+                side: Side::Buy,
+                qty: Qty::try_new(2).unwrap(),
+                market_protection: None,
+            })
+        };
+        let plan = old
+            .plan_market_with_registry(request.clone(), state(9), &old_registry, make_context(&ids))
+            .unwrap();
+        let expected = old
+            .apply_market_with_registry(&mut old_registry, plan)
+            .unwrap();
+        let actual = book
+            .market_with_registry_and_cursor(
+                request,
+                state(9),
+                &mut registry,
+                make_context(&[]),
+                &mut cursor,
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(book, old);
+        assert_eq!(registry, old_registry);
+        assert_eq!(cursor, expected_cursor);
+    }
+}
+
+#[test]
+fn registry_market_cursor_requires_configured_band_reference_with_explicit_context() {
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut book = ReferenceOrderBook::new();
+    book.set_price_band_config(Some((
+        matching_domain::PriceBandConfig {
+            reference_kind: matching_domain::PriceReferenceKind::MarkPrice,
+            max_deviation_bps: 100,
+        },
+        math,
+    )))
+    .unwrap();
+    let mut registry = ReservationRegistry::new([state(9)]).unwrap();
+    let before_book = book.clone();
+    let before_registry = registry.clone();
+    let mut cursor = matching_domain::TradeIdCursor::new(
+        matching_domain::ClusterId(1),
+        matching_domain::ShardId(2),
+        3,
+    );
+    let protection = matching_domain::market_order::CommandStartProtectionContext {
+        reference_price_at_command_start: Price::try_new(100).unwrap(),
+        market_band_worst: None,
+    };
+    let context = crate::MarketRegistryContext {
+        math: &math,
+        protection: Some(&protection),
+        trade_ids: &[],
+    };
+    let request = crate::MarketRegistryOrder::Base(matching_domain::MarketByBase {
+        order_id: OrderId::new(9),
+        user_id: UserId::new(9),
+        stp_key: matching_domain::StpKey::new(0),
+        stp_mode: matching_domain::StpMode::None,
+        side: Side::Buy,
+        qty: Qty::try_new(2).unwrap(),
+        market_protection: None,
+    });
+    assert_eq!(
+        book.market_with_registry_and_cursor(
+            request,
+            state(9),
+            &mut registry,
+            context,
+            &mut cursor
+        ),
+        Err(RejectReason::ReferencePriceUnavailable)
+    );
+    assert_eq!(book, before_book);
+    assert_eq!(registry, before_registry);
+    assert_eq!(cursor.next_index(), 0);
+}

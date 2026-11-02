@@ -6,6 +6,7 @@ use crate::reference_orderbook::ReferencePlaceContext;
 use matching_domain::ReservationAdjustmentToken;
 use proptest::prelude::*;
 
+/// 构造可重复执行的业务场景和校验输入。
 struct Fixture {
     /// 独立参考订单簿前态。
     reference: ReferenceOrderBook,

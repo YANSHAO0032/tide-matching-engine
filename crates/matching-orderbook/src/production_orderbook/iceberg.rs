@@ -16,6 +16,7 @@ use matching_domain::{
 use matching_risk::ReservationState;
 use std::collections::VecDeque;
 
+/// 只读扫描期间模拟的挂单与冰山可见、隐藏数量。
 #[derive(Clone, Copy)]
 struct VirtualMaker {
     /// 挂单订单标识符。
@@ -36,9 +37,10 @@ enum FokStpAction {
     Fill(SliceFill),
 }
 
+/// 一笔已规划的挂单片成交及其后续补量。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SliceFill {
-    /// 被成交冰山挂单的订单标识符。
+    /// 被成交挂单的订单标识符；挂单可以是普通单或冰山单。
     id: OrderId,
     /// 本片成交的挂单价格。
     pub(super) price: Price,
@@ -57,6 +59,7 @@ impl SliceFill {
     }
 }
 
+/// 冻结冰山成交片、预算及优先级结果的只读计划。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct IcebergPlan {
     /// 按撮合顺序排列的冰山片成交计划。
@@ -73,8 +76,11 @@ pub(super) struct IcebergPlan {
     pub(super) next_priority: u128,
 }
 
+/// 冰山撮合扫描采用的基础数量或报价金额预算。
 pub(super) enum Budget {
+    /// 剩余基础资产数量。
     Base(u64),
+    /// 剩余报价资产金额。
     Quote(QuoteAmount),
 }
 
@@ -146,222 +152,10 @@ impl ProductionOrderBook {
         math: &MarketMath,
         ids: &[TradeId],
     ) -> Result<LimitImmediateExecution, RejectReason> {
-        if self.contains_active_order(order.order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        math.trade_notional(order.price, order.qty)
-            .map_err(Self::reject_quote_math_error)?;
-        let levels = match order.side {
-            Side::Buy => &self.asks,
-            Side::Sell => &self.bids,
-        };
-        let ordered: Box<dyn Iterator<Item = (&Price, &PriceLevel)> + '_> = match order.side {
-            Side::Buy => Box::new(levels.iter()),
-            Side::Sell => Box::new(levels.iter().rev()),
-        };
-        let mut actions = Vec::new();
-        let mut remaining = order.qty.get();
-        let mut next_priority = self.next_queue_priority();
-        let mut total_notional = QuoteAmount::new(0);
-        let mut terminal = None;
-        'levels: for (price, level) in ordered {
-            if match order.side {
-                Side::Buy => *price > order.price,
-                Side::Sell => *price < order.price,
-            } {
-                break;
-            }
-            let mut fifo = VecDeque::new();
-            let mut cursor = level.head();
-            let mut previous = None;
-            let mut count = 0u32;
-            let mut aggregate = 0u64;
-            while let Some(index) = cursor {
-                let node = self.arena.get(index).expect("FOK maker slot must exist");
-                let original = node.original_order();
-                assert_eq!(node.prev(), previous, "FOK maker backlink mismatch");
-                assert_eq!(original.price, *price, "FOK maker price mismatch");
-                assert_ne!(original.side, order.side, "FOK maker side mismatch");
-                assert_eq!(self.orders.get(&original.order_id), Some(&index));
-                count = count.checked_add(1).expect("FOK maker count overflow");
-                assert!(count <= level.count(), "FOK maker chain cycle");
-                aggregate = aggregate
-                    .checked_add(node.remaining())
-                    .expect("existing aggregate overflow");
-                fifo.push_back((
-                    VirtualMaker {
-                        id: original.order_id,
-                        visible: node.remaining(),
-                        hidden: node.hidden_remaining(),
-                        peak: node.peak_size(),
-                    },
-                    original.user_id,
-                    original.stp_key,
-                ));
-                previous = Some(index);
-                cursor = node.next();
-            }
-            assert_eq!(previous, level.tail(), "FOK maker tail mismatch");
-            assert_eq!(count, level.count(), "FOK maker count mismatch");
-            assert_eq!(
-                aggregate,
-                level.total_visible_qty(),
-                "FOK maker aggregate mismatch"
-            );
-            while let Some((mut maker, maker_user, maker_key)) = fifo.pop_front() {
-                if remaining == 0 {
-                    break 'levels;
-                }
-                match decide_stp(
-                    order.user_id,
-                    order.stp_key,
-                    order.stp_mode,
-                    maker_user,
-                    maker_key,
-                ) {
-                    StpDecision::CancelMaker => {
-                        aggregate = aggregate
-                            .checked_sub(maker.visible)
-                            .expect("maker included in aggregate");
-                        let total = maker
-                            .visible
-                            .checked_add(maker.hidden)
-                            .ok_or(RejectReason::ArithmeticOverflow)?;
-                        actions.push(FokStpAction::CancelMaker(maker.id, Qty::try_new(total)?));
-                        continue;
-                    }
-                    StpDecision::CancelTaker | StpDecision::CancelBoth => {
-                        terminal = Some((maker.id, order.stp_mode));
-                        break 'levels;
-                    }
-                    StpDecision::NoConflict => {}
-                }
-                let qty = Qty::try_new(remaining.min(maker.visible))?;
-                total_notional = total_notional.checked_add(
-                    math.trade_notional(*price, qty)
-                        .map_err(Self::reject_quote_math_error)?,
-                )?;
-                remaining = remaining
-                    .checked_sub(qty.get())
-                    .expect("fill bounded by remaining");
-                maker.visible = maker
-                    .visible
-                    .checked_sub(qty.get())
-                    .expect("fill bounded by visible");
-                aggregate = aggregate
-                    .checked_sub(qty.get())
-                    .expect("fill included in aggregate");
-                let mut refresh = None;
-                if maker.visible == 0 && maker.hidden > 0 {
-                    let visible = maker
-                        .hidden
-                        .min(maker.peak.expect("hidden requires peak").get());
-                    maker.hidden = maker
-                        .hidden
-                        .checked_sub(visible)
-                        .expect("visible bounded by hidden");
-                    maker.visible = visible;
-                    aggregate = aggregate
-                        .checked_add(visible)
-                        .ok_or(RejectReason::ArithmeticOverflow)?;
-                    if next_priority >= self.queue_priority_allocator.policy().effective_ceiling() {
-                        return Err(RejectReason::PrioritySpaceExhaustion);
-                    }
-                    refresh = Some((Qty::try_new(visible)?, QueuePriority::new(next_priority)));
-                    next_priority = next_priority
-                        .checked_add(1)
-                        .ok_or(RejectReason::PrioritySpaceExhaustion)?;
-                    fifo.push_back((maker, maker_user, maker_key));
-                }
-                actions.push(FokStpAction::Fill(SliceFill {
-                    id: maker.id,
-                    price: *price,
-                    qty,
-                    total_after: maker
-                        .visible
-                        .checked_add(maker.hidden)
-                        .ok_or(RejectReason::ArithmeticOverflow)?,
-                    refresh,
-                }));
-            }
-        }
-        if let Some((maker_id, mode)) = terminal {
-            let mut events = Vec::new();
-            if mode == matching_domain::StpMode::CancelBoth {
-                let removed = self.cancel(maker_id).expect("planned maker remains active");
-                events.push(EngineEvent::OrderCanceled {
-                    order_id: maker_id,
-                    remaining: OrderRemaining::Base(Qty::try_new(removed.total_remaining())?),
-                    reason: CancelReason::SelfTradePreventionMaker,
-                });
-            }
-            events.push(EngineEvent::OrderCanceled {
-                order_id: order.order_id,
-                remaining: OrderRemaining::Base(order.qty),
-                reason: if mode == matching_domain::StpMode::CancelBoth {
-                    CancelReason::SelfTradePreventionBoth
-                } else {
-                    CancelReason::SelfTradePreventionTaker
-                },
-            });
-            return Ok(LimitImmediateExecution::from_events(
-                order.order_id,
-                events,
-                None,
-            ));
-        }
-        if remaining != 0 {
-            return Err(RejectReason::FokInsufficientLiquidity);
-        }
-        let count = actions
-            .iter()
-            .filter(|a| matches!(a, FokStpAction::Fill(_)))
-            .count();
-        assert!(
-            ids.len() >= count,
-            "insufficient TradeIds before FOK commit"
-        );
-        let mut events = Vec::new();
-        let mut id_iter = ids.iter().copied();
-        for action in actions {
-            match action {
-                FokStpAction::CancelMaker(id, remaining) => {
-                    let removed = self.cancel(id).expect("planned maker remains active");
-                    assert_eq!(removed.total_remaining(), remaining.get());
-                    events.push(EngineEvent::OrderCanceled {
-                        order_id: id,
-                        remaining: OrderRemaining::Base(remaining),
-                        reason: CancelReason::SelfTradePreventionMaker,
-                    });
-                }
-                FokStpAction::Fill(fill) => {
-                    let priority = self
-                        .next_queue_priority()
-                        .checked_add(u128::from(fill.refresh.is_some()))
-                        .expect("preflighted priority");
-                    let plan = IcebergPlan {
-                        fills: vec![fill],
-                        base_remaining: 0,
-                        quote_remaining: QuoteAmount::new(0),
-                        spent: QuoteAmount::new(0),
-                        stop: None,
-                        next_priority: priority,
-                    };
-                    events.extend(self.commit_iceberg_plan(
-                        &plan,
-                        order.side,
-                        order.order_id,
-                        &[id_iter.next().expect("preflighted TradeId")],
-                    ));
-                }
-            }
-        }
-        Ok(LimitImmediateExecution::from_events(
-            order.order_id,
-            events,
-            None,
-        ))
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(ids);
+        self.place_fok_stp_with_source(order, math, &mut source)
     }
+
     /// 在同一次独占调用中执行普通限价单并关联实际挂单余量。
     pub fn place_limit_gtc_with_reservation(
         &mut self,
@@ -909,13 +703,25 @@ impl ProductionOrderBook {
         rest_peak: Option<(Qty, Qty)>,
         immediate: bool,
     ) -> Result<(Vec<EngineEvent>, Option<Qty>), RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(trade_ids);
+        self.execute_limit_stp_with_source(order, &mut source, immediate_math, rest_peak, immediate)
+    }
+
+    /// 在候选簿中按真实成交推进共享的命令级身份来源。
+    pub(super) fn execute_limit_stp_with_source(
+        &mut self,
+        order: LimitOrder,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+        immediate_math: Option<&MarketMath>,
+        rest_peak: Option<(Qty, Qty)>,
+        immediate: bool,
+    ) -> Result<(Vec<EngineEvent>, Option<Qty>), RejectReason> {
         if self.contains_active_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
         let mut candidate = self.clone();
         let mut incoming = IncomingOrder::new(order.clone());
         let mut events = Vec::new();
-        let mut ids = trade_ids.iter().copied();
         let mut terminal = false;
         let mut notional = QuoteAmount::new(0);
         if let Some(math) = immediate_math {
@@ -957,7 +763,7 @@ impl ProductionOrderBook {
                 maker.original_order().stp_key,
             ) {
                 StpDecision::NoConflict => {
-                    let trade_id = ids.next().expect("STP plan requires sufficient TradeIds");
+                    let trade_id = source.next_id()?;
                     if candidate.has_iceberg_maker(order.side) {
                         let plan = candidate.preflight_iceberg_plan(
                             order.side,
@@ -1263,99 +1069,8 @@ impl ProductionOrderBook {
         boundary: Option<(Price, ProtectionSource)>,
         ids: &[TradeId],
     ) -> Result<Vec<EngineEvent>, RejectReason> {
-        if self.contains_active_order(incoming.order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        let mut candidate = self.clone();
-        let mut remaining = incoming.qty.get();
-        let mut spent = QuoteAmount::new(0);
-        let mut events = Vec::new();
-        let mut ids = ids.iter().copied();
-        let maker_side = match incoming.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        };
-        while remaining > 0 {
-            let Some(price) = candidate.best_price(maker_side) else {
-                break;
-            };
-            if let Some((worst, source)) = boundary
-                && !maker_price_within_protection(incoming.side, price, Some(worst))
-            {
-                events.push(EngineEvent::MarketProtectionTriggered {
-                    order_id: incoming.order_id,
-                    next_price: price,
-                    effective_worst_price: worst,
-                    source,
-                });
-                break;
-            }
-            let maker_id = match maker_side {
-                Side::Buy => candidate.bids.get(&price),
-                Side::Sell => candidate.asks.get(&price),
-            }
-            .expect("best price level")
-            .head()
-            .and_then(|index| candidate.arena.get(index))
-            .expect("best maker head")
-            .original_order()
-            .order_id;
-            let maker = candidate.order(maker_id).expect("best maker index");
-            let decision = decide_stp(
-                incoming.user_id,
-                incoming.stp_key,
-                incoming.stp_mode,
-                maker.original_order().user_id,
-                maker.original_order().stp_key,
-            );
-            if matches!(decision, StpDecision::CancelMaker | StpDecision::CancelBoth) {
-                let removed = candidate.cancel(maker_id)?;
-                events.push(EngineEvent::OrderCanceled {
-                    order_id: maker_id,
-                    remaining: OrderRemaining::Base(Qty::try_new(removed.total_remaining())?),
-                    reason: CancelReason::SelfTradePreventionMaker,
-                });
-            }
-            if matches!(decision, StpDecision::CancelTaker | StpDecision::CancelBoth) {
-                events.push(EngineEvent::OrderCanceled {
-                    order_id: incoming.order_id,
-                    remaining: OrderRemaining::Base(Qty::try_new(remaining)?),
-                    reason: if decision == StpDecision::CancelBoth {
-                        CancelReason::SelfTradePreventionBoth
-                    } else {
-                        CancelReason::SelfTradePreventionTaker
-                    },
-                });
-                break;
-            }
-            if decision == StpDecision::CancelMaker {
-                continue;
-            }
-            let plan = candidate.preflight_iceberg_plan(
-                incoming.side,
-                None,
-                Budget::Base(remaining),
-                math,
-                None,
-                Some(1),
-            )?;
-            if plan.fills.is_empty() {
-                break;
-            }
-            let id = ids
-                .next()
-                .expect("base STP plan requires sufficient TradeIds");
-            remaining = plan.base_remaining;
-            spent = spent.checked_add(plan.spent)?;
-            events.extend(candidate.commit_iceberg_plan(
-                &plan,
-                incoming.side,
-                incoming.order_id,
-                &[id],
-            ));
-        }
-        *self = candidate;
-        Ok(events)
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(ids);
+        self.execute_market_base_with_boundary_source(incoming, math, boundary, &mut source)
     }
 
     /// 使用真实预检的冻结边界执行报价预算市价单。
@@ -1366,107 +1081,8 @@ impl ProductionOrderBook {
         boundary: Option<(Price, ProtectionSource)>,
         ids: &[TradeId],
     ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
-        if self.contains_active_order(incoming.order_id) {
-            return Err(RejectReason::DuplicateOrderId);
-        }
-        let mut candidate = self.clone();
-        let mut unused = QuoteAmount::new(incoming.quote_budget.get());
-        let mut spent = QuoteAmount::new(0);
-        let mut events = Vec::new();
-        let mut ids = ids.iter().copied();
-        let maker_side = match incoming.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        };
-        while unused.get() > 0 {
-            let Some(price) = candidate.best_price(maker_side) else {
-                break;
-            };
-            if let Some((worst, source)) = boundary
-                && !maker_price_within_protection(incoming.side, price, Some(worst))
-            {
-                events.push(EngineEvent::MarketProtectionTriggered {
-                    order_id: incoming.order_id,
-                    next_price: price,
-                    effective_worst_price: worst,
-                    source,
-                });
-                break;
-            }
-            // 报价预算不足一手时本档不可成交，不能对该档挂单执行 STP。
-            if math
-                .max_qty_for_quote(unused, price)
-                .map_err(Self::reject_quote_math_error)?
-                .is_none()
-            {
-                break;
-            }
-            let maker_id = match maker_side {
-                Side::Buy => candidate.bids.get(&price),
-                Side::Sell => candidate.asks.get(&price),
-            }
-            .expect("best price level")
-            .head()
-            .and_then(|index| candidate.arena.get(index))
-            .expect("best maker head")
-            .original_order()
-            .order_id;
-            let maker = candidate.order(maker_id).expect("best maker index");
-            let decision = decide_stp(
-                incoming.user_id,
-                incoming.stp_key,
-                incoming.stp_mode,
-                maker.original_order().user_id,
-                maker.original_order().stp_key,
-            );
-            if matches!(decision, StpDecision::CancelMaker | StpDecision::CancelBoth) {
-                let removed = candidate.cancel(maker_id)?;
-                events.push(EngineEvent::OrderCanceled {
-                    order_id: maker_id,
-                    remaining: OrderRemaining::Base(Qty::try_new(removed.total_remaining())?),
-                    reason: CancelReason::SelfTradePreventionMaker,
-                });
-            }
-            if matches!(decision, StpDecision::CancelTaker | StpDecision::CancelBoth) {
-                events.push(EngineEvent::OrderCanceled {
-                    order_id: incoming.order_id,
-                    remaining: OrderRemaining::Quote(unused),
-                    reason: if decision == StpDecision::CancelBoth {
-                        CancelReason::SelfTradePreventionBoth
-                    } else {
-                        CancelReason::SelfTradePreventionTaker
-                    },
-                });
-                break;
-            }
-            if decision == StpDecision::CancelMaker {
-                continue;
-            }
-            let plan = candidate.preflight_iceberg_plan(
-                incoming.side,
-                None,
-                Budget::Quote(unused),
-                Some(math),
-                None,
-                Some(1),
-            )?;
-            if plan.fills.is_empty() {
-                break;
-            }
-            let id = ids
-                .next()
-                .expect("quote STP plan requires sufficient TradeIds");
-            unused = plan.quote_remaining;
-            spent = spent.checked_add(plan.spent)?;
-            events.extend(candidate.commit_iceberg_plan(
-                &plan,
-                incoming.side,
-                incoming.order_id,
-                &[id],
-            ));
-        }
-        *self = candidate;
-        Ok(ProtectedMarketByQuoteExecution::new(events, spent, unused))
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(ids);
+        self.execute_market_quote_with_boundary_source(incoming, math, boundary, &mut source)
     }
 
     fn place_iceberg_inner(
@@ -1474,6 +1090,16 @@ impl ProductionOrderBook {
         iceberg: IcebergOrder,
         math: &MarketMath,
         trade_ids: &[TradeId],
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut source = crate::trade_id_source::TradeIdSource::legacy(trade_ids);
+        self.place_iceberg_with_source(iceberg, math, &mut source)
+    }
+
+    fn place_iceberg_with_source(
+        &mut self,
+        iceberg: IcebergOrder,
+        math: &MarketMath,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         if let Some((_, configured)) = self.price_band_config() {
             assert_eq!(*math, configured, "市场数值配置不一致");
@@ -1492,9 +1118,9 @@ impl ProductionOrderBook {
             let order_id = order.order_id;
             let input = order.clone();
             let peak = iceberg.peak_size();
-            let (mut events, _) = self.execute_limit_stp(
+            let (mut events, _) = self.execute_limit_stp_with_source(
                 input.clone(),
-                trade_ids,
+                source,
                 Some(math),
                 Some((peak, input.qty)),
                 false,
@@ -1523,12 +1149,15 @@ impl ProductionOrderBook {
             None,
             None,
         )?;
-        assert!(
-            trade_ids.len() >= plan.fills.len(),
-            "insufficient TradeIds for iceberg"
-        );
+        if let Some(remaining) = source.legacy_remaining() {
+            assert!(
+                remaining >= plan.fills.len(),
+                "insufficient TradeIds for iceberg"
+            );
+        }
         self.preflight_iceberg_rest(&iceberg, &plan)?;
-        let mut events = self.commit_iceberg_plan(&plan, order.side, order.order_id, trade_ids);
+        let trade_ids = source.reserve(plan.fills.len())?;
+        let mut events = self.commit_iceberg_plan(&plan, order.side, order.order_id, &trade_ids);
         if !plan.fills.is_empty() {
             if plan.base_remaining == 0 {
                 events.push(EngineEvent::OrderFilled {
@@ -1616,6 +1245,455 @@ impl ProductionOrderBook {
                 .expect("preflighted GTC rest");
             self.commit_rest(residual, rest_plan);
         }
+        Ok(events)
+    }
+
+    /// 按已计划的真实成交依次使用共享身份来源。
+    pub(super) fn execute_market_base_with_boundary_source(
+        &mut self,
+        incoming: MarketByBase,
+        math: Option<&MarketMath>,
+        boundary: Option<(Price, ProtectionSource)>,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        if self.contains_active_order(incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        let mut candidate = self.clone();
+        let mut remaining = incoming.qty.get();
+        let mut spent = QuoteAmount::new(0);
+        let mut events = Vec::new();
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        while remaining > 0 {
+            let Some(price) = candidate.best_price(maker_side) else {
+                break;
+            };
+            if let Some((worst, source)) = boundary
+                && !maker_price_within_protection(incoming.side, price, Some(worst))
+            {
+                events.push(EngineEvent::MarketProtectionTriggered {
+                    order_id: incoming.order_id,
+                    next_price: price,
+                    effective_worst_price: worst,
+                    source,
+                });
+                break;
+            }
+            let maker_id = match maker_side {
+                Side::Buy => candidate.bids.get(&price),
+                Side::Sell => candidate.asks.get(&price),
+            }
+            .expect("best price level")
+            .head()
+            .and_then(|index| candidate.arena.get(index))
+            .expect("best maker head")
+            .original_order()
+            .order_id;
+            let maker = candidate.order(maker_id).expect("best maker index");
+            let decision = decide_stp(
+                incoming.user_id,
+                incoming.stp_key,
+                incoming.stp_mode,
+                maker.original_order().user_id,
+                maker.original_order().stp_key,
+            );
+            if matches!(decision, StpDecision::CancelMaker | StpDecision::CancelBoth) {
+                let removed = candidate.cancel(maker_id)?;
+                events.push(EngineEvent::OrderCanceled {
+                    order_id: maker_id,
+                    remaining: OrderRemaining::Base(Qty::try_new(removed.total_remaining())?),
+                    reason: CancelReason::SelfTradePreventionMaker,
+                });
+            }
+            if matches!(decision, StpDecision::CancelTaker | StpDecision::CancelBoth) {
+                events.push(EngineEvent::OrderCanceled {
+                    order_id: incoming.order_id,
+                    remaining: OrderRemaining::Base(Qty::try_new(remaining)?),
+                    reason: if decision == StpDecision::CancelBoth {
+                        CancelReason::SelfTradePreventionBoth
+                    } else {
+                        CancelReason::SelfTradePreventionTaker
+                    },
+                });
+                break;
+            }
+            if decision == StpDecision::CancelMaker {
+                continue;
+            }
+            let plan = candidate.preflight_iceberg_plan(
+                incoming.side,
+                None,
+                Budget::Base(remaining),
+                math,
+                None,
+                Some(1),
+            )?;
+            if plan.fills.is_empty() {
+                break;
+            }
+            let id = source.next_id()?;
+            remaining = plan.base_remaining;
+            spent = spent.checked_add(plan.spent)?;
+            events.extend(candidate.commit_iceberg_plan(
+                &plan,
+                incoming.side,
+                incoming.order_id,
+                &[id],
+            ));
+        }
+        *self = candidate;
+        Ok(events)
+    }
+
+    /// 按已计划的真实成交依次使用共享身份来源。
+    pub(super) fn execute_market_quote_with_boundary_source(
+        &mut self,
+        incoming: MarketByQuote,
+        math: &MarketMath,
+        boundary: Option<(Price, ProtectionSource)>,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+    ) -> Result<ProtectedMarketByQuoteExecution, RejectReason> {
+        if self.contains_active_order(incoming.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        let mut candidate = self.clone();
+        let mut unused = QuoteAmount::new(incoming.quote_budget.get());
+        let mut spent = QuoteAmount::new(0);
+        let mut events = Vec::new();
+        let maker_side = match incoming.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        while unused.get() > 0 {
+            let Some(price) = candidate.best_price(maker_side) else {
+                break;
+            };
+            if let Some((worst, source)) = boundary
+                && !maker_price_within_protection(incoming.side, price, Some(worst))
+            {
+                events.push(EngineEvent::MarketProtectionTriggered {
+                    order_id: incoming.order_id,
+                    next_price: price,
+                    effective_worst_price: worst,
+                    source,
+                });
+                break;
+            }
+            // 报价预算不足一手时本档不可成交，不能对该档挂单执行 STP。
+            if math
+                .max_qty_for_quote(unused, price)
+                .map_err(Self::reject_quote_math_error)?
+                .is_none()
+            {
+                break;
+            }
+            let maker_id = match maker_side {
+                Side::Buy => candidate.bids.get(&price),
+                Side::Sell => candidate.asks.get(&price),
+            }
+            .expect("best price level")
+            .head()
+            .and_then(|index| candidate.arena.get(index))
+            .expect("best maker head")
+            .original_order()
+            .order_id;
+            let maker = candidate.order(maker_id).expect("best maker index");
+            let decision = decide_stp(
+                incoming.user_id,
+                incoming.stp_key,
+                incoming.stp_mode,
+                maker.original_order().user_id,
+                maker.original_order().stp_key,
+            );
+            if matches!(decision, StpDecision::CancelMaker | StpDecision::CancelBoth) {
+                let removed = candidate.cancel(maker_id)?;
+                events.push(EngineEvent::OrderCanceled {
+                    order_id: maker_id,
+                    remaining: OrderRemaining::Base(Qty::try_new(removed.total_remaining())?),
+                    reason: CancelReason::SelfTradePreventionMaker,
+                });
+            }
+            if matches!(decision, StpDecision::CancelTaker | StpDecision::CancelBoth) {
+                events.push(EngineEvent::OrderCanceled {
+                    order_id: incoming.order_id,
+                    remaining: OrderRemaining::Quote(unused),
+                    reason: if decision == StpDecision::CancelBoth {
+                        CancelReason::SelfTradePreventionBoth
+                    } else {
+                        CancelReason::SelfTradePreventionTaker
+                    },
+                });
+                break;
+            }
+            if decision == StpDecision::CancelMaker {
+                continue;
+            }
+            let plan = candidate.preflight_iceberg_plan(
+                incoming.side,
+                None,
+                Budget::Quote(unused),
+                Some(math),
+                None,
+                Some(1),
+            )?;
+            if plan.fills.is_empty() {
+                break;
+            }
+            let id = source.next_id()?;
+            unused = plan.quote_remaining;
+            spent = spent.checked_add(plan.spent)?;
+            events.extend(candidate.commit_iceberg_plan(
+                &plan,
+                incoming.side,
+                incoming.order_id,
+                &[id],
+            ));
+        }
+        *self = candidate;
+        Ok(ProtectedMarketByQuoteExecution::new(events, spent, unused))
+    }
+
+    /// 对全部可执行的成交计划分配身份后再提交 FOK。
+    pub(super) fn place_fok_stp_with_source(
+        &mut self,
+        order: LimitOrder,
+        math: &MarketMath,
+        source: &mut crate::trade_id_source::TradeIdSource<'_>,
+    ) -> Result<LimitImmediateExecution, RejectReason> {
+        if self.contains_active_order(order.order_id) {
+            return Err(RejectReason::DuplicateOrderId);
+        }
+        math.trade_notional(order.price, order.qty)
+            .map_err(Self::reject_quote_math_error)?;
+        let levels = match order.side {
+            Side::Buy => &self.asks,
+            Side::Sell => &self.bids,
+        };
+        let ordered: Box<dyn Iterator<Item = (&Price, &PriceLevel)> + '_> = match order.side {
+            Side::Buy => Box::new(levels.iter()),
+            Side::Sell => Box::new(levels.iter().rev()),
+        };
+        let mut actions = Vec::new();
+        let mut remaining = order.qty.get();
+        let mut next_priority = self.next_queue_priority();
+        let mut total_notional = QuoteAmount::new(0);
+        let mut terminal = None;
+        'levels: for (price, level) in ordered {
+            if match order.side {
+                Side::Buy => *price > order.price,
+                Side::Sell => *price < order.price,
+            } {
+                break;
+            }
+            let mut fifo = VecDeque::new();
+            let mut cursor = level.head();
+            let mut previous = None;
+            let mut count = 0u32;
+            let mut aggregate = 0u64;
+            while let Some(index) = cursor {
+                let node = self.arena.get(index).expect("FOK maker slot must exist");
+                let original = node.original_order();
+                assert_eq!(node.prev(), previous, "FOK maker backlink mismatch");
+                assert_eq!(original.price, *price, "FOK maker price mismatch");
+                assert_ne!(original.side, order.side, "FOK maker side mismatch");
+                assert_eq!(self.orders.get(&original.order_id), Some(&index));
+                count = count.checked_add(1).expect("FOK maker count overflow");
+                assert!(count <= level.count(), "FOK maker chain cycle");
+                aggregate = aggregate
+                    .checked_add(node.remaining())
+                    .expect("existing aggregate overflow");
+                fifo.push_back((
+                    VirtualMaker {
+                        id: original.order_id,
+                        visible: node.remaining(),
+                        hidden: node.hidden_remaining(),
+                        peak: node.peak_size(),
+                    },
+                    original.user_id,
+                    original.stp_key,
+                ));
+                previous = Some(index);
+                cursor = node.next();
+            }
+            assert_eq!(previous, level.tail(), "FOK maker tail mismatch");
+            assert_eq!(count, level.count(), "FOK maker count mismatch");
+            assert_eq!(
+                aggregate,
+                level.total_visible_qty(),
+                "FOK maker aggregate mismatch"
+            );
+            while let Some((mut maker, maker_user, maker_key)) = fifo.pop_front() {
+                if remaining == 0 {
+                    break 'levels;
+                }
+                match decide_stp(
+                    order.user_id,
+                    order.stp_key,
+                    order.stp_mode,
+                    maker_user,
+                    maker_key,
+                ) {
+                    StpDecision::CancelMaker => {
+                        aggregate = aggregate
+                            .checked_sub(maker.visible)
+                            .expect("maker included in aggregate");
+                        let total = maker
+                            .visible
+                            .checked_add(maker.hidden)
+                            .ok_or(RejectReason::ArithmeticOverflow)?;
+                        actions.push(FokStpAction::CancelMaker(maker.id, Qty::try_new(total)?));
+                        continue;
+                    }
+                    StpDecision::CancelTaker | StpDecision::CancelBoth => {
+                        terminal = Some((maker.id, order.stp_mode));
+                        break 'levels;
+                    }
+                    StpDecision::NoConflict => {}
+                }
+                let qty = Qty::try_new(remaining.min(maker.visible))?;
+                total_notional = total_notional.checked_add(
+                    math.trade_notional(*price, qty)
+                        .map_err(Self::reject_quote_math_error)?,
+                )?;
+                remaining = remaining
+                    .checked_sub(qty.get())
+                    .expect("fill bounded by remaining");
+                maker.visible = maker
+                    .visible
+                    .checked_sub(qty.get())
+                    .expect("fill bounded by visible");
+                aggregate = aggregate
+                    .checked_sub(qty.get())
+                    .expect("fill included in aggregate");
+                let mut refresh = None;
+                if maker.visible == 0 && maker.hidden > 0 {
+                    let visible = maker
+                        .hidden
+                        .min(maker.peak.expect("hidden requires peak").get());
+                    maker.hidden = maker
+                        .hidden
+                        .checked_sub(visible)
+                        .expect("visible bounded by hidden");
+                    maker.visible = visible;
+                    aggregate = aggregate
+                        .checked_add(visible)
+                        .ok_or(RejectReason::ArithmeticOverflow)?;
+                    if next_priority >= self.queue_priority_allocator.policy().effective_ceiling() {
+                        return Err(RejectReason::PrioritySpaceExhaustion);
+                    }
+                    refresh = Some((Qty::try_new(visible)?, QueuePriority::new(next_priority)));
+                    next_priority = next_priority
+                        .checked_add(1)
+                        .ok_or(RejectReason::PrioritySpaceExhaustion)?;
+                    fifo.push_back((maker, maker_user, maker_key));
+                }
+                actions.push(FokStpAction::Fill(SliceFill {
+                    id: maker.id,
+                    price: *price,
+                    qty,
+                    total_after: maker
+                        .visible
+                        .checked_add(maker.hidden)
+                        .ok_or(RejectReason::ArithmeticOverflow)?,
+                    refresh,
+                }));
+            }
+        }
+        if let Some((maker_id, mode)) = terminal {
+            let mut events = Vec::new();
+            if mode == matching_domain::StpMode::CancelBoth {
+                let removed = self.cancel(maker_id).expect("planned maker remains active");
+                events.push(EngineEvent::OrderCanceled {
+                    order_id: maker_id,
+                    remaining: OrderRemaining::Base(Qty::try_new(removed.total_remaining())?),
+                    reason: CancelReason::SelfTradePreventionMaker,
+                });
+            }
+            events.push(EngineEvent::OrderCanceled {
+                order_id: order.order_id,
+                remaining: OrderRemaining::Base(order.qty),
+                reason: if mode == matching_domain::StpMode::CancelBoth {
+                    CancelReason::SelfTradePreventionBoth
+                } else {
+                    CancelReason::SelfTradePreventionTaker
+                },
+            });
+            return Ok(LimitImmediateExecution::from_events(
+                order.order_id,
+                events,
+                None,
+            ));
+        }
+        if remaining != 0 {
+            return Err(RejectReason::FokInsufficientLiquidity);
+        }
+        let count = actions
+            .iter()
+            .filter(|a| matches!(a, FokStpAction::Fill(_)))
+            .count();
+        let ids = source.reserve(count)?;
+        let mut events = Vec::new();
+        let mut id_iter = ids.iter().copied();
+        for action in actions {
+            match action {
+                FokStpAction::CancelMaker(id, remaining) => {
+                    let removed = self.cancel(id).expect("planned maker remains active");
+                    assert_eq!(removed.total_remaining(), remaining.get());
+                    events.push(EngineEvent::OrderCanceled {
+                        order_id: id,
+                        remaining: OrderRemaining::Base(remaining),
+                        reason: CancelReason::SelfTradePreventionMaker,
+                    });
+                }
+                FokStpAction::Fill(fill) => {
+                    let priority = self
+                        .next_queue_priority()
+                        .checked_add(u128::from(fill.refresh.is_some()))
+                        .expect("preflighted priority");
+                    let plan = IcebergPlan {
+                        fills: vec![fill],
+                        base_remaining: 0,
+                        quote_remaining: QuoteAmount::new(0),
+                        spent: QuoteAmount::new(0),
+                        stop: None,
+                        next_priority: priority,
+                    };
+                    events.extend(self.commit_iceberg_plan(
+                        &plan,
+                        order.side,
+                        order.order_id,
+                        &[id_iter.next().expect("preflighted TradeId")],
+                    ));
+                }
+            }
+        }
+        Ok(LimitImmediateExecution::from_events(
+            order.order_id,
+            events,
+            None,
+        ))
+    }
+    /// 在候选状态中按真实冰山成交分配根命令身份。
+    pub fn place_iceberg_with_cursor(
+        &mut self,
+        iceberg: IcebergOrder,
+        math: &MarketMath,
+        cursor: &mut matching_domain::TradeIdCursor,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        let mut candidate = self.clone();
+        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let events = candidate.place_iceberg_with_source(iceberg, math, &mut source)?;
+        candidate.reference_prices =
+            self.reference_prices
+                .plan_trade_prices(events.iter().filter_map(|event| match event {
+                    EngineEvent::Trade(trade) => Some(trade.price),
+                    _ => None,
+                }))?;
+        *cursor = source.into_cursor().expect("命令游标来源必须存在");
+        *self = candidate;
         Ok(events)
     }
 }

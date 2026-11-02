@@ -44,11 +44,11 @@ Stop 按 LastTrade、MarkPrice、IndexPrice 分区；StaticOpening 不可触发�
 
 低层 `amend_regular_with_events`（含冰山）及 `amend_stop_with_events` 要求调用方已完成数值与资金校验，并拒绝直接携带调整令牌。它们不能替代完整上下文入口。两模型保留旧无预留挂单入口，并提供 reservation-aware 的 rest、timed rest、GTC、冰山只挂单及 Stop 初始化入口，在同一独占调用中关联实际活动余量与所给状态；缺少 shadow 的活动订单不能 Amend。Cancel、Fill、Expire 与 Stop 终结同步清理 shadow。
 
-预留初始化在首次写入前核对订单和用户身份，Stop 另核对载荷中的预留身份。当前单市场簿和下单载荷没有独立 MarketId，不能在初始化时捏造市场核验；后续 Amend 必须把命令 MarketId 与 shadow 中的 MarketId 绑定。
+预留初始化在首次写入前核对订单和用户身份，Stop 另核对载荷中的预留身份。生产簿可在空簿时绑定可信 MarketId，并校验预留状态所属市场；未绑定生产簿与参考簿沿用既有兼容路径。后续 Amend 必须把命令 MarketId 与 shadow 中的 MarketId 绑定。
 
 ## 失败边界与验证
 
-数量、时间、保护、资金、算术、档位聚合与 priority 的普通拒绝都发生在写屏障之前；拒绝保持载荷、FIFO、深度、Arena/free-list、身份与到期索引、两种 priority 及 allocator、来源参考和完整预留/version。TradeId 不足遵循既有调用方容量契约，在首个写入前 fail-stop；不是客户业务 Reject。提交阶段消费已冻结计划，不返回新的普通业务错误。
+数量、时间、保护、资金、算术、档位聚合与 priority 的普通拒绝都发生在写屏障之前；拒绝保持载荷、FIFO、深度、Arena/free-list、身份与到期索引、两种 priority 及 allocator、来源参考和完整预留/version。旧切片入口的 TradeId 不足遵循调用方容量契约，在首个写入前 fail-stop；游标入口在候选中按真实成交分配，耗尽返回 `ArithmeticOverflow = 5001` 且不提交候选状态。提交阶段消费已冻结计划，不返回新的普通业务错误。
 
 完整入口先在普通簿、冰山或未触发 Stop 容器中定位活动 `OrderId`；三个容器均不存在时稳定返回 `OrderNotFound (2010)`，不读取已随 Cancel、Fill 或 Expire 清理的 shadow reservation。只有订单仍活动而 shadow 缺失、身份不匹配或版本/令牌验证失败时，才返回 `InvalidReservation (4002)`。两种拒绝均不改变任何订单簿或预留状态。
 
@@ -56,4 +56,4 @@ Stop 按 LastTrade、MarkPrice、IndexPrice 分区；StaticOpening 不可触发�
 
 固定边界、生成式失败性质和完整混合差分逐命令比较原序结果/事件、所有普通与 Stop 载荷、真实 FIFO、深度、到期引用、两个 allocator、来源价格/序号和完整预留。固定 seed 100k 及两组各双次 10k 比较完整逐步 transcript；状态投影用于本地测试，不是 durable digest。实现入口见[模块说明](orderbook_modules.md)，执行顺序见[逻辑流程](logic_flows.md)。
 
-当前不包含 MarketState/KillSwitch/路由 fencing、PreOpen 重校验、账户与 Settlement、WAL/快照/HA、durable envelope 或完整命令去重。改单候选按配置的价格带检查；改价重新撮合沿用订单的 STP 身份和模式，带登记表入口会规划终结订单的 PendingR2 归属。独立新身份替换见[原子撤单替换与预留归属](cancel_replace.md)；不能将旧窄 Amend/Cancel/expiry API 的 shadow 清理解释成已完成 R2。完整 Amend 上下文同时拒绝 Released 或固定费率漂移的 shadow，包括无调整令牌分支。止损 root reference update 一次冻结更新后参考作为全级联用户保护上下文，后代成交只更新触发检测状态。
+当前不包含完整 MarketState/KillSwitch/持久化路由迁移与主节点 fencing、PreOpen 重校验、账户与 Settlement、WAL/快照/HA、durable envelope 或完整命令去重。改单候选按配置的价格带检查；改价重新撮合沿用订单的 STP 身份和模式，带登记表入口会规划终结订单的 PendingR2 归属。独立新身份替换见[原子撤单替换与预留归属](cancel_replace.md)；不能将旧窄 Amend/Cancel/expiry API 的 shadow 清理解释成已完成 R2。完整 Amend 上下文同时拒绝 Released 或固定费率漂移的 shadow，包括无调整令牌分支。止损 root reference update 一次冻结更新后参考作为全级联用户保护上下文，后代成交只更新触发检测状态。
