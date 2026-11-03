@@ -176,7 +176,12 @@ fn stop(id: u128, kind: u8, side: Side, expiry: TriggerExpiry) -> StopOrder {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     /// 挂入指定有效期的订单。
-    Rest(LimitOrder, TimeInForce),
+    Rest(
+        /// 待挂入的限价单。
+        LimitOrder,
+        /// 订单的有效期策略。
+        TimeInForce,
+    ),
     /// 提交冰山订单。
     Iceberg(IcebergOrder),
     /// 登记未触发止损订单。
@@ -184,7 +189,12 @@ enum Command {
     /// 使用预留状态提交订单。
     ReservedPlace(LimitOrder),
     /// 提交普通限价单。
-    Place(LimitOrder, TimeInForce),
+    Place(
+        /// 待提交的限价单。
+        LimitOrder,
+        /// 订单的有效期策略。
+        TimeInForce,
+    ),
     /// 修改现有订单。
     Amend {
         /// 待执行的改单载荷。

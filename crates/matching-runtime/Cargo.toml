@@ -10,6 +10,4 @@ workspace = true
 crossbeam-queue = "0.3.14"
 matching-domain = { path = "../matching-domain" }
 matching-orderbook = { path = "../matching-orderbook" }
-
-[dev-dependencies]
-matching-risk = { path = '../matching-risk' }
+matching-risk = { path = "../matching-risk" }

@@ -32,7 +32,12 @@ struct VirtualMaker {
 /// 限价 FOK 自成交预检中按撮合顺序冻结的动作。
 enum FokStpAction {
     /// 终结完整挂单，载荷保留其总余量。
-    CancelMaker(OrderId, Qty),
+    CancelMaker(
+        /// 待终结的挂单身份。
+        OrderId,
+        /// 挂单被终结时的总基础数量余量。
+        Qty,
+    ),
     /// 执行一片已预检成交。
     Fill(SliceFill),
 }

@@ -53,9 +53,19 @@ enum Command {
     /// 取消指定订单。
     Cancel(OrderId),
     /// 执行基础数量市价单。
-    MarketByBase(MarketByBase, Vec<TradeId>),
+    MarketByBase(
+        /// 待执行的基础数量市价单。
+        MarketByBase,
+        /// 调用方提供、按实际成交顺序使用的成交身份。
+        Vec<TradeId>,
+    ),
     /// 执行报价预算市价单。
-    MarketByQuote(MarketByQuote, Vec<TradeId>),
+    MarketByQuote(
+        /// 待执行的报价预算市价单。
+        MarketByQuote,
+        /// 调用方提供、按实际成交顺序使用的成交身份。
+        Vec<TradeId>,
+    ),
 }
 
 /// 跨参考簿 / 生产簿的统一挂单-订单观察模型。

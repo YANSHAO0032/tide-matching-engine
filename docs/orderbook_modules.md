@@ -36,7 +36,7 @@
 | 撤单替换只读过滤视图 | [cancel_replace_view.rs](../crates/matching-orderbook/src/production_orderbook/cancel_replace_view.rs) | [cancel_replace_view.rs](../crates/matching-orderbook/src/reference_orderbook/cancel_replace_view.rs) |
 | 撤单替换独立计划与原子提交 | [cancel_replace.rs](../crates/matching-orderbook/src/production_orderbook/cancel_replace.rs) | [cancel_replace.rs](../crates/matching-orderbook/src/reference_orderbook/cancel_replace.rs) |
 | 分片本地批量撤单计划与原子提交 | [mass_cancel.rs](../crates/matching-orderbook/src/production_orderbook/mass_cancel.rs) | [mass_cancel.rs](../crates/matching-orderbook/src/reference_orderbook/mass_cancel.rs) |
-| 接收登记表的正常下单预演与归属提交 | 由撤单替换计划内部完成，未新增通用生产 Place API | [reservation_place.rs](../crates/matching-orderbook/src/reference_orderbook/reservation_place.rs) |
+| 接收登记表的正常下单预演与归属提交 | [reservation_place.rs](../crates/matching-orderbook/src/production_orderbook/reservation_place.rs) | [reservation_place.rs](../crates/matching-orderbook/src/reference_orderbook/reservation_place.rs) |
 
 文件按业务职责组织。预检与提交尽量保留在同一功能模块，便于核对拒绝是否发生在真实改簿之前；共享的结构预检仍由负责该结构的模块维护。限价和市价入口遇到冰山 maker 时，通过本模型的冰山计划完成相应执行。
 

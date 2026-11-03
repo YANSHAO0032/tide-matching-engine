@@ -1,6 +1,6 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-10-29 当前范围：T13、T14 与 T15 已完成本地交付提交；T16 已完成本地提交；用户已授权完成并本地提交 T17，当前分支为 `feature-t17-single-writer`，未经进一步授权不合并或推送。PendingR2 用户裁定取代初始任务书的提前释放：金融 Active 与 ActiveOrder/PendingR2 归属分离，终结仅迁移归属，不发 release；真实 R2、完整 MarketState/PreOpen 和 T18+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
+> 2026-11-03 当前范围：T13、T14 与 T15 已完成本地交付提交；T16 已完成本地提交；T17 已本地提交 `7474954`；T18 已本地提交 `6fc6736`；用户已授权完成验收并本地提交 T19，当前分支为 `feature-t19-command-events`，未经进一步授权不合并或推送。PendingR2 用户裁定取代初始任务书的提前释放：金融 Active 与 ActiveOrder/PendingR2 归属分离，终结仅迁移归属，不发 release；真实 R2、完整 MarketState/PreOpen 和 T20+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
 
 > 2026-10-26 当前事实：T12 Amend 已由 `d694974` 与 P2 收尾提交 `b763984` 合入并推送至 `origin/main`；本地完整验证已经通过。远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染尚未在本轮核验。`codex/t12-amend` 已删除。
 
@@ -12,7 +12,7 @@
 
 ## 角色与授权边界
 
-当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T12 均已交付；T13、T14 与 T15 已完成本地提交。T16 已完成本地提交；T17 已完成本地验收并获本地提交授权，未获合并或推送授权；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染未在本轮核验，不扩展 T18+。
+当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T12 均已交付；T13、T14 与 T15 已完成本地提交。T16 已完成本地提交；T17 已完成本地提交；T18 已完成本地提交；T19 已获本地提交授权，未获合并或推送授权；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染未在本轮核验，不扩展 T20+。
 
 - 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
 - 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
@@ -34,7 +34,7 @@ T08 覆盖 visible/hidden/total 守恒、仅 visible depth、maker 补量时新 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
 3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §8、§14–§17、§54（重点不变量 12、13、18）、§64；按当前小步核对 §9、§13、§45–§46.1、§58，保留 §6.5.1–§6.5.2、§26.3–§26.5、§55.2–§55.4、§63 的数值/保护和回归要求。保留当前适用不变量 1–13/16–18/26/28–30/49–52/54–56；§54.53 及 §18/§27 reservation 仅作后续资金接口契约。始终遵守 §77 和 Appendix E；读取未来契约不扩大实现范围。
-4. 当前 [T17](assignment/tasks/T17_P5_runtime_shard_queue.md) 原始任务书、用户独立执行计划及唯一交接中的冻结裁定；用户新授权优先于原始导师模式。保留已验收的 T05–T15 契约和验证门，T13 的 PendingR2 裁定仍然有效。
+4. 当前 [T19](assignment/tasks/T19_P6_command_event_protocol.md) 原始任务书、用户独立执行计划及唯一交接中的冻结裁定；用户新授权优先于原始导师模式。保留已验收的 T05–T15 契约和验证门，T13 的 PendingR2 裁定仍然有效。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
@@ -45,7 +45,7 @@ T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/coun
 
 T05 已以独立流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，验收可复现 100k command tape 与当前适用不变量。T06 已验收的 Market incoming 不 rest、不分配 QueuePriority；当前冰山 maker 补量会取得新 priority；quote budget 严格正且不含手续费，spent<=budget，unused_quote 不是成交。所有 notional/quote→qty 换算走统一 checked MarketMath；向下取整到合法 lot，本档不能成交一个 lot 时立即终止，不构造 Qty(0) 或零量 Trade。保护参考在命令开始捕获并固定；bps 只允许 0..=9_999，Buy 对 reference×(10_000+bps)/10_000 双重向下取整，Sell 对 reference×(10_000-bps)/10_000 双重向上取整，最终边界按方向与显式 worst price/market band 取更严格者。边界比较包含等号；首个越界 maker 不成交并终结命令。reservation/fee release 只保留后续接口契约，不伪造已实现的资金闭环。
 
-T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Iceberg、StopBook/确定性触发级联、DAY/GTD/EndSession、Amend、CancelReplace、MassCancel 和当前支持的 STP 模式均已在各自范围内验收；CancelReplace 支持矩阵见 docs/cancel_replace.md。HA、完整后续命令协议及 runtime/persistence/protocol 业务仍在后续任务；不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Iceberg、StopBook/确定性触发级联、DAY/GTD/EndSession、Amend、CancelReplace、MassCancel 和当前支持的 STP 模式均已在各自范围内验收；CancelReplace 支持矩阵见 docs/cancel_replace.md。进程内 runtime 已实现单写者、有限队列、查询和屏障；HA、持久化、完整命令协议及 runtime 后续扩展仍在后续任务；不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
 
 ## 固定工作循环
 
