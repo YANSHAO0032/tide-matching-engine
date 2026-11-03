@@ -1,4 +1,4 @@
-//! 单写者分片执行、有界消息入口、路由、排序和处理流程编排的规划边界。
+//! 单写者分片执行、有界消息入口、路由、序号及有限正式命令编排。
 
 mod ownership;
 mod queue;
@@ -13,8 +13,8 @@ pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable}
 pub use wait_strategy::WaitStrategy;
 /// 单写者工作线程及其结果。
 pub use worker::{
-    Execution, Mutation, MutationEnvelope, MutationOutcome, Shard, ShardConfig, ShardError,
-    ShardHandle,
+    Execution, FormalExecution, FormalOutcome, Mutation, MutationEnvelope, MutationOutcome, Shard,
+    ShardConfig, ShardError, ShardHandle,
 };
 mod router;
 

@@ -1,11 +1,13 @@
 //! 领域标识符、整数数值、市场金额换算、订单载荷、执行结果与稳定错误码。
 //!
-//! 当前提供撮合所需的领域子集，不包含完整命令封装、资金账本或持久化协议。
+//! 当前提供撮合所需的领域子集，不包含完整资金账本或持久化协议。
 
 /// 改单绝对目标、显式补丁与纯候选计算。
 pub mod amend_order;
 /// 撤单替换的独立新订单、资金过渡及拒绝结果。
 pub mod cancel_replace;
+/// 正式命令及事件的进程内身份封装。
+pub mod command_event;
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
 /// 订单到期的稳定业务原因。
@@ -83,6 +85,8 @@ pub use cancel_replace::{
     ReservationTransition, UnadoptedReservation, validate_cancel_replace_old_type,
     validate_replacement_combination,
 };
+/// 正式命令及事件的进程内身份封装。
+pub use command_event::{Command, CommandEnvelope, EventEnvelope};
 /// 最小订单生命周期事件及终结余量的计价模式。
 pub use engine_event::{EngineEvent, OrderRemaining};
 /// 订单到期的稳定业务原因。

@@ -4,10 +4,12 @@ use crate::route_table::{RouteState, RouteTable};
 use crate::sequencer::Sequencer;
 use crate::wait_strategy::{WaitStrategy, Waiter};
 use matching_domain::{
-    ClusterId, CommandId, EngineEvent, LimitOrder, MarketId, OrderId, RejectReason, ShardId,
-    TradeIdCursor,
+    ClusterId, Command, CommandEnvelope, CommandId, EngineEvent, EventEnvelope, LimitOrder,
+    LogicalClock, LogicalTime, MarketId, OrderId, RejectReason, ReservationId, ShardCancelScope,
+    ShardId, ShardMassCancelResult, TradeIdCursor,
 };
 use matching_orderbook::{OrderNode, ProductionOrderBook};
+use matching_risk::{ReservationRegistry, ReservationState};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
@@ -17,7 +19,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-/// 当前可执行的订单变更。
+/// 无登记表的低层模式可执行的订单变更；登记表模式拒绝该入口。
 #[derive(Clone, Debug)]
 pub enum Mutation {
     /// 执行普通限价单。
@@ -83,6 +85,34 @@ pub struct Execution {
     pub result: Result<MutationOutcome, RejectReason>,
 }
 
+/// 正式命令的进程内执行结果。
+#[derive(Debug)]
+pub struct FormalExecution {
+    /// 对应的根命令身份；零事件命令也保留该身份。
+    pub command_id: CommandId,
+    /// 已分配的分片序号。
+    pub seq: u64,
+    /// 与命令类型对应的业务结果或业务拒绝。
+    pub outcome: FormalOutcome,
+    /// 按业务原序封装的事件。
+    pub events: Vec<EventEnvelope>,
+}
+
+/// 正式命令的有类型结果，不作为业务事件。
+#[derive(Debug, PartialEq, Eq)]
+pub enum FormalOutcome {
+    /// 分片本地批量撤单的汇总结果。
+    MassCancel(
+        /// 成功终结的订单数量。
+        ShardMassCancelResult,
+    ),
+    /// 已进入业务执行的拒绝原因。
+    Rejected(
+        /// 该命令的稳定业务拒绝原因。
+        RejectReason,
+    ),
+}
+
 /// 入口或运行状态错误。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShardError {
@@ -122,6 +152,20 @@ enum Message {
         Mutation,
         /// 只在本进程使用的一次性执行回复端。
         SyncSender<Result<Execution, RejectReason>>,
+    ),
+    /// 通过完整预留归属路径执行正式命令。
+    Formal(
+        /// 含路由及业务身份的命令。
+        CommandEnvelope,
+        /// 返回执行结果或前置拒绝的一次性回复端。
+        SyncSender<Result<FormalExecution, RejectReason>>,
+    ),
+    /// 在工作线程顺序点读取预留及其待处理归属。
+    Reservation(
+        /// 待读取的预留身份。
+        ReservationId,
+        /// 返回金融快照与待处理状态的一次性回复端。
+        SyncSender<Option<(ReservationState, bool)>>,
     ),
     /// 在队列顺序点查询指定市场的订单节点。
     Order(
@@ -213,135 +257,15 @@ impl Shard {
         books: Vec<(MarketId, ProductionOrderBook)>,
         config: ShardConfig,
     ) -> Result<Self, ShardError> {
-        let mut markets = BTreeMap::new();
-        for (market, book) in books {
-            // 当前入口仅承载无预留影子的底层订单，不能破坏已接管预留的归属。
-            if !book.reservation_snapshots().is_empty()
-                || book.market_id().is_some_and(|bound| bound != market)
-            {
-                return Err(ShardError::InvalidConfig);
-            }
-            if routes
-                .get(market)
-                .is_none_or(|route| route.shard_id != shard)
-                || markets.insert(market, book).is_some()
-            {
-                return Err(ShardError::InvalidConfig);
-            }
-        }
-        if routes.routes().any(|route| {
-            route.shard_id == shard
-                && route.state == RouteState::Active
-                && !markets.contains_key(&route.market_id)
-        }) {
-            return Err(ShardError::InvalidConfig);
-        }
-        let ownership =
-            crate::ownership::MarketOwnership::acquire(cluster, shard, markets.keys().copied())
-                .ok_or(ShardError::InvalidConfig)?;
-        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
-            capacity: config.capacity,
-            mutation_reserved_slots: config.mutation_reserved_slots,
-            max_query_inflight: config.max_query_inflight,
-            max_control_inflight: config.max_control_inflight,
-        })
-        .map_err(|_| ShardError::InvalidConfig)?;
-        let route_snapshot = Arc::new(routes);
-        let worker_routes = Arc::clone(&route_snapshot);
-        let close = producer.clone();
-        let failed = Arc::new(AtomicBool::new(false));
-        let worker_failed = Arc::clone(&failed);
-        let drop_requested = Arc::new(AtomicBool::new(false));
-        let worker_drop = Arc::clone(&drop_requested);
-        let join = thread::spawn(move || {
-            // 所有权与工作线程同寿命，排空后才释放。
-            let _ownership = ownership;
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut seq = Sequencer::new();
-                let mut waiter = Waiter::new(config.wait_strategy);
-                loop {
-                    let Some(msg) = consumer.pop() else {
-                        if worker_drop.load(Ordering::Acquire) && consumer.is_closed_and_empty() {
-                            break;
-                        }
-                        waiter.idle();
-                        continue;
-                    };
-                    waiter.reset();
-                    match msg {
-                        Message::Mutation(command_id, market, epoch, mutation, reply) => {
-                            let result =
-                                worker_routes.validate(market, shard, epoch).and_then(|()| {
-                                    let book = markets
-                                        .get_mut(&market)
-                                        .ok_or(RejectReason::StaleRouteEpoch)?;
-                                    let n = seq.allocate().expect("分片序号耗尽，停止处理");
-                                    let mut cursor = TradeIdCursor::new(cluster, shard, n);
-                                    let result = match mutation {
-                                        Mutation::Place(order) => book
-                                            .place_limit_gtc_with_cursor(order, &mut cursor)
-                                            .map(MutationOutcome::Placed),
-                                        Mutation::MarketByBase(order, math) => book
-                                            .execute_market_by_base_with_cursor(
-                                                order,
-                                                &math,
-                                                &mut cursor,
-                                            )
-                                            .map(MutationOutcome::MarketByBase),
-                                        Mutation::Cancel(id) => {
-                                            book.cancel(id).map(MutationOutcome::Canceled)
-                                        }
-                                    };
-                                    Ok(Execution {
-                                        command_id,
-                                        seq: n,
-                                        result,
-                                    })
-                                });
-                            let _ = reply.send(result);
-                        }
-                        Message::Order(market, id, reply) => {
-                            let _ = reply.send(
-                                markets
-                                    .get(&market)
-                                    .map(|book| book.order(id).cloned())
-                                    .ok_or(RejectReason::MarketNotFound),
-                            );
-                        }
-                        Message::Barrier(id, reply) => {
-                            let _ = reply.send((id, seq.last_applied()));
-                        }
-                        Message::Shutdown(reply) => {
-                            let _ = reply.send(());
-                            break;
-                        }
-                    }
-                }
-            }));
-            if run.is_err() {
-                worker_failed.store(true, Ordering::Release);
-            }
-            close.close_ingress();
-            // 线程异常时释放所有尚未处理消息的回复端，使接收方能够观察断连。
-            if run.is_err() {
-                while consumer.pop().is_some() {}
-            }
-            if let Err(payload) = run {
-                std::panic::resume_unwind(payload);
-            }
-        });
-        let thread = join.thread().clone();
-        Ok(Self {
-            producer,
-            thread,
-            join: Some(join),
-            shutdown_reply: None,
-            barrier_reached: false,
-            failed,
-            drop_requested,
-            shard_id: shard,
-            routes: route_snapshot,
-        })
+        Self::start_inner(
+            shard,
+            cluster,
+            routes,
+            books,
+            config,
+            None,
+            LogicalTime::new(0),
+        )
     }
 
     /// 将变更尝试入队，调用方通过单次回复获取业务结果。
@@ -460,6 +384,217 @@ impl Shard {
     }
 }
 
+impl Shard {
+    /// 使用真实预留登记表启动仅允许正式命令的分片。
+    ///
+    /// 调用方必须保证初始逻辑时间与订单前态来自同一可信执行点，
+    /// 并保证 DAY 订单的交易时段仍有效；当前没有完整市场会话状态。
+    /// 市场范围批量撤单的授权由可信调用方负责，本接口不执行管理身份认证。
+    pub fn start_with_registry(
+        shard: ShardId,
+        cluster: ClusterId,
+        routes: RouteTable,
+        books: Vec<(MarketId, ProductionOrderBook)>,
+        registry: ReservationRegistry,
+        now: LogicalTime,
+    ) -> Result<Self, ShardError> {
+        Self::start_inner(
+            shard,
+            cluster,
+            routes,
+            books,
+            ShardConfig::default(),
+            Some(registry),
+            now,
+        )
+    }
+
+    /// 校验分片初始状态后建立唯一工作线程和有界入口。
+    fn start_inner(
+        shard: ShardId,
+        cluster: ClusterId,
+        routes: RouteTable,
+        books: Vec<(MarketId, ProductionOrderBook)>,
+        config: ShardConfig,
+        mut registry: Option<ReservationRegistry>,
+        now: LogicalTime,
+    ) -> Result<Self, ShardError> {
+        let mut markets = BTreeMap::new();
+        for (market, book) in books {
+            // 低层模式不接管预留影子；登记表模式必须使用与市场一致的已绑定订单簿。
+            if (registry.is_none() && !book.reservation_snapshots().is_empty())
+                || book.market_id().is_some_and(|bound| bound != market)
+                || (registry.is_some() && book.market_id() != Some(market))
+            {
+                return Err(ShardError::InvalidConfig);
+            }
+            if let Some(existing) = &registry {
+                let mut expiry_probe = book.clone();
+                if !expiry_probe.expire_gtd_through(now).is_empty() {
+                    return Err(ShardError::InvalidConfig);
+                }
+                book.plan_mass_cancel(ShardCancelScope::Market { market_id: market }, existing)
+                    .map_err(|_| ShardError::InvalidConfig)?;
+            }
+            if routes
+                .get(market)
+                .is_none_or(|route| route.shard_id != shard)
+                || markets.insert(market, book).is_some()
+            {
+                return Err(ShardError::InvalidConfig);
+            }
+        }
+        if let Some(existing) = &registry {
+            existing
+                .validate_order_bindings(
+                    markets
+                        .values()
+                        .flat_map(|book| book.reservation_snapshots()),
+                )
+                .map_err(|_| ShardError::InvalidConfig)?;
+        }
+        if routes.routes().any(|route| {
+            route.shard_id == shard
+                && route.state == RouteState::Active
+                && !markets.contains_key(&route.market_id)
+        }) {
+            return Err(ShardError::InvalidConfig);
+        }
+        let ownership =
+            crate::ownership::MarketOwnership::acquire(cluster, shard, markets.keys().copied())
+                .ok_or(ShardError::InvalidConfig)?;
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: config.capacity,
+            mutation_reserved_slots: config.mutation_reserved_slots,
+            max_query_inflight: config.max_query_inflight,
+            max_control_inflight: config.max_control_inflight,
+        })
+        .map_err(|_| ShardError::InvalidConfig)?;
+        let route_snapshot = Arc::new(routes);
+        let worker_routes = Arc::clone(&route_snapshot);
+        let close = producer.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = Arc::clone(&failed);
+        let drop_requested = Arc::new(AtomicBool::new(false));
+        let worker_drop = Arc::clone(&drop_requested);
+        let join = thread::spawn(move || {
+            // 所有权与工作线程同寿命，排空后才释放。
+            let _ownership = ownership;
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut seq = Sequencer::new();
+                let clock = LogicalClock::new(now);
+                let mut waiter = Waiter::new(config.wait_strategy);
+                loop {
+                    let Some(msg) = consumer.pop() else {
+                        if worker_drop.load(Ordering::Acquire) && consumer.is_closed_and_empty() {
+                            break;
+                        }
+                        waiter.idle();
+                        continue;
+                    };
+                    waiter.reset();
+                    match msg {
+                        Message::Mutation(command_id, market, epoch, mutation, reply) => {
+                            let result =
+                                worker_routes.validate(market, shard, epoch).and_then(|()| {
+                                    if registry.is_some() {
+                                        return Err(RejectReason::InvalidOrderCombination);
+                                    }
+                                    let book = markets
+                                        .get_mut(&market)
+                                        .ok_or(RejectReason::StaleRouteEpoch)?;
+                                    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+                                    let mut cursor = TradeIdCursor::new(cluster, shard, n);
+                                    let result = match mutation {
+                                        Mutation::Place(order) => book
+                                            .place_limit_gtc_with_cursor(order, &mut cursor)
+                                            .map(MutationOutcome::Placed),
+                                        Mutation::MarketByBase(order, math) => book
+                                            .execute_market_by_base_with_cursor(
+                                                order,
+                                                &math,
+                                                &mut cursor,
+                                            )
+                                            .map(MutationOutcome::MarketByBase),
+                                        Mutation::Cancel(id) => {
+                                            book.cancel(id).map(MutationOutcome::Canceled)
+                                        }
+                                    };
+                                    Ok(Execution {
+                                        command_id,
+                                        seq: n,
+                                        result,
+                                    })
+                                });
+                            let _ = reply.send(result);
+                        }
+                        Message::Formal(command, reply) => {
+                            let result = execute_formal(
+                                &worker_routes,
+                                FormalIdentity {
+                                    shard,
+                                    cluster,
+                                    event_capacity: u64::from(u32::MAX) + 1,
+                                },
+                                &mut seq,
+                                &clock,
+                                &mut markets,
+                                &mut registry,
+                                command,
+                            );
+                            let _ = reply.send(result);
+                        }
+                        Message::Reservation(id, reply) => {
+                            let result = registry.as_ref().and_then(|r| {
+                                r.get(id).cloned().map(|state| (state, r.is_pending_r2(id)))
+                            });
+                            let _ = reply.send(result);
+                        }
+                        Message::Order(market, id, reply) => {
+                            let _ = reply.send(
+                                markets
+                                    .get(&market)
+                                    .map(|book| book.order(id).cloned())
+                                    .ok_or(RejectReason::MarketNotFound),
+                            );
+                        }
+                        Message::Barrier(id, reply) => {
+                            let _ = reply.send((id, seq.last_applied()));
+                        }
+                        Message::Shutdown(reply) => {
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            }));
+            if run.is_err() {
+                worker_failed.store(true, Ordering::Release);
+            }
+            close.close_ingress();
+            // 线程异常时释放所有尚未处理消息的回复端，使接收方能够观察断连。
+            if run.is_err() {
+                while consumer.pop().is_some() {}
+            }
+            if let Err(payload) = run {
+                std::panic::resume_unwind(payload);
+            }
+        });
+        let thread = join.thread().clone();
+        Ok(Self {
+            producer,
+            thread,
+            join: Some(join),
+            shutdown_reply: None,
+            barrier_reached: false,
+            failed,
+            drop_requested,
+            shard_id: shard,
+            routes: route_snapshot,
+        })
+    }
+}
+
 impl Drop for Shard {
     fn drop(&mut self) {
         if self.join.is_some() {
@@ -469,6 +604,101 @@ impl Drop for Shard {
             self.thread.unpark();
         }
     }
+}
+
+/// 正式命令执行时固定的集群与分片身份。
+struct FormalIdentity {
+    /// 命令所属分片。
+    shard: ShardId,
+    /// 命令所属集群。
+    cluster: ClusterId,
+    /// 根命令可编码的最大事件数量；测试可使用较小边界。
+    event_capacity: u64,
+}
+
+/// 在候选订单簿及登记表上执行正式命令，完成事件封装后安装后态。
+fn execute_formal(
+    routes: &RouteTable,
+    identity: FormalIdentity,
+    seq: &mut Sequencer,
+    clock: &LogicalClock,
+    markets: &mut BTreeMap<MarketId, ProductionOrderBook>,
+    registry: &mut Option<ReservationRegistry>,
+    command: CommandEnvelope,
+) -> Result<FormalExecution, RejectReason> {
+    let market = command
+        .market_id
+        .ok_or(RejectReason::InvalidOrderCombination)?;
+    let epoch = command.route_epoch.ok_or(RejectReason::StaleRouteEpoch)?;
+    routes.validate(market, identity.shard, epoch)?;
+    let Command::MassCancelShard(input) = command.payload;
+    if input.scope != (ShardCancelScope::Market { market_id: market }) || command.user_id.is_some()
+    {
+        return Err(RejectReason::InvalidOrderCombination);
+    }
+    let book = markets
+        .get_mut(&market)
+        .ok_or(RejectReason::StaleRouteEpoch)?;
+    let registry = registry
+        .as_mut()
+        .ok_or(RejectReason::InvalidOrderCombination)?;
+    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+    let mut candidate = book.clone();
+    let mut candidate_registry = registry.clone();
+    let (mut outcome, events) = match candidate.plan_mass_cancel(input.scope, &candidate_registry) {
+        Ok(plan) => {
+            let (result, events) = candidate
+                .apply_mass_cancel(&mut candidate_registry, plan)
+                .expect("新生成的批量撤单计划发生状态漂移");
+            (FormalOutcome::MassCancel(result), events)
+        }
+        Err(RejectReason::InvalidReservation | RejectReason::InvalidQty) => {
+            panic!("正式批量撤单发现预留或订单状态不变量损坏")
+        }
+        Err(reason) => (
+            FormalOutcome::Rejected(reason),
+            vec![EngineEvent::CommandRejected { reason }],
+        ),
+    };
+    let overflow = u64::try_from(events.len()).map_or(true, |count| {
+        !event_count_fits(count, identity.event_capacity)
+    });
+    let events = if overflow {
+        outcome = FormalOutcome::Rejected(RejectReason::ArithmeticOverflow);
+        vec![EngineEvent::CommandRejected {
+            reason: RejectReason::ArithmeticOverflow,
+        }]
+    } else {
+        events
+    };
+    let mut wrapped = Vec::with_capacity(events.len());
+    for (index, payload) in events.into_iter().enumerate() {
+        wrapped.push(EventEnvelope {
+            cluster_id: identity.cluster,
+            shard_id: identity.shard,
+            shard_seq: n,
+            event_index: u32::try_from(index).expect("事件数量已预检"),
+            command_id: command.command_id,
+            engine_time: clock.now().get(),
+            market_id: Some(market),
+            payload,
+        });
+    }
+    if !overflow {
+        *book = candidate;
+        *registry = candidate_registry;
+    }
+    Ok(FormalExecution {
+        command_id: command.command_id,
+        seq: n,
+        outcome,
+        events: wrapped,
+    })
+}
+
+/// 判断根命令的事件数量是否能够由给定索引容量完整表示。
+fn event_count_fits(count: u64, capacity: u64) -> bool {
+    count <= capacity
 }
 
 /// 可克隆的有界生产者，只能投递消息，不可访问撮合状态。
@@ -562,6 +792,27 @@ impl ShardHandle {
                 PushError::Closed(_) => ShardError::Closed,
             })?;
         self.thread.unpark();
+        Ok(rx)
+    }
+    /// 在分片顺序队列提交正式业务命令。
+    pub fn submit_command(
+        &self,
+        command: CommandEnvelope,
+    ) -> Result<Receiver<Result<FormalExecution, RejectReason>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::Formal(command, tx), IngressClass::Mutation)?;
+        Ok(rx)
+    }
+
+    /// 在线程顺序点读取预留金融快照及其 PendingR2 归属。
+    ///
+    /// 没有登记表或指定预留身份不存在时均返回 `None`。
+    pub fn reservation(
+        &self,
+        id: ReservationId,
+    ) -> Result<Receiver<Option<(ReservationState, bool)>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::Reservation(id, tx), IngressClass::Query)?;
         Ok(rx)
     }
 }
@@ -873,6 +1124,194 @@ mod tests {
             Err(ShardError::Closed)
         ));
         assert_eq!(shard.shutdown(Duration::from_secs(2)), Ok(()));
+    }
+
+    #[test]
+    fn formal_event_capacity_failure_discards_order_and_reservation_changes() {
+        use matching_domain::{
+            AssetId, AssetReserve, MassCancelShard, OriginSessionId, Price, Qty, Side, StpKey,
+            StpMode, UserId,
+        };
+        use matching_risk::ReservationStatus;
+        let market = MarketId(71);
+        let state = ReservationState {
+            reservation_id: ReservationId(9),
+            order_id: OrderId(8),
+            user_id: UserId(7),
+            market_id: market,
+            origin_session_id: OriginSessionId(6),
+            version: 0,
+            reserves: vec![AssetReserve {
+                asset: AssetId(1),
+                atoms: 100,
+            }],
+            status: ReservationStatus::Active,
+            fee_schedule_version: 1,
+            fee_tier_id: 1,
+        };
+        let mut book = ProductionOrderBook::new(
+            matching_orderbook::QueuePriorityPolicy::try_new(1024).unwrap(),
+        );
+        book.bind_market(market).unwrap();
+        book.rest_with_reservation(
+            LimitOrder {
+                order_id: OrderId(8),
+                user_id: UserId(7),
+                stp_key: StpKey::new(0),
+                stp_mode: StpMode::None,
+                side: Side::Buy,
+                price: Price::try_new(10).unwrap(),
+                qty: Qty::try_new(1).unwrap(),
+            },
+            state.clone(),
+        )
+        .unwrap();
+        let mut books = BTreeMap::from([(market, book.clone())]);
+        let mut registry = Some(ReservationRegistry::new([state]).unwrap());
+        let before = registry.clone();
+        let routes = RouteTable::new([MarketRoute {
+            market_id: market,
+            shard_id: ShardId(2),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let command = CommandEnvelope {
+            command_id: CommandId(1),
+            session_id: 1,
+            client_seq: 1,
+            market_id: Some(market),
+            user_id: None,
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: Command::MassCancelShard(MassCancelShard {
+                scope: ShardCancelScope::Market { market_id: market },
+            }),
+        };
+        let mut sequence = Sequencer::new();
+        let outcome = execute_formal(
+            &routes,
+            FormalIdentity {
+                shard: ShardId(2),
+                cluster: ClusterId(1),
+                event_capacity: 0,
+            },
+            &mut sequence,
+            &LogicalClock::new(LogicalTime::new(0)),
+            &mut books,
+            &mut registry,
+            command,
+        )
+        .unwrap();
+        assert_eq!(sequence.last_applied(), 1);
+        assert_eq!(books.get(&market), Some(&book));
+        assert_eq!(registry, before);
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(
+            outcome.outcome,
+            FormalOutcome::Rejected(RejectReason::ArithmeticOverflow)
+        );
+        assert_eq!(outcome.events[0].event_index, 0);
+        assert_eq!(
+            outcome.events[0].payload,
+            EngineEvent::CommandRejected {
+                reason: RejectReason::ArithmeticOverflow
+            }
+        );
+    }
+
+    #[test]
+    fn event_capacity_allows_every_u32_index_including_maximum() {
+        let capacity = u64::from(u32::MAX) + 1;
+        assert!(event_count_fits(capacity, capacity));
+        assert!(!event_count_fits(capacity + 1, capacity));
+    }
+
+    #[test]
+    fn formal_registry_invariant_failure_stops_without_installing_candidate() {
+        use matching_domain::{
+            AssetId, AssetReserve, MassCancelShard, OriginSessionId, Price, Qty, Side, StpKey,
+            StpMode, UserId,
+        };
+        use matching_risk::ReservationStatus;
+        let market = MarketId(72);
+        let state = ReservationState {
+            reservation_id: ReservationId(19),
+            order_id: OrderId(18),
+            user_id: UserId(17),
+            market_id: market,
+            origin_session_id: OriginSessionId(16),
+            version: 0,
+            reserves: vec![AssetReserve {
+                asset: AssetId(1),
+                atoms: 100,
+            }],
+            status: ReservationStatus::Active,
+            fee_schedule_version: 1,
+            fee_tier_id: 1,
+        };
+        let mut book = ProductionOrderBook::new(
+            matching_orderbook::QueuePriorityPolicy::try_new(1024).unwrap(),
+        );
+        book.bind_market(market).unwrap();
+        book.rest_with_reservation(
+            LimitOrder {
+                order_id: OrderId(18),
+                user_id: UserId(17),
+                stp_key: StpKey::new(0),
+                stp_mode: StpMode::None,
+                side: Side::Buy,
+                price: Price::try_new(10).unwrap(),
+                qty: Qty::try_new(1).unwrap(),
+            },
+            state,
+        )
+        .unwrap();
+        let mut books = BTreeMap::from([(market, book.clone())]);
+        // 故意构造与订单影子不一致的登记表，验证不能降级为普通业务拒绝。
+        let mut registry = Some(ReservationRegistry::new([]).unwrap());
+        let before = registry.clone();
+        let routes = RouteTable::new([MarketRoute {
+            market_id: market,
+            shard_id: ShardId(2),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let command = CommandEnvelope {
+            command_id: CommandId(1),
+            session_id: 1,
+            client_seq: 1,
+            market_id: Some(market),
+            user_id: None,
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: Command::MassCancelShard(MassCancelShard {
+                scope: ShardCancelScope::Market { market_id: market },
+            }),
+        };
+        let mut sequence = Sequencer::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_formal(
+                &routes,
+                FormalIdentity {
+                    shard: ShardId(2),
+                    cluster: ClusterId(1),
+                    event_capacity: u64::from(u32::MAX) + 1,
+                },
+                &mut sequence,
+                &LogicalClock::new(LogicalTime::new(0)),
+                &mut books,
+                &mut registry,
+                command,
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(sequence.last_applied(), 1);
+        assert_eq!(books.get(&market), Some(&book));
+        assert_eq!(registry, before);
     }
 }
 
