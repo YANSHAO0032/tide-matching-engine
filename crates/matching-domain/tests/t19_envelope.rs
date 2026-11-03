@@ -47,6 +47,49 @@ fn command_and_event_keep_root_identity_and_order() {
 }
 
 #[test]
+fn place_payload_includes_client_identity_and_control_epoch_in_business_identity() {
+    use matching_domain::{
+        AssetId, AssetReserve, LimitOrder, OrderId, PlaceLimitOrder, Price, Qty, ReservationId,
+        ReservationToken, Side, StpKey, StpMode,
+    };
+    let place = PlaceLimitOrder {
+        order: LimitOrder {
+            order_id: OrderId(4),
+            user_id: UserId(5),
+            side: Side::Buy,
+            price: Price::try_new(10).unwrap(),
+            qty: Qty::try_new(2).unwrap(),
+            stp_key: StpKey::new(0),
+            stp_mode: StpMode::None,
+        },
+        client_order_id: Some("client-1".to_owned()),
+        user_control_epoch: 7,
+        post_only: false,
+        reservation: ReservationToken {
+            token_id: 1,
+            command_id: CommandId(12),
+            reservation_id: ReservationId(3),
+            order_id: OrderId(4),
+            user_id: UserId(5),
+            market_id: MarketId(3),
+            reserves: vec![AssetReserve {
+                asset: AssetId(1),
+                atoms: 20,
+            }]
+            .into(),
+            fee_schedule_version: 1,
+            fee_tier_id: 1,
+            risk_key_id: 1,
+            signature: [0; 64],
+        },
+    };
+    let command = Command::PlaceLimit(Box::new(place.clone()));
+    let mut changed = place;
+    changed.user_control_epoch += 1;
+    assert_ne!(command, Command::PlaceLimit(Box::new(changed)));
+}
+
+#[test]
 fn existing_reason_codes_remain_fixed() {
     use matching_domain::{CancelReason, ExpireReason, ProtectionSource, ReservationReleaseReason};
     let reasons = [

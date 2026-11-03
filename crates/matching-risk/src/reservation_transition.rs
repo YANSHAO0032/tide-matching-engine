@@ -5,10 +5,48 @@ use crate::{
     verify_amend_reservation,
 };
 use matching_domain::{
-    AssetReserve, CancelReplaceRejection, CommandId, MarketId, OrderId, RejectReason,
-    ReservationId, ReservationTransition, UnadoptedReservation, UserId,
+    AssetReserve, CancelReplaceRejection, CommandId, MarketId, OrderId, OriginSessionId,
+    RejectReason, ReservationId, ReservationToken, ReservationTransition, UnadoptedReservation,
+    UserId,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// 由可信市场配置及候选订单计算的新预留需求。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedNewReservation {
+    /// 根命令身份。
+    pub command_id: CommandId,
+    /// 新订单身份。
+    pub order_id: OrderId,
+    /// 订单所属用户。
+    pub user_id: UserId,
+    /// 订单所属市场。
+    pub market_id: MarketId,
+    /// 首次接受订单时的来源会话。
+    pub origin_session_id: OriginSessionId,
+    /// 可信费率版本。
+    pub fee_schedule_version: u64,
+    /// 可信费率层级。
+    pub fee_tier_id: u32,
+    /// 由敞口和费用计算的所需资产。
+    pub required_reserves: Vec<AssetReserve>,
+}
+
+/// 已核验签名、身份及覆盖的新增预留计划。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedNewReservation {
+    /// 核验时的完整登记表，用于漂移检查。
+    before: ReservationRegistry,
+    /// 接管后的金融状态。
+    active: ReservationState,
+}
+
+impl PlannedNewReservation {
+    /// 读取候选预留状态。
+    pub fn active_state(&self) -> &ReservationState {
+        &self.active
+    }
+}
 
 /// 调用方从实际旧单及可信费率、敞口计算取得的预留需求。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +143,62 @@ pub struct ReservationRegistry {
 }
 
 impl ReservationRegistry {
+    /// 校验独立令牌并冻结新订单预留，调用方须提供可信敞口和费率。
+    pub fn plan_new_reservation(
+        &self,
+        keys: &RiskKeySet,
+        expected: &ExpectedNewReservation,
+        token: &ReservationToken,
+    ) -> Result<PlannedNewReservation, RejectReason> {
+        let payload = token.canonical_signing_payload()?;
+        keys.verify_signature(token.risk_key_id, &payload, &token.signature)?;
+        if token.command_id != expected.command_id
+            || token.order_id != expected.order_id
+            || token.user_id != expected.user_id
+            || token.market_id != expected.market_id
+            || token.fee_schedule_version != expected.fee_schedule_version
+            || token.fee_tier_id != expected.fee_tier_id
+            || self.states.contains_key(&token.reservation_id)
+            || self.active_order_exists(expected.order_id)
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        validate_reserves(&expected.required_reserves)?;
+        verify_coverage(&token.reserves, &expected.required_reserves)?;
+        verify_asset_set(&token.reserves, &expected.required_reserves)?;
+        let active = ReservationState {
+            reservation_id: token.reservation_id,
+            order_id: token.order_id,
+            user_id: token.user_id,
+            market_id: token.market_id,
+            origin_session_id: expected.origin_session_id,
+            version: 0,
+            reserves: token.reserves.to_vec(),
+            status: ReservationStatus::Active,
+            fee_schedule_version: token.fee_schedule_version,
+            fee_tier_id: token.fee_tier_id,
+        };
+        Ok(PlannedNewReservation {
+            before: self.clone(),
+            active,
+        })
+    }
+
+    /// 在候选登记表中接管已验证新预留；前态漂移视为不变量错误。
+    pub fn apply_new_reservation(
+        &mut self,
+        plan: PlannedNewReservation,
+    ) -> Result<(), ReservationApplyError> {
+        if *self != plan.before {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        self.bindings.insert(
+            plan.active.reservation_id,
+            ReservationBinding::ActiveOrder(plan.active.order_id),
+        );
+        self.states.insert(plan.active.reservation_id, plan.active);
+        Ok(())
+    }
     /// 从已接管状态及释放历史建立唯一身份边界。
     ///
     /// 该实例持有实际状态，调用方必须保留其释放历史，不能每次仅从活动订单重建。

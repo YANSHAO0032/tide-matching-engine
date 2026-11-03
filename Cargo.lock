@@ -244,6 +244,7 @@ name = "matching-runtime"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
+ "ed25519-dalek",
  "matching-domain",
  "matching-orderbook",
  "matching-risk",

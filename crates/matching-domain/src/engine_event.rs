@@ -1,7 +1,7 @@
 use crate::reservation_release_reason::ReservationReleaseReason;
 use crate::{
     AmendedQuantity, CancelReason, OrderId, Price, ProtectionSource, Qty, QuoteAmount,
-    RejectReason, ReservationId, TradeEvent, TriggeredOrderKind,
+    RejectReason, ReservationId, TradeEvent, TriggeredOrderKind, UserId,
 };
 
 /// 订单终结时的业务余量。
@@ -20,6 +20,13 @@ pub enum OrderRemaining {
 /// 它不是完整持久化事件封装：不携带市场事件序列、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
+    /// 用户控制下限已推进或保持。
+    UserControlEpochAdvanced {
+        /// 用户身份。
+        user_id: UserId,
+        /// 生效的下限。
+        epoch: u64,
+    },
     /// 命令在状态变更前被拒绝，并携带稳定的原因码。
     CommandRejected {
         /// 拒绝命令的稳定原因码。

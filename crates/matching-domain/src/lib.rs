@@ -86,7 +86,10 @@ pub use cancel_replace::{
     validate_replacement_combination,
 };
 /// 正式命令及事件的进程内身份封装。
-pub use command_event::{Command, CommandEnvelope, EventEnvelope};
+pub use command_event::{
+    ApplyUserControlFenceShard, Command, CommandEnvelope, CommandResultSummary, CommandStatus,
+    EventEnvelope, PlaceLimitOrder, UserFenceAction,
+};
 /// 最小订单生命周期事件及终结余量的计价模式。
 pub use engine_event::{EngineEvent, OrderRemaining};
 /// 订单到期的稳定业务原因。

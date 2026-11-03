@@ -121,6 +121,16 @@ impl MarketMath {
         })
     }
 
+    /// 返回基础数量整数的十进制缩放位数，供资产单位映射核验。
+    pub const fn qty_scale(&self) -> u8 {
+        self.qty_scale
+    }
+
+    /// 返回报价金额整数的十进制缩放位数，供资产单位映射核验。
+    pub const fn quote_scale(&self) -> u8 {
+        self.quote_scale
+    }
+
     /// 返回构造时已验证的市场价格步长。
     ///
     /// 保留 Price 原始值单位，不进行重新校验或换算。
@@ -217,6 +227,12 @@ impl MarketMath {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn market_quantity_and_quote_scales_are_available_for_asset_mapping() {
+        let math = super::MarketMath::try_new(2, 3, 5, 1, 1).unwrap();
+        assert_eq!(math.qty_scale(), 3);
+        assert_eq!(math.quote_scale(), 5);
+    }
     use super::*;
     #[test]
     fn market_math_rejects_invalid_tick_and_lot() {

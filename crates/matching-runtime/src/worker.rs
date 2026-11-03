@@ -1,12 +1,17 @@
 //! 分片工作线程及进程内消息。
+use crate::client_order_id::ClientOrderIds;
+use crate::idempotency::{DedupWindow, IdempotencyConfig};
+use crate::place_candidate::{PlacePlanningContext, place_candidate};
+use crate::place_config::PlaceSupportConfig;
 use crate::queue::{IngressClass, IngressLimits, Producer, PushError, bounded_queue_with_limits};
 use crate::route_table::{RouteState, RouteTable};
 use crate::sequencer::Sequencer;
+use crate::user_control::UserControlEpochs;
 use crate::wait_strategy::{WaitStrategy, Waiter};
 use matching_domain::{
-    ClusterId, Command, CommandEnvelope, CommandId, EngineEvent, EventEnvelope, LimitOrder,
-    LogicalClock, LogicalTime, MarketId, OrderId, RejectReason, ReservationId, ShardCancelScope,
-    ShardId, ShardMassCancelResult, TradeIdCursor,
+    ClusterId, Command, CommandEnvelope, CommandId, CommandResultSummary, CommandStatus,
+    EngineEvent, EventEnvelope, LimitOrder, LogicalClock, LogicalTime, MarketId, OrderId,
+    RejectReason, ReservationId, ShardCancelScope, ShardId, ShardMassCancelResult, TradeIdCursor,
 };
 use matching_orderbook::{OrderNode, ProductionOrderBook};
 use matching_risk::{ReservationRegistry, ReservationState};
@@ -90,17 +95,33 @@ pub struct Execution {
 pub struct FormalExecution {
     /// 对应的根命令身份；零事件命令也保留该身份。
     pub command_id: CommandId,
-    /// 已分配的分片序号。
+    /// 首次执行时分配的分片序号；去重命中时沿用原值。
     pub seq: u64,
     /// 与命令类型对应的业务结果或业务拒绝。
     pub outcome: FormalOutcome,
+    /// 首次执行的逻辑摘要；不代表已持久化。
+    pub summary: CommandResultSummary,
     /// 按业务原序封装的事件。
     pub events: Vec<EventEnvelope>,
+    /// 首次执行事件的闭区间；零事件时为空。
+    pub event_range: Option<(u32, u32)>,
+    /// 此次响应是否来自已执行命令的窗口缓存。
+    pub deduplicated: bool,
 }
 
 /// 正式命令的有类型结果，不作为业务事件。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormalOutcome {
+    /// 正式限价命令成功接收的订单身份。
+    Placed(
+        /// 已接受的订单身份。
+        OrderId,
+    ),
+    /// 用户控制下限的生效值。
+    UserFence(
+        /// 执行后生效的用户控制下限。
+        u64,
+    ),
     /// 分片本地批量撤单的汇总结果。
     MassCancel(
         /// 成功终结的订单数量。
@@ -111,6 +132,23 @@ pub enum FormalOutcome {
         /// 该命令的稳定业务拒绝原因。
         RejectReason,
     ),
+}
+
+/// 正式命令的入口拒绝或协议身份冲突。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormalError {
+    /// 现有稳定入口拒绝原因。
+    Rejected(
+        /// 按原协议保留的稳定入口拒绝原因。
+        RejectReason,
+    ),
+    /// 命令身份或会话序号与先前业务意图冲突。
+    ProtocolError,
+}
+impl PartialEq<RejectReason> for FormalError {
+    fn eq(&self, other: &RejectReason) -> bool {
+        matches!(self, Self::Rejected(reason) if reason == other)
+    }
 }
 
 /// 入口或运行状态错误。
@@ -158,7 +196,7 @@ enum Message {
         /// 含路由及业务身份的命令。
         CommandEnvelope,
         /// 返回执行结果或前置拒绝的一次性回复端。
-        SyncSender<Result<FormalExecution, RejectReason>>,
+        SyncSender<Result<FormalExecution, FormalError>>,
     ),
     /// 在工作线程顺序点读取预留及其待处理归属。
     Reservation(
@@ -264,7 +302,13 @@ impl Shard {
             books,
             config,
             None,
-            LogicalTime::new(0),
+            (
+                LogicalTime::new(0),
+                IdempotencyConfig::default(),
+                0,
+                4096,
+                None,
+            ),
         )
     }
 
@@ -405,7 +449,78 @@ impl Shard {
             books,
             ShardConfig::default(),
             Some(registry),
-            now,
+            (now, IdempotencyConfig::default(), 0, 4096, None),
+        )
+    }
+
+    /// 使用显式容量启动登记表模式；其他可信前态要求与 `start_with_registry` 相同。
+    pub fn start_with_registry_and_idempotency(
+        shard: ShardId,
+        cluster: ClusterId,
+        routes: RouteTable,
+        books: Vec<(MarketId, ProductionOrderBook)>,
+        registry: ReservationRegistry,
+        now: LogicalTime,
+        idempotency: IdempotencyConfig,
+    ) -> Result<Self, ShardError> {
+        Self::start_inner(
+            shard,
+            cluster,
+            routes,
+            books,
+            ShardConfig::default(),
+            Some(registry),
+            (now, idempotency, 0, 4096, None),
+        )
+    }
+
+    /// 以显式进程内主节点纪元与用户下限容量启动；不提供租约或持久化。
+    pub fn start_with_user_control(
+        shard: ShardId,
+        cluster: ClusterId,
+        routes: RouteTable,
+        books: Vec<(MarketId, ProductionOrderBook)>,
+        registry: ReservationRegistry,
+        now: LogicalTime,
+        (idempotency, primary_epoch, user_capacity): (IdempotencyConfig, u64, usize),
+    ) -> Result<Self, ShardError> {
+        Self::start_inner(
+            shard,
+            cluster,
+            routes,
+            books,
+            ShardConfig::default(),
+            Some(registry),
+            (now, idempotency, primary_epoch, user_capacity, None),
+        )
+    }
+
+    /// 从空活动订单状态启动限价入口；策略和费率由可信本地配置提供。
+    ///
+    /// 当前客户端身份索引无法从旧订单恢复，因此拒绝包含活动订单的初始簿。
+    /// 用户控制纪元、订单及命令去重均只在本进程生命周期内生效。
+    pub fn start_with_place_support(
+        shard: ShardId,
+        cluster: ClusterId,
+        routes: RouteTable,
+        books: Vec<(MarketId, ProductionOrderBook)>,
+        registry: ReservationRegistry,
+        now: LogicalTime,
+        (idempotency, primary_epoch, user_capacity, place): (
+            IdempotencyConfig,
+            u64,
+            usize,
+            PlaceSupportConfig,
+        ),
+    ) -> Result<Self, ShardError> {
+        Self::start_inner(
+            shard,
+            cluster,
+            routes,
+            books,
+            ShardConfig::default(),
+            Some(registry),
+            (now, idempotency, primary_epoch, user_capacity, Some(place)),
         )
     }
 
@@ -417,8 +532,24 @@ impl Shard {
         books: Vec<(MarketId, ProductionOrderBook)>,
         config: ShardConfig,
         mut registry: Option<ReservationRegistry>,
-        now: LogicalTime,
+        (now, idempotency, primary_epoch, user_capacity, place_config): (
+            LogicalTime,
+            IdempotencyConfig,
+            u64,
+            usize,
+            Option<PlaceSupportConfig>,
+        ),
     ) -> Result<Self, ShardError> {
+        let mut user_epochs =
+            UserControlEpochs::new(user_capacity).map_err(|()| ShardError::InvalidConfig)?;
+        if !idempotency.valid() {
+            return Err(ShardError::InvalidConfig);
+        }
+        let mut dedup = if registry.is_some() {
+            Some(DedupWindow::new(idempotency).map_err(|()| ShardError::InvalidConfig)?)
+        } else {
+            None
+        };
         let mut markets = BTreeMap::new();
         for (market, book) in books {
             // 低层模式不接管预留影子；登记表模式必须使用与市场一致的已绑定订单簿。
@@ -453,6 +584,29 @@ impl Shard {
                 )
                 .map_err(|_| ShardError::InvalidConfig)?;
         }
+        let mut place_state = if let Some(place) = place_config {
+            if markets
+                .values()
+                .any(|book| !book.reservation_snapshots().is_empty())
+                || place.policies.iter().any(|(market, policy)| {
+                    markets.get(market).is_none_or(|book| {
+                        book.price_band_config()
+                            .is_some_and(|(_, math)| math != policy.market_math())
+                    })
+                })
+            {
+                return Err(ShardError::InvalidConfig);
+            }
+            let ids = ClientOrderIds::with_max_id_bytes(
+                place.limits.active_orders,
+                place.limits.terminal_history,
+                place.limits.client_id_bytes,
+            )
+            .map_err(|()| ShardError::InvalidConfig)?;
+            Some(PlaceRuntimeState { config: place, ids })
+        } else {
+            None
+        };
         if routes.routes().any(|route| {
             route.shard_id == shard
                 && route.state == RouteState::Active
@@ -529,19 +683,97 @@ impl Shard {
                             let _ = reply.send(result);
                         }
                         Message::Formal(command, reply) => {
-                            let result = execute_formal(
-                                &worker_routes,
-                                FormalIdentity {
-                                    shard,
-                                    cluster,
-                                    event_capacity: u64::from(u32::MAX) + 1,
-                                },
-                                &mut seq,
-                                &clock,
-                                &mut markets,
-                                &mut registry,
-                                command,
-                            );
+                            let result = if let Command::ApplyUserControlFenceShard(ref fence) =
+                                command.payload
+                            {
+                                if fence.expected_primary_epoch != primary_epoch {
+                                    Err(FormalError::Rejected(RejectReason::StalePrimaryEpoch))
+                                } else if let Some(window) = dedup.as_mut() {
+                                    execute_fence(
+                                        &mut user_epochs,
+                                        window,
+                                        &mut seq,
+                                        &clock,
+                                        FormalIdentity {
+                                            shard,
+                                            cluster,
+                                            event_capacity: u64::from(u32::MAX) + 1,
+                                        },
+                                        command,
+                                    )
+                                } else {
+                                    Err(FormalError::Rejected(
+                                        RejectReason::InvalidOrderCombination,
+                                    ))
+                                }
+                            } else if let Command::PlaceLimit(ref place) = command.payload {
+                                let preflight = (|| {
+                                    let market = command
+                                        .market_id
+                                        .ok_or(RejectReason::InvalidOrderCombination)?;
+                                    let epoch =
+                                        command.route_epoch.ok_or(RejectReason::StaleRouteEpoch)?;
+                                    worker_routes.validate(market, shard, epoch)?;
+                                    if !markets.contains_key(&market) || registry.is_none() {
+                                        return Err(RejectReason::InvalidOrderCombination);
+                                    }
+                                    user_epochs
+                                        .check(place.order.user_id, place.user_control_epoch)?;
+                                    Ok(())
+                                })();
+                                match (preflight, dedup.as_mut(), place_state.as_mut()) {
+                                    (Err(reason), _, _) => Err(FormalError::Rejected(reason)),
+                                    (Ok(()), Some(window), Some(state)) => execute_place(
+                                        PlaceExecutionContext {
+                                            identity: FormalIdentity {
+                                                shard,
+                                                cluster,
+                                                event_capacity: u64::from(u32::MAX) + 1,
+                                            },
+                                            seq: &mut seq,
+                                            clock: &clock,
+                                            markets: &mut markets,
+                                            registry: registry.as_mut().expect("已验证登记表"),
+                                            window,
+                                            state,
+                                        },
+                                        command,
+                                    ),
+                                    _ => Err(FormalError::Rejected(
+                                        RejectReason::InvalidOrderCombination,
+                                    )),
+                                }
+                            } else {
+                                match dedup.as_mut() {
+                                    Some(window) => execute_formal_idempotent(
+                                        &worker_routes,
+                                        FormalIdentity {
+                                            shard,
+                                            cluster,
+                                            event_capacity: u64::from(u32::MAX) + 1,
+                                        },
+                                        &mut seq,
+                                        &clock,
+                                        &mut markets,
+                                        &mut registry,
+                                        (command, window, &mut place_state),
+                                    ),
+                                    None => execute_formal(
+                                        &worker_routes,
+                                        FormalIdentity {
+                                            shard,
+                                            cluster,
+                                            event_capacity: u64::from(u32::MAX) + 1,
+                                        },
+                                        &mut seq,
+                                        &clock,
+                                        &mut markets,
+                                        &mut registry,
+                                        command,
+                                    )
+                                    .map_err(FormalError::Rejected),
+                                }
+                            };
                             let _ = reply.send(result);
                         }
                         Message::Reservation(id, reply) => {
@@ -616,7 +848,296 @@ struct FormalIdentity {
     event_capacity: u64,
 }
 
+/// 仅允许单写者访问的限价配置及客户端身份状态。
+struct PlaceRuntimeState {
+    /// 启动时固定的可信市场策略和容量。
+    config: PlaceSupportConfig,
+    /// 与活动订单及终结历史同步的客户端身份。
+    ids: ClientOrderIds,
+}
+
+/// 正式限价命令所需的单写者状态。
+struct PlaceExecutionContext<'a> {
+    /// 根事件身份与事件容量。
+    identity: FormalIdentity,
+    /// 根命令序号分配器。
+    seq: &'a mut Sequencer,
+    /// 分片业务逻辑时间。
+    clock: &'a LogicalClock,
+    /// 本分片拥有的市场簿。
+    markets: &'a mut BTreeMap<MarketId, ProductionOrderBook>,
+    /// 真实预留登记表。
+    registry: &'a mut ReservationRegistry,
+    /// 已执行命令的有界窗口。
+    window: &'a mut DedupWindow,
+    /// 可信限价配置和客户端身份索引。
+    state: &'a mut PlaceRuntimeState,
+}
+
+/// 完成预检后执行限价候选，事件容量有效时才一次安装全部后态。
+fn execute_place(
+    context: PlaceExecutionContext<'_>,
+    command: CommandEnvelope,
+) -> Result<FormalExecution, FormalError> {
+    let PlaceExecutionContext {
+        identity,
+        seq,
+        clock,
+        markets,
+        registry,
+        window,
+        state,
+    } = context;
+    let Command::PlaceLimit(ref place) = command.payload else {
+        unreachable!()
+    };
+    let market = command.market_id.expect("已验证市场路由");
+    if let Some(result) = window
+        .lookup(&command)
+        .map_err(|()| FormalError::ProtocolError)?
+    {
+        window.remember_alias(&command);
+        return Ok(result);
+    }
+    if command.user_id != Some(place.order.user_id) {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    if place
+        .client_order_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > state.config.limits.client_id_bytes)
+        || place.reservation.reserves.len() > 3
+    {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    let policy = state
+        .config
+        .policies
+        .get(&market)
+        .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
+    let active = markets
+        .values()
+        .try_fold(0usize, |sum, book| {
+            sum.checked_add(book.reservation_snapshots().len())
+        })
+        .ok_or(FormalError::Rejected(RejectReason::EngineBusy))?;
+    if active >= state.config.limits.active_orders {
+        return Err(FormalError::Rejected(RejectReason::EngineBusy));
+    }
+    let ids = state
+        .ids
+        .try_clone_preallocated()
+        .map_err(|()| FormalError::Rejected(RejectReason::EngineBusy))?;
+    let prepared = window.prepare(&command);
+    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+    let cursor = TradeIdCursor::new(identity.cluster, identity.shard, n);
+    let book = markets.get_mut(&market).expect("已验证市场存在");
+    let planned = place_candidate(
+        PlacePlanningContext {
+            policy,
+            keys: &state.config.keys,
+            command_id: command.command_id,
+            session: command.session_id,
+            now: clock.now(),
+        },
+        place,
+        book,
+        registry,
+        ids,
+        &cursor,
+    );
+    let (mut outcome, mut payloads, candidate) = match planned {
+        Ok(candidate) => (
+            FormalOutcome::Placed(place.order.order_id),
+            candidate.events.clone(),
+            Some(candidate),
+        ),
+        Err(reason) => (
+            FormalOutcome::Rejected(reason),
+            vec![EngineEvent::CommandRejected { reason }],
+            None,
+        ),
+    };
+    let overflow = u64::try_from(payloads.len()).map_or(true, |count| {
+        !event_count_fits(count, identity.event_capacity)
+    });
+    if overflow {
+        outcome = FormalOutcome::Rejected(RejectReason::ArithmeticOverflow);
+        payloads = vec![EngineEvent::CommandRejected {
+            reason: RejectReason::ArithmeticOverflow,
+        }];
+    }
+    let events: Vec<_> = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| EventEnvelope {
+            cluster_id: identity.cluster,
+            shard_id: identity.shard,
+            shard_seq: n,
+            event_index: u32::try_from(index).expect("事件数量已预检"),
+            command_id: command.command_id,
+            engine_time: clock.now().get(),
+            market_id: Some(market),
+            payload,
+        })
+        .collect();
+    let (status, reject_reason) = match outcome {
+        FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(reason)),
+        _ => (CommandStatus::Succeeded, None),
+    };
+    let result = FormalExecution {
+        command_id: command.command_id,
+        seq: n,
+        outcome,
+        summary: CommandResultSummary {
+            status,
+            first_event_index: events.first().map(|event| event.event_index),
+            last_event_index: events.last().map(|event| event.event_index),
+            durable_seq: Some(n),
+            reject_reason,
+        },
+        event_range: events.last().map(|event| (0, event.event_index)),
+        events,
+        deduplicated: false,
+    };
+    if !overflow && let Some(candidate) = candidate {
+        *book = candidate.book;
+        *registry = candidate.registry;
+        state.ids = candidate.ids;
+        let _cursor = candidate.cursor;
+    }
+    window.insert_prepared(&command, prepared, &result);
+    Ok(result)
+}
+
+/// 栅栏在去重后先构造候选状态，再分配序号并原子安装。
+fn execute_fence(
+    epochs: &mut UserControlEpochs,
+    dedup: &mut DedupWindow,
+    seq: &mut Sequencer,
+    clock: &LogicalClock,
+    identity: FormalIdentity,
+    command: CommandEnvelope,
+) -> Result<FormalExecution, FormalError> {
+    let Command::ApplyUserControlFenceShard(ref fence) = command.payload else {
+        unreachable!()
+    };
+    if let Some(result) = dedup
+        .lookup(&command)
+        .map_err(|()| FormalError::ProtocolError)?
+    {
+        dedup.remember_alias(&command);
+        return Ok(result);
+    }
+    if command.market_id.is_some()
+        || command.route_epoch.is_some()
+        || command.user_id != Some(fence.user_id)
+        || fence.action != matching_domain::UserFenceAction::FenceOnly
+    {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    let mut candidate = epochs.clone();
+    let epoch = candidate
+        .advance(fence.user_id, fence.new_epoch)
+        .map_err(FormalError::Rejected)?;
+    let prepared = dedup.prepare(&command);
+    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+    let event = EventEnvelope {
+        cluster_id: identity.cluster,
+        shard_id: identity.shard,
+        shard_seq: n,
+        event_index: 0,
+        command_id: command.command_id,
+        engine_time: clock.now().get(),
+        market_id: None,
+        payload: EngineEvent::UserControlEpochAdvanced {
+            user_id: fence.user_id,
+            epoch,
+        },
+    };
+    let summary = CommandResultSummary {
+        status: CommandStatus::Succeeded,
+        first_event_index: Some(0),
+        last_event_index: Some(0),
+        durable_seq: Some(n),
+        reject_reason: None,
+    };
+    let result = FormalExecution {
+        command_id: command.command_id,
+        seq: n,
+        outcome: FormalOutcome::UserFence(epoch),
+        summary,
+        events: vec![event],
+        event_range: Some((0, 0)),
+        deduplicated: false,
+    };
+    *epochs = candidate;
+    dedup.insert_prepared(&command, prepared, &result);
+    Ok(result)
+}
+
 /// 在候选订单簿及登记表上执行正式命令，完成事件封装后安装后态。
+fn execute_formal_idempotent(
+    routes: &RouteTable,
+    identity: FormalIdentity,
+    seq: &mut Sequencer,
+    clock: &LogicalClock,
+    markets: &mut BTreeMap<MarketId, ProductionOrderBook>,
+    registry: &mut Option<ReservationRegistry>,
+    (command, dedup, place_state): (
+        CommandEnvelope,
+        &mut DedupWindow,
+        &mut Option<PlaceRuntimeState>,
+    ),
+) -> Result<FormalExecution, FormalError> {
+    let market = command
+        .market_id
+        .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
+    let epoch = command
+        .route_epoch
+        .ok_or(FormalError::Rejected(RejectReason::StaleRouteEpoch))?;
+    routes
+        .validate(market, identity.shard, epoch)
+        .map_err(FormalError::Rejected)?;
+    if !markets.contains_key(&market) || registry.is_none() {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    if let Some(result) = dedup
+        .lookup(&command)
+        .map_err(|()| FormalError::ProtocolError)?
+    {
+        dedup.remember_alias(&command);
+        return Ok(result);
+    }
+    let mut candidate_ids = place_state
+        .as_ref()
+        .map(|state| state.ids.try_clone_preallocated())
+        .transpose()
+        .map_err(|()| FormalError::Rejected(RejectReason::EngineBusy))?;
+    let prepared = dedup.prepare(&command);
+    let result = execute_formal(
+        routes,
+        identity,
+        seq,
+        clock,
+        markets,
+        registry,
+        command.clone(),
+    )
+    .map_err(FormalError::Rejected)?;
+    if let (Some(ids), Some(state)) = (candidate_ids.as_mut(), place_state.as_mut()) {
+        for event in &result.events {
+            if let EngineEvent::OrderCanceled { order_id, .. } = event.payload {
+                ids.terminal_in_market(market, order_id);
+            }
+        }
+        state.ids = candidate_ids.expect("候选身份索引存在");
+    }
+    dedup.insert_prepared(&command, prepared, &result);
+    Ok(result)
+}
+
+/// 在候选状态中完成业务执行及事件封装。
 fn execute_formal(
     routes: &RouteTable,
     identity: FormalIdentity,
@@ -631,7 +1152,9 @@ fn execute_formal(
         .ok_or(RejectReason::InvalidOrderCombination)?;
     let epoch = command.route_epoch.ok_or(RejectReason::StaleRouteEpoch)?;
     routes.validate(market, identity.shard, epoch)?;
-    let Command::MassCancelShard(input) = command.payload;
+    let Command::MassCancelShard(input) = command.payload else {
+        return Err(RejectReason::InvalidOrderCombination);
+    };
     if input.scope != (ShardCancelScope::Market { market_id: market }) || command.user_id.is_some()
     {
         return Err(RejectReason::InvalidOrderCombination);
@@ -688,11 +1211,27 @@ fn execute_formal(
         *book = candidate;
         *registry = candidate_registry;
     }
+    let (status, reject_reason) = match &outcome {
+        FormalOutcome::MassCancel(_) | FormalOutcome::UserFence(_) | FormalOutcome::Placed(_) => {
+            (CommandStatus::Succeeded, None)
+        }
+        FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(*reason)),
+    };
+    let summary = CommandResultSummary {
+        status,
+        first_event_index: wrapped.first().map(|event| event.event_index),
+        last_event_index: wrapped.last().map(|event| event.event_index),
+        durable_seq: Some(n),
+        reject_reason,
+    };
     Ok(FormalExecution {
         command_id: command.command_id,
         seq: n,
         outcome,
+        summary,
+        event_range: wrapped.last().map(|event| (0, event.event_index)),
         events: wrapped,
+        deduplicated: false,
     })
 }
 
@@ -798,7 +1337,7 @@ impl ShardHandle {
     pub fn submit_command(
         &self,
         command: CommandEnvelope,
-    ) -> Result<Receiver<Result<FormalExecution, RejectReason>>, ShardError> {
+    ) -> Result<Receiver<Result<FormalExecution, FormalError>>, ShardError> {
         let (tx, rx) = sync_channel(1);
         self.push(Message::Formal(command, tx), IngressClass::Mutation)?;
         Ok(rx)
@@ -1190,7 +1729,8 @@ mod tests {
             }),
         };
         let mut sequence = Sequencer::new();
-        let outcome = execute_formal(
+        let mut window = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let outcome = execute_formal_idempotent(
             &routes,
             FormalIdentity {
                 shard: ShardId(2),
@@ -1201,7 +1741,7 @@ mod tests {
             &LogicalClock::new(LogicalTime::new(0)),
             &mut books,
             &mut registry,
-            command,
+            (command.clone(), &mut window, &mut None),
         )
         .unwrap();
         assert_eq!(sequence.last_applied(), 1);
@@ -1219,6 +1759,26 @@ mod tests {
                 reason: RejectReason::ArithmeticOverflow
             }
         );
+        let retry = execute_formal_idempotent(
+            &routes,
+            FormalIdentity {
+                shard: ShardId(2),
+                cluster: ClusterId(1),
+                event_capacity: 0,
+            },
+            &mut sequence,
+            &LogicalClock::new(LogicalTime::new(0)),
+            &mut books,
+            &mut registry,
+            (command, &mut window, &mut None),
+        )
+        .unwrap();
+        assert!(retry.deduplicated);
+        assert_eq!(retry.summary, outcome.summary);
+        assert!(retry.events.is_empty());
+        assert_eq!(sequence.last_applied(), 1);
+        assert_eq!(books.get(&market), Some(&book));
+        assert_eq!(registry, before);
     }
 
     #[test]
@@ -1403,5 +1963,226 @@ mod concurrent_real_orders {
             );
         }
         shard.shutdown(Duration::from_secs(5)).unwrap();
+    }
+}
+
+/// 验证限价单事件索引容量不足时的根命令原子性。
+#[cfg(test)]
+mod place_event_capacity_tests {
+    use super::*;
+    use crate::place_config::PlaceLimits;
+    use ed25519_dalek::{Signer, SigningKey};
+    use matching_domain::{
+        AssetId, AssetReserve, MarketMath, PlaceLimitOrder, Price, Qty, ReservationToken, Side,
+        StpKey, StpMode, UserId,
+    };
+    use matching_orderbook::QueuePriorityPolicy;
+    use matching_risk::{LimitReservePolicy, RiskKeySet};
+
+    #[test]
+    fn capacity_overflow_discards_signed_place_and_caches_rejection() {
+        let market = MarketId(88);
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let keys = RiskKeySet::new(1, [(1, signing.verifying_key())]).unwrap();
+        let policy = LimitReservePolicy::new(
+            (AssetId(1), 0),
+            (AssetId(2), 0),
+            MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let config = PlaceSupportConfig::new(
+            keys,
+            [(market, policy)],
+            PlaceLimits {
+                active_orders: 2,
+                terminal_history: 2,
+                client_id_bytes: 32,
+            },
+        )
+        .unwrap();
+        let ids = ClientOrderIds::with_max_id_bytes(2, 2, 32).unwrap();
+        let mut state = PlaceRuntimeState { config, ids };
+        let ids_before = state.ids.clone();
+        let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(100).unwrap());
+        book.bind_market(market).unwrap();
+        let priority_before = book.next_queue_priority();
+        let mut markets = BTreeMap::from([(market, book)]);
+        let mut registry = ReservationRegistry::new([]).unwrap();
+        let registry_before = registry.clone();
+        let mut token = ReservationToken {
+            token_id: 1,
+            command_id: CommandId(1),
+            reservation_id: ReservationId(1),
+            order_id: OrderId(1),
+            user_id: UserId(7),
+            market_id: market,
+            reserves: vec![AssetReserve {
+                asset: AssetId(2),
+                atoms: 20,
+            }]
+            .into(),
+            fee_schedule_version: 1,
+            fee_tier_id: 1,
+            risk_key_id: 1,
+            signature: [0; 64],
+        };
+        token.signature = signing
+            .sign(&token.canonical_signing_payload().unwrap())
+            .to_bytes();
+        let place = PlaceLimitOrder {
+            order: LimitOrder {
+                order_id: OrderId(1),
+                user_id: UserId(7),
+                side: Side::Buy,
+                price: Price::try_new(10).unwrap(),
+                qty: Qty::try_new(2).unwrap(),
+                stp_key: StpKey::new(0),
+                stp_mode: StpMode::None,
+            },
+            client_order_id: Some("client-1".into()),
+            user_control_epoch: 0,
+            post_only: false,
+            reservation: token,
+        };
+        let command = CommandEnvelope {
+            command_id: CommandId(1),
+            session_id: 11,
+            client_seq: 1,
+            market_id: Some(market),
+            user_id: Some(UserId(7)),
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: Command::PlaceLimit(Box::new(place.clone())),
+        };
+        let cursor = TradeIdCursor::new(ClusterId(1), ShardId(1), 1);
+        let candidate = place_candidate(
+            PlacePlanningContext {
+                policy: state.config.policies.get(&market).unwrap(),
+                keys: &state.config.keys,
+                command_id: command.command_id,
+                session: command.session_id,
+                now: LogicalTime::new(0),
+            },
+            &place,
+            markets.get(&market).unwrap(),
+            &registry,
+            state.ids.try_clone_preallocated().unwrap(),
+            &cursor,
+        )
+        .unwrap();
+        assert!(candidate.events.iter().any(
+            |e| matches!(e, EngineEvent::OrderAccepted { order_id } if *order_id == OrderId(1))
+        ));
+        // 使用已耗尽游标与真实对手挂单，验证候选成交无法留下部分状态。
+        let mut sell = place.clone();
+        sell.order.order_id = OrderId(2);
+        sell.order.user_id = UserId(8);
+        sell.order.side = Side::Sell;
+        sell.client_order_id = Some("seller".into());
+        sell.reservation.token_id = 2;
+        sell.reservation.command_id = CommandId(2);
+        sell.reservation.reservation_id = ReservationId(2);
+        sell.reservation.order_id = OrderId(2);
+        sell.reservation.user_id = UserId(8);
+        sell.reservation.reserves = vec![AssetReserve {
+            asset: AssetId(1),
+            atoms: 2,
+        }]
+        .into();
+        sell.reservation.signature = signing
+            .sign(&sell.reservation.canonical_signing_payload().unwrap())
+            .to_bytes();
+        let exhausted =
+            TradeIdCursor::with_next_index(ClusterId(1), ShardId(1), 2, u64::from(u32::MAX) + 1)
+                .unwrap();
+        let maker_before = candidate.book.order(OrderId(1)).cloned();
+        let registry_before_overflow = candidate.registry.clone();
+        let ids_before_overflow = candidate.ids.clone();
+        let cursor_before = exhausted.clone();
+        let result = place_candidate(
+            PlacePlanningContext {
+                policy: state.config.policies.get(&market).unwrap(),
+                keys: &state.config.keys,
+                command_id: CommandId(2),
+                session: 12,
+                now: LogicalTime::new(0),
+            },
+            &sell,
+            &candidate.book,
+            &candidate.registry,
+            candidate.ids.try_clone_preallocated().unwrap(),
+            &exhausted,
+        );
+        assert_eq!(result.err(), Some(RejectReason::ArithmeticOverflow));
+        assert_eq!(candidate.book.order(OrderId(1)).cloned(), maker_before);
+        assert!(candidate.book.order(OrderId(2)).is_none());
+        assert_eq!(candidate.registry, registry_before_overflow);
+        assert_eq!(candidate.ids, ids_before_overflow);
+        assert_eq!(exhausted, cursor_before);
+        let mut window = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        let clock = LogicalClock::new(LogicalTime::new(0));
+        let first = execute_place(
+            PlaceExecutionContext {
+                identity: FormalIdentity {
+                    cluster: ClusterId(1),
+                    shard: ShardId(1),
+                    event_capacity: 0,
+                },
+                seq: &mut seq,
+                clock: &clock,
+                markets: &mut markets,
+                registry: &mut registry,
+                window: &mut window,
+                state: &mut state,
+            },
+            command.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(seq.last_applied(), 1);
+        assert_eq!(
+            first.outcome,
+            FormalOutcome::Rejected(RejectReason::ArithmeticOverflow)
+        );
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(
+            first.events[0].payload,
+            EngineEvent::CommandRejected {
+                reason: RejectReason::ArithmeticOverflow
+            }
+        );
+        assert!(markets[&market].order(OrderId(1)).is_none());
+        assert!(markets[&market].reservation_snapshots().is_empty());
+        assert_eq!(markets[&market].next_queue_priority(), priority_before);
+        assert_eq!(registry, registry_before);
+        assert_eq!(state.ids, ids_before);
+        let second = execute_place(
+            PlaceExecutionContext {
+                identity: FormalIdentity {
+                    cluster: ClusterId(1),
+                    shard: ShardId(1),
+                    event_capacity: 0,
+                },
+                seq: &mut seq,
+                clock: &clock,
+                markets: &mut markets,
+                registry: &mut registry,
+                window: &mut window,
+                state: &mut state,
+            },
+            command,
+        )
+        .unwrap();
+        assert!(second.deduplicated);
+        assert!(second.events.is_empty());
+        assert_eq!(second.seq, 1);
+        assert_eq!(second.summary, first.summary);
+        assert_eq!(second.event_range, first.event_range);
+        assert_eq!(seq.last_applied(), 1);
     }
 }

@@ -80,6 +80,100 @@ fn sign_new(signing: &SigningKey, token: &mut ReservationToken) {
         .to_bytes();
 }
 
+#[test]
+fn new_order_adoption_checks_signature_identity_coverage_and_drift() {
+    use matching_risk::ExpectedNewReservation;
+    let (signing, keys, old, replacement) = fixture();
+    let token = new_token(&signing, &replacement);
+    let expected = ExpectedNewReservation {
+        command_id: replacement.command_id,
+        order_id: replacement.new_order_id,
+        user_id: replacement.user_id,
+        market_id: replacement.market_id,
+        origin_session_id: OriginSessionId(42),
+        fee_schedule_version: replacement.fee_schedule_version,
+        fee_tier_id: replacement.fee_tier_id,
+        required_reserves: replacement.required_reserves.clone(),
+    };
+    let mut registry = ReservationRegistry::new([old]).unwrap();
+    let before = registry.clone();
+    let plan = registry
+        .plan_new_reservation(&keys, &expected, &token)
+        .unwrap();
+    assert_eq!(registry, before);
+    let mut invalid = token.clone();
+    invalid.signature[0] ^= 1;
+    assert_eq!(
+        registry
+            .plan_new_reservation(&keys, &expected, &invalid)
+            .unwrap_err(),
+        RejectReason::InvalidReservation
+    );
+    let mut insufficient = expected.clone();
+    insufficient.required_reserves[0].atoms = 31;
+    assert_eq!(
+        registry
+            .plan_new_reservation(&keys, &insufficient, &token)
+            .unwrap_err(),
+        RejectReason::InsufficientReservation
+    );
+    registry.apply_new_reservation(plan.clone()).unwrap();
+    assert_eq!(
+        registry
+            .get(token.reservation_id)
+            .unwrap()
+            .origin_session_id,
+        OriginSessionId(42)
+    );
+    assert_eq!(
+        registry.apply_new_reservation(plan).unwrap_err(),
+        ReservationApplyError::StateChanged
+    );
+    assert_eq!(
+        registry
+            .plan_new_reservation(&keys, &expected, &token)
+            .unwrap_err(),
+        RejectReason::InvalidReservation
+    );
+}
+
+#[test]
+fn new_order_adoption_rejects_wrong_identity_fee_and_invalid_reserve_shape() {
+    use matching_risk::ExpectedNewReservation;
+    let (signing, keys, old, replacement) = fixture();
+    let token = new_token(&signing, &replacement);
+    let expected = ExpectedNewReservation {
+        command_id: replacement.command_id,
+        order_id: replacement.new_order_id,
+        user_id: replacement.user_id,
+        market_id: replacement.market_id,
+        origin_session_id: OriginSessionId(42),
+        fee_schedule_version: replacement.fee_schedule_version,
+        fee_tier_id: replacement.fee_tier_id,
+        required_reserves: replacement.required_reserves.clone(),
+    };
+    let registry = ReservationRegistry::new([old]).unwrap();
+    for case in 0..7 {
+        let mut changed = expected.clone();
+        match case {
+            0 => changed.command_id = CommandId(99),
+            1 => changed.order_id = OrderId(99),
+            2 => changed.user_id = UserId(99),
+            3 => changed.market_id = MarketId(99),
+            4 => changed.fee_schedule_version += 1,
+            5 => changed.fee_tier_id += 1,
+            6 => changed.required_reserves.clear(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            registry
+                .plan_new_reservation(&keys, &changed, &token)
+                .unwrap_err(),
+            RejectReason::InvalidReservation
+        );
+    }
+}
+
 fn adjustment(
     signing: &SigningKey,
     e: &ExpectedReplacementReservation,

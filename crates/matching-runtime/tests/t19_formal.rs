@@ -22,6 +22,51 @@ fn retry<T>(mut call: impl FnMut() -> Result<T, ShardError>) -> T {
 }
 
 #[test]
+fn low_level_formal_command_validates_route_before_rejecting_mode() {
+    let market = MarketId(19);
+    let shard_id = ShardId(19);
+    let routes = RouteTable::new([MarketRoute {
+        market_id: market,
+        shard_id,
+        route_epoch: 3,
+        state: RouteState::Active,
+    }])
+    .unwrap();
+    let book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut shard = Shard::start(shard_id, ClusterId(1), routes, vec![(market, book)]).unwrap();
+    let mut command = CommandEnvelope {
+        command_id: CommandId(44),
+        session_id: 7,
+        client_seq: 1,
+        market_id: Some(market),
+        user_id: None,
+        route_epoch: Some(2),
+        client_timestamp: None,
+        received_at_unix_ns: None,
+        payload: Command::MassCancelShard(MassCancelShard {
+            scope: ShardCancelScope::Market { market_id: market },
+        }),
+    };
+    for epoch in [Some(2), None] {
+        command.route_epoch = epoch;
+        assert_eq!(
+            retry(|| shard.handle().submit_command(command.clone()))
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err(),
+            matching_domain::RejectReason::StaleRouteEpoch
+        );
+    }
+    assert_eq!(
+        retry(|| shard.handle().barrier(1))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        (1, 0)
+    );
+    shard.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
 fn formal_mass_cancel_emits_enveloped_events_and_preserves_pending_r2() {
     let market = MarketId(19);
     let shard_id = ShardId(19);
@@ -134,6 +179,31 @@ fn formal_mass_cancel_emits_enveloped_events_and_preserves_pending_r2() {
         .unwrap();
     assert_eq!(result.events.len(), 2);
     assert_eq!(
+        result.summary.status,
+        matching_domain::CommandStatus::Succeeded
+    );
+    assert_eq!(result.summary.first_event_index, Some(0));
+    assert_eq!(result.summary.last_event_index, Some(1));
+    assert_eq!(result.summary.durable_seq, Some(1));
+    let mut session_collision = command.clone();
+    session_collision.command_id = CommandId(45);
+    assert_eq!(
+        retry(|| shard.handle().submit_command(session_collision.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err(),
+        matching_runtime::FormalError::ProtocolError,
+    );
+    let mut mismatch = command.clone();
+    mismatch.user_id = Some(UserId(2));
+    assert_eq!(
+        retry(|| shard.handle().submit_command(mismatch.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err(),
+        matching_runtime::FormalError::ProtocolError
+    );
+    assert_eq!(
         result.outcome,
         matching_runtime::FormalOutcome::MassCancel(matching_domain::ShardMassCancelResult {
             canceled_orders: 2
@@ -179,19 +249,26 @@ fn formal_mass_cancel_emits_enveloped_events_and_preserves_pending_r2() {
             .unwrap()
             .1
     );
-    let no_op = retry(|| shard.handle().submit_command(command.clone()))
+    let mut reconnect = command.clone();
+    reconnect.session_id = 99;
+    reconnect.client_seq = 8;
+    reconnect.client_timestamp = Some(999);
+    let replayed = retry(|| shard.handle().submit_command(reconnect.clone()))
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    assert_eq!(no_op.seq, 2);
-    assert_eq!(no_op.command_id, CommandId(44));
+    assert_eq!(replayed.seq, 1);
+    assert_eq!(replayed.command_id, CommandId(44));
+    assert!(replayed.deduplicated);
+    assert_eq!(replayed.summary, result.summary);
+    assert_eq!(replayed.event_range, Some((0, 1)));
     assert_eq!(
-        no_op.outcome,
+        replayed.outcome,
         matching_runtime::FormalOutcome::MassCancel(matching_domain::ShardMassCancelResult {
-            canceled_orders: 0
+            canceled_orders: 2
         })
     );
-    assert!(no_op.events.is_empty());
+    assert!(replayed.events.is_empty());
     shard.shutdown(Duration::from_secs(5)).unwrap();
 }
 
@@ -548,4 +625,179 @@ fn concurrent_formal_commands_replay_in_allocated_sequence_order() {
         assert_eq!(replay.events, previous.events);
     }
     second.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn rejects_zero_idempotency_capacity() {
+    use matching_runtime::IdempotencyConfig;
+    let market = MarketId(99);
+    let shard_id = ShardId(99);
+    let routes = RouteTable::new([MarketRoute {
+        market_id: market,
+        shard_id,
+        route_epoch: 1,
+        state: RouteState::Active,
+    }])
+    .unwrap();
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    book.bind_market(market).unwrap();
+    let config = IdempotencyConfig {
+        command_capacity: 0,
+        session_capacity: 1,
+        aliases_per_session: 1,
+    };
+    assert!(
+        Shard::start_with_registry_and_idempotency(
+            shard_id,
+            ClusterId(699),
+            routes,
+            vec![(market, book)],
+            ReservationRegistry::new([]).unwrap(),
+            LogicalTime::new(0),
+            config
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn concurrent_duplicate_command_executes_once_and_emits_once() {
+    use std::sync::{Arc, Barrier};
+    let market = MarketId(101);
+    let shard_id = ShardId(101);
+    let routes = RouteTable::new([MarketRoute {
+        market_id: market,
+        shard_id,
+        route_epoch: 1,
+        state: RouteState::Active,
+    }])
+    .unwrap();
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    book.bind_market(market).unwrap();
+    let state = ReservationState {
+        reservation_id: ReservationId(101),
+        order_id: OrderId(101),
+        user_id: UserId(2),
+        market_id: market,
+        origin_session_id: OriginSessionId(1),
+        version: 0,
+        reserves: vec![AssetReserve {
+            asset: AssetId(1),
+            atoms: 100,
+        }],
+        status: ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 1,
+    };
+    book.rest_with_reservation(
+        LimitOrder {
+            order_id: OrderId(101),
+            user_id: UserId(2),
+            stp_key: StpKey::new(0),
+            stp_mode: StpMode::None,
+            side: Side::Buy,
+            price: Price::try_new(10).unwrap(),
+            qty: Qty::try_new(1).unwrap(),
+        },
+        state.clone(),
+    )
+    .unwrap();
+    let mut shard = Shard::start_with_registry(
+        shard_id,
+        ClusterId(701),
+        routes,
+        vec![(market, book)],
+        ReservationRegistry::new([state]).unwrap(),
+        LogicalTime::new(0),
+    )
+    .unwrap();
+    let command = CommandEnvelope {
+        command_id: CommandId(101),
+        session_id: 3,
+        client_seq: 1,
+        market_id: Some(market),
+        user_id: None,
+        route_epoch: Some(1),
+        client_timestamp: None,
+        received_at_unix_ns: None,
+        payload: Command::MassCancelShard(MassCancelShard {
+            scope: ShardCancelScope::Market { market_id: market },
+        }),
+    };
+    let start = Arc::new(Barrier::new(101));
+    let mut threads = Vec::new();
+    for _ in 0..100 {
+        let h = shard.handle();
+        let gate = Arc::clone(&start);
+        let cmd = command.clone();
+        threads.push(std::thread::spawn(move || {
+            gate.wait();
+            retry(|| h.submit_command(cmd.clone()))
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+        }));
+    }
+    start.wait();
+    let mut fresh = 0;
+    let mut emitted = 0;
+    for thread in threads {
+        let result = thread.join().unwrap();
+        assert_eq!(result.seq, 1);
+        assert_eq!(result.event_range, Some((0, 0)));
+        if !result.deduplicated {
+            fresh += 1;
+        }
+        emitted += result.events.len();
+    }
+    assert_eq!((fresh, emitted), (1, 1));
+    assert_eq!(
+        retry(|| shard.handle().barrier(1))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        (1, 1)
+    );
+    let mut stale = command;
+    stale.route_epoch = Some(0);
+    assert_eq!(
+        retry(|| shard.handle().submit_command(stale.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err(),
+        matching_runtime::FormalError::Rejected(matching_domain::RejectReason::StaleRouteEpoch)
+    );
+    shard.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn unrepresentable_idempotency_capacity_rejects_startup() {
+    use matching_runtime::IdempotencyConfig;
+    let market = MarketId(102);
+    let shard_id = ShardId(102);
+    let routes = RouteTable::new([MarketRoute {
+        market_id: market,
+        shard_id,
+        route_epoch: 1,
+        state: RouteState::Active,
+    }])
+    .unwrap();
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    book.bind_market(market).unwrap();
+    let config = IdempotencyConfig {
+        command_capacity: usize::MAX,
+        session_capacity: 1,
+        aliases_per_session: 1,
+    };
+    assert!(
+        Shard::start_with_registry_and_idempotency(
+            shard_id,
+            ClusterId(702),
+            routes,
+            vec![(market, book)],
+            ReservationRegistry::new([]).unwrap(),
+            LogicalTime::new(0),
+            config
+        )
+        .is_err()
+    );
 }
