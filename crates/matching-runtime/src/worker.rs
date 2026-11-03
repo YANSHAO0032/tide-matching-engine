@@ -21,11 +21,22 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub enum Mutation {
     /// 执行普通限价单。
-    Place(LimitOrder),
+    Place(
+        /// 待执行的普通限价订单。
+        LimitOrder,
+    ),
     /// 取消普通挂单。
-    Cancel(OrderId),
+    Cancel(
+        /// 待取消的普通订单身份。
+        OrderId,
+    ),
     /// 执行基础数量市价单及其市场数值规则。
-    MarketByBase(matching_domain::MarketByBase, matching_domain::MarketMath),
+    MarketByBase(
+        /// 按基础数量执行的市价订单。
+        matching_domain::MarketByBase,
+        /// 该市场用于数值校验及本金计算的规则。
+        matching_domain::MarketMath,
+    ),
 }
 
 /// 进程内变更封装；回复句柄不进入持久化或线协议。
@@ -45,11 +56,20 @@ pub struct MutationEnvelope {
 #[derive(Debug, PartialEq, Eq)]
 pub enum MutationOutcome {
     /// 按原序返回限价撮合事件。
-    Placed(Vec<EngineEvent>),
+    Placed(
+        /// 限价订单执行后按原序产生的事件。
+        Vec<EngineEvent>,
+    ),
     /// 返回基础数量市价单的实际执行结果。
-    MarketByBase(matching_domain::MarketByBaseExecution),
+    MarketByBase(
+        /// 基础数量市价订单的实际执行结果。
+        matching_domain::MarketByBaseExecution,
+    ),
     /// 返回已移除的普通订单节点，不伪造生命周期事件。
-    Canceled(OrderNode),
+    Canceled(
+        /// 从订单簿中移除的普通订单节点。
+        OrderNode,
+    ),
 }
 
 /// 已进入业务执行的结果及其分片序号。
@@ -113,9 +133,17 @@ enum Message {
         SyncSender<Result<Option<OrderNode>, RejectReason>>,
     ),
     /// 确认此前已入队消息处理完毕；载荷为请求身份和返回已完成序号水位的回复端。
-    Barrier(u128, SyncSender<(u128, u64)>),
+    Barrier(
+        /// 调用方提供的屏障请求身份。
+        u128,
+        /// 返回请求身份与已完成变更序号水位的一次性回复端。
+        SyncSender<(u128, u64)>,
+    ),
     /// 外部入口关闭后入队的最终排空屏障，载荷为确认到达屏障的回复端。
-    Shutdown(SyncSender<()>),
+    Shutdown(
+        /// 工作线程到达终止屏障后发送确认的一次性回复端。
+        SyncSender<()>,
+    ),
 }
 
 /// 分片入口容量和空闲等待配置。
@@ -811,6 +839,40 @@ mod tests {
                 .unwrap();
         assert_eq!(b.seq, 2);
         shard.shutdown(std::time::Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn timeout_after_admission_closed_keeps_ingress_closed_and_can_retry() {
+        let routes = RouteTable::new([MarketRoute {
+            market_id: MarketId(3),
+            shard_id: ShardId(1),
+            route_epoch: 7,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let mut shard = Shard::start(
+            ShardId(1),
+            ClusterId(1017),
+            routes,
+            vec![(
+                MarketId(3),
+                ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap()),
+            )],
+        )
+        .unwrap();
+        let handle = shard.handle();
+        shard.producer.close_ingress();
+        assert_eq!(shard.shutdown(Duration::ZERO), Err(ShardError::Timeout));
+        assert!(matches!(
+            handle.order(MarketId(3), OrderId(1)),
+            Err(ShardError::Closed)
+        ));
+        assert!(matches!(handle.barrier(1), Err(ShardError::Closed)));
+        assert!(matches!(
+            handle.submit(CommandId(1), MarketId(3), 7, Mutation::Cancel(OrderId(1))),
+            Err(ShardError::Closed)
+        ));
+        assert_eq!(shard.shutdown(Duration::from_secs(2)), Ok(()));
     }
 }
 

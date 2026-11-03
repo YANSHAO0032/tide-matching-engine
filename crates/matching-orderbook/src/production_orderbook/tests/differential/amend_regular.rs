@@ -47,9 +47,21 @@ fn amend(input: &LimitOrder) -> AmendOrder {
 #[derive(Clone, Debug)]
 enum Command {
     /// 挂入指定有效期的订单。
-    Rest(LimitOrder, TimeInForce, bool),
+    Rest(
+        /// 待挂入的普通限价订单。
+        LimitOrder,
+        /// 订单使用的有效期。
+        TimeInForce,
+        /// 是否同时登记本地预留影子。
+        bool,
+    ),
     /// 提交普通限价单。
-    Place(LimitOrder, TimeInForce),
+    Place(
+        /// 待执行的普通限价订单。
+        LimitOrder,
+        /// 订单使用的有效期。
+        TimeInForce,
+    ),
     /// 修改现有订单。
     Amend(Box<AmendOrder>),
     /// 取消指定订单。

@@ -181,7 +181,12 @@ fn replacement(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     /// 挂入指定有效期的订单。
-    Rest(LimitOrder, TimeInForce),
+    Rest(
+        /// 待挂入的限价单。
+        LimitOrder,
+        /// 订单的有效期策略。
+        TimeInForce,
+    ),
     /// 提交冰山订单。
     Iceberg(IcebergOrder),
     /// 登记未触发止损订单。

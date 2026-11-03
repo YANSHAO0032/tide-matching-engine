@@ -9,11 +9,17 @@ use std::sync::mpsc::Receiver;
 #[derive(Debug, PartialEq, Eq)]
 pub enum RouterError {
     /// 路由状态或版本被拒绝，不分配业务序号。
-    Rejected(RejectReason),
+    Rejected(
+        /// 前置路由校验使用的稳定拒绝原因。
+        RejectReason,
+    ),
     /// 快照、分片身份或可用句柄不一致。
     InvalidConfig,
     /// 目标分片的入口或运行状态错误。
-    Shard(ShardError),
+    Shard(
+        /// 目标分片返回的入口或运行状态错误。
+        ShardError,
+    ),
 }
 
 /// 唯一不可变路由快照和显式分片句柄集合。

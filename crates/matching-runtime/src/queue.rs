@@ -35,9 +35,15 @@ pub(crate) struct IngressLimits {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PushError<T> {
     /// 容量、类别配额已满，或准入锁正被其他线程使用。
-    Full(T),
+    Full(
+        /// 未能入队、归还调用方的消息。
+        T,
+    ),
     /// 外部入口已经关闭。
-    Closed(T),
+    Closed(
+        /// 入口关闭后归还调用方的消息。
+        T,
+    ),
 }
 
 /// 入队、出队配额和关闭共享同一短临界区，不持有业务状态。
@@ -469,6 +475,76 @@ mod admission_tests {
             assert!(consumer.pop().unwrap() < 100);
         }
         assert_eq!(consumer.pop(), Some(100));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn query_and_control_quotas_are_independent_and_release_on_pop() {
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: 5,
+            mutation_reserved_slots: 1,
+            max_query_inflight: 1,
+            max_control_inflight: 1,
+        })
+        .unwrap();
+        assert!(producer.try_push_classified(1, IngressClass::Query).is_ok());
+        assert_eq!(
+            producer.try_push_classified(2, IngressClass::Query),
+            Err(PushError::Full(2))
+        );
+        assert!(
+            producer
+                .try_push_classified(3, IngressClass::Control)
+                .is_ok()
+        );
+        assert_eq!(
+            producer.try_push_classified(4, IngressClass::Control),
+            Err(PushError::Full(4))
+        );
+        assert_eq!(consumer.pop(), Some(1));
+        assert!(producer.try_push_classified(5, IngressClass::Query).is_ok());
+        assert_eq!(consumer.pop(), Some(3));
+        assert!(
+            producer
+                .try_push_classified(6, IngressClass::Control)
+                .is_ok()
+        );
+        assert_eq!(consumer.pop(), Some(5));
+        assert_eq!(consumer.pop(), Some(6));
+    }
+
+    #[test]
+    fn failed_admission_does_not_consume_quota_and_close_rejects_all_classes() {
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: 2,
+            mutation_reserved_slots: 1,
+            max_query_inflight: 1,
+            max_control_inflight: 1,
+        })
+        .unwrap();
+        assert!(producer.try_push_classified(1, IngressClass::Query).is_ok());
+        assert_eq!(
+            producer.try_push_classified(2, IngressClass::Control),
+            Err(PushError::Full(2))
+        );
+        assert_eq!(consumer.pop(), Some(1));
+        assert!(
+            producer
+                .try_push_classified(3, IngressClass::Control)
+                .is_ok()
+        );
+        producer.close_ingress();
+        for class in [
+            IngressClass::Query,
+            IngressClass::Control,
+            IngressClass::Mutation,
+        ] {
+            assert_eq!(
+                producer.try_push_classified(4, class),
+                Err(PushError::Closed(4))
+            );
+        }
+        assert_eq!(consumer.pop(), Some(3));
         assert_eq!(consumer.pop(), None);
     }
 }
