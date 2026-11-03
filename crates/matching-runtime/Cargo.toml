@@ -11,3 +11,6 @@ crossbeam-queue = "0.3.14"
 matching-domain = { path = "../matching-domain" }
 matching-orderbook = { path = "../matching-orderbook" }
 matching-risk = { path = "../matching-risk" }
+
+[dev-dependencies]
+ed25519-dalek = { version = "3.0.0", default-features = false }

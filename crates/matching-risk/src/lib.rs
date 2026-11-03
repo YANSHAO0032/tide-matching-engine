@@ -9,6 +9,10 @@ pub use reservation_adjustment::{
 };
 
 pub use reservation_transition::{
-    ExpectedReplacementReservation, PlannedAmendAdjustment, PlannedBindingTransition,
-    PlannedReservationTransition, ReservationApplyError, ReservationRegistry,
+    ExpectedNewReservation, ExpectedReplacementReservation, PlannedAmendAdjustment,
+    PlannedBindingTransition, PlannedNewReservation, PlannedReservationTransition,
+    ReservationApplyError, ReservationRegistry,
 };
+
+mod limit_reserve;
+pub use limit_reserve::{LimitReserveError, LimitReservePolicy};

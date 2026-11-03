@@ -22,6 +22,8 @@ pub enum RejectReason {
     InvalidLot = 2005,
     /// 同一订单簿内已存在相同的订单身份。
     DuplicateOrderId = 2008,
+    /// 用户的客户端订单身份仍被活动订单或终结保留窗口占用。
+    DuplicateClientOrderId = 2009,
     /// 请求引用的订单不在当前订单簿中。
     OrderNotFound = 2010,
     /// 冰山显示上限不满足严格小于订单总量的关系。
@@ -56,10 +58,14 @@ pub enum RejectReason {
     FeeScheduleNotFound = 4003,
     /// 已接受订单固定引用的费率版本或层级不再匹配。
     FeeScheduleMismatch = 4004,
+    /// 用户控制版本低于分片当前接收下限。
+    StaleUserControlEpoch = 4005,
     /// 所需带溢出检查的算术无法以目标整数类型精确表示。
     ArithmeticOverflow = 5001,
     /// 有界入口容量已满，当前请求未进入业务执行。
     EngineBusy = 5002,
+    /// 主节点纪元与控制命令不一致。
+    StalePrimaryEpoch = 5005,
     /// 市场本地优先级已进入不可分配的保护区。
     PrioritySpaceExhaustion = 5006,
 }
@@ -79,7 +85,10 @@ mod tests {
         assert_eq!(RejectReason::InvalidTick as u16, 2004);
         assert_eq!(RejectReason::InvalidLot as u16, 2005);
         assert_eq!(RejectReason::DuplicateOrderId as u16, 2008);
+        assert_eq!(RejectReason::DuplicateClientOrderId as u16, 2009);
+        assert_eq!(RejectReason::StaleUserControlEpoch as u16, 4005);
         assert_eq!(RejectReason::ArithmeticOverflow as u16, 5001);
+        assert_eq!(RejectReason::StalePrimaryEpoch as u16, 5005);
         assert_eq!(RejectReason::InvalidExpireTime as u16, 2013);
         assert_eq!(RejectReason::InvalidSession as u16, 2014);
         assert_eq!(RejectReason::PostOnlyWouldCross as u16, 2015);
