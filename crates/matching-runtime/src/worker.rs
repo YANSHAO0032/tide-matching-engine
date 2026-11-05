@@ -3227,7 +3227,9 @@ mod group_sync_tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Probe {
+        /// 已调用的同步次数，供测试线程观察。
         syncs: Arc<AtomicUsize>,
+        /// 是否在同步时注入失败。
         fail: bool,
     }
     impl DurableAppender for Probe {

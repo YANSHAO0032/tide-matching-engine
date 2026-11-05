@@ -6,6 +6,7 @@ mod ownership;
 mod place_candidate;
 mod place_config;
 mod queue;
+mod recovery;
 mod route_table;
 mod sequencer;
 mod user_control;
@@ -16,6 +17,8 @@ mod worker;
 pub use idempotency::IdempotencyConfig;
 /// 正式限价下单使用的可信市场策略与资源上限。
 pub use place_config::{PlaceConfigError, PlaceLimits, PlaceSupportConfig};
+/// 本地持久前缀中的正式命令。
+pub use recovery::{RecoveredCommand, recover_local_commands};
 /// 显式路由与配置错误。
 pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable};
 /// 工作线程空闲等待策略。

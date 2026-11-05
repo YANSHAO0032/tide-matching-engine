@@ -6,6 +6,8 @@ use std::io;
 pub struct ManifestState {
     /// 已完成持久化的代际。
     pub generation: u64,
+    /// 已完成本地文件及目录同步的连续前缀。
+    pub local_durable_seq: u64,
     /// 已确认的备节点安全前缀。
     pub replication_safe_seq: u64,
     /// 最近持久化快照身份及其分片序号。
@@ -16,16 +18,31 @@ pub struct ManifestState {
     pub wal_gc_safe_seq: u64,
     /// 已计划但尚未完成的 segment 首序号。
     pub gc_plan: Vec<u64>,
+    /// 计划完成后应保留的首个 segment 首序号。
+    pub gc_retained_first: Option<u64>,
+    /// 已登记回收计划所属的集群与分片身份。
+    pub gc_identity: Option<(u16, u16)>,
 }
 
 /// 向单写者提交的状态变更意图。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManifestIntent {
+    /// 建立空状态的首代恢复锚点。
+    Initialize,
     /// 登记已创建的活动 segment。
     SegmentRolled {
         /// 新 segment 首序号。
         first_seq: u64,
     },
+    /// 原子登记本地持久前缀和活动段。
+    LocalDurableAdvanced {
+        /// 已完成同步的连续前缀。
+        through_seq: u64,
+        /// 当前活动段的首序号。
+        first_seq: u64,
+    },
+    /// 首次持久确认前将首代状态复制到另一槽。
+    RecoveryAnchor,
     /// 登记已持久化的快照。
     SnapshotCommitted {
         /// 快照身份。
@@ -42,11 +59,19 @@ pub enum ManifestIntent {
     WalGcPlanned {
         /// 严格递增的 segment 首序号。
         segments: Vec<u64>,
+        /// 计划后首个保留段的首序号。
+        retained_first: u64,
+        /// 快照与 WAL 所属的集群身份。
+        cluster_id: u16,
+        /// 快照与 WAL 所属的分片身份。
+        shard_id: u16,
     },
-    /// 完成当前已登记的回收计划。
+    /// 完成回收并持久登记已删除的连续序号前缀。
     WalGcCompleted {
         /// 与当前计划一致的 segment 首序号。
         segments: Vec<u64>,
+        /// 已删除段覆盖的最高序号。
+        through_seq: u64,
     },
 }
 
@@ -74,6 +99,8 @@ pub struct ManifestManager<S> {
     state: ManifestState,
     /// 由本管理器独占的存储。
     storage: S,
+    /// 是否经过严格槽位恢复校验。
+    recovery_checked: bool,
     /// 写入过程出错后保持关闭。
     failed: bool,
 }
@@ -83,8 +110,17 @@ impl<S: ManifestStorage> ManifestManager<S> {
         Self {
             state,
             storage,
+            recovery_checked: false,
             failed: false,
         }
+    }
+    /// 标记由文件存储执行过严格的槽位检查。
+    pub(crate) fn mark_recovery_checked(&mut self) {
+        self.recovery_checked = true;
+    }
+    /// 返回是否已执行严格恢复检查。
+    pub(crate) fn recovery_checked(&self) -> bool {
+        self.recovery_checked
     }
     /// 返回最近完成持久化的状态。
     pub fn state(&self) -> &ManifestState {
@@ -105,6 +141,11 @@ impl<S: ManifestStorage> ManifestManager<S> {
         }
         let mut next = self.state.clone();
         match intent {
+            ManifestIntent::Initialize => {
+                if next != ManifestState::default() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "清单不为空"));
+                }
+            }
             ManifestIntent::SegmentRolled { first_seq } => {
                 if first_seq == 0
                     || next
@@ -117,6 +158,33 @@ impl<S: ManifestStorage> ManifestManager<S> {
                     ));
                 }
                 next.active_segment = Some(first_seq);
+            }
+            ManifestIntent::LocalDurableAdvanced {
+                through_seq,
+                first_seq,
+            } => {
+                if first_seq == 0
+                    || first_seq > through_seq
+                    || through_seq <= next.local_durable_seq
+                    || next
+                        .active_segment
+                        .is_some_and(|current| first_seq < current)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "本地持久前缀不递增",
+                    ));
+                }
+                next.active_segment = Some(first_seq);
+                next.local_durable_seq = through_seq;
+            }
+            ManifestIntent::RecoveryAnchor => {
+                if next.generation != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "恢复锚点状态无效",
+                    ));
+                }
             }
             ManifestIntent::SnapshotCommitted {
                 snapshot_id,
@@ -142,25 +210,58 @@ impl<S: ManifestStorage> ManifestManager<S> {
                 }
                 next.replication_safe_seq = seq;
             }
-            ManifestIntent::WalGcPlanned { segments } => {
+            ManifestIntent::WalGcPlanned {
+                segments,
+                retained_first,
+                cluster_id,
+                shard_id,
+            } => {
                 if !next.gc_plan.is_empty()
                     || segments.is_empty()
                     || segments.len() > 65_536
                     || segments[0] == 0
                     || segments.windows(2).any(|w| w[0] >= w[1])
+                    || segments.last().is_none_or(|last| retained_first <= *last)
+                    || next
+                        .active_segment
+                        .is_none_or(|active| retained_first > active)
+                    || next.latest_snapshot.is_none()
+                    || next
+                        .active_segment
+                        .is_none_or(|active| segments.last().is_none_or(|last| *last >= active))
                 {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "无效回收计划"));
                 }
                 next.gc_plan = segments;
+                next.gc_retained_first = Some(retained_first);
+                next.gc_identity = Some((cluster_id, shard_id));
             }
-            ManifestIntent::WalGcCompleted { segments } => {
-                if next.gc_plan.is_empty() || next.gc_plan != segments {
+            ManifestIntent::WalGcCompleted {
+                segments,
+                through_seq,
+            } => {
+                if next.gc_plan.is_empty()
+                    || next.gc_plan != segments
+                    || segments.last().is_none_or(|last| *last > through_seq)
+                    || next.gc_retained_first.and_then(|seq| seq.checked_sub(1))
+                        != Some(through_seq)
+                    || through_seq < next.wal_gc_safe_seq
+                    || next
+                        .latest_snapshot
+                        .is_none_or(|(_, seq)| through_seq > seq)
+                    || next
+                        .active_segment
+                        .is_none_or(|active| through_seq >= active)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "回收计划不匹配",
+                        "回收完成水位无效",
                     ));
                 }
+                next.wal_gc_safe_seq = through_seq;
                 next.gc_plan.clear();
+                next.gc_retained_first = None;
+                next.gc_identity = None;
             }
         }
         next.generation = next

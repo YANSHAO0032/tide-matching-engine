@@ -41,6 +41,7 @@ pub mod order_state;
 pub mod order_type;
 /// 市场价格带配置与确定性边界计算。
 pub mod price_band;
+/// 市场参考价格及其来源序号。
 pub mod price_reference;
 /// 市场本地先进先出优先级值对象。
 pub mod queue_priority;

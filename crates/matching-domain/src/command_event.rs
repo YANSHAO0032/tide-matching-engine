@@ -37,7 +37,7 @@ pub struct CommandResultSummary {
     pub first_event_index: Option<u32>,
     /// 最后一个事件的索引；无事件时为空。
     pub last_event_index: Option<u32>,
-    /// 已分配的进程内逻辑序号；当前不代表磁盘持久化。
+    /// 已分配的分片序号；是否持久化取决于运行时入口及其提交策略。
     pub durable_seq: Option<u64>,
     /// 被业务拒绝时的稳定原因。
     pub reject_reason: Option<RejectReason>,
