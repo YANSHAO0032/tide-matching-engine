@@ -1,6 +1,6 @@
 //! 领域标识符、整数数值、市场金额换算、订单载荷、执行结果与稳定错误码。
 //!
-//! 当前提供撮合所需的领域子集，不包含完整资金账本或持久化协议。
+//! 当前提供撮合所需的领域子集与命令载荷编码，不包含完整资金账本或 WAL 恢复。
 
 /// 改单绝对目标、显式补丁与纯候选计算。
 pub mod amend_order;
@@ -8,6 +8,8 @@ pub mod amend_order;
 pub mod cancel_replace;
 /// 正式命令及事件的进程内身份封装。
 pub mod command_event;
+/// 正式命令的持久化编码。
+pub mod command_wal_codec;
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
 /// 订单到期的稳定业务原因。
@@ -90,6 +92,8 @@ pub use command_event::{
     ApplyUserControlFenceShard, Command, CommandEnvelope, CommandResultSummary, CommandStatus,
     EventEnvelope, PlaceLimitOrder, UserFenceAction,
 };
+/// 正式命令的版本化持久编码与解码。
+pub use command_wal_codec::{CommandCodecError, decode_wal_command, encode_wal_command};
 /// 最小订单生命周期事件及终结余量的计价模式。
 pub use engine_event::{EngineEvent, OrderRemaining};
 /// 订单到期的稳定业务原因。

@@ -9,8 +9,10 @@ workspace = true
 [dependencies]
 crossbeam-queue = "0.3.14"
 matching-domain = { path = "../matching-domain" }
+matching-persistence = { path = "../matching-persistence" }
 matching-orderbook = { path = "../matching-orderbook" }
 matching-risk = { path = "../matching-risk" }
+same-file = "1.0.6"
 
 [dev-dependencies]
 ed25519-dalek = { version = "3.0.0", default-features = false }

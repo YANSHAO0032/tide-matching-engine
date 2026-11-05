@@ -1,8 +1,17 @@
 //! WAL、快照、清单、恢复和持久性边界的规划位置。
 
+mod durability;
+mod manifest;
+mod manifest_file;
 mod record;
 mod scan;
 mod segment;
+pub use durability::{
+    CommitWatermark, DurabilityConfig, DurabilityError, DurabilityMode, DurableAppender,
+    DurableBatcher, Profile, RegisteredAppender, ReplicationMode,
+};
+pub use manifest::{ManifestIntent, ManifestManager, ManifestState, ManifestStorage};
+pub use manifest_file::FileManifestStorage;
 pub use record::{WalError, WalRecord};
 pub use scan::{ScanError, ScanResult, scan_segment};
 pub use segment::{SegmentMeta, SegmentScan, SegmentWriter, scan_segments, truncate_torn_tail};

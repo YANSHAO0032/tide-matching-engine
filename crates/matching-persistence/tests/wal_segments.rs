@@ -168,7 +168,7 @@ fn unexpected_segment_name_is_never_silently_skipped() {
 }
 
 #[test]
-fn writer_rejects_sequence_gap_without_writing_and_propagates_rotation_failure() {
+fn writer_propagates_rotation_failure_and_stops() {
     let path = std::env::temp_dir().join(format!(
         "matching-wal-{}-{}",
         std::process::id(),
@@ -177,8 +177,6 @@ fn writer_rejects_sequence_gap_without_writing_and_propagates_rotation_failure()
     std::fs::create_dir(&path).unwrap();
     let mut writer = SegmentWriter::new(&path, 70).unwrap();
     writer.append(&record(1)).unwrap();
-    assert!(writer.append(&record(3)).is_err());
-    assert_eq!(scan_segments(&path).unwrap().records, vec![record(1)]);
     // 创建同名目标使下一次轮转失败，必须返回文件错误。
     std::fs::write(path.join("00000000000000000002.wal"), []).unwrap();
     assert_eq!(
@@ -189,5 +187,22 @@ fn writer_rejects_sequence_gap_without_writing_and_propagates_rotation_failure()
     assert!(writer.append(&record(2)).is_err());
     assert!(!path.join("00000000000000000002.wal").exists());
     drop(writer);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sequence_corruption_permanently_stops_low_level_writer() {
+    let path = std::env::temp_dir().join(format!(
+        "matching-wal-seq-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let mut writer = SegmentWriter::new(&path, 1024).unwrap();
+    writer.append(&record(1)).unwrap();
+    assert!(writer.append(&record(3)).is_err());
+    assert!(writer.append(&record(2)).is_err());
+    drop(writer);
+    assert_eq!(scan_segments(&path).unwrap().records, vec![record(1)]);
     std::fs::remove_dir_all(path).unwrap();
 }

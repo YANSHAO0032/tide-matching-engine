@@ -21,6 +21,12 @@ impl UserControlEpochs {
         Ok(Self { capacity, entries })
     }
 
+    /// 复制候选下限并预留原有容量；分配失败时不修改真实状态。
+    pub(crate) fn try_clone_preallocated(&self) -> Result<Self, ()> {
+        let mut copy = Self::new(self.capacity)?;
+        copy.entries.extend(self.entries.iter().copied());
+        Ok(copy)
+    }
     /// 未出现的用户下限为零，等于下限的命令有效。
     pub(crate) fn check(&self, user: UserId, epoch: u64) -> Result<(), RejectReason> {
         let minimum = self

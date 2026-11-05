@@ -130,6 +130,19 @@ impl DedupWindow {
             session_order,
         })
     }
+    /// 按固定容量复制候选窗口；预留容器失败时不改变原窗口。
+    pub(crate) fn try_clone_preallocated(&self) -> Result<Self, ()> {
+        let mut copy = Self::new(self.config)?;
+        copy.entries.extend(self.entries.iter().cloned());
+        copy.session_order
+            .extend(self.session_order.iter().copied());
+        for (target, source) in copy.sessions.iter_mut().zip(&self.sessions) {
+            target.id = source.id;
+            target.highest = source.highest;
+            target.aliases.extend(source.aliases.iter().copied());
+        }
+        Ok(copy)
+    }
     /// 别名冲突及意图冲突不占序号，不修改任何缓存。
     pub(crate) fn lookup(&self, c: &CommandEnvelope) -> Result<Option<FormalExecution>, ()> {
         if let Some(session) = self.sessions.iter().find(|s| s.id == Some(c.session_id))
@@ -364,5 +377,29 @@ mod tests {
         d.insert_prepared(&original, prepared, &result(1, 1));
         assert!(d.lookup(&original).unwrap().is_some());
         assert!(d.lookup(&changed).is_err());
+    }
+    #[test]
+    fn candidate_clone_keeps_all_limits_and_does_not_change_original() {
+        let config = IdempotencyConfig {
+            command_capacity: 3,
+            session_capacity: 2,
+            aliases_per_session: 4,
+        };
+        let mut original = DedupWindow::new(config).unwrap();
+        let first = cmd(1, 1, 1, 7);
+        original.insert(&first, &result(1, 1));
+        let mut candidate = original.try_clone_preallocated().unwrap();
+        assert!(candidate.entries.capacity() >= config.command_capacity);
+        assert!(candidate.session_order.capacity() >= config.session_capacity);
+        assert!(
+            candidate
+                .sessions
+                .iter()
+                .all(|s| s.aliases.capacity() >= config.aliases_per_session)
+        );
+        let second = cmd(2, 1, 2, 7);
+        candidate.insert(&second, &result(2, 2));
+        assert!(candidate.lookup(&second).unwrap().is_some());
+        assert!(original.lookup(&second).unwrap().is_none());
     }
 }

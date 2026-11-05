@@ -36,6 +36,12 @@ pub struct SegmentScan {
 /// 单写者文件追加器；调用方须确保目录仅由一个写入器使用。
 ///
 /// 写入成功不代表数据已经持久化；该类型不提供进程间独占锁。
+///
+/// 低层写入器不能直接用于推进持久提交水位：
+/// ```compile_fail
+/// fn requires_registered<T: matching_persistence::DurableAppender>() {}
+/// requires_registered::<matching_persistence::SegmentWriter>();
+/// ```
 pub struct SegmentWriter {
     /// 已存在的 segment 目录。
     directory: PathBuf,
@@ -43,11 +49,13 @@ pub struct SegmentWriter {
     max_size: u64,
     /// 当前追加文件。
     file: Option<File>,
+    /// 当前 segment 的首序号。
+    active_first: Option<u64>,
     /// 当前文件已写字节数。
     size: u64,
     /// 最近成功写入的分片身份和序号。
     last: Option<(u16, u16, u64)>,
-    /// 一旦写入发生错误，禁止继续使用。
+    /// 序号或分片身份不连续、文件写入错误后禁止继续使用。
     failed: bool,
 }
 impl SegmentWriter {
@@ -64,6 +72,7 @@ impl SegmentWriter {
             directory,
             max_size,
             file: None,
+            active_first: None,
             size: 0,
             last: None,
             failed: false,
@@ -82,6 +91,7 @@ impl SegmentWriter {
                     || seq.checked_add(1) != Some(record.shard_seq)
             })
         {
+            self.failed = true;
             return Err(invalid("分片身份或序号不连续"));
         }
         let bytes = record.encode().map_err(|_| invalid("记录不能编码"))?;
@@ -104,6 +114,7 @@ impl SegmentWriter {
                 }
             };
             self.file = Some(file);
+            self.active_first = Some(record.shard_seq);
             self.size = 0;
         }
         if let Err(error) = self.file.as_mut().expect("文件已创建").write_all(&bytes) {
@@ -113,6 +124,51 @@ impl SegmentWriter {
         self.size += len;
         self.last = Some((record.cluster_id, record.shard_id, record.shard_seq));
         Ok(())
+    }
+
+    /// 返回当前文件的首序号。
+    pub(crate) const fn active_first(&self) -> Option<u64> {
+        self.active_first
+    }
+
+    /// 检查该写入器尚未接收任何记录。
+    pub(crate) const fn is_pristine(&self) -> bool {
+        self.file.is_none() && self.last.is_none() && !self.failed
+    }
+}
+
+impl SegmentWriter {
+    /// 在改变文件之前判断是否需要轮转。
+    pub(crate) fn durable_would_rotate(&self, record: &WalRecord) -> io::Result<bool> {
+        if self.failed {
+            return Err(io::Error::other("写入器已失败"));
+        }
+        let len = u64::try_from(record.encode().map_err(|_| invalid("记录不能编码"))?.len())
+            .map_err(|_| invalid("记录长度溢出"))?;
+        if len > self.max_size {
+            return Err(invalid("记录超过 segment 容量"));
+        }
+        Ok(self.file.is_some()
+            && self
+                .size
+                .checked_add(len)
+                .is_none_or(|sum| sum > self.max_size))
+    }
+    /// 同步当前文件和目录；任一失败均停止后续写入。
+    pub(crate) fn durable_sync(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("写入器已失败"));
+        }
+        let result = self
+            .file
+            .as_ref()
+            .ok_or_else(|| invalid("没有可同步的文件"))?
+            .sync_all()
+            .and_then(|()| crate::manifest_file::sync_directory(&self.directory));
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 }
 
