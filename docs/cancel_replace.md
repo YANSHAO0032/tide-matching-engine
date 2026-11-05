@@ -45,4 +45,4 @@ Apply 前态漂移返回 `ReservationApplyError::StateChanged`，属于必须停
 
 永久测试固定 old-only FOK、冰山全部身份排除、PostOnly 过滤后最优价、Stop 非流动性、真实签名和拒绝优先级。完整失败/漂移快照覆盖 Arena/free-list、链表/价档、活动身份、真实 regular/Stop expiry、两个 allocator、reference 与 registry 金融/归属历史；重复 Plan 相等且不改变状态。
 
-差分磁带使用两个独立适配器和持续 registry，逐命令比较原序结果/事件及完整状态，保留固定种子 100k 和两组各双次 10k。旧窄 Place/Cancel/Amend/expiry 入口的测试驱动显式维护其外部归属边界；只有 CancelReplace 自身直接提交完整 registry 计划，不能把测试适配器视为所有旧 API 已获得原子资金闭环。当前没有 WAL/快照/HA、durable replay digest、远端 CI 或生产性能验收证据。
+差分磁带使用两个独立适配器和持续 registry，逐命令比较原序结果/事件及完整状态，保留固定种子 100k 和两组各双次 10k。旧窄 Place/Cancel/Amend/expiry 入口的测试驱动显式维护其外部归属边界；只有 CancelReplace 自身直接提交完整 registry 计划，不能把测试适配器视为所有旧 API 已获得原子资金闭环。当前运行时没有接入 WAL，亦没有快照/HA、durable replay digest、远端 CI 或生产性能验收证据。

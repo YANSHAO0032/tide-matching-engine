@@ -1,6 +1,6 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-11-04 当前范围：T19 已提交并推送 `f5325af`；T20 已提交并推送 `28c17cc`；用户已授权验收、提交 T21 并推送当前分支 `feature-t21-wal-record-segment`，未经进一步授权不合并。用户允许在 WAL 格式中增加独立头 CRC 并同步规格。PendingR2 用户裁定仍然有效；真实 R2、完整 MarketState/PreOpen 和 T22+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
+> 2026-11-04 当前范围：T19、T20、T21 已提交并推送各自开发分支，T21 提交为 `025c29d`；用户已授权 T22 验收通过后提交并推送当前分支 `feature-t22-manifest-group-commit`，未经进一步授权不合并。用户允许在 WAL 格式中增加独立头 CRC 并同步规格。PendingR2 用户裁定仍然有效；真实 R2、完整 MarketState/PreOpen 和 T23+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
 
 > 2026-10-26 当前事实：T12 Amend 已由 `d694974` 与 P2 收尾提交 `b763984` 合入并推送至 `origin/main`；本地完整验证已经通过。远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染尚未在本轮核验。`codex/t12-amend` 已删除。
 
@@ -12,7 +12,7 @@
 
 ## 角色与授权边界
 
-当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T12 均已交付；T13–T18 已完成本地提交，T19、T20 已提交并推送各自开发分支。T21 已获验收、提交及推送当前分支授权，未获合并授权；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染未在本轮核验，不扩展 T22+。
+当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T12 均已交付；T13–T18 已完成本地提交，T19–T21 已提交并推送各自开发分支。T22 获授权验收通过后提交并推送当前分支，未获合并授权；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染未在本轮核验，不扩展 T23+。
 
 - 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
 - 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
@@ -34,7 +34,7 @@ T08 覆盖 visible/hidden/total 守恒、仅 visible depth、maker 补量时新 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
 3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §8、§14–§17、§54（重点不变量 12、13、18）、§64；按当前小步核对 §9、§13、§45–§46.1、§58，保留 §6.5.1–§6.5.2、§26.3–§26.5、§55.2–§55.4、§63 的数值/保护和回归要求。保留当前适用不变量 1–13/16–18/26/28–30/49–52/54–56；§54.53 及 §18/§27 reservation 仅作后续资金接口契约。始终遵守 §77 和 Appendix E；读取未来契约不扩大实现范围。
-4. 当前 [T21](assignment/tasks/T21_P7_wal_record_segment.md) 原始任务书及唯一交接中的冻结裁定；用户新授权优先于原始导师模式。保留已验收的 T05–T20 契约和验证门，T13 的 PendingR2 裁定仍然有效。
+4. 当前 [T22](assignment/tasks/T22_P7_manifest_group_commit.md) 原始任务书及唯一交接中的冻结裁定；用户新授权优先于原始导师模式。保留已验收的 T05–T21 契约和验证门，T13 的 PendingR2 裁定仍然有效。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。

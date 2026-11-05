@@ -70,10 +70,7 @@ fn fence_is_sequenced_once_and_checks_primary_before_dedup() {
     }
     assert_eq!(run(command).unwrap_err(), RejectReason::StalePrimaryEpoch);
     assert_eq!(
-        shard
-            .handle()
-            .barrier(1)
-            .unwrap()
+        retry(|| shard.handle().barrier(1))
             .recv_timeout(Duration::from_secs(5))
             .unwrap(),
         (1, 1)
