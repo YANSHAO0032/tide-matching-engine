@@ -12,9 +12,15 @@ pub enum TimeInForce {
     /// 只有可完整成交时才允许执行。
     Fok,
     /// 仅在给定交易会话内有效。
-    Day { session_id: u64 },
+    Day {
+        /// 订单所属交易会话的身份。
+        session_id: u64,
+    },
     /// 在给定逻辑时间到达后到期。
-    Gtd { expire_at: LogicalTime },
+    Gtd {
+        /// 订单到期时的逻辑时间。
+        expire_at: LogicalTime,
+    },
 }
 
 #[cfg(test)]

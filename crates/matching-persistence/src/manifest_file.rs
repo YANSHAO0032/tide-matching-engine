@@ -16,12 +16,21 @@ pub struct FileManifestStorage {
     pending_paths: Option<(PathBuf, PathBuf)>,
     /// 从已验证槽位恢复的权威状态。
     committed: ManifestState,
+    /// 已有槽损坏或缺失时禁止在回退状态上写入。
+    unsafe_baseline: bool,
+    /// 是否存在不含本地水位的旧版本槽。
+    legacy_slot: bool,
     /// 正在持久化的候选状态。
     pending_state: Option<ManifestState>,
 }
 impl FileManifestStorage {
     /// 获取独占锁，验证双槽并选择最高合法代际。
     pub(crate) fn open(directory: impl AsRef<Path>) -> io::Result<(Self, ManifestState)> {
+        Self::open_inner(directory, false)
+    }
+
+    /// 在读取已确认水位时拒绝缺失或损坏的历史槽。
+    fn open_inner(directory: impl AsRef<Path>, strict: bool) -> io::Result<(Self, ManifestState)> {
         let directory = directory.as_ref().to_path_buf();
         let lock = OpenOptions::new()
             .read(true)
@@ -33,6 +42,9 @@ impl FileManifestStorage {
             .map_err(|error| io::Error::other(format!("manifest 锁不可用: {error}")))?;
         let mut best: Option<ManifestState> = None;
         let mut existing = false;
+        let mut invalid_slot = false;
+        let mut generations = Vec::new();
+        let mut legacy_slot = false;
         for name in ["manifest-a", "manifest-b"] {
             match File::open(directory.join(name)) {
                 Ok(file) => {
@@ -42,6 +54,8 @@ impl FileManifestStorage {
                     if let Some(state) = decode(&bytes)
                         && ((name == "manifest-a") == (state.generation % 2 == 1))
                     {
+                        legacy_slot |= bytes[4..6] != 2u16.to_be_bytes();
+                        generations.push(state.generation);
                         if let Some(current) = &best
                             && current.generation == state.generation
                             && current != &state
@@ -54,6 +68,8 @@ impl FileManifestStorage {
                         {
                             best = Some(state);
                         }
+                    } else {
+                        invalid_slot = true;
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -66,6 +82,17 @@ impl FileManifestStorage {
         if !existing && directory.join("manifest.tmp").try_exists()? {
             return Err(invalid("初始 manifest 存在未完成临时文件"));
         }
+        generations.sort_unstable();
+        let valid_slots = match generations.as_slice() {
+            [] if !existing => true,
+            [1] => true,
+            [a, b] => a.checked_add(1) == Some(*b),
+            _ => false,
+        };
+        let unsafe_baseline = invalid_slot || !valid_slots || (existing && generations.len() != 2);
+        if strict && existing && (unsafe_baseline || legacy_slot || generations.len() != 2) {
+            return Err(invalid("无法证明已确认水位，拒绝回退"));
+        }
         let state = best.unwrap_or_default();
         Ok((
             Self {
@@ -74,6 +101,8 @@ impl FileManifestStorage {
                 pending_file: None,
                 pending_paths: None,
                 committed: state.clone(),
+                unsafe_baseline,
+                legacy_slot,
                 pending_state: None,
             },
             state,
@@ -87,9 +116,22 @@ impl ManifestManager<FileManifestStorage> {
         let (storage, state) = FileManifestStorage::open(directory)?;
         Ok(Self::new(storage, state))
     }
+    /// 严格检查双槽，禁止将损坏槽回退作为已确认水位。
+    pub fn open_recovery(directory: impl AsRef<Path>) -> io::Result<Self> {
+        let (storage, state) = FileManifestStorage::open_inner(directory, true)?;
+        let mut manager = Self::new(storage, state);
+        manager.mark_recovery_checked();
+        Ok(manager)
+    }
 }
 impl ManifestStorage for FileManifestStorage {
     fn validate_base(&self, state: &ManifestState) -> io::Result<()> {
+        if self.unsafe_baseline {
+            return Err(invalid("清单槽损坏或缺失，禁止在回退状态上写入"));
+        }
+        if self.legacy_slot {
+            return Err(invalid("旧版清单缺少可信提交水位，禁止直接升级"));
+        }
         if state != &self.committed {
             return Err(invalid("管理器前态与持久槽位不一致"));
         }
@@ -168,12 +210,17 @@ fn encode(state: &ManifestState) -> io::Result<Vec<u8>> {
     if state.gc_plan.len() > 65_536
         || state.gc_plan.contains(&0)
         || state.gc_plan.windows(2).any(|w| w[0] >= w[1])
+        || (state.gc_plan.is_empty() != state.gc_retained_first.is_none())
+        || (state.gc_plan.is_empty() != state.gc_identity.is_none())
+        || state
+            .gc_retained_first
+            .is_some_and(|first| state.gc_plan.last().is_none_or(|last| first <= *last))
     {
         return Err(invalid("无效回收计划"));
     }
     let mut out = Vec::new();
     out.extend_from_slice(b"MNF1");
-    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&2u16.to_be_bytes());
     out.extend_from_slice(&state.generation.to_be_bytes());
     out.extend_from_slice(&state.replication_safe_seq.to_be_bytes());
     out.push(u8::from(state.latest_snapshot.is_some()));
@@ -187,6 +234,11 @@ fn encode(state: &ManifestState) -> io::Result<Vec<u8>> {
     for id in &state.gc_plan {
         out.extend_from_slice(&id.to_be_bytes());
     }
+    out.extend_from_slice(&state.local_durable_seq.to_be_bytes());
+    out.extend_from_slice(&state.gc_retained_first.unwrap_or(0).to_be_bytes());
+    let (cluster, shard) = state.gc_identity.unwrap_or((0, 0));
+    out.extend_from_slice(&cluster.to_be_bytes());
+    out.extend_from_slice(&shard.to_be_bytes());
     out.extend_from_slice(&crc32c(&out).to_be_bytes());
     Ok(out)
 }
@@ -196,7 +248,7 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     if bytes.len() < 64
         || bytes.len() > 600_000
         || &bytes[..4] != b"MNF1"
-        || bytes[4..6] != 1u16.to_be_bytes()
+        || ![1u16, 2u16].contains(&u16::from_be_bytes(bytes[4..6].try_into().ok()?))
     {
         return None;
     }
@@ -222,7 +274,10 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     };
     let wal_gc_safe_seq = u64_at(48);
     let count = u32::from_be_bytes(bytes[56..60].try_into().ok()?) as usize;
-    if count > 65_536 || 60usize.checked_add(count.checked_mul(8)?)? != data_end {
+    let version = u16::from_be_bytes(bytes[4..6].try_into().ok()?);
+    let plan_end = 60usize.checked_add(count.checked_mul(8)?)?;
+    let expected_end = plan_end.checked_add(if version == 2 { 20 } else { 0 })?;
+    if count > 65_536 || expected_end != data_end {
         return None;
     }
     let mut gc_plan = Vec::with_capacity(count);
@@ -232,13 +287,36 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     if gc_plan.contains(&0) || gc_plan.windows(2).any(|w| w[0] >= w[1]) {
         return None;
     }
+    let retained_first = if version == 2 {
+        u64_at(plan_end + 8)
+    } else {
+        0
+    };
+    if (count == 0 && retained_first != 0)
+        || (count != 0 && version == 2 && gc_plan.last().is_none_or(|last| retained_first <= *last))
+    {
+        return None;
+    }
+    let gc_identity = if version == 2 {
+        let cluster = u16::from_be_bytes(bytes[plan_end + 16..plan_end + 18].try_into().ok()?);
+        let shard = u16::from_be_bytes(bytes[plan_end + 18..plan_end + 20].try_into().ok()?);
+        if count == 0 && (cluster != 0 || shard != 0) {
+            return None;
+        }
+        (count != 0).then_some((cluster, shard))
+    } else {
+        None
+    };
     Some(ManifestState {
         generation,
+        local_durable_seq: if version == 2 { u64_at(plan_end) } else { 0 },
         replication_safe_seq,
         latest_snapshot: snapshot,
         active_segment: active,
         wal_gc_safe_seq,
         gc_plan,
+        gc_retained_first: (retained_first != 0).then_some(retained_first),
+        gc_identity,
     })
 }
 
@@ -310,5 +388,70 @@ mod tests {
             drop(reopened);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn strict_recovery_preserves_confirmed_watermark_at_manifest_write_boundaries() {
+        for boundary in 0..4 {
+            let dir = std::env::temp_dir().join(format!(
+                "manifest-strict-boundary-{}-{boundary}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let mut manager = ManifestManager::<FileManifestStorage>::open(&dir).unwrap();
+            manager
+                .submit(ManifestIntent::LocalDurableAdvanced {
+                    through_seq: 1,
+                    first_seq: 1,
+                })
+                .unwrap();
+            manager.submit(ManifestIntent::RecoveryAnchor).unwrap();
+            let before = manager.state().clone();
+            drop(manager);
+            let (mut storage, _) = FileManifestStorage::open(&dir).unwrap();
+            let mut after = before.clone();
+            after.generation = 3;
+            after.local_durable_seq = 2;
+            storage.write_inactive_tmp(3, &after).unwrap();
+            if boundary >= 1 {
+                storage.sync_tmp().unwrap();
+            }
+            if boundary >= 2 {
+                storage.rename_inactive_slot().unwrap();
+            }
+            if boundary >= 3 {
+                storage.sync_directory().unwrap();
+            }
+            drop(storage);
+            let reopened = ManifestManager::<FileManifestStorage>::open_recovery(&dir).unwrap();
+            assert_eq!(
+                reopened.state(),
+                if boundary < 2 { &before } else { &after }
+            );
+            assert!(reopened.state().local_durable_seq >= 1);
+            drop(reopened);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn version_two_manifest_has_stable_golden_bytes() {
+        let hex = "4d4e463100020000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c4c102e0";
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let digits = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(digits, 16).unwrap()
+            })
+            .collect();
+        let state = ManifestState {
+            generation: 1,
+            ..ManifestState::default()
+        };
+        assert_eq!(encode(&state).unwrap(), bytes);
+        assert_eq!(decode(&bytes), Some(state));
     }
 }

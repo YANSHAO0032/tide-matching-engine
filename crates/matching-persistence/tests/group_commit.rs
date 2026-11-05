@@ -276,10 +276,18 @@ fn manifest_failure_after_wal_sync_cannot_advance_commit() {
     use matching_persistence::{
         ManifestManager, ManifestState, ManifestStorage, RegisteredAppender, SegmentWriter,
     };
-    struct Failing;
+    struct Failing {
+        /// 已尝试写入的清单代数。
+        writes: usize,
+    }
     impl ManifestStorage for Failing {
         fn write_inactive_tmp(&mut self, _: u64, _: &ManifestState) -> io::Result<()> {
-            Err(io::Error::other("manifest 故障"))
+            self.writes += 1;
+            if self.writes == 3 {
+                Err(io::Error::other("manifest 故障"))
+            } else {
+                Ok(())
+            }
         }
         fn sync_tmp(&mut self) -> io::Result<()> {
             Ok(())
@@ -294,7 +302,7 @@ fn manifest_failure_after_wal_sync_cannot_advance_commit() {
     let dir = std::env::temp_dir().join(format!("t22-manifest-failure-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
     let writer = SegmentWriter::new(&dir, 1024).unwrap();
-    let manager = ManifestManager::new(Failing, ManifestState::default());
+    let manager = ManifestManager::new(Failing { writes: 0 }, ManifestState::default());
     let appender = RegisteredAppender::new(writer, manager).unwrap();
     let mut batch = DurableBatcher::new_with_config(
         appender,
@@ -323,4 +331,97 @@ fn constructor_rejects_ha_local_durability_without_explicit_loss_acceptance() {
     assert!(DurableBatcher::new_with_config(Appender::default(), config, 1).is_err());
     config.allow_data_loss_on_failover = true;
     assert!(DurableBatcher::new_with_config(Appender::default(), config, 1).is_ok());
+}
+
+#[test]
+fn synced_batch_recovers_local_durable_watermark_from_manifest() {
+    use matching_persistence::{
+        FileManifestStorage, ManifestManager, RegisteredAppender, SegmentWriter,
+    };
+    let root = std::env::temp_dir().join(format!("t23-watermark-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir(&wal).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+    let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    let appender =
+        RegisteredAppender::new(SegmentWriter::new(&wal, 1024).unwrap(), manager).unwrap();
+    let mut batch = DurableBatcher::new_with_config(
+        appender,
+        config(DurabilityMode::FsyncEach, ReplicationMode::LocalDurable),
+        1,
+    )
+    .unwrap();
+    batch.append_at(&record(1), Instant::now()).unwrap();
+    batch.append_at(&record(2), Instant::now()).unwrap();
+    drop(batch);
+    let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 2);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_rejects_missing_second_slot_after_first_ack() {
+    use matching_persistence::{
+        FileManifestStorage, ManifestManager, RegisteredAppender, SegmentWriter,
+    };
+    let root = std::env::temp_dir().join(format!("t23-missing-slot-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir(&wal).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+    let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    let appender =
+        RegisteredAppender::new(SegmentWriter::new(&wal, 1024).unwrap(), manager).unwrap();
+    let mut batch = DurableBatcher::new_with_config(
+        appender,
+        config(DurabilityMode::FsyncEach, ReplicationMode::LocalDurable),
+        1,
+    )
+    .unwrap();
+    batch.append_at(&record(1), Instant::now()).unwrap();
+    drop(batch);
+    assert!(manifest.join("manifest-b").exists());
+    std::fs::remove_file(manifest.join("manifest-b")).unwrap();
+    assert!(ManifestManager::<FileManifestStorage>::open_recovery(&manifest).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn startup_fails_before_wal_write_if_second_manifest_slot_fails() {
+    use matching_persistence::{
+        ManifestManager, ManifestState, ManifestStorage, RegisteredAppender, SegmentWriter,
+    };
+    struct FailSecond {
+        /// 已尝试写入的清单代数。
+        writes: usize,
+    }
+    impl ManifestStorage for FailSecond {
+        fn write_inactive_tmp(&mut self, _: u64, _: &ManifestState) -> io::Result<()> {
+            self.writes += 1;
+            if self.writes == 2 {
+                Err(io::Error::other("第二槽故障"))
+            } else {
+                Ok(())
+            }
+        }
+        fn sync_tmp(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn rename_inactive_slot(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn sync_directory(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("t23-second-slot-fault-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let manager = ManifestManager::new(FailSecond { writes: 0 }, ManifestState::default());
+    assert!(RegisteredAppender::new(SegmentWriter::new(&dir, 1024).unwrap(), manager).is_err());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
 }

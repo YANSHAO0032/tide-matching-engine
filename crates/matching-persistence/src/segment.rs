@@ -131,6 +131,11 @@ impl SegmentWriter {
         self.active_first
     }
 
+    /// 返回最近成功追加的分片序号。
+    pub(crate) fn last_seq(&self) -> Option<u64> {
+        self.last.map(|(_, _, seq)| seq)
+    }
+
     /// 检查该写入器尚未接收任何记录。
     pub(crate) const fn is_pristine(&self) -> bool {
         self.file.is_none() && self.last.is_none() && !self.failed

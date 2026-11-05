@@ -354,14 +354,16 @@ pub struct RegisteredAppender<S> {
     manifest: ManifestManager<S>,
 }
 impl<S: ManifestStorage> RegisteredAppender<S> {
-    /// 只从空 WAL 和无活动 segment 的 manifest 启动；恢复另行实现。
-    pub fn new(writer: SegmentWriter, manifest: ManifestManager<S>) -> io::Result<Self> {
+    /// 只从空 WAL 和默认清单启动，先持久初始化双槽；现有 WAL 的续写尚不支持。
+    pub fn new(writer: SegmentWriter, mut manifest: ManifestManager<S>) -> io::Result<Self> {
         if !writer.is_pristine() || manifest.state() != &ManifestState::default() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "非空状态需要恢复流程",
             ));
         }
+        manifest.submit(ManifestIntent::Initialize)?;
+        manifest.submit(ManifestIntent::RecoveryAnchor)?;
         Ok(Self { writer, manifest })
     }
     /// 返回已完成持久化的 manifest 前态。
@@ -385,10 +387,14 @@ impl<S: ManifestStorage> DurableAppender for RegisteredAppender<S> {
             .writer
             .active_first()
             .ok_or_else(|| io::Error::other("活动 segment 不存在"))?;
-        if self.manifest.state().active_segment != Some(first_seq) {
-            self.manifest
-                .submit(ManifestIntent::SegmentRolled { first_seq })?;
-        }
+        let through_seq = self
+            .writer
+            .last_seq()
+            .ok_or_else(|| io::Error::other("没有可登记的记录"))?;
+        self.manifest.submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq,
+            first_seq,
+        })?;
         Ok(())
     }
 }

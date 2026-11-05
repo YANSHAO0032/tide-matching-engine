@@ -93,6 +93,12 @@ fn fence_is_durable_before_reply_and_dedup_does_not_reappend() {
         1
     );
     shard.shutdown(Duration::from_secs(5)).unwrap();
+    let recovered =
+        matching_runtime::recover_local_commands(base.join("wal"), base.join("manifest"), 0, 2, 1)
+            .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].shard_seq, first.seq);
+    assert_eq!(recovered[0].command, command);
 }
 
 #[test]
@@ -489,4 +495,66 @@ fn durable_start_rejects_windows_junction_alias() {
     assert!(result.is_err());
     assert!(std::fs::read_dir(&shared).unwrap().next().is_none());
     std::fs::remove_dir(junction).unwrap();
+}
+
+#[test]
+fn recovered_wal_decodes_command_and_rejects_mismatched_identity() {
+    use matching_domain::{
+        ApplyUserControlFenceShard, Command, CommandEnvelope, CommandId, UserFenceAction, UserId,
+        encode_wal_command,
+    };
+    use matching_persistence::{
+        FileManifestStorage, ManifestIntent, ManifestManager, SegmentWriter, WalRecord,
+    };
+    use matching_runtime::recover_local_commands;
+    let temp = t22_support::TestDirectory::new();
+    let command = CommandEnvelope {
+        command_id: CommandId(3),
+        session_id: 4,
+        client_seq: 5,
+        market_id: None,
+        user_id: Some(UserId(6)),
+        route_epoch: None,
+        client_timestamp: None,
+        received_at_unix_ns: None,
+        payload: Command::ApplyUserControlFenceShard(ApplyUserControlFenceShard {
+            parent_command_id: CommandId(8),
+            user_id: UserId(6),
+            new_epoch: 9,
+            action: UserFenceAction::FenceOnly,
+            expected_primary_epoch: 7,
+        }),
+    };
+    let wal = temp.0.join("wal");
+    let manifest = temp.0.join("manifest");
+    let record = WalRecord {
+        cluster_id: 2,
+        shard_id: 1,
+        flags: 0,
+        epoch: 7,
+        shard_seq: 1,
+        engine_time: 0,
+        command_id: 3,
+        payload: encode_wal_command(&command).unwrap(),
+    };
+    let mut writer = SegmentWriter::new(&wal, 1024).unwrap();
+    writer.append(&record).unwrap();
+    drop(writer);
+    let mut manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 1,
+            first_seq: 1,
+        })
+        .unwrap();
+    manager.submit(ManifestIntent::RecoveryAnchor).unwrap();
+    drop(manager);
+    assert_eq!(
+        recover_local_commands(&wal, &manifest, 0, 2, 1).unwrap()[0].command,
+        command
+    );
+    let mut bad = record;
+    bad.command_id = 999;
+    std::fs::write(wal.join("00000000000000000001.wal"), bad.encode().unwrap()).unwrap();
+    assert!(recover_local_commands(&wal, &manifest, 0, 2, 1).is_err());
 }

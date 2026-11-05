@@ -1,11 +1,13 @@
-//! WAL、快照、清单、恢复和持久性边界的规划位置。
+//! WAL 记录、持久提交、清单、本地恢复与安全回收。
 
 mod durability;
 mod manifest;
 mod manifest_file;
 mod record;
+mod recovery;
 mod scan;
 mod segment;
+mod wal_gc;
 pub use durability::{
     CommitWatermark, DurabilityConfig, DurabilityError, DurabilityMode, DurableAppender,
     DurableBatcher, Profile, RegisteredAppender, ReplicationMode,
@@ -13,8 +15,10 @@ pub use durability::{
 pub use manifest::{ManifestIntent, ManifestManager, ManifestState, ManifestStorage};
 pub use manifest_file::FileManifestStorage;
 pub use record::{WalError, WalRecord};
+pub use recovery::{recover_committed, recover_local, repair_local_wal};
 pub use scan::{ScanError, ScanResult, scan_segment};
 pub use segment::{SegmentMeta, SegmentScan, SegmentWriter, scan_segments, truncate_torn_tail};
+pub use wal_gc::{WalGcPolicy, run_wal_gc};
 
 /// 计算 Castagnoli 多项式的 CRC32C，用于检测持久化记录损坏。
 ///
