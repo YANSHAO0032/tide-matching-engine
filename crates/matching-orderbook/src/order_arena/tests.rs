@@ -98,3 +98,66 @@ mod metrics;
 mod model;
 #[path = "tests/preflight.rs"]
 mod preflight;
+
+#[test]
+fn snapshot_arena_preserves_slot_and_free_list_order() {
+    use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+    let mut arena = OrderArena::new();
+    let a = arena
+        .insert(OrderNode::new(
+            order(1, Side::Buy, 5),
+            QueuePriority::new(1),
+        ))
+        .unwrap();
+    let _b = arena
+        .insert(OrderNode::new(
+            order(2, Side::Buy, 5),
+            QueuePriority::new(2),
+        ))
+        .unwrap();
+    let c = arena
+        .insert(OrderNode::new(
+            order(3, Side::Buy, 5),
+            QueuePriority::new(3),
+        ))
+        .unwrap();
+    arena.remove(a).unwrap();
+    arena.remove(c).unwrap();
+    let mut writer = SnapshotEncoder::new(4096);
+    arena.write_snapshot(&mut writer).unwrap();
+    let bytes = writer.finish();
+    let mut reader = SnapshotDecoder::new(&bytes, 4096).unwrap();
+    let mut restored = OrderArena::read_snapshot(&mut reader).unwrap();
+    reader.finish().unwrap();
+    assert_eq!(restored.state_snapshot(), arena.state_snapshot());
+    assert_eq!(
+        restored
+            .insert(OrderNode::new(
+                order(4, Side::Buy, 1),
+                QueuePriority::new(4)
+            ))
+            .unwrap(),
+        c
+    );
+    for end in 0..bytes.len() {
+        let mut reader = SnapshotDecoder::new(&bytes[..end], 4096).unwrap();
+        assert!(OrderArena::read_snapshot(&mut reader).is_err());
+    }
+}
+
+#[test]
+fn snapshot_arena_rejects_duplicate_or_missing_free_entries() {
+    use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+    let mut body = SnapshotEncoder::new(128);
+    body.u32(2).unwrap();
+    body.u8(0).unwrap();
+    body.u8(0).unwrap();
+    body.u32(2).unwrap();
+    body.u32(0).unwrap();
+    body.u32(0).unwrap();
+    let mut outer = SnapshotEncoder::new(128);
+    outer.bytes(&body.finish()).unwrap();
+    let bytes = outer.finish();
+    let mut reader = SnapshotDecoder::new(&bytes, 128).unwrap();
+    assert!(OrderArena::read_snapshot(&mut reader).is_err());
+}

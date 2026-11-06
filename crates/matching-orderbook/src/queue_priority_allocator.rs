@@ -89,6 +89,34 @@ impl QueuePriorityPolicy {
         })
     }
 
+    /// 写入优先级策略的保护区和可选合成上限。
+    pub(crate) fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        writer.u128(self.guard)?;
+        match self.synthetic_ceiling {
+            Some(limit) => {
+                writer.u8(1)?;
+                writer.u128(limit)
+            }
+            None => writer.u8(0),
+        }
+    }
+    /// 读取并验证优先级策略。
+    pub(crate) fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::SnapshotWireError;
+        let guard = reader.u128()?;
+        let ceiling = match reader.u8()? {
+            0 => None,
+            1 => Some(reader.u128()?),
+            _ => return Err(SnapshotWireError),
+        };
+        Self::try_with_synthetic_ceiling(guard, ceiling).map_err(|_| SnapshotWireError)
+    }
+
     /// 返回不可分配尾部的真实预留边界配置。
     pub fn guard(&self) -> u128 {
         self.guard
@@ -181,6 +209,28 @@ impl QueuePriorityAllocator {
     /// 策略已在构造时验证；此函数不共享或重置任何其他市场的计数器。
     pub fn new(policy: QueuePriorityPolicy) -> Self {
         Self { policy, next: 0 }
+    }
+
+    /// 编码策略和下一普通订单优先级。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        let mut body = matching_domain::snapshot_wire::SnapshotEncoder::new(64);
+        self.policy.write_snapshot(&mut body)?;
+        body.u128(self.next)?;
+        writer.bytes(&body.finish())
+    }
+    /// 恢复策略和下一优先级，并拒绝超出安全边界的值。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotWireError};
+        let mut body = SnapshotDecoder::new(reader.bytes()?, 64)?;
+        let policy = QueuePriorityPolicy::read_snapshot(&mut body)?;
+        let next = body.u128()?;
+        body.finish()?;
+        Self::try_restore(policy, next).map_err(|_| SnapshotWireError)
     }
 
     /// 从持久化快照 / 市场迁移状态恢复分配器。
@@ -657,5 +707,27 @@ mod tests {
         assert_eq!(allocator.allocate(), Ok(QueuePriority::new(1)));
 
         assert_eq!(*allocator.policy(), before_policy);
+    }
+
+    #[test]
+    fn snapshot_allocator_restores_policy_and_next_without_increment() {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+        let policy = QueuePriorityPolicy::try_with_synthetic_ceiling(1024, Some(3)).unwrap();
+        let allocator = QueuePriorityAllocator::try_restore(policy, 3).unwrap();
+        let mut writer = SnapshotEncoder::new(128);
+        allocator.write_snapshot(&mut writer).unwrap();
+        let bytes = writer.finish();
+        let mut reader = SnapshotDecoder::new(&bytes, 128).unwrap();
+        let mut restored = QueuePriorityAllocator::read_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(restored, allocator);
+        assert_eq!(
+            restored.allocate(),
+            Err(RejectReason::PrioritySpaceExhaustion)
+        );
+        let mut invalid = bytes.clone();
+        invalid[4..20].fill(0);
+        let mut reader = SnapshotDecoder::new(&invalid, 128).unwrap();
+        assert!(QueuePriorityAllocator::read_snapshot(&mut reader).is_err());
     }
 }

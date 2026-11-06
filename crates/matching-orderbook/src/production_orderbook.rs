@@ -26,6 +26,7 @@ mod matching;
 mod price_band;
 mod reservation_place;
 mod resting;
+mod snapshot;
 mod stop_orders;
 mod stop_trigger;
 
@@ -152,6 +153,128 @@ impl ProductionOrderBook {
             reference_prices: PriceReferenceState::default(),
             price_band: None,
         }
+    }
+
+    /// 校验恢复镜像中的价档、链表、索引、到期与优先级约束。
+    ///
+    /// 只验证当前市场内状态，不验证外部分片的预留登记表或路由。
+    pub fn validate_snapshot_invariants(&self) -> Result<(), &'static str> {
+        use std::collections::BTreeSet;
+        if self.queue_priority_allocator.policy() != self.stop_priority_allocator.policy() {
+            return Err("普通与止损优先级策略不一致");
+        }
+        self.arena
+            .validate_snapshot_free()
+            .map_err(|_| "Arena 空闲栈不一致")?;
+        self.stop_book.validate()?;
+        let mut slots = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        let mut queue_priorities = BTreeSet::new();
+        let mut expiry = RegularExpiryIndex::default();
+        for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (price, level) in levels {
+                level
+                    .validate_snapshot_shape()
+                    .map_err(|_| "价档端点无效")?;
+                if level.count() == 0 {
+                    return Err("价格索引包含空档");
+                }
+                let mut current = level.head();
+                let mut previous = None;
+                let mut previous_priority = None;
+                let mut count = 0_u32;
+                let mut visible = 0_u64;
+                while let Some(index) = current {
+                    if !slots.insert(index) {
+                        return Err("价档链存在重复节点或环");
+                    }
+                    let node = self.arena.get(index).ok_or("价档引用空槽")?;
+                    node.validate_snapshot_fields()
+                        .map_err(|_| "节点数量或有效期无效")?;
+                    if node.prev() != previous
+                        || node.original_order().side != side
+                        || node.original_order().price != *price
+                    {
+                        return Err("价档链接或节点位置不一致");
+                    }
+                    if previous_priority.is_some_and(|p| p >= node.priority())
+                        || !queue_priorities.insert(node.priority())
+                        || node.priority().get() >= self.next_queue_priority()
+                    {
+                        return Err("普通订单优先级无效");
+                    }
+                    let id = node.original_order().order_id;
+                    if !ids.insert(id) || self.orders.get(&id) != Some(&index) {
+                        return Err("普通订单身份索引无效");
+                    }
+                    count = count.checked_add(1).ok_or("价档数量溢出")?;
+                    visible = visible
+                        .checked_add(node.remaining())
+                        .ok_or("价档聚合溢出")?;
+                    expiry.insert(id, node.time_in_force());
+                    previous = Some(index);
+                    previous_priority = Some(node.priority());
+                    current = node.next();
+                }
+                if previous != level.tail()
+                    || count != level.count()
+                    || visible != level.total_visible_qty()
+                {
+                    return Err("价档端点或聚合不一致");
+                }
+            }
+        }
+        if self.orders.len() != slots.len() || expiry != self.regular_expiry {
+            return Err("订单或到期索引不一致");
+        }
+        let (arena_slots, _) = self.arena.state_snapshot();
+        for (position, node) in arena_slots.iter().enumerate() {
+            if node.is_some()
+                && !slots
+                    .contains(&OrderIndex::try_from_usize(position).map_err(|_| "Arena 下标溢出")?)
+            {
+                return Err("Arena 活动节点不可达");
+            }
+        }
+        let mut stop_priorities = BTreeSet::new();
+        for side in [Side::Buy, Side::Sell] {
+            for (order, priority) in self.stop_book.ordered(side) {
+                if !ids.insert(order.order_id())
+                    || !stop_priorities.insert(priority)
+                    || priority.get() >= self.next_stop_priority()
+                {
+                    return Err("止损订单身份或优先级无效");
+                }
+            }
+        }
+        for (id, state) in &self.reservations {
+            let regular_user = self
+                .orders
+                .get(id)
+                .and_then(|index| self.arena.get(*index))
+                .map(|node| node.original_order().user_id);
+            let stop = self.stop_book.get(*id).map(|(order, _)| order);
+            let stop_user = stop.map(|order| match order {
+                matching_domain::StopOrder::Limit(order) => order.user_id,
+                matching_domain::StopOrder::Market(order) => order.user_id,
+            });
+            if state.order_id != *id
+                || !ids.contains(id)
+                || state.status != matching_risk::ReservationStatus::Active
+                || self
+                    .market_id
+                    .is_some_and(|market| market != state.market_id)
+                || regular_user.or(stop_user) != Some(state.user_id)
+                || stop.is_some_and(|order| order.reservation_id() != state.reservation_id)
+            {
+                return Err("本地预留身份不一致");
+            }
+        }
+        if matches!((self.best_price(Side::Buy),self.best_price(Side::Sell)),(Some(bid),Some(ask)) if bid>=ask)
+        {
+            return Err("订单簿交叉");
+        }
+        Ok(())
     }
 
     /// 查询订单簿绑定的可信市场。

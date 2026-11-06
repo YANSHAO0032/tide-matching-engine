@@ -261,7 +261,7 @@ fn strict_recovery_rejects_a_mixed_legacy_slot_pair() {
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
     let len = bytes.len();
-    bytes.truncate(len - 24);
+    bytes.truncate(len - 41);
     bytes.extend_from_slice(&matching_persistence::crc32c(&bytes).to_be_bytes());
     std::fs::write(path, bytes).unwrap();
     assert!(ManifestManager::<FileManifestStorage>::open_recovery(&dir).is_err());
@@ -282,7 +282,7 @@ fn legacy_manifest_cannot_be_upgraded_by_unrelated_intents() {
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
     let len = bytes.len();
-    bytes.truncate(len - 24);
+    bytes.truncate(len - 41);
     bytes.extend_from_slice(&matching_persistence::crc32c(&bytes).to_be_bytes());
     std::fs::write(path, bytes).unwrap();
     let mut manager = ManifestManager::<FileManifestStorage>::open(&dir).unwrap();
@@ -351,6 +351,51 @@ fn missing_slot_cannot_be_hidden_by_followup_writes() {
             .submit(ManifestIntent::ReplicationSafeSeqAdvanced { seq: 1 })
             .is_err()
     );
+    drop(manager);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn version_two_slot_migrates_without_losing_durable_watermark() {
+    use matching_persistence::FileManifestStorage;
+    let dir = std::env::temp_dir().join(format!("t24-v2-migration-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut manager = ManifestManager::<FileManifestStorage>::open(&dir).unwrap();
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 1,
+            first_seq: 1,
+        })
+        .unwrap();
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 2,
+            first_seq: 1,
+        })
+        .unwrap();
+    drop(manager);
+    for name in ["manifest-a", "manifest-b"] {
+        let path = dir.join(name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        let len = bytes.len();
+        bytes.truncate(len - 21);
+        let checksum = matching_persistence::crc32c(&bytes);
+        bytes.extend_from_slice(&checksum.to_be_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&dir).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 2);
+    assert_eq!(manager.state().previous_snapshot, None);
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 3,
+            first_seq: 1,
+        })
+        .unwrap();
+    drop(manager);
+    let manager = ManifestManager::<FileManifestStorage>::open_recovery(&dir).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 3);
     drop(manager);
     std::fs::remove_dir_all(dir).unwrap();
 }

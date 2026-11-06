@@ -223,6 +223,134 @@ impl OrderNode {
         self.tif = tif;
     }
 
+    /// 以固定大端字段和长度前缀编码活动节点，包括双向链接与存活期。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotEncoder, SnapshotWireError, encode_limit_order,
+        };
+        self.validate_snapshot_fields()?;
+        let mut body = SnapshotEncoder::new(128);
+        encode_limit_order(&mut body, &self.order)?;
+        body.u64(self.remaining)?;
+        body.u64(self.hidden_remaining)?;
+        match self.peak_size {
+            Some(peak) => {
+                body.u8(1)?;
+                body.u64(peak.get())?;
+            }
+            None => body.u8(0)?,
+        }
+        body.u128(self.priority.get())?;
+        match self.tif {
+            TimeInForce::Gtc => body.u8(0)?,
+            TimeInForce::Day { session_id } => {
+                body.u8(1)?;
+                body.u64(session_id)?;
+            }
+            TimeInForce::Gtd { expire_at } => {
+                body.u8(2)?;
+                body.u64(expire_at.get())?;
+            }
+            _ => return Err(SnapshotWireError),
+        }
+        for index in [self.prev, self.next] {
+            match index {
+                Some(index) => {
+                    body.u8(1)?;
+                    body.u32(index.get())?;
+                }
+                None => body.u8(0)?,
+            }
+        }
+        writer.bytes(&body.finish())
+    }
+
+    /// 解码活动节点并校验数量、存活期和字段标记；跨节点链接由上层验证。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotDecoder, SnapshotWireError, decode_limit_order,
+        };
+        let bytes = reader.bytes()?;
+        let mut body = SnapshotDecoder::new(bytes, 128)?;
+        let order = decode_limit_order(&mut body)?;
+        let remaining = body.u64()?;
+        let hidden_remaining = body.u64()?;
+        let peak_size = match body.u8()? {
+            0 => None,
+            1 => Some(Qty::try_new(body.u64()?).map_err(|_| SnapshotWireError)?),
+            _ => return Err(SnapshotWireError),
+        };
+        let priority = QueuePriority::new(body.u128()?);
+        let tif = match body.u8()? {
+            0 => TimeInForce::Gtc,
+            1 => TimeInForce::Day {
+                session_id: body.u64()?,
+            },
+            2 => TimeInForce::Gtd {
+                expire_at: matching_domain::LogicalTime::new(body.u64()?),
+            },
+            _ => return Err(SnapshotWireError),
+        };
+        let read_index =
+            |body: &mut SnapshotDecoder<'_>| -> Result<Option<OrderIndex>, SnapshotWireError> {
+                match body.u8()? {
+                    0 => Ok(None),
+                    1 => Ok(Some(
+                        OrderIndex::try_from_usize(
+                            usize::try_from(body.u32()?).map_err(|_| SnapshotWireError)?,
+                        )
+                        .map_err(|_| SnapshotWireError)?,
+                    )),
+                    _ => Err(SnapshotWireError),
+                }
+            };
+        let prev = read_index(&mut body)?;
+        let next = read_index(&mut body)?;
+        body.finish()?;
+        let node = Self {
+            order,
+            remaining,
+            hidden_remaining,
+            peak_size,
+            priority,
+            tif,
+            prev,
+            next,
+        };
+        node.validate_snapshot_fields()?;
+        Ok(node)
+    }
+
+    /// 校验单节点自身约束，不检查所属链表和索引。
+    pub(crate) fn validate_snapshot_fields(
+        &self,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::SnapshotWireError;
+        let total = self
+            .remaining
+            .checked_add(self.hidden_remaining)
+            .ok_or(SnapshotWireError)?;
+        if self.order.validate_stp_mode().is_err()
+            || self.remaining == 0
+            || total > self.order.qty.get()
+            || matches!(self.tif, TimeInForce::Ioc | TimeInForce::Fok)
+        {
+            return Err(SnapshotWireError);
+        }
+        match self.peak_size {
+            None if self.hidden_remaining != 0 => Err(SnapshotWireError),
+            Some(peak) if peak.get() >= self.order.qty.get() || self.remaining > peak.get() => {
+                Err(SnapshotWireError)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// 仅由完成局部链表预检的库内维护路径设置前驱。
     ///
     /// 单独调用不会验证双向链接、方向/价格或优先级不变量。
@@ -321,5 +449,43 @@ mod tests {
         node.commit_partial_remaining(1);
         assert_eq!(node.total_remaining(), 8);
         assert_eq!(node.hidden_remaining(), 7);
+    }
+
+    #[test]
+    fn snapshot_roundtrips_iceberg_links_and_rejects_invalid_remaining() {
+        use matching_domain::{
+            IcebergOrder,
+            snapshot_wire::{SnapshotDecoder, SnapshotEncoder},
+        };
+        let order = LimitOrder {
+            order_id: OrderId::new(8),
+            user_id: UserId::new(4),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
+            side: Side::Sell,
+            price: Price::try_new(90).unwrap(),
+            qty: Qty::try_new(10).unwrap(),
+        };
+        let iceberg = IcebergOrder::try_new(order, Qty::try_new(3).unwrap()).unwrap();
+        let mut node = OrderNode::new_iceberg(iceberg, 10, QueuePriority::new(8));
+        node.set_prev(Some(OrderIndex::try_from_usize(2).unwrap()));
+        node.set_next(Some(OrderIndex::try_from_usize(5).unwrap()));
+        let mut writer = SnapshotEncoder::new(1024);
+        node.write_snapshot(&mut writer).unwrap();
+        let bytes = writer.finish();
+        let mut reader = SnapshotDecoder::new(&bytes, 1024).unwrap();
+        assert_eq!(OrderNode::read_snapshot(&mut reader).unwrap(), node);
+        reader.finish().unwrap();
+        for end in 0..bytes.len() {
+            let mut reader = SnapshotDecoder::new(&bytes[..end], 1024).unwrap();
+            assert!(OrderNode::read_snapshot(&mut reader).is_err());
+        }
+        let mut unsupported = node.clone();
+        unsupported.order.stp_mode = matching_domain::StpMode::DecrementAndCancel;
+        assert!(unsupported.validate_snapshot_fields().is_err());
+        let mut invalid = bytes.clone();
+        invalid[54..62].fill(0);
+        let mut reader = SnapshotDecoder::new(&invalid, 1024).unwrap();
+        assert!(OrderNode::read_snapshot(&mut reader).is_err());
     }
 }

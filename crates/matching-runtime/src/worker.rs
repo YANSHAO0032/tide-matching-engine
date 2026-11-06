@@ -1,4 +1,7 @@
 //! 分片工作线程及进程内消息。
+mod snapshot;
+mod snapshot_writer;
+
 use crate::client_order_id::ClientOrderIds;
 use crate::idempotency::{DedupWindow, IdempotencyConfig};
 use crate::place_candidate::{PlacePlanningContext, place_candidate};
@@ -15,6 +18,8 @@ use matching_domain::{
 };
 use matching_orderbook::{OrderNode, ProductionOrderBook};
 use matching_risk::{ReservationRegistry, ReservationState};
+pub use snapshot::{SnapshotRecoveryCandidate, SnapshotRestoreConfig};
+pub use snapshot_writer::{SnapshotWriter, SnapshotWriterError};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
@@ -176,6 +181,126 @@ impl ShardError {
     }
 }
 
+/// 一致性镜像构造失败。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// 无法为有界状态副本预留容量。
+    Capacity,
+}
+
+/// 分片线程在队列顺序点构建的独立内存镜像。
+///
+/// 镜像可编码并由后台写入器提交；仅内存捕获不代表快照已持久提交。
+pub struct SnapshotImage {
+    /// 本进程屏障来源凭据；从磁盘恢复的镜像没有提交权限。
+    origin: Option<Arc<()>>,
+    /// 已证明镜像可作为本地进程内启动点；落后于持久水位的候选不得启动。
+    start_allowed: bool,
+    /// 调用方的请求身份。
+    request_id: u128,
+    /// 镜像覆盖的最后已应用分片序号。
+    snapshot_seq: u64,
+    /// 所属集群。
+    cluster: ClusterId,
+    /// 所属分片。
+    shard: ShardId,
+    /// 捕获时的逻辑时间。
+    now: LogicalTime,
+    /// 捕获时的主节点纪元。
+    primary_epoch: u64,
+    /// 市场路由的不可变副本。
+    routes: Arc<RouteTable>,
+    /// 各市场完整订单簿副本。
+    markets: BTreeMap<MarketId, ProductionOrderBook>,
+    /// 完整的预留登记表副本。
+    registry: Option<ReservationRegistry>,
+    /// 分片用户控制下限副本。
+    user_epochs: UserControlEpochs,
+    /// 分片命令去重窗口副本。
+    dedup: Option<DedupWindow>,
+    /// 可信下单配置和客户端身份索引副本。
+    place: Option<PlaceRuntimeState>,
+}
+impl SnapshotImage {
+    /// 返回请求身份。
+    pub fn request_id(&self) -> u128 {
+        self.request_id
+    }
+    /// 返回已应用分片序号。
+    pub fn snapshot_seq(&self) -> u64 {
+        self.snapshot_seq
+    }
+    /// 返回所属集群与分片。
+    pub fn identity(&self) -> (ClusterId, ShardId) {
+        (self.cluster, self.shard)
+    }
+    /// 返回捕获时逻辑时间和主节点纪元。
+    pub fn clock_and_epoch(&self) -> (LogicalTime, u64) {
+        (self.now, self.primary_epoch)
+    }
+    /// 借用路由快照。
+    pub fn routes(&self) -> &RouteTable {
+        &self.routes
+    }
+    /// 查询镜像中的普通订单。
+    pub fn order(&self, market: MarketId, id: OrderId) -> Result<Option<&OrderNode>, RejectReason> {
+        self.markets
+            .get(&market)
+            .map(|book| book.order(id))
+            .ok_or(RejectReason::MarketNotFound)
+    }
+    /// 查询镜像中的未触发止损订单及其优先级。
+    pub fn stop_order(
+        &self,
+        market: MarketId,
+        id: OrderId,
+    ) -> Result<Option<(&matching_domain::StopOrder, matching_domain::StopPriority)>, RejectReason>
+    {
+        self.markets
+            .get(&market)
+            .map(|book| book.stop_order(id))
+            .ok_or(RejectReason::MarketNotFound)
+    }
+    /// 返回市场内下一普通订单和止损订单的优先级。
+    pub fn next_priorities(&self, market: MarketId) -> Result<(u128, u128), RejectReason> {
+        self.markets
+            .get(&market)
+            .map(|book| (book.next_queue_priority(), book.next_stop_priority()))
+            .ok_or(RejectReason::MarketNotFound)
+    }
+    /// 查询镜像中保留的预留金融状态。
+    pub fn reservation(&self, id: ReservationId) -> Option<&ReservationState> {
+        self.registry.as_ref().and_then(|registry| registry.get(id))
+    }
+    /// 检查用户纪元是否满足镜像中的下限。
+    pub fn check_user_epoch(
+        &self,
+        user: matching_domain::UserId,
+        epoch: u64,
+    ) -> Result<(), RejectReason> {
+        self.user_epochs.check(user, epoch)
+    }
+    /// 查询该正式命令是否已在捕获时保留在去重窗口。
+    pub fn contains_command(&self, command: &CommandEnvelope) -> Result<bool, FormalError> {
+        self.dedup.as_ref().map_or(Ok(false), |window| {
+            window
+                .lookup(command)
+                .map(|entry| entry.is_some())
+                .map_err(|()| FormalError::ProtocolError)
+        })
+    }
+    /// 按用户和客户端身份查询镜像中的活动或保留终结订单。
+    pub fn client_order(
+        &self,
+        user: matching_domain::UserId,
+        client_id: &str,
+    ) -> Option<(MarketId, OrderId)> {
+        self.place
+            .as_ref()
+            .and_then(|state| state.ids.lookup(user, client_id))
+    }
+}
+
 /// 只在本进程队列内传递的变更、查询与控制消息。
 enum Message {
     /// 包含调用方身份、路由版本、业务载荷及一次性回复端的变更。
@@ -221,6 +346,26 @@ enum Message {
         /// 返回请求身份与已完成变更序号水位的一次性回复端。
         SyncSender<(u128, u64)>,
     ),
+    /// 在队列顺序点复制分片状态，不分配业务序号。
+    Snapshot(
+        /// 调用方提供的屏障请求身份。
+        u128,
+        /// 返回独立镜像或容量错误的一次性回复端。
+        SyncSender<Result<SnapshotImage, SnapshotError>>,
+    ),
+    /// 对已同步快照文件向唯一清单写者提交意图。
+    SnapshotCommitted(
+        /// 已同步文件的快照身份。
+        u64,
+        /// 快照捕获的最后已应用序号。
+        u64,
+        /// 镜像所属集群身份。
+        ClusterId,
+        /// 镜像所属分片身份。
+        ShardId,
+        /// 返回清单持久提交结果的一次性回复端。
+        SyncSender<std::io::Result<()>>,
+    ),
     /// 外部入口关闭后入队的最终排空屏障，载荷为确认到达屏障的回复端。
     Shutdown(
         /// 工作线程到达终止屏障后发送确认的一次性回复端。
@@ -256,6 +401,10 @@ impl Default for ShardConfig {
 
 /// 分片入口与线程所有权；订单簿仅存在于工作线程中。
 pub struct Shard {
+    /// 当前工作线程专属的快照来源凭据。
+    snapshot_origin: Arc<()>,
+    /// 限制本分片同时存在的快照后台写入器数量。
+    snapshot_writer_active: Arc<AtomicBool>,
     /// 外部与内部消息的有界入口。
     producer: Producer<Message>,
     /// 唤醒工作线程的句柄。
@@ -343,6 +492,8 @@ impl Shard {
     /// 创建可并发克隆的外部生产者句柄。
     pub fn handle(&self) -> ShardHandle {
         ShardHandle {
+            snapshot_origin: Arc::clone(&self.snapshot_origin),
+            snapshot_writer_active: Arc::clone(&self.snapshot_writer_active),
             producer: self.producer.clone(),
             thread: self.thread.clone(),
             failed: Arc::clone(&self.failed),
@@ -449,6 +600,9 @@ fn validate_durable_directories(
 /// 由分片独占的持久写入原语。
 struct OwnedAppender(Box<dyn matching_persistence::DurableAppender + Send>);
 impl matching_persistence::DurableAppender for OwnedAppender {
+    fn commit_snapshot(&mut self, id: u64, seq: u64) -> std::io::Result<()> {
+        self.0.commit_snapshot(id, seq)
+    }
     fn would_rotate(&self, record: &matching_persistence::WalRecord) -> std::io::Result<bool> {
         self.0.would_rotate(record)
     }
@@ -881,6 +1035,70 @@ impl Shard {
         routes: RouteTable,
         books: Vec<(MarketId, ProductionOrderBook)>,
         config: ShardConfig,
+        registry: Option<ReservationRegistry>,
+        options: (
+            LogicalTime,
+            IdempotencyConfig,
+            u64,
+            usize,
+            Option<PlaceSupportConfig>,
+            Option<LocalDurableCommit>,
+        ),
+    ) -> Result<Self, ShardError> {
+        Self::start_inner_with_snapshot(
+            (shard, cluster),
+            routes,
+            books,
+            config,
+            registry,
+            options,
+            None,
+        )
+    }
+
+    /// 以验证过的快照恢复进程内分片，不恢复 WAL 或续写持久化。
+    pub fn start_in_memory_from_snapshot(
+        image: SnapshotImage,
+        trusted: &SnapshotRestoreConfig,
+    ) -> Result<Self, ShardError> {
+        if !image.start_allowed {
+            return Err(ShardError::InvalidConfig);
+        }
+        let bytes = image
+            .encode_snapshot(trusted.max_bytes)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        let image = SnapshotImage::decode_snapshot(&bytes, trusted)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        let books = image
+            .markets
+            .iter()
+            .map(|(id, book)| (*id, book.clone()))
+            .collect();
+        let registry = image.registry.clone();
+        Self::start_inner_with_snapshot(
+            (image.shard, image.cluster),
+            trusted.routes.clone(),
+            books,
+            ShardConfig::default(),
+            registry,
+            (
+                image.now,
+                trusted.idempotency,
+                image.primary_epoch,
+                trusted.user_capacity,
+                None,
+                None,
+            ),
+            Some(image),
+        )
+    }
+
+    /// 在正常初始化或可信镜像状态上构建唯一工作线程。
+    fn start_inner_with_snapshot(
+        (shard, cluster): (ShardId, ClusterId),
+        routes: RouteTable,
+        books: Vec<(MarketId, ProductionOrderBook)>,
+        config: ShardConfig,
         mut registry: Option<ReservationRegistry>,
         (now, idempotency, primary_epoch, user_capacity, place_config, mut durable): (
             LogicalTime,
@@ -890,6 +1108,7 @@ impl Shard {
             Option<PlaceSupportConfig>,
             Option<LocalDurableCommit>,
         ),
+        restored: Option<SnapshotImage>,
     ) -> Result<Self, ShardError> {
         let mut user_epochs =
             UserControlEpochs::new(user_capacity).map_err(|()| ShardError::InvalidConfig)?;
@@ -958,6 +1177,16 @@ impl Shard {
         } else {
             None
         };
+        let mut initial_sequence = Sequencer::new();
+        if let Some(image) = restored {
+            initial_sequence = Sequencer::from_last_applied(image.snapshot_seq)
+                .map_err(|_| ShardError::InvalidConfig)?;
+            markets = image.markets;
+            registry = image.registry;
+            user_epochs = image.user_epochs;
+            dedup = image.dedup;
+            place_state = image.place;
+        }
         if routes.routes().any(|route| {
             route.shard_id == shard
                 && route.state == RouteState::Active
@@ -977,6 +1206,9 @@ impl Shard {
         .map_err(|_| ShardError::InvalidConfig)?;
         let route_snapshot = Arc::new(routes);
         let worker_routes = Arc::clone(&route_snapshot);
+        let snapshot_origin = Arc::new(());
+        let worker_snapshot_origin = Arc::clone(&snapshot_origin);
+        let snapshot_writer_active = Arc::new(AtomicBool::new(false));
         let close = producer.clone();
         let failed = Arc::new(AtomicBool::new(false));
         let worker_failed = Arc::clone(&failed);
@@ -986,7 +1218,7 @@ impl Shard {
             // 所有权与工作线程同寿命，排空后才释放。
             let _ownership = ownership;
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut seq = Sequencer::new();
+                let mut seq = initial_sequence;
                 let clock = LogicalClock::new(now);
                 let mut waiter = Waiter::new(config.wait_strategy);
                 let mut deferred = None;
@@ -1185,6 +1417,80 @@ impl Shard {
                         Message::Barrier(id, reply) => {
                             let _ = reply.send((id, seq.last_applied()));
                         }
+                        Message::Snapshot(request_id, reply) => {
+                            let image = (|| {
+                                let user_epochs = user_epochs
+                                    .try_clone_preallocated()
+                                    .map_err(|()| SnapshotError::Capacity)?;
+                                let dedup = dedup
+                                    .as_ref()
+                                    .map(DedupWindow::try_clone_preallocated)
+                                    .transpose()
+                                    .map_err(|()| SnapshotError::Capacity)?;
+                                let place = place_state
+                                    .as_ref()
+                                    .map(|state| {
+                                        Ok::<_, SnapshotError>(PlaceRuntimeState {
+                                            config: state.config.clone(),
+                                            ids: state
+                                                .ids
+                                                .try_clone_preallocated()
+                                                .map_err(|()| SnapshotError::Capacity)?,
+                                        })
+                                    })
+                                    .transpose()?;
+                                Ok(SnapshotImage {
+                                    origin: Some(Arc::clone(&worker_snapshot_origin)),
+                                    start_allowed: durable.is_none(),
+                                    request_id,
+                                    snapshot_seq: seq.last_applied(),
+                                    cluster,
+                                    shard,
+                                    now: clock.now(),
+                                    primary_epoch,
+                                    routes: Arc::clone(&worker_routes),
+                                    markets: markets.clone(),
+                                    registry: registry.clone(),
+                                    user_epochs,
+                                    dedup,
+                                    place,
+                                })
+                            })();
+                            let _ = reply.send(image);
+                        }
+                        Message::SnapshotCommitted(
+                            id,
+                            snapshot_seq,
+                            image_cluster,
+                            image_shard,
+                            reply,
+                        ) => {
+                            let result = if image_cluster != cluster
+                                || image_shard != shard
+                                || snapshot_seq > seq.last_applied()
+                            {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "快照身份或应用水位不一致",
+                                ))
+                            } else if let Some(gate) = durable.as_mut() {
+                                gate.batcher.commit_snapshot(id, snapshot_seq)
+                            } else {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::Unsupported,
+                                    "分片没有持久化写入器",
+                                ))
+                            };
+                            let halt = result.as_ref().is_err_and(|error| {
+                                error.kind() != std::io::ErrorKind::InvalidInput
+                                    && error.kind() != std::io::ErrorKind::Unsupported
+                            });
+                            let _ = reply.send(result);
+                            if halt {
+                                worker_failed.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
                         Message::Shutdown(reply) => {
                             let _ = reply.send(());
                             break;
@@ -1206,6 +1512,8 @@ impl Shard {
         });
         let thread = join.thread().clone();
         Ok(Self {
+            snapshot_origin,
+            snapshot_writer_active,
             producer,
             thread,
             join: Some(join),
@@ -2135,6 +2443,10 @@ fn event_count_fits(count: u64, capacity: u64) -> bool {
 /// 可克隆的有界生产者，只能投递消息，不可访问撮合状态。
 #[derive(Clone)]
 pub struct ShardHandle {
+    /// 用于验证镜像来自本工作线程的凭据。
+    snapshot_origin: Arc<()>,
+    /// 当前分片写入器持有标志。
+    snapshot_writer_active: Arc<AtomicBool>,
     /// 有界消息入口。
     producer: Producer<Message>,
     /// 入队后使用的工作线程唤醒句柄。
@@ -2165,6 +2477,15 @@ impl ShardHandle {
     ) -> Result<Receiver<Result<Option<OrderNode>, RejectReason>>, ShardError> {
         let (tx, rx) = sync_channel(1);
         self.push(Message::Order(market, id, tx), IngressClass::Query)?;
+        Ok(rx)
+    }
+    /// 在队列顺序点请求独立内存镜像，不分配业务序号。
+    pub fn take_snapshot(
+        &self,
+        id: u128,
+    ) -> Result<Receiver<Result<SnapshotImage, SnapshotError>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::Snapshot(id, tx), IngressClass::Control)?;
         Ok(rx)
     }
     /// 请求线性化屏障。

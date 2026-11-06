@@ -18,6 +18,50 @@ pub struct RiskKeySet {
 }
 
 impl RiskKeySet {
+    /// 保存版本和按身份排序的已加载验签公钥。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotEncoder, SnapshotWireError};
+        let mut w = SnapshotEncoder::new(256 * 1024 * 1024);
+        w.u64(self.version)?;
+        w.u32(u32::try_from(self.keys.len()).map_err(|_| SnapshotWireError)?)?;
+        for (id, key) in &self.keys {
+            w.u32(*id)?;
+            w.bytes(key.as_bytes())?;
+        }
+        writer.bytes(&w.finish())
+    }
+    /// 按可信公钥数量上限恢复并重新校验公钥及顺序。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+        max_keys: usize,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotWireError};
+        let bytes = reader.bytes()?;
+        let mut r = SnapshotDecoder::new(bytes, 256 * 1024 * 1024)?;
+        let version = r.u64()?;
+        let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+        if count > max_keys || count > r.remaining() / 40 {
+            return Err(SnapshotWireError);
+        }
+        let mut keys = Vec::new();
+        keys.try_reserve(count).map_err(|_| SnapshotWireError)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let id = r.u32()?;
+            if previous.is_some_and(|p| p >= id) {
+                return Err(SnapshotWireError);
+            }
+            previous = Some(id);
+            let bytes: [u8; 32] = r.bytes()?.try_into().map_err(|_| SnapshotWireError)?;
+            let key = VerifyingKey::from_bytes(&bytes).map_err(|_| SnapshotWireError)?;
+            keys.push((id, key));
+        }
+        r.finish()?;
+        Self::new(version, keys).map_err(|_| SnapshotWireError)
+    }
     /// 从已加载公钥建立版本化索引，拒绝重复标识符。
     pub fn new(
         version: u64,

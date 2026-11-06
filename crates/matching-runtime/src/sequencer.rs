@@ -23,6 +23,13 @@ impl Sequencer {
         Self { next: 1 }
     }
 
+    /// 从已验证的最后应用序号恢复，不允许序号回绕。
+    pub fn from_last_applied(last: u64) -> Result<Self, SequenceExhausted> {
+        Ok(Self {
+            next: last.checked_add(1).ok_or(SequenceExhausted)?,
+        })
+    }
+
     /// 返回最近分配的序号；消费端完成业务后可用作完成水位。
     pub fn last_applied(&self) -> u64 {
         self.next - 1
@@ -56,5 +63,14 @@ mod tests {
         assert_eq!(sequencer.allocate(), Err(SequenceExhausted));
         assert_eq!(sequencer.allocate(), Err(SequenceExhausted));
         assert_eq!(sequencer.last_applied(), u64::MAX - 1);
+    }
+    #[test]
+    fn restore_advances_after_snapshot_and_rejects_unrepresentable_state() {
+        let mut seq = Sequencer::from_last_applied(41).unwrap();
+        assert_eq!(seq.last_applied(), 41);
+        assert_eq!(seq.allocate(), Ok(42));
+        assert!(Sequencer::from_last_applied(u64::MAX).is_err());
+        let mut exhausted = Sequencer::from_last_applied(u64::MAX - 1).unwrap();
+        assert_eq!(exhausted.allocate(), Err(SequenceExhausted));
     }
 }

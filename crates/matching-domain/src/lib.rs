@@ -55,6 +55,8 @@ pub mod reservation_release_reason;
 pub mod reservation_token;
 /// 买卖方向。
 pub mod side;
+/// 快照结构使用的有界基础编码。
+pub mod snapshot_wire;
 /// 未触发 Stop 的输入载荷和触发后 child 的数量模式。
 pub mod stop_order;
 /// 未触发 Stop 的市场本地触发优先级值。

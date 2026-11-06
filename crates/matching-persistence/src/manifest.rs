@@ -12,6 +12,8 @@ pub struct ManifestState {
     pub replication_safe_seq: u64,
     /// 最近持久化快照身份及其分片序号。
     pub latest_snapshot: Option<(u64, u64)>,
+    /// 最近一份之前已提交的快照身份和序号。
+    pub previous_snapshot: Option<(u64, u64)>,
     /// 当前活动 segment 的首序号。
     pub active_segment: Option<u64>,
     /// 已确认的 WAL 回收安全前缀。
@@ -119,7 +121,7 @@ impl<S: ManifestStorage> ManifestManager<S> {
         self.recovery_checked = true;
     }
     /// 返回是否已执行严格恢复检查。
-    pub(crate) fn recovery_checked(&self) -> bool {
+    pub fn recovery_checked(&self) -> bool {
         self.recovery_checked
     }
     /// 返回最近完成持久化的状态。
@@ -199,6 +201,16 @@ impl<S: ManifestStorage> ManifestManager<S> {
                         "快照序号不递增",
                     ));
                 }
+                if next
+                    .latest_snapshot
+                    .is_some_and(|(id, _)| id == snapshot_id)
+                    || next
+                        .previous_snapshot
+                        .is_some_and(|(id, _)| id == snapshot_id)
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "快照身份重复"));
+                }
+                next.previous_snapshot = next.latest_snapshot;
                 next.latest_snapshot = Some((snapshot_id, snapshot_seq));
             }
             ManifestIntent::ReplicationSafeSeqAdvanced { seq } => {

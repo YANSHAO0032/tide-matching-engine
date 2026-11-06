@@ -21,3 +21,28 @@ mod pop_front;
 mod push_back;
 #[path = "tests/unlink.rs"]
 mod unlink;
+
+#[test]
+fn snapshot_price_level_roundtrips_and_rejects_invalid_endpoints() {
+    use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+    let level = PriceLevel {
+        head: Some(OrderIndex::try_from_usize(2).unwrap()),
+        tail: Some(OrderIndex::try_from_usize(5).unwrap()),
+        count: 2,
+        total_visible_qty: 8,
+    };
+    let mut writer = SnapshotEncoder::new(128);
+    level.write_snapshot(&mut writer).unwrap();
+    let bytes = writer.finish();
+    let mut reader = SnapshotDecoder::new(&bytes, 128).unwrap();
+    assert_eq!(PriceLevel::read_snapshot(&mut reader).unwrap(), level);
+    reader.finish().unwrap();
+    let mut invalid = bytes.clone();
+    invalid[4] = 0;
+    let mut reader = SnapshotDecoder::new(&invalid, 128).unwrap();
+    assert!(PriceLevel::read_snapshot(&mut reader).is_err());
+    for end in 0..bytes.len() {
+        let mut reader = SnapshotDecoder::new(&bytes[..end], 128).unwrap();
+        assert!(PriceLevel::read_snapshot(&mut reader).is_err());
+    }
+}

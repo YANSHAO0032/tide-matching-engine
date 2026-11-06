@@ -143,6 +143,109 @@ impl OrderArena {
         Ok(())
     }
 
+    /// 按槽位顺序和空闲栈顺序编码 Arena；失败不追加部分结果。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotEncoder, SnapshotWireError};
+        self.validate_snapshot_free()?;
+        let mut body = SnapshotEncoder::new(256 * 1024 * 1024);
+        body.u32(u32::try_from(self.slots.len()).map_err(|_| SnapshotWireError)?)?;
+        for slot in &self.slots {
+            match slot {
+                Some(node) => {
+                    body.u8(1)?;
+                    node.write_snapshot(&mut body)?;
+                }
+                None => body.u8(0)?,
+            }
+        }
+        body.u32(u32::try_from(self.free.len()).map_err(|_| SnapshotWireError)?)?;
+        for index in &self.free {
+            body.u32(index.get())?;
+        }
+        writer.bytes(&body.finish())
+    }
+
+    /// 解码完整 Arena 并验证空槽与空闲栈的一一对应。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotWireError};
+        let bytes = reader.bytes()?;
+        let mut body = SnapshotDecoder::new(bytes, 256 * 1024 * 1024)?;
+        let count = usize::try_from(body.u32()?).map_err(|_| SnapshotWireError)?;
+        if count > body.remaining() {
+            return Err(SnapshotWireError);
+        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(count)
+            .map_err(|_| SnapshotWireError)?;
+        for _ in 0..count {
+            slots.push(match body.u8()? {
+                0 => None,
+                1 => Some(OrderNode::read_snapshot(&mut body)?),
+                _ => return Err(SnapshotWireError),
+            });
+        }
+        let free_count = usize::try_from(body.u32()?).map_err(|_| SnapshotWireError)?;
+        if free_count > count || free_count > body.remaining() / 4 {
+            return Err(SnapshotWireError);
+        }
+        let mut free = Vec::new();
+        free.try_reserve_exact(free_count)
+            .map_err(|_| SnapshotWireError)?;
+        for _ in 0..free_count {
+            free.push(
+                OrderIndex::try_from_usize(
+                    usize::try_from(body.u32()?).map_err(|_| SnapshotWireError)?,
+                )
+                .map_err(|_| SnapshotWireError)?,
+            );
+        }
+        body.finish()?;
+        let arena = Self {
+            slots,
+            free,
+            #[cfg(test)]
+            slot_accesses: Cell::new(0),
+        };
+        arena.validate_snapshot_free()?;
+        Ok(arena)
+    }
+
+    /// 检查每个空槽恰好在空闲栈中出现一次。
+    pub(crate) fn validate_snapshot_free(
+        &self,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::SnapshotWireError;
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(self.slots.len())
+            .map_err(|_| SnapshotWireError)?;
+        seen.resize(self.slots.len(), false);
+        for index in &self.free {
+            let position = usize::try_from(index.get()).map_err(|_| SnapshotWireError)?;
+            let Some((slot, marked)) = self.slots.get(position).zip(seen.get_mut(position)) else {
+                return Err(SnapshotWireError);
+            };
+            if slot.is_some() || *marked {
+                return Err(SnapshotWireError);
+            }
+            *marked = true;
+        }
+        if self
+            .slots
+            .iter()
+            .zip(seen)
+            .any(|(slot, marked)| slot.is_none() != marked)
+        {
+            return Err(SnapshotWireError);
+        }
+        Ok(())
+    }
+
     /// 记录一次真实槽位读取或写入，仅用于 O(1) 访问路径测试。
     ///
     /// 计数溢出是测试诊断失败，不能改变生产错误语义。

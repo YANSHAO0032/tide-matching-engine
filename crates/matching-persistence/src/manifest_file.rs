@@ -54,7 +54,7 @@ impl FileManifestStorage {
                     if let Some(state) = decode(&bytes)
                         && ((name == "manifest-a") == (state.generation % 2 == 1))
                     {
-                        legacy_slot |= bytes[4..6] != 2u16.to_be_bytes();
+                        legacy_slot |= bytes[4..6] == 1u16.to_be_bytes();
                         generations.push(state.generation);
                         if let Some(current) = &best
                             && current.generation == state.generation
@@ -208,6 +208,11 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
 /// 以固定大端顺序编码完整状态并附加 CRC32C。
 fn encode(state: &ManifestState) -> io::Result<Vec<u8>> {
     if state.gc_plan.len() > 65_536
+        || state.previous_snapshot.is_some_and(|(id, seq)| {
+            state
+                .latest_snapshot
+                .is_none_or(|(latest_id, latest_seq)| id == latest_id || seq >= latest_seq)
+        })
         || state.gc_plan.contains(&0)
         || state.gc_plan.windows(2).any(|w| w[0] >= w[1])
         || (state.gc_plan.is_empty() != state.gc_retained_first.is_none())
@@ -220,7 +225,7 @@ fn encode(state: &ManifestState) -> io::Result<Vec<u8>> {
     }
     let mut out = Vec::new();
     out.extend_from_slice(b"MNF1");
-    out.extend_from_slice(&2u16.to_be_bytes());
+    out.extend_from_slice(&3u16.to_be_bytes());
     out.extend_from_slice(&state.generation.to_be_bytes());
     out.extend_from_slice(&state.replication_safe_seq.to_be_bytes());
     out.push(u8::from(state.latest_snapshot.is_some()));
@@ -239,6 +244,10 @@ fn encode(state: &ManifestState) -> io::Result<Vec<u8>> {
     let (cluster, shard) = state.gc_identity.unwrap_or((0, 0));
     out.extend_from_slice(&cluster.to_be_bytes());
     out.extend_from_slice(&shard.to_be_bytes());
+    out.push(u8::from(state.previous_snapshot.is_some()));
+    let (previous_id, previous_seq) = state.previous_snapshot.unwrap_or((0, 0));
+    out.extend_from_slice(&previous_id.to_be_bytes());
+    out.extend_from_slice(&previous_seq.to_be_bytes());
     out.extend_from_slice(&crc32c(&out).to_be_bytes());
     Ok(out)
 }
@@ -248,7 +257,7 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     if bytes.len() < 64
         || bytes.len() > 600_000
         || &bytes[..4] != b"MNF1"
-        || ![1u16, 2u16].contains(&u16::from_be_bytes(bytes[4..6].try_into().ok()?))
+        || ![1u16, 2u16, 3u16].contains(&u16::from_be_bytes(bytes[4..6].try_into().ok()?))
     {
         return None;
     }
@@ -276,7 +285,12 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     let count = u32::from_be_bytes(bytes[56..60].try_into().ok()?) as usize;
     let version = u16::from_be_bytes(bytes[4..6].try_into().ok()?);
     let plan_end = 60usize.checked_add(count.checked_mul(8)?)?;
-    let expected_end = plan_end.checked_add(if version == 2 { 20 } else { 0 })?;
+    let expected_end = plan_end.checked_add(match version {
+        1 => 0,
+        2 => 20,
+        3 => 37,
+        _ => return None,
+    })?;
     if count > 65_536 || expected_end != data_end {
         return None;
     }
@@ -287,17 +301,17 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     if gc_plan.contains(&0) || gc_plan.windows(2).any(|w| w[0] >= w[1]) {
         return None;
     }
-    let retained_first = if version == 2 {
+    let retained_first = if version >= 2 {
         u64_at(plan_end + 8)
     } else {
         0
     };
     if (count == 0 && retained_first != 0)
-        || (count != 0 && version == 2 && gc_plan.last().is_none_or(|last| retained_first <= *last))
+        || (count != 0 && version >= 2 && gc_plan.last().is_none_or(|last| retained_first <= *last))
     {
         return None;
     }
-    let gc_identity = if version == 2 {
+    let gc_identity = if version >= 2 {
         let cluster = u16::from_be_bytes(bytes[plan_end + 16..plan_end + 18].try_into().ok()?);
         let shard = u16::from_be_bytes(bytes[plan_end + 18..plan_end + 20].try_into().ok()?);
         if count == 0 && (cluster != 0 || shard != 0) {
@@ -307,11 +321,26 @@ fn decode(bytes: &[u8]) -> Option<ManifestState> {
     } else {
         None
     };
+    let previous_snapshot = if version == 3 {
+        match bytes[plan_end + 20] {
+            0 if u64_at(plan_end + 21) == 0 && u64_at(plan_end + 29) == 0 => None,
+            1 => Some((u64_at(plan_end + 21), u64_at(plan_end + 29))),
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    if previous_snapshot.is_some_and(|(id, seq)| {
+        snapshot.is_none_or(|(latest_id, latest_seq)| id == latest_id || seq >= latest_seq)
+    }) {
+        return None;
+    }
     Some(ManifestState {
         generation,
-        local_durable_seq: if version == 2 { u64_at(plan_end) } else { 0 },
+        local_durable_seq: if version >= 2 { u64_at(plan_end) } else { 0 },
         replication_safe_seq,
         latest_snapshot: snapshot,
+        previous_snapshot,
         active_segment: active,
         wal_gc_safe_seq,
         gc_plan,
@@ -451,7 +480,12 @@ mod tests {
             generation: 1,
             ..ManifestState::default()
         };
-        assert_eq!(encode(&state).unwrap(), bytes);
-        assert_eq!(decode(&bytes), Some(state));
+        assert_eq!(decode(&bytes), Some(state.clone()));
+        let mut version_three = bytes[..bytes.len() - 4].to_vec();
+        version_three[5] = 3;
+        version_three.extend_from_slice(&[0; 17]);
+        version_three.extend_from_slice(&[0x4a, 0x98, 0x4d, 0x80]);
+        assert_eq!(encode(&state).unwrap(), version_three);
+        assert_eq!(decode(&version_three), Some(state));
     }
 }

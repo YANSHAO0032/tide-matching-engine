@@ -24,6 +24,82 @@ impl PriceLevel {
         Self::default()
     }
 
+    /// 编码价档端点、计数和可见量；不遍历关联 Arena。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::SnapshotEncoder;
+        self.validate_snapshot_shape()?;
+        let mut body = SnapshotEncoder::new(32);
+        for index in [self.head, self.tail] {
+            match index {
+                Some(index) => {
+                    body.u8(1)?;
+                    body.u32(index.get())?;
+                }
+                None => body.u8(0)?,
+            }
+        }
+        body.u32(self.count)?;
+        body.u64(self.total_visible_qty)?;
+        writer.bytes(&body.finish())
+    }
+
+    /// 解码价档并校验端点形状；链表及聚合须由上层结合 Arena 验证。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotWireError};
+        let mut body = SnapshotDecoder::new(reader.bytes()?, 32)?;
+        let read_index =
+            |body: &mut SnapshotDecoder<'_>| -> Result<Option<OrderIndex>, SnapshotWireError> {
+                match body.u8()? {
+                    0 => Ok(None),
+                    1 => Ok(Some(
+                        OrderIndex::try_from_usize(
+                            usize::try_from(body.u32()?).map_err(|_| SnapshotWireError)?,
+                        )
+                        .map_err(|_| SnapshotWireError)?,
+                    )),
+                    _ => Err(SnapshotWireError),
+                }
+            };
+        let head = read_index(&mut body)?;
+        let tail = read_index(&mut body)?;
+        let count = body.u32()?;
+        let total_visible_qty = body.u64()?;
+        body.finish()?;
+        let level = Self {
+            head,
+            tail,
+            count,
+            total_visible_qty,
+        };
+        level.validate_snapshot_shape()?;
+        Ok(level)
+    }
+
+    /// 校验只依赖当前价档字段的端点条件。
+    pub(crate) fn validate_snapshot_shape(
+        &self,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::SnapshotWireError;
+        let valid = match (self.count, self.head, self.tail) {
+            (0, None, None) => self.total_visible_qty == 0,
+            (1, Some(head), Some(tail)) => head == tail && self.total_visible_qty > 0,
+            (count, Some(head), Some(tail)) if count > 1 => {
+                head != tail && self.total_visible_qty > 0
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(SnapshotWireError)
+        }
+    }
+
     /// 返回先进先出头节点槽位；不遍历或验证 Arena 中的链接。
     pub fn head(&self) -> Option<OrderIndex> {
         self.head

@@ -558,3 +558,352 @@ fn recovered_wal_decodes_command_and_rejects_mismatched_identity() {
     std::fs::write(wal.join("00000000000000000001.wal"), bad.encode().unwrap()).unwrap();
     assert!(recover_local_commands(&wal, &manifest, 0, 2, 1).is_err());
 }
+
+#[test]
+fn snapshot_barrier_flushes_group_and_captures_fence_and_dedup() {
+    let temp = t22_support::TestDirectory::new();
+    let mut shard = Shard::start_group_fence_only(
+        ShardId(9),
+        ClusterId(2),
+        ReservationRegistry::new([]).unwrap(),
+        LogicalTime::new(0),
+        (IdempotencyConfig::default(), 7, 8),
+        (temp.0.join("wal"), temp.0.join("manifest")),
+        (8, 500_000),
+    )
+    .unwrap();
+    let command = CommandEnvelope {
+        command_id: CommandId(3),
+        session_id: 4,
+        client_seq: 5,
+        market_id: None,
+        user_id: Some(UserId(6)),
+        route_epoch: None,
+        client_timestamp: None,
+        received_at_unix_ns: None,
+        payload: Command::ApplyUserControlFenceShard(ApplyUserControlFenceShard {
+            parent_command_id: CommandId(8),
+            user_id: UserId(6),
+            new_epoch: 9,
+            action: UserFenceAction::FenceOnly,
+            expected_primary_epoch: 7,
+        }),
+    };
+    let result = retry(|| shard.handle().submit_command(command.clone()));
+    let snapshot = retry(|| shard.handle().take_snapshot(91));
+    assert_eq!(
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .seq,
+        1
+    );
+    let image = snapshot
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(image.snapshot_seq(), 1);
+    assert!(image.contains_command(&command).unwrap());
+    assert!(image.check_user_epoch(UserId(6), 8).is_err());
+    let mut config = matching_runtime::SnapshotRestoreConfig {
+        cluster: ClusterId(2),
+        shard: ShardId(9),
+        primary_epoch: 7,
+        routes: image.routes().clone(),
+        user_capacity: 8,
+        idempotency: IdempotencyConfig::default(),
+        place: None,
+        expect_registry: true,
+        max_markets: 0,
+        max_bytes: 1024 * 1024,
+    };
+    let bytes = image.encode_snapshot(config.max_bytes).unwrap();
+    let restored = matching_runtime::SnapshotImage::decode_snapshot(&bytes, &config).unwrap();
+    assert_eq!(
+        image.canonical_state(config.max_bytes).unwrap(),
+        restored.canonical_state(config.max_bytes).unwrap()
+    );
+    assert!(restored.contains_command(&command).unwrap());
+    assert!(restored.check_user_epoch(UserId(6), 8).is_err());
+    let mut collision = command.clone();
+    collision.command_id = CommandId(4);
+    assert!(restored.contains_command(&collision).is_err());
+    config.primary_epoch = 8;
+    assert!(matching_runtime::SnapshotImage::decode_snapshot(&bytes, &config).is_err());
+    let mut seed = 817_u64;
+    for step in 0..128_u64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        if (seed >> 32) & 1 == 0 {
+            let captured = retry(|| shard.handle().take_snapshot(u128::from(step)))
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(captured.snapshot_seq(), 1);
+        } else {
+            let result = retry(|| {
+                shard
+                    .handle()
+                    .reservation(matching_domain::ReservationId(99))
+            })
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+            assert!(result.is_none());
+        }
+    }
+    assert_eq!(
+        matching_persistence::scan_segments(temp.0.join("wal"))
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+    assert_eq!(
+        retry(|| shard.handle().barrier(92))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        (92, 1)
+    );
+    let directory = temp.0.join("snapshot");
+    std::fs::create_dir(&directory).unwrap();
+    let mut writer =
+        matching_runtime::SnapshotWriter::start(shard.handle(), directory.clone(), 1024 * 1024)
+            .unwrap();
+    assert!(
+        matching_runtime::SnapshotWriter::start(shard.handle(), directory.clone(), 1024 * 1024)
+            .is_err()
+    );
+    assert!(
+        writer
+            .submit(53, restored)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    assert!(!directory.join("snapshot-53.bin").exists());
+    writer
+        .submit(51, image)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let duplicate = retry(|| shard.handle().take_snapshot(93))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(
+        writer
+            .submit(52, duplicate)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        retry(|| shard.handle().barrier(94))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        (94, 1)
+    );
+    writer.shutdown().unwrap();
+    shard.shutdown(Duration::from_secs(5)).unwrap();
+    config.primary_epoch = 7;
+    let unverified = matching_persistence::ManifestManager::<
+        matching_persistence::FileManifestStorage,
+    >::open(temp.0.join("manifest"))
+    .unwrap();
+    assert!(
+        matching_runtime::SnapshotImage::read_committed_snapshot(
+            temp.0.join("snapshot"),
+            &unverified,
+            &config
+        )
+        .is_err()
+    );
+    drop(unverified);
+    let mut manager = matching_persistence::ManifestManager::<
+        matching_persistence::FileManifestStorage,
+    >::open_recovery(temp.0.join("manifest"))
+    .unwrap();
+    let (_, seq, payload) = matching_persistence::read_committed_snapshot(directory, &manager)
+        .unwrap()
+        .unwrap();
+    assert_eq!(manager.state().latest_snapshot, Some((51, 1)));
+    assert_eq!(seq, 1);
+    config.primary_epoch = 7;
+    let restored = matching_runtime::SnapshotImage::read_committed_snapshot(
+        temp.0.join("snapshot"),
+        &manager,
+        &config,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(restored.contains_command(&command).unwrap());
+    assert_eq!(restored.snapshot_seq(), seq);
+    assert!(!payload.is_empty());
+    let canonical = restored.canonical_state(config.max_bytes).unwrap();
+    let mut recovered = Shard::start_in_memory_from_snapshot(restored, &config).unwrap();
+    let retry_result = retry(|| recovered.handle().submit_command(command.clone()))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(retry_result.deduplicated);
+    assert_eq!(retry_result.seq, 1);
+    let mut next = command.clone();
+    next.command_id = CommandId(4);
+    next.client_seq = 6;
+    if let Command::ApplyUserControlFenceShard(ref mut fence) = next.payload {
+        fence.new_epoch = 10;
+    }
+    let next_result = retry(|| recovered.handle().submit_command(next.clone()))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(next_result.seq, 2);
+    recovered.shutdown(Duration::from_secs(5)).unwrap();
+    let file = temp.0.join("snapshot").join("snapshot-51.bin");
+    let mut damaged = std::fs::read(&file).unwrap();
+    let offset = 30 + 2 + 4 + env!("CARGO_PKG_VERSION").len() + 16;
+    damaged[offset..offset + 8].copy_from_slice(&2_u64.to_be_bytes());
+    let end = damaged.len() - 4;
+    let mut altered_state = canonical.clone();
+    altered_state[6..14].copy_from_slice(&2_u64.to_be_bytes());
+    use sha2::{Digest, Sha256};
+    damaged[end - 32..end].copy_from_slice(&Sha256::digest(&altered_state));
+    let crc = matching_persistence::crc32c(&damaged[..end]);
+    damaged[end..].copy_from_slice(&crc.to_be_bytes());
+    std::fs::write(&file, damaged).unwrap();
+    assert!(
+        matching_runtime::SnapshotImage::read_committed_snapshot(
+            temp.0.join("snapshot"),
+            &manager,
+            &config
+        )
+        .is_err()
+    );
+    let mut forged = payload.clone();
+    let offset = 2 + 4 + env!("CARGO_PKG_VERSION").len() + 16;
+    forged[offset..offset + 8].copy_from_slice(&999_u64.to_be_bytes());
+    let mut altered_state = canonical;
+    altered_state[6..14].copy_from_slice(&999_u64.to_be_bytes());
+    let end = forged.len();
+    forged[end - 32..].copy_from_slice(&Sha256::digest(&altered_state));
+    matching_persistence::write_snapshot_file(temp.0.join("snapshot"), 999, 999, &forged).unwrap();
+    manager
+        .submit(matching_persistence::ManifestIntent::SnapshotCommitted {
+            snapshot_id: 999,
+            snapshot_seq: 999,
+        })
+        .unwrap();
+    assert!(
+        matching_runtime::SnapshotImage::read_committed_snapshot(
+            temp.0.join("snapshot"),
+            &manager,
+            &config
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn damaged_latest_snapshot_selects_prior_candidate_without_rolling_back_watermark() {
+    let temp = t22_support::TestDirectory::new();
+    let directory = temp.0.join("snapshot");
+    std::fs::create_dir(&directory).unwrap();
+    let mut shard = Shard::start_group_fence_only(
+        ShardId(19),
+        ClusterId(2),
+        ReservationRegistry::new([]).unwrap(),
+        LogicalTime::new(0),
+        (IdempotencyConfig::default(), 7, 8),
+        (temp.0.join("wal"), temp.0.join("manifest")),
+        (8, 500_000),
+    )
+    .unwrap();
+    let command = |id: u128, epoch: u64| CommandEnvelope {
+        command_id: CommandId(id),
+        session_id: 1,
+        client_seq: id as u64,
+        market_id: None,
+        user_id: Some(UserId(6)),
+        route_epoch: None,
+        client_timestamp: None,
+        received_at_unix_ns: None,
+        payload: Command::ApplyUserControlFenceShard(ApplyUserControlFenceShard {
+            parent_command_id: CommandId(id),
+            user_id: UserId(6),
+            new_epoch: epoch,
+            action: UserFenceAction::FenceOnly,
+            expected_primary_epoch: 7,
+        }),
+    };
+    let mut writer =
+        matching_runtime::SnapshotWriter::start(shard.handle(), directory.clone(), 1024 * 1024)
+            .unwrap();
+    let mut stale = None;
+    for (id, epoch) in [(1, 9), (2, 10)] {
+        let cmd = command(id, epoch);
+        assert_eq!(
+            retry(|| shard.handle().submit_command(cmd.clone()))
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .seq,
+            id as u64
+        );
+        let image = retry(|| shard.handle().take_snapshot(id))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        if id == 1 {
+            stale = Some(
+                retry(|| shard.handle().take_snapshot(100))
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        writer
+            .submit(id as u64, image)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    }
+    writer.shutdown().unwrap();
+    shard.shutdown(Duration::from_secs(5)).unwrap();
+    let config = matching_runtime::SnapshotRestoreConfig {
+        cluster: ClusterId(2),
+        shard: ShardId(19),
+        primary_epoch: 7,
+        routes: matching_runtime::RouteTable::new([]).unwrap(),
+        user_capacity: 8,
+        idempotency: IdempotencyConfig::default(),
+        place: None,
+        expect_registry: true,
+        max_markets: 0,
+        max_bytes: 1024 * 1024,
+    };
+    assert!(Shard::start_in_memory_from_snapshot(stale.unwrap(), &config).is_err());
+    let file = directory.join("snapshot-2.bin");
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[35] ^= 1;
+    std::fs::write(&file, bytes).unwrap();
+    let manager=matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(temp.0.join("manifest")).unwrap();
+    let candidate =
+        matching_runtime::SnapshotImage::read_recovery_candidate(&directory, &manager, &config)
+            .unwrap()
+            .unwrap();
+    assert!(candidate.used_previous);
+    assert_eq!(candidate.committed_through, 2);
+    assert_eq!(candidate.image.snapshot_seq(), 1);
+    assert!(candidate.image.check_user_epoch(UserId(6), 8).is_err());
+    assert!(candidate.image.check_user_epoch(UserId(6), 9).is_ok());
+    assert!(Shard::start_in_memory_from_snapshot(candidate.image, &config).is_err());
+    std::fs::write(directory.join("snapshot-1.bin"), b"broken").unwrap();
+    assert!(
+        matching_runtime::SnapshotImage::read_recovery_candidate(&directory, &manager, &config)
+            .is_err()
+    );
+}
