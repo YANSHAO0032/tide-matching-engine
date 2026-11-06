@@ -426,6 +426,124 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// 从严格清单及快照恢复本地批量持久分片；调用方须独占 WAL 和快照目录。
+    ///
+    /// 先在隔离镜像完成提交前缀重放，成功后才修复尾部和恢复持久追加；不支持备节点持久策略。
+    pub fn recover_group_local(
+        wal: impl AsRef<std::path::Path>,
+        manifest: impl AsRef<std::path::Path>,
+        snapshot_dir: impl AsRef<std::path::Path>,
+        trusted: &SnapshotRestoreConfig,
+        (max_batch, max_delay_micros): (usize, u64),
+    ) -> Result<Self, ShardError> {
+        Self::recover_group_local_with_genesis(
+            wal,
+            manifest,
+            snapshot_dir,
+            trusted,
+            &[],
+            (max_batch, max_delay_micros),
+        )
+    }
+
+    /// 无快照时以调用方提供的可信市场初始策略重建空市场后回放。
+    pub fn recover_group_local_with_genesis(
+        wal: impl AsRef<std::path::Path>,
+        manifest: impl AsRef<std::path::Path>,
+        snapshot_dir: impl AsRef<std::path::Path>,
+        trusted: &SnapshotRestoreConfig,
+        policies: &[(MarketId, matching_orderbook::QueuePriorityPolicy)],
+        (max_batch, max_delay_micros): (usize, u64),
+    ) -> Result<Self, ShardError> {
+        use matching_persistence::{
+            DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
+            Profile, RegisteredAppender, ReplicationMode,
+        };
+        if max_batch == 0
+            || max_batch > ShardConfig::default().capacity
+            || max_delay_micros == 0
+            || Instant::now()
+                .checked_add(Duration::from_micros(max_delay_micros))
+                .is_none()
+        {
+            return Err(ShardError::InvalidConfig);
+        }
+        validate_durable_directories(wal.as_ref(), manifest.as_ref())?;
+        validate_durable_directories(wal.as_ref(), snapshot_dir.as_ref())?;
+        validate_durable_directories(manifest.as_ref(), snapshot_dir.as_ref())?;
+        let manager = ManifestManager::<FileManifestStorage>::open_recovery(manifest)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        let records = crate::recovery::recover_snapshot_records_with_genesis(
+            &wal,
+            snapshot_dir,
+            &manager,
+            trusted,
+            policies,
+        )
+        .map_err(|_| ShardError::InvalidConfig)?
+        .ok_or(ShardError::InvalidConfig)?;
+        let snapshot_seq = records.snapshot().image.snapshot_seq();
+        let image = records
+            .replay()
+            .map_err(|_| ShardError::InvalidConfig)?
+            .image;
+        let ownership = crate::ownership::MarketOwnership::acquire(
+            image.cluster,
+            image.shard,
+            image.markets.keys().copied(),
+        )
+        .ok_or(ShardError::InvalidConfig)?;
+        let appender = RegisteredAppender::recover_local(
+            &wal,
+            64 * 1024 * 1024,
+            manager,
+            snapshot_seq,
+            trusted.cluster.get(),
+            trusted.shard.get(),
+        )
+        .map_err(|_| ShardError::InvalidConfig)?;
+        let config = DurabilityConfig {
+            profile: Profile::Development,
+            mode: DurabilityMode::GroupCommit {
+                max_batch,
+                max_delay_micros,
+            },
+            replication: ReplicationMode::LocalDurable,
+            crash_recovery_required: true,
+            ha_enabled: false,
+            allow_data_loss_on_failover: false,
+        };
+        let batcher = DurableBatcher::resume_local(appender, config, trusted.primary_epoch)
+            .map_err(|_| ShardError::InvalidConfig)?
+            .into_boxed();
+        let books = image
+            .markets
+            .iter()
+            .map(|(id, book)| (*id, book.clone()))
+            .collect();
+        let registry = image.registry.clone();
+        Self::start_inner_with_snapshot(
+            (image.shard, image.cluster),
+            trusted.routes.clone(),
+            books,
+            ShardConfig::default(),
+            registry,
+            (
+                image.now,
+                trusted.idempotency,
+                image.primary_epoch,
+                trusted.user_capacity,
+                None,
+                Some(LocalDurableCommit {
+                    batcher,
+                    epoch: trusted.primary_epoch,
+                    group: Some((max_batch, max_delay_micros)),
+                }),
+            ),
+            (Some(image), Some(ownership)),
+        )
+    }
+
     /// 从明确分片路由和已有单市场订单簿启动。
     pub fn start(
         shard: ShardId,
@@ -598,21 +716,7 @@ fn validate_durable_directories(
 }
 
 /// 由分片独占的持久写入原语。
-struct OwnedAppender(Box<dyn matching_persistence::DurableAppender + Send>);
-impl matching_persistence::DurableAppender for OwnedAppender {
-    fn commit_snapshot(&mut self, id: u64, seq: u64) -> std::io::Result<()> {
-        self.0.commit_snapshot(id, seq)
-    }
-    fn would_rotate(&self, record: &matching_persistence::WalRecord) -> std::io::Result<bool> {
-        self.0.would_rotate(record)
-    }
-    fn append(&mut self, record: &matching_persistence::WalRecord) -> std::io::Result<()> {
-        self.0.append(record)
-    }
-    fn sync(&mut self) -> std::io::Result<()> {
-        self.0.sync()
-    }
-}
+type OwnedAppender = matching_persistence::BoxedDurableAppender;
 /// 支持本地逐条或批量同步提交的 WAL 写入器。
 struct LocalDurableCommit {
     /// 单写者批处理器。
@@ -651,7 +755,7 @@ impl LocalDurableCommit {
     }
 }
 impl Shard {
-    /// 从空状态启动有界批量本地提交的用户栅栏分片；尚不支持恢复或其他命令。
+    /// 从空状态启动有界批量本地提交的用户栅栏分片。
     pub fn start_group_fence_only<P: AsRef<std::path::Path>>(
         shard: ShardId,
         cluster: ClusterId,
@@ -693,9 +797,9 @@ impl Shard {
             ManifestManager::open(manifest_dir).map_err(|_| ShardError::InvalidConfig)?;
         let registered =
             RegisteredAppender::new(writer, manifest).map_err(|_| ShardError::InvalidConfig)?;
-        let batcher =
-            DurableBatcher::new_with_config(OwnedAppender(Box::new(registered)), config, epoch)
-                .map_err(|_| ShardError::InvalidConfig)?;
+        let batcher = DurableBatcher::new_with_config(registered, config, epoch)
+            .map_err(|_| ShardError::InvalidConfig)?
+            .into_boxed();
         Self::start_inner(
             shard,
             cluster,
@@ -717,7 +821,7 @@ impl Shard {
             ),
         )
     }
-    /// 从空状态启动正式命令有界批量本地提交；尚不支持崩溃恢复。
+    /// 从空状态启动正式命令有界批量本地提交。
     pub fn start_group_place_support<P: AsRef<std::path::Path>>(
         shard: ShardId,
         cluster: ClusterId,
@@ -771,9 +875,9 @@ impl Shard {
             ManifestManager::open(manifest_dir).map_err(|_| ShardError::InvalidConfig)?;
         let appender =
             RegisteredAppender::new(writer, manifest).map_err(|_| ShardError::InvalidConfig)?;
-        let batcher =
-            DurableBatcher::new_with_config(OwnedAppender(Box::new(appender)), config, epoch)
-                .map_err(|_| ShardError::InvalidConfig)?;
+        let batcher = DurableBatcher::new_with_config(appender, config, epoch)
+            .map_err(|_| ShardError::InvalidConfig)?
+            .into_boxed();
         Self::start_inner(
             shard,
             cluster,
@@ -795,7 +899,7 @@ impl Shard {
             ),
         )
     }
-    /// 从空状态启动支持正式命令的本地同步分片；尚不提供崩溃恢复。
+    /// 从空状态启动支持正式命令的本地同步分片；恢复须使用专门入口。
     pub fn start_with_durable_place_support<P: AsRef<std::path::Path>>(
         shard: ShardId,
         cluster: ClusterId,
@@ -841,9 +945,9 @@ impl Shard {
             ManifestManager::open(manifest_dir).map_err(|_| ShardError::InvalidConfig)?;
         let registered =
             RegisteredAppender::new(writer, manifest).map_err(|_| ShardError::InvalidConfig)?;
-        let batcher =
-            DurableBatcher::new_with_config(OwnedAppender(Box::new(registered)), config, epoch)
-                .map_err(|_| ShardError::InvalidConfig)?;
+        let batcher = DurableBatcher::new_with_config(registered, config, epoch)
+            .map_err(|_| ShardError::InvalidConfig)?
+            .into_boxed();
         Self::start_inner(
             shard,
             cluster,
@@ -865,7 +969,7 @@ impl Shard {
             ),
         )
     }
-    /// 从空 WAL 启动仅支持 FenceOnly 的本地同步分片；尚不提供崩溃恢复。
+    /// 从空 WAL 启动仅支持 FenceOnly 的本地同步分片；恢复须使用专门入口。
     pub fn start_durable_fence_only(
         shard: ShardId,
         cluster: ClusterId,
@@ -900,9 +1004,9 @@ impl Shard {
             ManifestManager::open(manifest_dir).map_err(|_| ShardError::InvalidConfig)?;
         let registered =
             RegisteredAppender::new(writer, manifest).map_err(|_| ShardError::InvalidConfig)?;
-        let batcher =
-            DurableBatcher::new_with_config(OwnedAppender(Box::new(registered)), config, epoch)
-                .map_err(|_| ShardError::InvalidConfig)?;
+        let batcher = DurableBatcher::new_with_config(registered, config, epoch)
+            .map_err(|_| ShardError::InvalidConfig)?
+            .into_boxed();
         Self::start_inner(
             shard,
             cluster,
@@ -1052,7 +1156,7 @@ impl Shard {
             config,
             registry,
             options,
-            None,
+            (None, None),
         )
     }
 
@@ -1089,7 +1193,7 @@ impl Shard {
                 None,
                 None,
             ),
-            Some(image),
+            (Some(image), None),
         )
     }
 
@@ -1108,7 +1212,10 @@ impl Shard {
             Option<PlaceSupportConfig>,
             Option<LocalDurableCommit>,
         ),
-        restored: Option<SnapshotImage>,
+        (restored, ownership): (
+            Option<SnapshotImage>,
+            Option<crate::ownership::MarketOwnership>,
+        ),
     ) -> Result<Self, ShardError> {
         let mut user_epochs =
             UserControlEpochs::new(user_capacity).map_err(|()| ShardError::InvalidConfig)?;
@@ -1194,9 +1301,13 @@ impl Shard {
         }) {
             return Err(ShardError::InvalidConfig);
         }
-        let ownership =
-            crate::ownership::MarketOwnership::acquire(cluster, shard, markets.keys().copied())
-                .ok_or(ShardError::InvalidConfig)?;
+        let ownership = match ownership {
+            Some(ownership) => ownership,
+            None => {
+                crate::ownership::MarketOwnership::acquire(cluster, shard, markets.keys().copied())
+                    .ok_or(ShardError::InvalidConfig)?
+            }
+        };
         let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
             capacity: config.capacity,
             mutation_reserved_slots: config.mutation_reserved_slots,
@@ -3436,8 +3547,9 @@ mod durability_atomicity_tests {
             allow_data_loss_on_failover: false,
         };
         let mut durable = Some(LocalDurableCommit {
-            batcher: DurableBatcher::new_with_config(OwnedAppender(Box::new(appender)), config, 7)
-                .unwrap(),
+            batcher: DurableBatcher::new_with_config(appender, config, 7)
+                .unwrap()
+                .into_boxed(),
             epoch: 7,
             group: None,
         });
@@ -3613,14 +3725,15 @@ mod group_sync_tests {
             };
             let mut gate = LocalDurableCommit {
                 batcher: DurableBatcher::new_with_config(
-                    OwnedAppender(Box::new(Probe {
+                    Probe {
                         syncs: syncs.clone(),
                         fail,
-                    })),
+                    },
                     config,
                     7,
                 )
-                .unwrap(),
+                .unwrap()
+                .into_boxed(),
                 epoch: 7,
                 group: Some((2, 100_000)),
             };
@@ -3706,12 +3819,9 @@ mod group_sync_tests {
             allow_data_loss_on_failover: false,
         };
         let mut gate = LocalDurableCommit {
-            batcher: DurableBatcher::new_with_config(
-                OwnedAppender(Box::new(PrefixProbe(syncs.clone()))),
-                config,
-                7,
-            )
-            .unwrap(),
+            batcher: DurableBatcher::new_with_config(PrefixProbe(syncs.clone()), config, 7)
+                .unwrap()
+                .into_boxed(),
             epoch: 7,
             group: Some((2, 100_000)),
         };
@@ -3771,4 +3881,245 @@ mod group_sync_tests {
         assert!(first_rx.recv().is_err());
         assert!(second_rx.recv().is_err());
     }
+}
+
+/// 从可信配置构造空市场基线；市场策略尚不可从恢复配置单独推导。
+pub(crate) fn empty_recovery_candidate(
+    trusted: &SnapshotRestoreConfig,
+    policies: &[(MarketId, matching_orderbook::QueuePriorityPolicy)],
+    committed_through: u64,
+) -> std::io::Result<SnapshotRecoveryCandidate> {
+    if !trusted.expect_registry
+        || policies.len() > trusted.max_markets
+        || !trusted.idempotency.valid()
+        || (trusted.place.is_none() && !policies.is_empty())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "无效初始基线配置",
+        ));
+    }
+    let mut markets = BTreeMap::new();
+    for &(market, policy) in policies {
+        let mut book = ProductionOrderBook::new(policy);
+        book.bind_market(market)
+            .map_err(|_| std::io::Error::other("市场绑定无效"))?;
+        if trusted
+            .routes
+            .get(market)
+            .is_none_or(|route| route.shard_id != trusted.shard)
+            || markets.insert(market, book).is_some()
+        {
+            return Err(std::io::Error::other("初始市场路由无效或重复"));
+        }
+    }
+    if trusted.routes.routes().any(|route| {
+        route.shard_id == trusted.shard
+            && route.state == RouteState::Active
+            && !markets.contains_key(&route.market_id)
+    }) {
+        return Err(std::io::Error::other("初始市场策略缺失"));
+    }
+    let place = if let Some(config) = &trusted.place {
+        if config
+            .policies
+            .keys()
+            .any(|market| !markets.contains_key(market))
+        {
+            return Err(std::io::Error::other("下单市场策略缺失"));
+        }
+        let ids = ClientOrderIds::with_max_id_bytes(
+            config.limits.active_orders,
+            config.limits.terminal_history,
+            config.limits.client_id_bytes,
+        )
+        .map_err(|()| std::io::Error::other("客户端身份容量无效"))?;
+        Some(PlaceRuntimeState {
+            config: config.clone(),
+            ids,
+        })
+    } else {
+        None
+    };
+    let user_epochs = UserControlEpochs::new(trusted.user_capacity)
+        .map_err(|()| std::io::Error::other("用户容量无效"))?;
+    let dedup = DedupWindow::new(trusted.idempotency)
+        .map_err(|()| std::io::Error::other("去重容量无效"))?;
+    let registry =
+        ReservationRegistry::new([]).map_err(|_| std::io::Error::other("预留基线无效"))?;
+    let image = SnapshotImage {
+        origin: None,
+        start_allowed: false,
+        request_id: 0,
+        snapshot_seq: 0,
+        cluster: trusted.cluster,
+        shard: trusted.shard,
+        now: LogicalTime::new(0),
+        primary_epoch: trusted.primary_epoch,
+        routes: Arc::new(trusted.routes.clone()),
+        markets,
+        registry: Some(registry),
+        user_epochs,
+        dedup: Some(dedup),
+        place,
+    };
+    image
+        .canonical_state(trusted.max_bytes)
+        .map_err(|_| std::io::Error::other("空基线超过容量"))?;
+    Ok(SnapshotRecoveryCandidate {
+        image,
+        committed_through,
+        used_previous: false,
+    })
+}
+
+/// 仅在独立候选镜像中重放已验证 WAL，失败时丢弃整个候选。
+pub(crate) fn replay_snapshot_records(
+    candidate: SnapshotRecoveryCandidate,
+    records: Vec<crate::RecoveredCommand>,
+) -> std::io::Result<crate::SnapshotReplayResult> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut image = candidate.image;
+        let mut seq = Sequencer::from_last_applied(image.snapshot_seq)
+            .map_err(|_| std::io::Error::other("重放序号耗尽"))?;
+        let clock = LogicalClock::new(image.now);
+        let mut durable: Option<LocalDurableCommit> = None;
+        let mut executions = Vec::new();
+        executions
+            .try_reserve(records.len())
+            .map_err(|_| std::io::Error::other("重放结果容量不足"))?;
+        let mut event_hasher = crate::EventHasher::new();
+        for record in records {
+            if seq.last_applied().checked_add(1) != Some(record.shard_seq)
+                || record.shard_seq == u64::MAX
+                || record.epoch != image.primary_epoch
+                || record.engine_time != clock.now().get()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "重放序号、纪元或逻辑时间不一致",
+                ));
+            }
+            let identity = FormalIdentity {
+                cluster: image.cluster,
+                shard: image.shard,
+                event_capacity: u64::from(u32::MAX) + 1,
+            };
+            let command = record.command;
+            let result = match &command.payload {
+                Command::ApplyUserControlFenceShard(fence) => {
+                    if fence.expected_primary_epoch != image.primary_epoch {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "重放栅栏纪元不一致",
+                        ));
+                    }
+                    let window = image
+                        .dedup
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
+                    execute_fence(
+                        &mut image.user_epochs,
+                        window,
+                        &mut seq,
+                        &clock,
+                        &mut durable,
+                        identity,
+                        command,
+                    )
+                }
+                Command::PlaceLimit(place) => {
+                    let market = command
+                        .market_id
+                        .ok_or_else(|| std::io::Error::other("重放下单缺少市场"))?;
+                    let epoch = command
+                        .route_epoch
+                        .ok_or_else(|| std::io::Error::other("重放下单缺少路由版本"))?;
+                    image
+                        .routes
+                        .validate(market, image.shard, epoch)
+                        .map_err(|_| std::io::Error::other("重放下单路由无效"))?;
+                    image
+                        .user_epochs
+                        .check(place.order.user_id, place.user_control_epoch)
+                        .map_err(|_| std::io::Error::other("重放下单用户纪元无效"))?;
+                    let registry = image
+                        .registry
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("缺少重放预留登记表"))?;
+                    let window = image
+                        .dedup
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
+                    let state = image
+                        .place
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("缺少重放下单配置"))?;
+                    if !image.markets.contains_key(&market) {
+                        return Err(std::io::Error::other("重放市场不存在"));
+                    }
+                    execute_place(
+                        PlaceExecutionContext {
+                            identity,
+                            seq: &mut seq,
+                            clock: &clock,
+                            markets: &mut image.markets,
+                            registry,
+                            window,
+                            state,
+                            durable: &mut durable,
+                        },
+                        command,
+                    )
+                }
+                Command::MassCancelShard(_) => {
+                    let window = image
+                        .dedup
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
+                    execute_formal_idempotent(
+                        &image.routes,
+                        identity,
+                        &mut seq,
+                        &clock,
+                        &mut image.markets,
+                        &mut image.registry,
+                        (command, window, &mut image.place, &mut durable),
+                    )
+                }
+            }
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "已提交命令重放时被前置拒绝",
+                )
+            })?;
+            if result.deduplicated || result.seq != record.shard_seq {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "重放结果序号或去重状态不一致",
+                ));
+            }
+            for event in &result.events {
+                event_hasher
+                    .update(event)
+                    .map_err(|_| std::io::Error::other("重放事件摘要编码失败"))?;
+            }
+            image.snapshot_seq = result.seq;
+            executions.push(result);
+        }
+        if seq.last_applied() != candidate.committed_through {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "重放未覆盖持久前缀",
+            ));
+        }
+        image.start_allowed = true;
+        Ok(crate::SnapshotReplayResult {
+            image,
+            executions,
+            event_hash: event_hasher.finish(),
+        })
+    }));
+    result.map_err(|_| std::io::Error::other("重放触发内部不变量失败"))?
 }

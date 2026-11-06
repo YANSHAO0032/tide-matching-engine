@@ -10,13 +10,16 @@ mod segment;
 mod snapshot;
 mod wal_gc;
 pub use durability::{
-    CommitWatermark, DurabilityConfig, DurabilityError, DurabilityMode, DurableAppender,
-    DurableBatcher, Profile, RegisteredAppender, ReplicationMode,
+    BoxedDurableAppender, CommitWatermark, DurabilityConfig, DurabilityError, DurabilityMode,
+    DurableAppender, DurableBatcher, Profile, RegisteredAppender, ReplicationMode,
 };
 pub use manifest::{ManifestIntent, ManifestManager, ManifestState, ManifestStorage};
 pub use manifest_file::FileManifestStorage;
 pub use record::{WalError, WalRecord};
-pub use recovery::{recover_committed, recover_local, repair_local_wal};
+pub use recovery::{
+    recover_committed, recover_local, recover_local_with_manifest, repair_local_wal,
+    repair_local_wal_with_manifest,
+};
 pub use scan::{ScanError, ScanResult, scan_segment};
 pub use segment::{SegmentMeta, SegmentScan, SegmentWriter, scan_segments, truncate_torn_tail};
 pub use snapshot::{

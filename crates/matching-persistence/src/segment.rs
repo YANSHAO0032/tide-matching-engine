@@ -59,6 +59,55 @@ pub struct SegmentWriter {
     failed: bool,
 }
 impl SegmentWriter {
+    /// 在调用方独占目录且完成修复后重开严格验证的活动段。
+    pub(crate) fn open_repaired(
+        directory: impl AsRef<Path>,
+        max_size: u64,
+        active: Option<u64>,
+        cluster: u16,
+        shard: u16,
+        committed: u64,
+    ) -> io::Result<Self> {
+        if !(64..=MAX_SEGMENT).contains(&max_size) {
+            return Err(invalid("无效 segment 容量"));
+        }
+        let directory = directory.as_ref().to_path_buf();
+        let scan = scan_segments(&directory)?;
+        if committed == 0 {
+            if active.is_some() || !scan.segments.is_empty() {
+                return Err(invalid("空水位包含 WAL"));
+            }
+            return Self::new(directory, max_size);
+        }
+        let first = active.ok_or_else(|| invalid("缺少活动段"))?;
+        let tail = scan.segments.last().ok_or_else(|| invalid("缺少 WAL"))?;
+        if tail.first_seq != first
+            || tail.last_seq != Some(committed)
+            || tail.torn_tail
+            || tail.size > max_size
+            || scan
+                .records
+                .iter()
+                .any(|r| r.cluster_id != cluster || r.shard_id != shard)
+        {
+            return Err(invalid("修复后的 WAL 与提交水位不一致"));
+        }
+        let path = directory.join(format!("{first:020}.wal"));
+        let file = OpenOptions::new().append(true).open(path)?;
+        if file.metadata()?.len() != tail.size {
+            return Err(invalid("活动段发生变化"));
+        }
+        Ok(Self {
+            directory,
+            max_size,
+            file: Some(file),
+            active_first: Some(first),
+            size: tail.size,
+            last: Some((cluster, shard, committed)),
+            failed: false,
+        })
+    }
+
     /// 仅对空的已存在目录建立新写入器。
     pub fn new(directory: impl AsRef<Path>, max_size: u64) -> io::Result<Self> {
         if !(64..=MAX_SEGMENT).contains(&max_size) {

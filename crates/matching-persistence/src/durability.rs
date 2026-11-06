@@ -161,6 +161,23 @@ pub trait DurableAppender {
     }
 }
 
+/// 类型擦除后的持久写入器，保留原写入器及其持久状态。
+pub struct BoxedDurableAppender(Box<dyn DurableAppender + Send>);
+impl DurableAppender for BoxedDurableAppender {
+    fn would_rotate(&self, record: &WalRecord) -> io::Result<bool> {
+        self.0.would_rotate(record)
+    }
+    fn append(&mut self, record: &WalRecord) -> io::Result<()> {
+        self.0.append(record)
+    }
+    fn sync(&mut self) -> io::Result<()> {
+        self.0.sync()
+    }
+    fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
+        self.0.commit_snapshot(snapshot_id, snapshot_seq)
+    }
+}
+
 /// 负责批量同步与持久前缀推进的单写者。
 pub struct DurableBatcher<A> {
     /// 具有真实同步语义的顺序写入器。
@@ -185,6 +202,24 @@ pub struct DurableBatcher<A> {
     halted: bool,
 }
 impl<A: DurableAppender> DurableBatcher<A> {
+    /// 在不更换写入器和水位的前提下擦除其具体类型。
+    pub fn into_boxed(self) -> DurableBatcher<BoxedDurableAppender>
+    where
+        A: Send + 'static,
+    {
+        DurableBatcher {
+            appender: BoxedDurableAppender(Box::new(self.appender)),
+            mode: self.mode,
+            expected_epoch: self.expected_epoch,
+            watermark: self.watermark,
+            last_appended: self.last_appended,
+            pending_first: self.pending_first,
+            pending_count: self.pending_count,
+            pending_since: self.pending_since,
+            standby_available: self.standby_available,
+            halted: self.halted,
+        }
+    }
     /// 校验完整持久性配置后创建磁盘同步批处理器；备节点认证仍由调用方负责。
     pub fn new_with_config(
         appender: A,
@@ -377,8 +412,60 @@ pub struct RegisteredAppender<S> {
     /// 独占的单写者 manifest 管理器。
     manifest: ManifestManager<S>,
 }
+
+impl RegisteredAppender<crate::FileManifestStorage> {
+    /// 持有严格清单锁校验并修复尾部，再重开活动段；调用方须独占目录并先完成业务重放。
+    ///
+    /// 此入口仅验证持久前缀，不验证业务镜像或重放结果；仅适用于本地持久策略。
+    pub fn recover_local(
+        wal: impl AsRef<std::path::Path>,
+        max_size: u64,
+        manifest: ManifestManager<crate::FileManifestStorage>,
+        snapshot_seq: u64,
+        cluster: u16,
+        shard: u16,
+    ) -> io::Result<Self> {
+        crate::repair_local_wal_with_manifest(&wal, &manifest, snapshot_seq, cluster, shard)?;
+        let state = manifest.state();
+        if state.generation < 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "清单未初始化"));
+        }
+        let writer = SegmentWriter::open_repaired(
+            &wal,
+            max_size,
+            state.active_segment,
+            cluster,
+            shard,
+            state.local_durable_seq,
+        )?;
+        Ok(Self { writer, manifest })
+    }
+}
+
+impl DurableBatcher<RegisteredAppender<crate::FileManifestStorage>> {
+    /// 仅以严格验证和修复后的本地持久水位初始化续写批处理器。
+    pub fn resume_local(
+        appender: RegisteredAppender<crate::FileManifestStorage>,
+        config: DurabilityConfig,
+        expected_epoch: u64,
+    ) -> io::Result<Self> {
+        if !appender.manifest.recovery_checked()
+            || config.replication != ReplicationMode::LocalDurable
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "续写需要严格清单和本地持久策略",
+            ));
+        }
+        let baseline = appender.manifest.state().local_durable_seq;
+        let mut batcher = Self::new_with_config(appender, config, expected_epoch)?;
+        batcher.watermark = CommitWatermark::new(ReplicationMode::LocalDurable, baseline);
+        batcher.last_appended = baseline;
+        Ok(batcher)
+    }
+}
 impl<S: ManifestStorage> RegisteredAppender<S> {
-    /// 只从空 WAL 和默认清单启动，先持久初始化双槽；现有 WAL 的续写尚不支持。
+    /// 只从空 WAL 和默认清单启动并持久初始化双槽；已有 WAL 使用恢复入口。
     pub fn new(writer: SegmentWriter, mut manifest: ManifestManager<S>) -> io::Result<Self> {
         if !writer.is_pristine() || manifest.state() != &ManifestState::default() {
             return Err(io::Error::new(

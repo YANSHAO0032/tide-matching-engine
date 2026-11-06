@@ -10,6 +10,10 @@ pub mod cancel_replace;
 pub mod command_event;
 /// 正式命令的持久化编码。
 pub mod command_wal_codec;
+/// 事件摘要使用的规范编码。
+mod event_digest;
+/// 导出事件摘要编码入口。
+pub use event_digest::encode_event_for_hash;
 /// 当前订单簿使用的最小生命周期与成交事件载荷。
 pub mod engine_event;
 /// 订单到期的稳定业务原因。

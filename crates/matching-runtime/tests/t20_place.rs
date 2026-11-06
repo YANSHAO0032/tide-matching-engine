@@ -120,10 +120,17 @@ fn place_retry_and_client_order_identity_follow_actual_order_lifecycle() {
     let first_command = make(1, 1, 1);
     let first = run(first_command.clone()).unwrap();
     assert_eq!(first.seq, 1);
-    let image = shard
-        .handle()
-        .take_snapshot(99)
-        .unwrap()
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let snapshot_reply = loop {
+        match shard.handle().take_snapshot(99) {
+            Ok(reply) => break reply,
+            Err(matching_runtime::ShardError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::yield_now()
+            }
+            Err(error) => panic!("快照请求尚未入队: {error:?}"),
+        }
+    };
+    let image = snapshot_reply
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();

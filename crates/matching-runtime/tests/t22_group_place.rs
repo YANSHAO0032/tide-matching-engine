@@ -78,10 +78,10 @@ fn group_place_and_mass_cancel_write_before_reply() {
     let mut shard = Shard::start_group_place_support(
         shard_id,
         ClusterId(1),
-        routes,
+        routes.clone(),
         vec![(market, QueuePriorityPolicy::try_new(100).unwrap())],
         (ReservationRegistry::new([]).unwrap(), LogicalTime::new(0)),
-        (IdempotencyConfig::default(), 1, 8, config),
+        (IdempotencyConfig::default(), 1, 8, config.clone()),
         ((base.join("wal"), base.join("manifest")), (8, 200_000)),
     )
     .unwrap();
@@ -168,6 +168,59 @@ fn group_place_and_mass_cancel_write_before_reply() {
         .unwrap()
         .unwrap();
     assert_eq!(first.seq, 1);
+    let snapshot_dir = base.join("snapshot");
+    std::fs::create_dir(&snapshot_dir).unwrap();
+    shard.shutdown(Duration::from_secs(5)).unwrap();
+    let trusted = matching_runtime::SnapshotRestoreConfig {
+        cluster: ClusterId(1),
+        shard: shard_id,
+        primary_epoch: 1,
+        routes: routes.clone(),
+        user_capacity: 8,
+        idempotency: IdempotencyConfig::default(),
+        place: Some(config.clone()),
+        expect_registry: true,
+        max_markets: 1,
+        max_bytes: 1024 * 1024,
+    };
+    let before_rejected_recovery =
+        std::fs::read(base.join("wal").join("00000000000000000001.wal")).unwrap();
+    assert!(
+        Shard::recover_group_local(
+            base.join("wal"),
+            base.join("manifest"),
+            &snapshot_dir,
+            &trusted,
+            (8, 200_000),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read(base.join("wal").join("00000000000000000001.wal")).unwrap(),
+        before_rejected_recovery
+    );
+    let mut shard = Shard::recover_group_local_with_genesis(
+        base.join("wal"),
+        base.join("manifest"),
+        &snapshot_dir,
+        &trusted,
+        &[(market, QueuePriorityPolicy::try_new(100).unwrap())],
+        (8, 200_000),
+    )
+    .unwrap();
+    let mut snapshot_writer =
+        matching_runtime::SnapshotWriter::start(shard.handle(), snapshot_dir.clone(), 1024 * 1024)
+            .unwrap();
+    let snapshot = retry(|| shard.handle().take_snapshot(1))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    snapshot_writer
+        .submit(1, snapshot)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         matching_persistence::scan_segments(base.join("wal"))
             .unwrap()
@@ -297,6 +350,16 @@ fn group_place_and_mass_cancel_write_before_reply() {
         (77, 3)
     );
     assert_eq!(result.seq, 3);
+    let digest = retry(|| shard.handle().take_snapshot(2))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .state_digest(1024 * 1024)
+        .unwrap();
+    let mut event_hash = matching_runtime::EventHasher::new();
+    for event in filled.events.iter().chain(&result.events) {
+        event_hash.update(event).unwrap();
+    }
     let records = matching_persistence::scan_segments(base.join("wal"))
         .unwrap()
         .records;
@@ -305,5 +368,60 @@ fn group_place_and_mass_cancel_write_before_reply() {
         matching_domain::decode_wal_command(&records[2].payload).unwrap(),
         cancel
     );
+    snapshot_writer.shutdown().unwrap();
     shard.shutdown(Duration::from_secs(5)).unwrap();
+    let restore = matching_runtime::SnapshotRestoreConfig {
+        cluster: ClusterId(1),
+        shard: shard_id,
+        primary_epoch: 1,
+        routes,
+        user_capacity: 8,
+        idempotency: IdempotencyConfig::default(),
+        place: Some(config),
+        expect_registry: true,
+        max_markets: 1,
+        max_bytes: 1024 * 1024,
+    };
+    let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(base.join("manifest")).unwrap();
+    let batch = matching_runtime::recover_snapshot_records(
+        base.join("wal"),
+        &snapshot_dir,
+        &manager,
+        &restore,
+    )
+    .unwrap()
+    .unwrap();
+    let replay = batch.replay().unwrap();
+    assert_eq!(replay.executions[0].events, filled.events);
+    assert_eq!(replay.executions[1].events, result.events);
+    assert_eq!(replay.event_hash, event_hash.finish());
+    assert_eq!(replay.image.state_digest(1024 * 1024).unwrap(), digest);
+    drop(manager);
+    let mut restarted = Shard::recover_group_local(
+        base.join("wal"),
+        base.join("manifest"),
+        &snapshot_dir,
+        &restore,
+        (8, 10_000),
+    )
+    .unwrap();
+    let duplicate = retry(|| restarted.handle().submit_command(cancel.clone()))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(duplicate.deduplicated);
+    assert_eq!(duplicate.seq, 3);
+    let mut next = make(4, 4, 4);
+    if let Command::PlaceLimit(place) = &mut next.payload {
+        place.client_order_id = Some("client-4".into());
+    }
+    assert_eq!(
+        retry(|| restarted.handle().submit_command(next.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .seq,
+        4
+    );
+    restarted.shutdown(Duration::from_secs(5)).unwrap();
 }
