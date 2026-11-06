@@ -2,6 +2,16 @@
 use crate::{WalRecord, scan_segments};
 use std::{io, path::Path};
 
+/// 校验调用方已验证快照的序号属于清单记录且未落在已回收前缀内。
+fn valid_snapshot_boundary(state: &crate::ManifestState, seq: u64) -> bool {
+    seq >= state.wal_gc_safe_seq
+        && (seq == 0
+            || state.latest_snapshot.is_some_and(|(_, value)| value == seq)
+            || state
+                .previous_snapshot
+                .is_some_and(|(_, value)| value == seq))
+}
+
 /// 在目录独占且提交水位由调用方可靠持久化的前提下，选择快照之后的提交记录。
 ///
 /// 本函数不验证快照或提交水位的来源，不修改文件，也不执行命令。
@@ -50,6 +60,25 @@ pub fn recover_local(
     shard_id: u16,
 ) -> io::Result<Vec<WalRecord>> {
     let manager = crate::ManifestManager::<crate::FileManifestStorage>::open_recovery(manifest)?;
+    recover_local_with_manifest(wal, &manager, snapshot_seq, cluster_id, shard_id)
+}
+
+/// 复用调用方独占且严格验证的清单，避免快照读取与 WAL 选择间释放锁。
+///
+/// 调用方仍须独占 WAL 目录并验证所选快照内容；本入口只适用于 LocalDurable。
+pub fn recover_local_with_manifest(
+    wal: impl AsRef<Path>,
+    manager: &crate::ManifestManager<crate::FileManifestStorage>,
+    snapshot_seq: u64,
+    cluster_id: u16,
+    shard_id: u16,
+) -> io::Result<Vec<WalRecord>> {
+    if !manager.recovery_checked() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "清单未通过严格恢复检查",
+        ));
+    }
     let state = manager.state();
     if state.generation == 0
         && std::fs::read_dir(wal.as_ref())?
@@ -68,7 +97,7 @@ pub fn recover_local(
             "回收计划尚未恢复",
         ));
     }
-    if snapshot_seq != 0 && state.latest_snapshot.map(|(_, seq)| seq) != Some(snapshot_seq) {
+    if !valid_snapshot_boundary(state, snapshot_seq) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "快照与清单不一致",
@@ -113,13 +142,28 @@ pub fn repair_local_wal(
     cluster_id: u16,
     shard_id: u16,
 ) -> io::Result<Vec<WalRecord>> {
-    use std::fs::{self, OpenOptions};
-    let wal = wal.as_ref();
     let manager = crate::ManifestManager::<crate::FileManifestStorage>::open_recovery(manifest)?;
+    repair_local_wal_with_manifest(wal, &manager, snapshot_seq, cluster_id, shard_id)
+}
+
+/// 复用严格清单锁修复未提交 WAL 尾部；调用方必须独占 WAL 目录。
+pub fn repair_local_wal_with_manifest(
+    wal: impl AsRef<Path>,
+    manager: &crate::ManifestManager<crate::FileManifestStorage>,
+    snapshot_seq: u64,
+    cluster_id: u16,
+    shard_id: u16,
+) -> io::Result<Vec<WalRecord>> {
+    use std::fs::{self, OpenOptions};
+    if !manager.recovery_checked() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "清单未通过严格恢复检查",
+        ));
+    }
+    let wal = wal.as_ref();
     let state = manager.state();
-    if !state.gc_plan.is_empty()
-        || (snapshot_seq != 0 && state.latest_snapshot.map(|(_, seq)| seq) != Some(snapshot_seq))
-    {
+    if !state.gc_plan.is_empty() || !valid_snapshot_boundary(state, snapshot_seq) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "快照或回收计划状态无效",
@@ -197,4 +241,22 @@ pub fn repair_local_wal(
         file.sync_all()?;
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn snapshot_boundary_must_not_precede_gc_watermark() {
+        let state = crate::ManifestState {
+            latest_snapshot: Some((2, 10)),
+            previous_snapshot: Some((1, 4)),
+            wal_gc_safe_seq: 5,
+            ..Default::default()
+        };
+        assert!(!valid_snapshot_boundary(&state, 0));
+        assert!(!valid_snapshot_boundary(&state, 4));
+        assert!(valid_snapshot_boundary(&state, 10));
+        assert!(!valid_snapshot_boundary(&state, 6));
+    }
 }

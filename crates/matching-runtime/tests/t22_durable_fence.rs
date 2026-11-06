@@ -99,6 +99,73 @@ fn fence_is_durable_before_reply_and_dedup_does_not_reappend() {
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].shard_seq, first.seq);
     assert_eq!(recovered[0].command, command);
+    let snapshots = base.join("snapshot");
+    std::fs::create_dir(&snapshots).unwrap();
+    let trusted = matching_runtime::SnapshotRestoreConfig {
+        cluster: ClusterId(2),
+        shard: ShardId(1),
+        primary_epoch: 7,
+        routes: matching_runtime::RouteTable::new([]).unwrap(),
+        user_capacity: 8,
+        idempotency: IdempotencyConfig::default(),
+        place: None,
+        expect_registry: true,
+        max_markets: 0,
+        max_bytes: 1024 * 1024,
+    };
+    let mut competing = Shard::start(
+        ShardId(1),
+        ClusterId(2),
+        matching_runtime::RouteTable::new([]).unwrap(),
+        vec![],
+    )
+    .unwrap();
+    let path = base.join("wal").join("00000000000000000001.wal");
+    let mut tail = scan.records[0].clone();
+    tail.shard_seq = 2;
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&tail.encode().unwrap())
+        .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    assert!(
+        Shard::recover_group_local(
+            base.join("wal"),
+            base.join("manifest"),
+            &snapshots,
+            &trusted,
+            (8, 10_000)
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    competing.shutdown(Duration::from_secs(5)).unwrap();
+    let mut restarted = Shard::recover_group_local(
+        base.join("wal"),
+        base.join("manifest"),
+        snapshots,
+        &trusted,
+        (8, 10_000),
+    )
+    .unwrap();
+    let mut next = command;
+    next.command_id = CommandId(4);
+    next.client_seq = 6;
+    if let Command::ApplyUserControlFenceShard(fence) = &mut next.payload {
+        fence.new_epoch = 10;
+    }
+    assert_eq!(
+        retry(|| restarted.handle().submit_command(next.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .seq,
+        2
+    );
+    restarted.shutdown(Duration::from_secs(5)).unwrap();
 }
 
 #[test]
@@ -842,20 +909,25 @@ fn damaged_latest_snapshot_selects_prior_candidate_without_rolling_back_watermar
         matching_runtime::SnapshotWriter::start(shard.handle(), directory.clone(), 1024 * 1024)
             .unwrap();
     let mut stale = None;
+    let mut live_events = Vec::new();
+    let mut live_digest = None;
     for (id, epoch) in [(1, 9), (2, 10)] {
         let cmd = command(id, epoch);
-        assert_eq!(
-            retry(|| shard.handle().submit_command(cmd.clone()))
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .seq,
-            id as u64
-        );
+        let execution = retry(|| shard.handle().submit_command(cmd.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.seq, id as u64);
+        if id == 2 {
+            live_events = execution.events;
+        }
         let image = retry(|| shard.handle().take_snapshot(id))
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
+        if id == 2 {
+            live_digest = Some(image.state_digest(1024 * 1024).unwrap());
+        }
         if id == 1 {
             stale = Some(
                 retry(|| shard.handle().take_snapshot(100))
@@ -898,9 +970,84 @@ fn damaged_latest_snapshot_selects_prior_candidate_without_rolling_back_watermar
     assert!(candidate.used_previous);
     assert_eq!(candidate.committed_through, 2);
     assert_eq!(candidate.image.snapshot_seq(), 1);
+    let wal_file = temp.0.join("wal").join("00000000000000000001.wal");
+    let wal_bytes = std::fs::read(&wal_file).unwrap();
+    let mut corrupted = matching_persistence::scan_segments(temp.0.join("wal"))
+        .unwrap()
+        .records;
+    corrupted[1].epoch = 8;
+    let bad: Vec<u8> = corrupted
+        .iter()
+        .flat_map(|record| record.encode().unwrap())
+        .collect();
+    std::fs::write(&wal_file, bad).unwrap();
+    let bad_batch = matching_runtime::recover_snapshot_records(
+        temp.0.join("wal"),
+        &directory,
+        &manager,
+        &config,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(bad_batch.replay().is_err());
+    drop(manager);
+    let before_failed_restart = std::fs::read(&wal_file).unwrap();
+    assert!(
+        Shard::recover_group_local(
+            temp.0.join("wal"),
+            temp.0.join("manifest"),
+            &directory,
+            &config,
+            (8, 500_000),
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&wal_file).unwrap(), before_failed_restart);
+    std::fs::write(&wal_file, wal_bytes).unwrap();
+    let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(temp.0.join("manifest")).unwrap();
+    let batch = matching_runtime::recover_snapshot_records(
+        temp.0.join("wal"),
+        &directory,
+        &manager,
+        &config,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(batch.snapshot().used_previous);
+    assert_eq!(batch.commands().len(), 1);
+    assert_eq!(batch.commands()[0].shard_seq, 2);
+    assert_eq!(batch.commands()[0].command, command(2, 10));
+    let mut live_hash = matching_runtime::EventHasher::new();
+    for event in &live_events {
+        live_hash.update(event).unwrap();
+    }
+    let replay = batch.replay().unwrap();
+    assert_eq!(replay.executions[0].events, live_events);
+    assert_eq!(replay.event_hash, live_hash.finish());
+    assert_eq!(
+        replay.image.state_digest(1024 * 1024).unwrap(),
+        live_digest.unwrap()
+    );
     assert!(candidate.image.check_user_epoch(UserId(6), 8).is_err());
     assert!(candidate.image.check_user_epoch(UserId(6), 9).is_ok());
     assert!(Shard::start_in_memory_from_snapshot(candidate.image, &config).is_err());
+    drop(manager);
+    let mut resumed = Shard::recover_group_local(
+        temp.0.join("wal"),
+        temp.0.join("manifest"),
+        &directory,
+        &config,
+        (8, 500_000),
+    )
+    .unwrap();
+    let resumed_execution = retry(|| resumed.handle().submit_command(command(3, 11)))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed_execution.seq, 3);
+    resumed.shutdown(Duration::from_secs(5)).unwrap();
+    let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(temp.0.join("manifest")).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 3);
     std::fs::write(directory.join("snapshot-1.bin"), b"broken").unwrap();
     assert!(
         matching_runtime::SnapshotImage::read_recovery_candidate(&directory, &manager, &config)

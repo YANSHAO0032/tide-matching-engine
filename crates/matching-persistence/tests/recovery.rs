@@ -424,3 +424,194 @@ fn recovery_rejects_manifest_active_segment_that_does_not_contain_watermark() {
     assert!(recover_local(&wal, &manifest, 0, 1, 2).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn recovery_and_repair_accept_verified_previous_snapshot_and_reject_other_boundaries() {
+    use matching_persistence::{
+        FileManifestStorage, ManifestIntent, ManifestManager, recover_local, repair_local_wal,
+    };
+    let root = std::env::temp_dir().join(format!(
+        "t25-fallback-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir(&wal).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+    let mut writer = SegmentWriter::new(&wal, 4096).unwrap();
+    for n in 1..=5 {
+        writer.append(&record(n)).unwrap();
+    }
+    drop(writer);
+    let mut manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 5,
+            first_seq: 1,
+        })
+        .unwrap();
+    manager.submit(ManifestIntent::RecoveryAnchor).unwrap();
+    manager
+        .submit(ManifestIntent::SnapshotCommitted {
+            snapshot_id: 11,
+            snapshot_seq: 2,
+        })
+        .unwrap();
+    manager
+        .submit(ManifestIntent::SnapshotCommitted {
+            snapshot_id: 12,
+            snapshot_seq: 4,
+        })
+        .unwrap();
+    drop(manager);
+    assert_eq!(
+        recover_local(&wal, &manifest, 2, 1, 2).unwrap(),
+        vec![record(3), record(4), record(5)]
+    );
+    assert_eq!(
+        repair_local_wal(&wal, &manifest, 2, 1, 2).unwrap(),
+        vec![record(3), record(4), record(5)]
+    );
+    assert!(recover_local(&wal, &manifest, 3, 1, 2).is_err());
+    assert!(repair_local_wal(&wal, &manifest, 3, 1, 2).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_uses_existing_strict_manifest_lock_without_reopening() {
+    use matching_persistence::{
+        FileManifestStorage, ManifestIntent, ManifestManager, recover_local_with_manifest,
+    };
+    let root = std::env::temp_dir().join(format!(
+        "t25-held-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir(&wal).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+    let mut writer = SegmentWriter::new(&wal, 4096).unwrap();
+    writer.append(&record(1)).unwrap();
+    drop(writer);
+    let mut manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 1,
+            first_seq: 1,
+        })
+        .unwrap();
+    manager.submit(ManifestIntent::RecoveryAnchor).unwrap();
+    assert!(recover_local_with_manifest(&wal, &manager, 0, 1, 2).is_err());
+    drop(manager);
+    let manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    assert!(ManifestManager::<FileManifestStorage>::open_recovery(&manifest).is_err());
+    assert_eq!(
+        recover_local_with_manifest(&wal, &manager, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tail_repair_uses_existing_strict_manifest_lock() {
+    use matching_persistence::{
+        FileManifestStorage, ManifestIntent, ManifestManager, repair_local_wal_with_manifest,
+    };
+    let root = std::env::temp_dir().join(format!(
+        "t25-repair-held-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir(&wal).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+    let mut writer = SegmentWriter::new(&wal, 4096).unwrap();
+    writer.append(&record(1)).unwrap();
+    writer.append(&record(2)).unwrap();
+    drop(writer);
+    let mut manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    manager
+        .submit(ManifestIntent::LocalDurableAdvanced {
+            through_seq: 1,
+            first_seq: 1,
+        })
+        .unwrap();
+    manager.submit(ManifestIntent::RecoveryAnchor).unwrap();
+    assert!(repair_local_wal_with_manifest(&wal, &manager, 0, 1, 2).is_err());
+    drop(manager);
+    let manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    assert_eq!(
+        repair_local_wal_with_manifest(&wal, &manager, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    assert_eq!(
+        std::fs::read(wal.join("00000000000000000001.wal")).unwrap(),
+        record(1).encode().unwrap()
+    );
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovered_appender_repairs_tail_and_continues_from_committed_watermark() {
+    use matching_persistence::{
+        DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
+        Profile, RegisteredAppender, ReplicationMode,
+    };
+    let root = std::env::temp_dir().join(format!(
+        "t25-resume-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir_all(&wal).unwrap();
+    std::fs::create_dir_all(&manifest).unwrap();
+    let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    let writer = SegmentWriter::new(&wal, 4096).unwrap();
+    let appender = RegisteredAppender::new(writer, manager).unwrap();
+    let config = DurabilityConfig {
+        profile: Profile::Development,
+        mode: DurabilityMode::FsyncEach,
+        replication: ReplicationMode::LocalDurable,
+        crash_recovery_required: true,
+        ha_enabled: false,
+        allow_data_loss_on_failover: false,
+    };
+    let mut batcher = DurableBatcher::new_with_config(appender, config, 3).unwrap();
+    batcher
+        .append_at(&record(1), std::time::Instant::now())
+        .unwrap();
+    drop(batcher);
+    use std::io::Write;
+    let path = wal.join("00000000000000000001.wal");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&record(2).encode().unwrap())
+        .unwrap();
+    let manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    let appender = RegisteredAppender::recover_local(&wal, 4096, manager, 0, 1, 2).unwrap();
+    let mut batcher = DurableBatcher::resume_local(appender, config, 3)
+        .unwrap()
+        .into_boxed();
+    assert_eq!(batcher.committed(), 1);
+    batcher
+        .append_at(&record(2), std::time::Instant::now())
+        .unwrap();
+    assert_eq!(batcher.committed(), 2);
+    drop(batcher);
+    assert_eq!(
+        matching_persistence::recover_local(&wal, &manifest, 0, 1, 2).unwrap(),
+        vec![record(1), record(2)]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
