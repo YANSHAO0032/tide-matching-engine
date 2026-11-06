@@ -69,6 +69,11 @@ pub struct MarketMath {
 }
 
 impl MarketMath {
+    /// 返回价格整数的十进制缩放位数。
+    pub const fn price_scale(&self) -> u8 {
+        self.price_scale
+    }
+
     /// 校验小数位数、价格步长与手，并在成功时构造不可变数值配置。
     pub fn try_new(
         price_scale: u8,

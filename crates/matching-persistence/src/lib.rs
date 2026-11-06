@@ -7,6 +7,7 @@ mod record;
 mod recovery;
 mod scan;
 mod segment;
+mod snapshot;
 mod wal_gc;
 pub use durability::{
     CommitWatermark, DurabilityConfig, DurabilityError, DurabilityMode, DurableAppender,
@@ -18,6 +19,10 @@ pub use record::{WalError, WalRecord};
 pub use recovery::{recover_committed, recover_local, repair_local_wal};
 pub use scan::{ScanError, ScanResult, scan_segment};
 pub use segment::{SegmentMeta, SegmentScan, SegmentWriter, scan_segments, truncate_torn_tail};
+pub use snapshot::{
+    commit_snapshot, read_committed_snapshot, read_previous_snapshot, read_snapshot,
+    write_snapshot_file,
+};
 pub use wal_gc::{WalGcPolicy, run_wal_gc};
 
 /// 计算 Castagnoli 多项式的 CRC32C，用于检测持久化记录损坏。

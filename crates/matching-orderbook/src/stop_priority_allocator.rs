@@ -25,6 +25,32 @@ impl StopPriorityAllocator {
         Self { policy, next: 0 }
     }
 
+    /// 编码优先级策略和下一止损订单优先级。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        let mut body = matching_domain::snapshot_wire::SnapshotEncoder::new(64);
+        self.policy.write_snapshot(&mut body)?;
+        body.u128(self.next)?;
+        writer.bytes(&body.finish())
+    }
+    /// 恢复策略和下一止损优先级，并拒绝超出安全边界的值。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotWireError};
+        let mut body = SnapshotDecoder::new(reader.bytes()?, 64)?;
+        let policy = QueuePriorityPolicy::read_snapshot(&mut body)?;
+        let next = body.u128()?;
+        body.finish()?;
+        Self::try_restore(policy, next).map_err(|_| SnapshotWireError)
+    }
+    /// 返回此分配器使用的不可变高水位策略。
+    pub fn policy(&self) -> &QueuePriorityPolicy {
+        &self.policy
+    }
+
     /// 从快照或迁移状态恢复，不自动推进计数器。
     pub fn try_restore(
         policy: QueuePriorityPolicy,
@@ -86,5 +112,23 @@ mod tests {
             Err(RejectReason::PrioritySpaceExhaustion)
         );
         assert_eq!(allocator.next(), 3);
+    }
+
+    #[test]
+    fn snapshot_restores_stop_allocator_without_advancing() {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+        let policy = QueuePriorityPolicy::try_with_synthetic_ceiling(1024, Some(3)).unwrap();
+        let allocator = StopPriorityAllocator::try_restore(policy, 3).unwrap();
+        let mut writer = SnapshotEncoder::new(128);
+        allocator.write_snapshot(&mut writer).unwrap();
+        let bytes = writer.finish();
+        let mut reader = SnapshotDecoder::new(&bytes, 128).unwrap();
+        let mut restored = StopPriorityAllocator::read_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(restored, allocator);
+        assert_eq!(
+            restored.allocate(),
+            Err(RejectReason::PrioritySpaceExhaustion)
+        );
     }
 }

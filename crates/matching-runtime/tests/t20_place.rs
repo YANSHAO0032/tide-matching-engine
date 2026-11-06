@@ -50,11 +50,11 @@ fn place_retry_and_client_order_identity_follow_actual_order_lifecycle() {
     let mut shard = Shard::start_with_place_support(
         shard_id,
         ClusterId(1),
-        routes,
+        routes.clone(),
         vec![(market, book)],
         ReservationRegistry::new([]).unwrap(),
         LogicalTime::new(0),
-        (IdempotencyConfig::default(), 1, 8, config),
+        (IdempotencyConfig::default(), 1, 8, config.clone()),
     )
     .unwrap();
     let make = |command_id: u128, order_id: u128, client_seq: u64| {
@@ -120,6 +120,37 @@ fn place_retry_and_client_order_identity_follow_actual_order_lifecycle() {
     let first_command = make(1, 1, 1);
     let first = run(first_command.clone()).unwrap();
     assert_eq!(first.seq, 1);
+    let image = shard
+        .handle()
+        .take_snapshot(99)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let restore = matching_runtime::SnapshotRestoreConfig {
+        cluster: ClusterId(1),
+        shard: shard_id,
+        primary_epoch: 1,
+        routes: routes.clone(),
+        user_capacity: 8,
+        idempotency: IdempotencyConfig::default(),
+        place: Some(config.clone()),
+        expect_registry: true,
+        max_markets: 1,
+        max_bytes: 1024 * 1024,
+    };
+    let bytes = image.encode_snapshot(restore.max_bytes).unwrap();
+    let recovered = matching_runtime::SnapshotImage::decode_snapshot(&bytes, &restore).unwrap();
+    assert_eq!(
+        image.canonical_state(restore.max_bytes).unwrap(),
+        recovered.canonical_state(restore.max_bytes).unwrap()
+    );
+    assert_eq!(
+        recovered.client_order(UserId(7), "client-1"),
+        Some((market, OrderId(1)))
+    );
+    assert!(recovered.contains_command(&first_command).unwrap());
+    assert!(recovered.reservation(ReservationId(1)).is_some());
     assert!(first.events.iter().any(
         |e| matches!(e.payload, EngineEvent::OrderAccepted { order_id } if order_id == OrderId(1))
     ));

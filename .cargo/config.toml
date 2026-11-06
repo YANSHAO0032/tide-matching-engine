@@ -1,0 +1,3 @@
+[build]
+# 快照摘要固定使用纯软件、紧凑的 SHA-256 后端，避免引入向量指令和手写 unsafe。
+rustflags = ['--cfg=sha2_256_backend="soft"', '--cfg=sha2_backend_soft="compact"']

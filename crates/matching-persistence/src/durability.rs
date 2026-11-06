@@ -152,6 +152,13 @@ pub trait DurableAppender {
     fn append(&mut self, record: &WalRecord) -> io::Result<()>;
     /// 同步当前文件以及新目录项。
     fn sync(&mut self) -> io::Result<()>;
+    /// 通过同一个清单写者登记已同步的快照文件。
+    fn commit_snapshot(&mut self, _snapshot_id: u64, _snapshot_seq: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "写入器不支持快照清单",
+        ))
+    }
 }
 
 /// 负责批量同步与持久前缀推进的单写者。
@@ -228,6 +235,23 @@ impl<A: DurableAppender> DurableBatcher<A> {
     /// 返回当前策略允许对外提交的前缀。
     pub const fn committed(&self) -> u64 {
         self.watermark.committed()
+    }
+    /// 在提交前缀内登记已同步快照；清单写入失败后停止持久写入。
+    pub fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
+        if self.halted || self.pending_count != 0 || snapshot_seq > self.committed() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "快照不属于已提交前缀",
+            ));
+        }
+        let result = self.appender.commit_snapshot(snapshot_id, snapshot_seq);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput)
+        {
+            self.halted = true;
+        }
+        result
     }
     /// 只读查看底层写入器与持久元数据状态。
     pub fn appender(&self) -> &A {
@@ -372,6 +396,20 @@ impl<S: ManifestStorage> RegisteredAppender<S> {
     }
 }
 impl<S: ManifestStorage> DurableAppender for RegisteredAppender<S> {
+    fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
+        if self.manifest.state().generation < 2
+            || snapshot_seq > self.manifest.state().local_durable_seq
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "快照不属于本地持久前缀",
+            ));
+        }
+        self.manifest.submit(ManifestIntent::SnapshotCommitted {
+            snapshot_id,
+            snapshot_seq,
+        })
+    }
     /// 在同步前识别将发生的文件轮转。
     fn would_rotate(&self, record: &WalRecord) -> io::Result<bool> {
         self.writer.durable_would_rotate(record)

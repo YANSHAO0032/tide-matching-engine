@@ -26,7 +26,8 @@ pub use wait_strategy::WaitStrategy;
 /// 单写者工作线程及其结果。
 pub use worker::{
     Execution, FormalError, FormalExecution, FormalOutcome, Mutation, MutationEnvelope,
-    MutationOutcome, Shard, ShardConfig, ShardError, ShardHandle,
+    MutationOutcome, Shard, ShardConfig, ShardError, ShardHandle, SnapshotError, SnapshotImage,
+    SnapshotRecoveryCandidate, SnapshotRestoreConfig, SnapshotWriter, SnapshotWriterError,
 };
 mod router;
 

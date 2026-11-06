@@ -363,3 +363,218 @@ fn validate_book_rejects_non_increasing_level_priority() {
 
     let _ = book.arena.remove(second).unwrap();
 }
+
+#[test]
+fn restored_book_invariants_reject_missing_index_and_broken_aggregate() {
+    let mut book = ProductionOrderBook::new(policy());
+    rest_fixture(&mut book, order(1, Side::Buy, 100, 5));
+    rest_fixture(&mut book, order(2, Side::Buy, 100, 7));
+    assert!(book.validate_snapshot_invariants().is_ok());
+    let mut missing = book.clone();
+    missing.orders.remove(&OrderId::new(1));
+    assert!(missing.validate_snapshot_invariants().is_err());
+    let mut broken = book.clone();
+    let index = broken.orders[&OrderId::new(1)];
+    broken
+        .arena
+        .get_mut(index)
+        .unwrap()
+        .commit_partial_remaining(1);
+    assert!(broken.validate_snapshot_invariants().is_err());
+}
+
+#[test]
+fn snapshot_book_roundtrip_preserves_arena_fifo_and_allocators() {
+    use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+    let mut book = ProductionOrderBook::new(policy());
+    rest_fixture(&mut book, order(1, Side::Buy, 90, 4));
+    rest_fixture(&mut book, order(2, Side::Buy, 90, 5));
+    rest_fixture(&mut book, order(3, Side::Sell, 110, 6));
+    book.cancel(OrderId::new(1)).unwrap();
+    rest_fixture(&mut book, order(4, Side::Buy, 90, 8));
+    let mut w = SnapshotEncoder::new(10000);
+    book.write_snapshot(&mut w).unwrap();
+    let bytes = w.finish();
+    let mut r = SnapshotDecoder::new(&bytes, 10000).unwrap();
+    let restored = ProductionOrderBook::read_snapshot(&mut r).unwrap();
+    r.finish().unwrap();
+    let mut rewritten = SnapshotEncoder::new(10000);
+    restored.write_snapshot(&mut rewritten).unwrap();
+    assert_eq!(rewritten.finish(), bytes);
+    assert!(restored.validate_snapshot_invariants().is_ok());
+    for end in 0..bytes.len() {
+        let mut r = SnapshotDecoder::new(&bytes[..end], 10000).unwrap();
+        assert!(ProductionOrderBook::read_snapshot(&mut r).is_err());
+    }
+}
+
+#[test]
+fn snapshot_validator_rejects_reservation_wrong_owner_or_market() {
+    use matching_domain::{
+        AssetId, AssetReserve, MarketId, OriginSessionId, ReservationId, UserId,
+    };
+    use matching_risk::{ReservationState, ReservationStatus};
+    let mut book = ProductionOrderBook::new(policy());
+    book.bind_market(MarketId::new(7)).unwrap();
+    rest_fixture(&mut book, order(1, Side::Buy, 90, 4));
+    let state = ReservationState {
+        reservation_id: ReservationId::new(1),
+        order_id: OrderId::new(1),
+        user_id: UserId::new(99),
+        market_id: MarketId::new(7),
+        origin_session_id: OriginSessionId::new(1),
+        version: 1,
+        reserves: vec![AssetReserve {
+            asset: AssetId::new(1),
+            atoms: 2,
+        }],
+        status: ReservationStatus::Active,
+        fee_schedule_version: 1,
+        fee_tier_id: 1,
+    };
+    book.reservations.insert(OrderId::new(1), state);
+    assert!(book.validate_snapshot_invariants().is_err());
+    book.reservations.get_mut(&OrderId::new(1)).unwrap().user_id = UserId::new(1);
+    book.reservations
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .market_id = MarketId::new(8);
+    assert!(book.validate_snapshot_invariants().is_err());
+}
+
+#[test]
+fn snapshot_book_restores_stop_expiry_reference_and_price_band() {
+    use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+    use matching_domain::{
+        LogicalTime, MarketMath, PriceBandConfig, PriceReference, PriceReferenceKind,
+        ReservationId, StopLimitOrder, StopOrder, TimeInForce, TriggerExpiry,
+    };
+    let mut book = ProductionOrderBook::new(policy());
+    book.place_limit_timed_with_events(
+        order(7, Side::Sell, 130, 4),
+        TimeInForce::Gtd {
+            expire_at: LogicalTime::new(20),
+        },
+        LogicalTime::new(1),
+        3,
+        &[],
+    )
+    .unwrap();
+    book.place_stop(
+        StopOrder::Limit(StopLimitOrder {
+            trigger_reference: PriceReferenceKind::MarkPrice,
+            order_id: OrderId::new(8),
+            user_id: matching_domain::UserId::new(8),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
+            reservation_id: ReservationId::new(8),
+            fee_schedule_version: 1,
+            side: Side::Buy,
+            stop_price: Price::try_new(110).unwrap(),
+            price: Price::try_new(111).unwrap(),
+            qty: matching_domain::Qty::try_new(2).unwrap(),
+            child_tif: TimeInForce::Gtc,
+            trigger_expiry: TriggerExpiry::Day { session_id: 3 },
+        }),
+        LogicalTime::new(1),
+        3,
+    )
+    .unwrap();
+    book.reference_prices
+        .advance(PriceReference {
+            kind: PriceReferenceKind::MarkPrice,
+            source_seq: 4,
+            price: Price::try_new(100).unwrap(),
+        })
+        .unwrap();
+    book.set_price_band_config(Some((
+        PriceBandConfig {
+            reference_kind: PriceReferenceKind::MarkPrice,
+            max_deviation_bps: 1000,
+        },
+        MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+    )))
+    .unwrap();
+    let mut w = SnapshotEncoder::new(10000);
+    book.write_snapshot(&mut w).unwrap();
+    let bytes = w.finish();
+    let mut r = SnapshotDecoder::new(&bytes, 10000).unwrap();
+    let mut restored = ProductionOrderBook::read_snapshot(&mut r).unwrap();
+    r.finish().unwrap();
+    let canonical = |book: &ProductionOrderBook| {
+        let mut w = SnapshotEncoder::new(10000);
+        book.write_canonical_state(&mut w).unwrap();
+        w.finish()
+    };
+    let baseline = canonical(&book);
+    assert_eq!(baseline, canonical(&restored));
+    let mut changed = book.clone();
+    changed.stop_priority_allocator.allocate().unwrap();
+    assert_ne!(baseline, canonical(&changed));
+    let mut changed = book.clone();
+    changed.queue_priority_allocator.allocate().unwrap();
+    assert_ne!(baseline, canonical(&changed));
+    let mut changed = book.clone();
+    changed
+        .reference_prices
+        .advance(PriceReference {
+            kind: PriceReferenceKind::MarkPrice,
+            source_seq: 5,
+            price: Price::try_new(100).unwrap(),
+        })
+        .unwrap();
+    assert_ne!(baseline, canonical(&changed));
+    assert_eq!(
+        restored.expire_stop_day_session(3),
+        book.expire_stop_day_session(3)
+    );
+    assert_eq!(
+        restored.expire_gtd_through(LogicalTime::new(20)),
+        book.expire_gtd_through(LogicalTime::new(20))
+    );
+    assert_eq!(restored.price_band, book.price_band);
+    assert_eq!(restored.reference_prices, book.reference_prices);
+}
+
+#[test]
+fn canonical_snapshot_state_ignores_arena_slot_layout_but_preserves_fifo() {
+    use crate::OrderArena;
+    use matching_domain::snapshot_wire::SnapshotEncoder;
+    let mut original = ProductionOrderBook::new(policy());
+    rest_fixture(&mut original, order(1, Side::Buy, 90, 4));
+    rest_fixture(&mut original, order(2, Side::Buy, 90, 5));
+    let mut relocated = original.clone();
+    let mut first = original.order(OrderId::new(1)).unwrap().clone();
+    first.set_prev(None);
+    first.set_next(None);
+    let mut second = original.order(OrderId::new(2)).unwrap().clone();
+    second.set_prev(None);
+    second.set_next(None);
+    let mut arena = OrderArena::new();
+    let temporary = arena
+        .insert(OrderNode::new(
+            order(99, Side::Buy, 90, 1),
+            QueuePriority::new(0),
+        ))
+        .unwrap();
+    let mut level = PriceLevel::new();
+    let first_index = level.push_back(&mut arena, first).unwrap();
+    arena.remove(temporary).unwrap();
+    let second_index = level.push_back(&mut arena, second).unwrap();
+    relocated.arena = arena;
+    relocated.bids.insert(Price::try_new(90).unwrap(), level);
+    relocated.orders.insert(OrderId::new(1), first_index);
+    relocated.orders.insert(OrderId::new(2), second_index);
+    assert!(relocated.validate_snapshot_invariants().is_ok());
+    let mut a = SnapshotEncoder::new(10000);
+    let mut b = SnapshotEncoder::new(10000);
+    original.write_canonical_state(&mut a).unwrap();
+    relocated.write_canonical_state(&mut b).unwrap();
+    assert_eq!(a.finish(), b.finish());
+    relocated.cancel(OrderId::new(1)).unwrap();
+    let mut changed = SnapshotEncoder::new(10000);
+    relocated.write_canonical_state(&mut changed).unwrap();
+    let mut before = SnapshotEncoder::new(10000);
+    original.write_canonical_state(&mut before).unwrap();
+    assert_ne!(before.finish(), changed.finish());
+}

@@ -16,3 +16,6 @@ pub use reservation_transition::{
 
 mod limit_reserve;
 pub use limit_reserve::{LimitReserveError, LimitReservePolicy};
+
+mod snapshot;
+pub use snapshot::{decode_reservation_snapshot, encode_reservation_snapshot};

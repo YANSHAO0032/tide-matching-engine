@@ -139,6 +139,154 @@ pub(crate) struct StopReplacementPlan {
 }
 
 impl StopBook {
+    /// 按来源、方向和价格遍历止损订单，保留同档先进先出与到期桶原序。
+    pub(crate) fn write_canonical_state(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotEncoder, SnapshotWireError, encode_stop_order,
+        };
+        self.validate().map_err(|_| SnapshotWireError)?;
+        let mut entries = self.ordered(Side::Buy);
+        entries.extend(self.ordered(Side::Sell));
+        entries.sort_by_key(|(order, _)| {
+            (
+                order.trigger_reference(),
+                order.stop_price(),
+                match order.side() {
+                    Side::Buy => 0_u8,
+                    Side::Sell => 1_u8,
+                },
+            )
+        });
+        let mut w = SnapshotEncoder::new(256 * 1024 * 1024);
+        w.u32(u32::try_from(entries.len()).map_err(|_| SnapshotWireError)?)?;
+        for (order, priority) in entries {
+            encode_stop_order(&mut w, order)?;
+            w.u128(priority.get())?;
+        }
+        w.u32(u32::try_from(self.expiry_index.gtd.len()).map_err(|_| SnapshotWireError)?)?;
+        for (time, refs) in &self.expiry_index.gtd {
+            w.u64(time.get())?;
+            w.u32(u32::try_from(refs.len()).map_err(|_| SnapshotWireError)?)?;
+            for entry in refs {
+                w.u128(entry.order_id.get())?;
+            }
+        }
+        w.u32(u32::try_from(self.expiry_index.day.len()).map_err(|_| SnapshotWireError)?)?;
+        for (session, refs) in &self.expiry_index.day {
+            w.u64(*session)?;
+            w.u32(u32::try_from(refs.len()).map_err(|_| SnapshotWireError)?)?;
+            for entry in refs {
+                w.u128(entry.order_id.get())?;
+            }
+        }
+        writer.bytes(&w.finish())
+    }
+    /// 按价位与桶内原序保存订单及到期引用。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotEncoder, SnapshotWireError, encode_stop_order,
+        };
+        self.validate().map_err(|_| SnapshotWireError)?;
+        let mut w = SnapshotEncoder::new(256 * 1024 * 1024);
+        w.u32(u32::try_from(self.locations.len()).map_err(|_| SnapshotWireError)?)?;
+        for levels in [&self.buy_stops, &self.sell_stops] {
+            for entries in levels.values() {
+                for entry in entries {
+                    encode_stop_order(&mut w, &entry.order)?;
+                    w.u128(entry.priority.get())?;
+                }
+            }
+        }
+        for buckets in [
+            &self.expiry_index.gtd.values().collect::<Vec<_>>(),
+            &self.expiry_index.day.values().collect::<Vec<_>>(),
+        ] {
+            let count = buckets
+                .iter()
+                .try_fold(0usize, |n, b| n.checked_add(b.len()))
+                .ok_or(SnapshotWireError)?;
+            w.u32(u32::try_from(count).map_err(|_| SnapshotWireError)?)?;
+            for bucket in buckets {
+                for reference in *bucket {
+                    w.u128(reference.order_id.get())?;
+                }
+            }
+        }
+        writer.bytes(&w.finish())
+    }
+
+    /// 重建位置索引并以编码顺序恢复到期桶，拒绝不一致或重复引用。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotDecoder, SnapshotWireError, decode_stop_order,
+        };
+        let bytes = reader.bytes()?;
+        let mut r = SnapshotDecoder::new(bytes, 256 * 1024 * 1024)?;
+        let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+        if count > r.remaining() / 20 {
+            return Err(SnapshotWireError);
+        }
+        let mut book = Self::new();
+        book.locations
+            .try_reserve(count)
+            .map_err(|_| SnapshotWireError)?;
+        for _ in 0..count {
+            let order = decode_stop_order(&mut r)?;
+            let priority = StopPriority::new(r.u128()?);
+            let location = StopLocation {
+                reference: order.trigger_reference(),
+                side: order.side(),
+                stop_price: order.stop_price(),
+            };
+            if book.locations.insert(order.order_id(), location).is_some() {
+                return Err(SnapshotWireError);
+            }
+            book.levels_mut(location.side)
+                .entry((location.stop_price, location.reference))
+                .or_default()
+                .push(StopEntry { order, priority });
+        }
+        for gtd in [true, false] {
+            let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+            if count > r.remaining() / 16 {
+                return Err(SnapshotWireError);
+            }
+            for _ in 0..count {
+                let id = OrderId::new(r.u128()?);
+                let location = *book.locations.get(&id).ok_or(SnapshotWireError)?;
+                let expiry = book
+                    .entry(id)
+                    .ok_or(SnapshotWireError)?
+                    .order
+                    .trigger_expiry();
+                if !matches!(
+                    (gtd, expiry),
+                    (true, TriggerExpiry::Gtd { .. }) | (false, TriggerExpiry::Day { .. })
+                ) {
+                    return Err(SnapshotWireError);
+                }
+                book.expiry_index.insert(
+                    expiry,
+                    ExpiryRef {
+                        order_id: id,
+                        location,
+                    },
+                );
+            }
+        }
+        r.finish()?;
+        book.validate().map_err(|_| SnapshotWireError)?;
+        Ok(book)
+    }
+
     /// 创建空的 StopBook。
     pub fn new() -> Self {
         Self::default()
@@ -647,6 +795,75 @@ mod tests {
 
     fn allocator() -> StopPriorityAllocator {
         StopPriorityAllocator::new(QueuePriorityPolicy::try_new(1024).unwrap())
+    }
+
+    #[test]
+    fn snapshot_preserves_expiry_insertion_order_and_rejects_truncation() {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+        let mut book = StopBook::new();
+        let mut priorities = allocator();
+        for (id, price) in [(1, 120), (2, 80), (3, 100)] {
+            book.insert(
+                limit(
+                    id,
+                    Side::Buy,
+                    price,
+                    TriggerExpiry::Gtd {
+                        expire_at: LogicalTime::new(20),
+                    },
+                ),
+                LogicalTime::new(1),
+                3,
+                &mut priorities,
+            )
+            .unwrap();
+        }
+        let mut writer = SnapshotEncoder::new(4096);
+        book.write_snapshot(&mut writer).unwrap();
+        let bytes = writer.finish();
+        let mut reader = SnapshotDecoder::new(&bytes, 4096).unwrap();
+        let mut restored = StopBook::read_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(book, restored);
+        assert_eq!(
+            restored
+                .expire_gtd_through(LogicalTime::new(20))
+                .iter()
+                .map(|(o, _)| o.order_id().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for end in 0..bytes.len() {
+            let mut reader = SnapshotDecoder::new(&bytes[..end], 4096).unwrap();
+            assert!(StopBook::read_snapshot(&mut reader).is_err());
+        }
+        let mut corrupt = bytes.clone();
+        let end = corrupt.len();
+        let first_id: [u8; 16] = corrupt[end - 52..end - 36].try_into().unwrap();
+        corrupt[end - 36..end - 20].copy_from_slice(&first_id);
+        let mut reader = SnapshotDecoder::new(&corrupt, 4096).unwrap();
+        assert!(StopBook::read_snapshot(&mut reader).is_err());
+    }
+
+    #[test]
+    fn canonical_state_changes_when_active_stop_priority_changes() {
+        use matching_domain::snapshot_wire::SnapshotEncoder;
+        let mut book = StopBook::new();
+        let mut priorities = allocator();
+        book.insert(
+            limit(1, Side::Buy, 100, TriggerExpiry::Gtc),
+            LogicalTime::new(1),
+            3,
+            &mut priorities,
+        )
+        .unwrap();
+        let mut before = SnapshotEncoder::new(1024);
+        book.write_canonical_state(&mut before).unwrap();
+        book.buy_stops.values_mut().next().unwrap()[0].priority =
+            matching_domain::StopPriority::new(8);
+        let mut after = SnapshotEncoder::new(1024);
+        book.write_canonical_state(&mut after).unwrap();
+        assert_ne!(before.finish(), after.finish());
     }
 
     #[test]

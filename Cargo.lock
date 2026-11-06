@@ -250,6 +250,7 @@ dependencies = [
  "matching-persistence",
  "matching-risk",
  "same-file",
+ "sha2",
 ]
 
 [[package]]

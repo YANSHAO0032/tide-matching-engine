@@ -143,6 +143,56 @@ pub struct ReservationRegistry {
 }
 
 impl ReservationRegistry {
+    /// 按预留身份顺序保存金融状态及待后置处理归属。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotEncoder, SnapshotWireError};
+        self.validate_bindings(&self.bindings)
+            .map_err(|_| SnapshotWireError)?;
+        let mut w = SnapshotEncoder::new(256 * 1024 * 1024);
+        w.u32(u32::try_from(self.states.len()).map_err(|_| SnapshotWireError)?)?;
+        for state in self.states.values() {
+            crate::encode_reservation_snapshot(&mut w, state)?;
+            w.u8(u8::from(self.is_pending_r2(state.reservation_id)))?;
+        }
+        writer.bytes(&w.finish())
+    }
+
+    /// 恢复登记表并通过原始构造入口重建及验证归属。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotWireError};
+        let bytes = reader.bytes()?;
+        let mut r = SnapshotDecoder::new(bytes, 256 * 1024 * 1024)?;
+        let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+        if count > r.remaining() / 5 {
+            return Err(SnapshotWireError);
+        }
+        let mut states = Vec::new();
+        states.try_reserve(count).map_err(|_| SnapshotWireError)?;
+        let mut pending = Vec::new();
+        pending.try_reserve(count).map_err(|_| SnapshotWireError)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let state = crate::decode_reservation_snapshot(&mut r)?;
+            if previous.is_some_and(|id| id >= state.reservation_id) {
+                return Err(SnapshotWireError);
+            }
+            previous = Some(state.reservation_id);
+            match r.u8()? {
+                0 => {}
+                1 => pending.push(state.reservation_id),
+                _ => return Err(SnapshotWireError),
+            }
+            states.push(state);
+        }
+        r.finish()?;
+        Self::new_with_pending_r2(states, pending).map_err(|_| SnapshotWireError)
+    }
+
     /// 校验独立令牌并冻结新订单预留，调用方须提供可信敞口和费率。
     pub fn plan_new_reservation(
         &self,

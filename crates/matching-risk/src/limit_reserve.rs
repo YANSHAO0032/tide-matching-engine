@@ -37,6 +37,49 @@ pub enum LimitReserveError {
 }
 
 impl LimitReservePolicy {
+    /// 写入可信限价预留策略的完整配置。
+    pub fn write_snapshot(
+        &self,
+        writer: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotEncoder, SnapshotWireError, encode_market_math,
+        };
+        let mut body = SnapshotEncoder::new(64);
+        body.u32(self.base.get())?;
+        body.u32(self.quote.get())?;
+        encode_market_math(&mut body, &self.math)?;
+        body.u64(self.fee_schedule_version)?;
+        body.u32(self.fee_tier_id)?;
+        body.u16(self.fee_bps)?;
+        writer.bytes(&body.finish()).map_err(|_| SnapshotWireError)
+    }
+    /// 恢复并重新验证资产、缩放及费率配置。
+    pub fn read_snapshot(
+        reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
+    ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::{
+            SnapshotDecoder, SnapshotWireError, decode_market_math,
+        };
+        let bytes = reader.bytes()?;
+        let mut r = SnapshotDecoder::new(bytes, 64)?;
+        let base = AssetId::new(r.u32()?);
+        let quote = AssetId::new(r.u32()?);
+        let math = decode_market_math(&mut r)?;
+        let version = r.u64()?;
+        let tier = r.u32()?;
+        let bps = r.u16()?;
+        r.finish()?;
+        Self::new(
+            (base, math.qty_scale()),
+            (quote, math.quote_scale()),
+            math,
+            version,
+            tier,
+            bps,
+        )
+        .map_err(|_| SnapshotWireError)
+    }
     /// 使用可信市场数值配置及锁定费率创建策略。
     /// 基础资产和报价资产参数分别包含身份与十进制缩放位数，
     /// 缩放位数须与 `MarketMath` 的数量和报价缩放位数对应。
