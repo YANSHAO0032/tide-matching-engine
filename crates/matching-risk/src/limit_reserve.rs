@@ -113,6 +113,17 @@ impl LimitReservePolicy {
         self.math
     }
 
+    /// 在资产精度不变时更新市场数值规则，保留可信资产和费率配置。
+    /// 调用方须先校验历史金额引用及市场状态。
+    pub fn with_market_math(&self, math: MarketMath) -> Result<Self, LimitReserveError> {
+        if (self.math.qty_scale(), self.math.quote_scale())
+            != (math.qty_scale(), math.quote_scale())
+        {
+            return Err(LimitReserveError::InvalidPolicy);
+        }
+        Ok(Self { math, ..*self })
+    }
+
     /// 返回锁定的费率版本。
     pub const fn fee_schedule_version(&self) -> u64 {
         self.fee_schedule_version

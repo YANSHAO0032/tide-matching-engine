@@ -1,7 +1,8 @@
 use crate::reservation_release_reason::ReservationReleaseReason;
 use crate::{
-    AmendedQuantity, CancelReason, OrderId, Price, ProtectionSource, Qty, QuoteAmount,
-    RejectReason, ReservationId, TradeEvent, TriggeredOrderKind, UserId,
+    AmendedQuantity, CancelReason, ExpireReason, MarketId, MarketState, MarketStateReason, OrderId,
+    Price, ProtectionSource, Qty, QuoteAmount, RejectReason, ReservationId, TradeEvent,
+    TriggeredOrderKind, UserId,
 };
 
 /// 订单终结时的业务余量。
@@ -20,6 +21,48 @@ pub enum OrderRemaining {
 /// 它不是完整持久化事件封装：不携带市场事件序列、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
+    /// 订单因到期或交易时段结束而终结。
+    OrderExpired {
+        /// 已终结的订单身份。
+        order_id: OrderId,
+        /// 稳定到期原因。
+        reason: ExpireReason,
+    },
+    /// 市场已创建。
+    MarketCreated {
+        /// 新市场身份。
+        market_id: MarketId,
+    },
+    /// 市场配置已更新。
+    MarketConfigUpdated {
+        /// 已更新市场身份。
+        market_id: MarketId,
+    },
+    /// 交易时段已开始。
+    SessionStarted {
+        /// 市场身份。
+        market_id: MarketId,
+        /// 新时段身份。
+        session_id: u64,
+    },
+    /// 交易时段已结束。
+    SessionEnded {
+        /// 市场身份。
+        market_id: MarketId,
+        /// 已结束时段身份。
+        session_id: u64,
+    },
+    /// 市场业务状态发生确定性转换。
+    MarketStateChanged {
+        /// 市场身份。
+        market_id: MarketId,
+        /// 转换前状态。
+        old: MarketState,
+        /// 转换后状态。
+        new: MarketState,
+        /// 稳定转换原因。
+        reason: MarketStateReason,
+    },
     /// 用户控制下限已推进或保持。
     UserControlEpochAdvanced {
         /// 用户身份。

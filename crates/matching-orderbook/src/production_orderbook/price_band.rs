@@ -4,6 +4,10 @@ use super::ProductionOrderBook;
 use matching_domain::{Price, RejectReason};
 
 impl ProductionOrderBook {
+    /// 判断指定来源的最新参考价格是否存在。
+    pub fn has_reference_price(&self, kind: matching_domain::PriceReferenceKind) -> bool {
+        self.reference_prices.latest(kind).is_some()
+    }
     /// 设置可选价格带及其对应的市场数值规则，非法基点不得改变配置。
     pub fn set_price_band_config(
         &mut self,
@@ -30,7 +34,7 @@ impl ProductionOrderBook {
     }
 
     /// 从指定来源当前参考价冻结包含式价格带。
-    pub(super) fn price_band_bounds(&self) -> Result<Option<(Price, Price)>, RejectReason> {
+    pub fn price_band_bounds(&self) -> Result<Option<(Price, Price)>, RejectReason> {
         self.price_band
             .map(|(band, math)| {
                 let reference = self

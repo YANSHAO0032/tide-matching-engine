@@ -12,6 +12,10 @@ pub struct SnapshotEncoder {
     limit: usize,
 }
 impl SnapshotEncoder {
+    /// 在一次容量检查后追加完整字节，失败时不改变已有编码。
+    pub fn raw_bytes(&mut self, value: &[u8]) -> Result<(), SnapshotWireError> {
+        self.raw(value)
+    }
     /// 创建空编码器，并固定允许的总字节数。
     pub fn new(limit: usize) -> Self {
         Self {
@@ -598,13 +602,26 @@ pub fn decode_reject_reason(
     use crate::RejectReason::*;
     Ok(match reader.u16()? {
         1001 => MarketNotFound,
+        1002 => MarketNotOpen,
+        1003 => MarketHalted,
+        1004 => MarketSuspended,
+        1005 => MarketClosed,
+        1006 => PreOpenWouldCross,
         1008 => MigrationInProgress,
         1009 => StaleRouteEpoch,
+        1010 => InvalidMarketStateTransition,
+        1011 => MarketConfigInvalidTick,
+        1012 => MarketConfigInvalidLot,
+        1013 => MarketConfigUnsupportedScale,
+        1014 => MarketConfigNonIntegralQuoteUnit,
+        1015 => MarketConfigArithmeticOverflow,
         2001 => InvalidOrderCombination,
         2002 => InvalidPrice,
         2003 => InvalidQty,
         2004 => InvalidTick,
         2005 => InvalidLot,
+        2006 => MinNotional,
+        2007 => MaxNotional,
         2008 => DuplicateOrderId,
         2009 => DuplicateClientOrderId,
         2010 => OrderNotFound,

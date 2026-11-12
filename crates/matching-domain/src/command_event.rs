@@ -67,9 +67,105 @@ pub struct ApplyUserControlFenceShard {
     pub expected_primary_epoch: u64,
 }
 
+/// 在已关闭市场启动新交易时段的持久命令载荷。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartSession {
+    /// 要启动时段的市场身份。
+    pub market_id: MarketId,
+    /// 新交易时段身份。
+    pub new_session_id: u64,
+}
+
+/// 创建市场的完整可信候选配置。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateMarket {
+    /// 待创建市场及其初始配置。
+    pub config: crate::MarketConfig,
+}
+/// 更新已存在市场配置的目标值。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateMarket {
+    /// 更新后的完整市场配置。
+    pub config: crate::MarketConfig,
+}
+/// 开放指定市场的当前交易时段。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenMarket {
+    /// 市场身份。
+    pub market_id: MarketId,
+    /// 待开放的当前时段身份。
+    pub session_id: u64,
+}
+/// 人工暂停指定市场。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuspendMarket {
+    /// 市场身份。
+    pub market_id: MarketId,
+}
+/// 恢复暂停或停止的市场。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeMarket {
+    /// 市场身份。
+    pub market_id: MarketId,
+}
+/// 结束指定市场的交易时段。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndSession {
+    /// 市场身份。
+    pub market_id: MarketId,
+    /// 待结束的当前时段身份。
+    pub session_id: u64,
+}
+/// 关闭市场并按照配置终结活动订单。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseMarket {
+    /// 市场身份。
+    pub market_id: MarketId,
+}
+
 /// 当前具有实际载荷的正式业务命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// 创建市场及其初始配置。
+    CreateMarket(
+        /// 完整初始配置。
+        Box<CreateMarket>,
+    ),
+    /// 更新市场配置。
+    UpdateMarket(
+        /// 完整目标配置。
+        Box<UpdateMarket>,
+    ),
+    /// 在关闭的市场启动新的交易时段。
+    StartSession(
+        /// 市场与新时段身份。
+        StartSession,
+    ),
+    /// 开放指定交易时段。
+    OpenMarket(
+        /// 市场及时段载荷。
+        OpenMarket,
+    ),
+    /// 人工暂停市场。
+    SuspendMarket(
+        /// 市场身份载荷。
+        SuspendMarket,
+    ),
+    /// 恢复暂停市场。
+    ResumeMarket(
+        /// 市场身份载荷。
+        ResumeMarket,
+    ),
+    /// 结束当前时段。
+    EndSession(
+        /// 市场及时段载荷。
+        EndSession,
+    ),
+    /// 关闭市场。
+    CloseMarket(
+        /// 市场身份载荷。
+        CloseMarket,
+    ),
     /// 处理单分片用户栅栏。
     ApplyUserControlFenceShard(
         /// 分片内用户控制操作的完整载荷。

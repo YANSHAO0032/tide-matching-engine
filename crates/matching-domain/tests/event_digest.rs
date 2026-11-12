@@ -60,14 +60,38 @@ fn canonical_event_encoding_preserves_identity_and_selected_payload() {
 #[test]
 fn all_current_event_variants_have_distinct_versioned_encodings() {
     use matching_domain::{
-        AmendedQuantity, CancelReason, OrderRemaining, Price, ProtectionSource, Qty, QuoteAmount,
-        RejectReason, ReservationId, ReservationReleaseReason, Side, TradeEvent, TradeId,
-        TriggeredOrderKind, UserId, encode_event_for_hash,
+        AmendedQuantity, CancelReason, MarketState, MarketStateReason, OrderRemaining, Price,
+        ProtectionSource, Qty, QuoteAmount, RejectReason, ReservationId, ReservationReleaseReason,
+        Side, TradeEvent, TradeId, TriggeredOrderKind, UserId, encode_event_for_hash,
     };
     let id = OrderId(1);
     let price = Price::try_new(10).unwrap();
     let qty = Qty::try_new(2).unwrap();
     let variants = vec![
+        EngineEvent::OrderExpired {
+            order_id: id,
+            reason: matching_domain::ExpireReason::SessionEnded,
+        },
+        EngineEvent::MarketCreated {
+            market_id: MarketId(4),
+        },
+        EngineEvent::MarketConfigUpdated {
+            market_id: MarketId(4),
+        },
+        EngineEvent::SessionStarted {
+            market_id: MarketId(4),
+            session_id: 3,
+        },
+        EngineEvent::SessionEnded {
+            market_id: MarketId(4),
+            session_id: 3,
+        },
+        EngineEvent::MarketStateChanged {
+            market_id: MarketId(4),
+            old: MarketState::Closed,
+            new: MarketState::PreOpen,
+            reason: MarketStateReason::SessionStarted,
+        },
         EngineEvent::UserControlEpochAdvanced {
             user_id: UserId(3),
             epoch: 4,
@@ -143,5 +167,5 @@ fn all_current_event_variants_have_distinct_versioned_encodings() {
         encode_event_for_hash(&mut w, &event).unwrap();
         assert!(seen.insert(w.finish()));
     }
-    assert_eq!(seen.len(), 14);
+    assert_eq!(seen.len(), 20);
 }

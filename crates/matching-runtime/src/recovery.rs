@@ -48,7 +48,9 @@ pub fn recover_snapshot_records(
 }
 
 /// 使用可信市场初始策略构造无快照基线，并在同一清单锁下读取 WAL。
-pub(crate) fn recover_snapshot_records_with_genesis(
+///
+/// 调用方必须独占 WAL 和快照目录，并保证策略与市场最初启动时一致。
+pub fn recover_snapshot_records_with_genesis(
     wal: impl AsRef<Path>,
     snapshot_dir: impl AsRef<Path>,
     manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,

@@ -2,7 +2,7 @@ use crate::{ExpireReason, OrderId};
 
 /// 最小的订单到期业务结果。
 ///
-/// 它不代表持久化事件封装，后续协议层再将其映射到完整事件载荷。
+/// 此值本身不包含事件身份；管理命令可将它映射到完整到期事件载荷。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiredOrder {
     /// 已从活动状态删除的订单标识符。

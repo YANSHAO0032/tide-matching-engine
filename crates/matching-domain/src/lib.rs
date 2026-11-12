@@ -30,6 +30,10 @@ pub mod limit_execution;
 pub mod limit_order;
 /// 不依赖系统时钟的逻辑时间值。
 pub mod logical_time;
+/// 市场静态配置和发布前校验。
+pub mod market_config;
+/// 市场交易状态及交易时段转换。
+pub mod market_lifecycle;
 /// 市场整数金额换算的已验证配置与内部错误分类。
 pub mod market_math;
 /// 市价输入、执行结果与固定参考价的保护边界。
@@ -81,6 +85,16 @@ pub use ids::{
     AssetId, ClusterId, CommandId, MarketId, OrderId, OriginSessionId, ReservationId, ShardId,
     TradeId, UserId,
 };
+/// 市场静态配置及其限制。
+pub use market_config::{
+    ClosePolicy, ExecutionLimits, ManagedMarket, MarketConfig, MarketConfigError,
+    MarketConfigUpdateChecks, MarketConfigUpdateError, OrderLimits,
+};
+/// 市场生命周期及其状态。
+pub use market_lifecycle::{
+    MarketLifecycle, MarketMathUpdateError, MarketState, MarketStateReason,
+    validate_market_math_update,
+};
 
 /// 改单载荷、数量模式及纯候选计算。
 pub use amend_order::{
@@ -96,8 +110,9 @@ pub use cancel_replace::{
 };
 /// 正式命令及事件的进程内身份封装。
 pub use command_event::{
-    ApplyUserControlFenceShard, Command, CommandEnvelope, CommandResultSummary, CommandStatus,
-    EventEnvelope, PlaceLimitOrder, UserFenceAction,
+    ApplyUserControlFenceShard, CloseMarket, Command, CommandEnvelope, CommandResultSummary,
+    CommandStatus, CreateMarket, EndSession, EventEnvelope, OpenMarket, PlaceLimitOrder,
+    ResumeMarket, StartSession, SuspendMarket, UpdateMarket, UserFenceAction,
 };
 /// 正式命令的版本化持久编码与解码。
 pub use command_wal_codec::{CommandCodecError, decode_wal_command, encode_wal_command};

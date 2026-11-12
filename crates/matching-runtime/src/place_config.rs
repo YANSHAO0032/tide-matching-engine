@@ -27,6 +27,8 @@ pub struct PlaceSupportConfig {
     pub(crate) policies: BTreeMap<MarketId, LimitReservePolicy>,
     /// 分片内资源边界。
     pub(crate) limits: PlaceLimits,
+    /// 是否要求市场先通过持久管理命令创建。
+    pub(crate) managed_only: bool,
 }
 
 /// 正式下单配置不满足市场唯一性或容量约束。
@@ -57,7 +59,13 @@ impl PlaceSupportConfig {
             keys,
             policies: ordered,
             limits,
+            managed_only: false,
         })
+    }
+    /// 要求正式业务变更仅作用于已创建的受管理市场。
+    pub fn require_managed_markets(mut self) -> Self {
+        self.managed_only = true;
+        self
     }
 }
 

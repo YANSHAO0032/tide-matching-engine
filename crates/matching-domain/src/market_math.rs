@@ -2,7 +2,7 @@ use crate::{Price, Qty, QuoteAmount, RejectReason};
 
 /// 创建 MarketMath 数值配置时的内部校验失败分类。
 ///
-/// 这些分类尚未进入线协议；管理命令接入时须另行冻结映射。
+/// 该枚举本身不是线协议；市场管理命令通过 `MarketConfigError` 映射到稳定拒绝码。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathConfigError {
     /// tick_size 不是严格正的 Price 原始值步长。

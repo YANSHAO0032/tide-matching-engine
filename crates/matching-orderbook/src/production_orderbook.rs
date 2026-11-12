@@ -137,6 +137,23 @@ pub struct ProductionOrderBook {
 }
 
 impl ProductionOrderBook {
+    /// 返回当前市场普通及 Stop 优先级分配器共用的策略。
+    pub fn priority_policy(&self) -> QueuePriorityPolicy {
+        *self.queue_priority_allocator.policy()
+    }
+    /// 原子更新两个优先级分配器的保护策略，保持各自计数器不变。
+    pub fn update_priority_policy(
+        &mut self,
+        policy: QueuePriorityPolicy,
+    ) -> Result<(), RejectReason> {
+        let queue = QueuePriorityAllocator::try_restore(policy, self.next_queue_priority())
+            .map_err(|_| RejectReason::PrioritySpaceExhaustion)?;
+        let stop = StopPriorityAllocator::try_restore(policy, self.next_stop_priority())
+            .map_err(|_| RejectReason::PrioritySpaceExhaustion)?;
+        self.queue_priority_allocator = queue;
+        self.stop_priority_allocator = stop;
+        Ok(())
+    }
     /// 使用已验证的策略创建空簿，市场内优先级从零开始。
     pub fn new(policy: QueuePriorityPolicy) -> Self {
         Self {

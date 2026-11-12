@@ -81,6 +81,23 @@ fn samples() -> Vec<CommandEnvelope> {
     }
     out
 }
+
+#[test]
+fn start_session_wal_preserves_market_and_session() {
+    let command = envelope(Command::StartSession(StartSession {
+        market_id: MarketId(4),
+        new_session_id: 44,
+    }));
+    let bytes = encode_wal_command(&command).unwrap();
+    assert_eq!(
+        &bytes[bytes.len() - 13..],
+        &[3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 44]
+    );
+    assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+    for n in 0..bytes.len() {
+        assert!(decode_wal_command(&bytes[..n]).is_err());
+    }
+}
 #[test]
 fn complete_command_round_trip_and_truncation() {
     for value in samples() {

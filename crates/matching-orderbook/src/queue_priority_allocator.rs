@@ -318,7 +318,7 @@ impl QueuePriorityAllocator {
 
     /// 返回下一次成功分配将使用的原始数值。
     ///
-    /// 此值适合由未来持久化所有者保存和恢复；读取它不推进分配器。
+    /// 快照保存并恢复此值；读取它不推进分配器。
     pub fn next(&self) -> u128 {
         self.next
     }

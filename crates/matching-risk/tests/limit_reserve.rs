@@ -2,6 +2,29 @@ use matching_domain::{AssetId, MarketMath, Price, Qty, Side};
 use matching_risk::LimitReservePolicy;
 
 #[test]
+fn market_math_update_preserves_fee_and_rejects_asset_scale_changes() {
+    let original = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let policy =
+        LimitReservePolicy::new((AssetId(1), 0), (AssetId(2), 0), original, 7, 3, 1).unwrap();
+    let next = MarketMath::try_new(0, 0, 0, 2, 1).unwrap();
+    let updated = policy.with_market_math(next).unwrap();
+    assert_eq!(updated.market_math(), next);
+    assert_eq!(updated.fee_schedule_version(), 7);
+    assert_eq!(updated.fee_tier_id(), 3);
+    let changed_price_scale = MarketMath::try_new(1, 0, 0, 10, 1).unwrap();
+    assert_eq!(
+        policy
+            .with_market_math(changed_price_scale)
+            .unwrap()
+            .market_math(),
+        changed_price_scale
+    );
+    let changed_scale = MarketMath::try_new(1, 0, 1, 1, 1).unwrap();
+    assert!(policy.with_market_math(changed_scale).is_err());
+    assert_eq!(policy.market_math(), original);
+}
+
+#[test]
 fn buy_reserves_principal_and_per_lot_rounded_fee() {
     let policy = LimitReservePolicy::new(
         (AssetId(1), 0),

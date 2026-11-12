@@ -6,10 +6,32 @@
 pub enum RejectReason {
     /// 查询或命令指定的市场不存在于当前执行单元。
     MarketNotFound = 1001,
+    /// 当前市场未开放所请求的业务操作。
+    MarketNotOpen = 1002,
+    /// 市场因风控或熔断停止新增及改单。
+    MarketHalted = 1003,
+    /// 市场因人工暂停停止新增及改单。
+    MarketSuspended = 1004,
+    /// 市场已关闭，不能接受该业务操作。
+    MarketClosed = 1005,
+    /// 开市前的限价订单将穿越对手最优价。
+    PreOpenWouldCross = 1006,
     /// 市场正在迁移，入口暂不接收该市场的变更。
     MigrationInProgress = 1008,
     /// 请求携带的路由版本或分片归属已经失效。
     StaleRouteEpoch = 1009,
+    /// 管理命令不符合当前市场状态转换规则。
+    InvalidMarketStateTransition = 1010,
+    /// 市场配置的价格步长无效。
+    MarketConfigInvalidTick = 1011,
+    /// 市场配置的数量步长无效。
+    MarketConfigInvalidLot = 1012,
+    /// 市场配置的精度因子不可表示。
+    MarketConfigUnsupportedScale = 1013,
+    /// 最小价格和数量步长的本金不是报价资产的整数原子。
+    MarketConfigNonIntegralQuoteUnit = 1014,
+    /// 计算市场配置的最小本金时发生溢出。
+    MarketConfigArithmeticOverflow = 1015,
     /// 当前执行入口不支持该订单类型、有效期或标志组合。
     InvalidOrderCombination = 2001,
     /// 价格原始整数不是该字段要求的严格正值。
@@ -20,6 +42,10 @@ pub enum RejectReason {
     InvalidTick = 2004,
     /// 数量不符合市场 lot_size 的对齐要求。
     InvalidLot = 2005,
+    /// 订单本金低于市场最小值。
+    MinNotional = 2006,
+    /// 订单本金超过市场最大值。
+    MaxNotional = 2007,
     /// 同一订单簿内已存在相同的订单身份。
     DuplicateOrderId = 2008,
     /// 用户的客户端订单身份仍被活动订单或终结保留窗口占用。
