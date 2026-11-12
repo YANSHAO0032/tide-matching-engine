@@ -118,6 +118,12 @@ q_{\max}=L_{\max}\cdot l.
 S=\sum_i a_i, \qquad U=B-S, \qquad S+U=B, \qquad 0\leq S\leq B.
 ```
 
+报价预算止损单尚未触发时，若新的单笔本金上限为 $`M_{\mathrm{new}}`$，以下条件保证该上限不低于订单预算，因此也不低于其实际成交本金：
+
+```math
+M_{\mathrm{new}}\geq B\geq S.
+```
+
 费用的取整策略独立于本金计算。本金必须精确；费用的向上、向下或其他取整只能由冻结的费率策略明确规定。
 
 ## 连续持久前缀与提交水位
@@ -291,6 +297,16 @@ P_{\mathrm{bps,sell}}
 ```
 
 市场价格带以相同计算得到上界 $`P_{\mathrm{band,upper}}=P_{\mathrm{bps,buy}}`$ 和下界 $`P_{\mathrm{band,lower}}=P_{\mathrm{bps,sell}}`$。限价必须处于包含两个端点的区间内；若下界大于上界，区间内没有合法 tick 价格。非法的滑点或价格带偏离基点统一以 `InvalidSlippageBps = 3007` 拒绝。
+
+当参考价格和 tick 不变、两个配置的边界均可表示时，增大偏离基点不会收窄价格带：
+
+```math
+b_{\mathrm{new}}\geq b_{\mathrm{old}}
+\quad\Longrightarrow\quad
+P_{\mathrm{band,lower}}(b_{\mathrm{new}})\leq P_{\mathrm{band,lower}}(b_{\mathrm{old}}),
+\quad
+P_{\mathrm{band,upper}}(b_{\mathrm{new}})\geq P_{\mathrm{band,upper}}(b_{\mathrm{old}}).
+```
 
 对非负整数 $`a`$ 与正整数 $`d`$，向上除法以商 $`q`$ 和余数 $`u`$ 表示：
 

@@ -9,6 +9,8 @@ use crate::{
 pub enum CancelReason {
     /// 分片本地批量撤单命中活动订单时终结。
     MassCancel = 1102,
+    /// 市场关闭时终结非 DAY 活动订单。
+    MarketClosed = 1104,
     /// 自成交防护按 CancelMaker 终结挂单。
     SelfTradePreventionMaker = 1106,
     /// 自成交防护按 CancelTaker 终结吃单余量。

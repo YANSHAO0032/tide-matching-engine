@@ -83,6 +83,17 @@ fn outcome_matches(command: &Command, outcome: &FormalOutcome) -> bool {
             *epoch >= fence.new_epoch
         }
         (Command::MassCancelShard(_), FormalOutcome::MassCancel(_)) => true,
+        (
+            Command::CreateMarket(_)
+            | Command::UpdateMarket(_)
+            | Command::StartSession(_)
+            | Command::OpenMarket(_)
+            | Command::SuspendMarket(_)
+            | Command::ResumeMarket(_)
+            | Command::EndSession(_)
+            | Command::CloseMarket(_),
+            FormalOutcome::MarketManaged,
+        ) => true,
         _ => false,
     }
 }
@@ -178,6 +189,7 @@ impl DedupWindow {
             w.bytes(&command)?;
             w.u64(entry.seq)?;
             match entry.outcome {
+                FormalOutcome::MarketManaged => w.u8(4)?,
                 FormalOutcome::Placed(id) => {
                     w.u8(0)?;
                     w.u128(id.get())?
@@ -294,6 +306,7 @@ impl DedupWindow {
                     canceled_orders: r.u64()?,
                 }),
                 3 => FormalOutcome::Rejected(decode_reject_reason(&mut r)?),
+                4 => FormalOutcome::MarketManaged,
                 _ => return Err(SnapshotWireError),
             };
             if !outcome_matches(&command.payload, &outcome) {
@@ -582,6 +595,32 @@ mod tests {
             event_range: Some((0, 0)),
             deduplicated: false,
         }
+    }
+    #[test]
+    fn snapshot_restores_successful_market_management_dedup() {
+        use matching_domain::{
+            Command, StartSession,
+            snapshot_wire::{SnapshotDecoder, SnapshotEncoder},
+        };
+        let config = IdempotencyConfig::default();
+        let mut window = DedupWindow::new(config).unwrap();
+        let mut command = cmd(1, 1, 1, 7);
+        command.payload = Command::StartSession(StartSession {
+            market_id: MarketId(7),
+            new_session_id: 8,
+        });
+        let mut outcome = result(1, 1);
+        outcome.outcome = FormalOutcome::MarketManaged;
+        window.insert(&command, &outcome);
+        let mut encoder = SnapshotEncoder::new(4096);
+        window.write_snapshot(&mut encoder).unwrap();
+        let bytes = encoder.finish();
+        let mut decoder = SnapshotDecoder::new(&bytes, 4096).unwrap();
+        let restored = DedupWindow::read_snapshot(&mut decoder, config, 1).unwrap();
+        decoder.finish().unwrap();
+        let replay = restored.lookup(&command).unwrap().unwrap();
+        assert!(replay.deduplicated);
+        assert_eq!(replay.outcome, FormalOutcome::MarketManaged);
     }
     #[test]
     fn retries_do_not_refresh_fifo_and_eviction_removes_aliases() {

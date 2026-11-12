@@ -117,6 +117,8 @@ pub struct FormalExecution {
 /// 正式命令的有类型结果，不作为业务事件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormalOutcome {
+    /// 市场管理命令成功，详细变化按事件顺序返回。
+    MarketManaged,
     /// 正式限价命令成功接收的订单身份。
     Placed(
         /// 已接受的订单身份。
@@ -212,6 +214,8 @@ pub struct SnapshotImage {
     routes: Arc<RouteTable>,
     /// 各市场完整订单簿副本。
     markets: BTreeMap<MarketId, ProductionOrderBook>,
+    /// 已启用管理状态机的市场及其持久配置。
+    managed_markets: BTreeMap<MarketId, matching_domain::ManagedMarket>,
     /// 完整的预留登记表副本。
     registry: Option<ReservationRegistry>,
     /// 分片用户控制下限副本。
@@ -487,6 +491,9 @@ impl Shard {
             .replay()
             .map_err(|_| ShardError::InvalidConfig)?
             .image;
+        if !image.managed_markets.is_empty() && image.place.is_none() {
+            return Err(ShardError::InvalidConfig);
+        }
         let ownership = crate::ownership::MarketOwnership::acquire(
             image.cluster,
             image.shard,
@@ -1165,7 +1172,7 @@ impl Shard {
         image: SnapshotImage,
         trusted: &SnapshotRestoreConfig,
     ) -> Result<Self, ShardError> {
-        if !image.start_allowed {
+        if !image.start_allowed || !image.managed_markets.is_empty() {
             return Err(ShardError::InvalidConfig);
         }
         let bytes = image
@@ -1217,6 +1224,17 @@ impl Shard {
             Option<crate::ownership::MarketOwnership>,
         ),
     ) -> Result<Self, ShardError> {
+        if durable.is_none()
+            && (place_config
+                .as_ref()
+                .is_some_and(|config| config.managed_only)
+                || restored
+                    .as_ref()
+                    .and_then(|image| image.place.as_ref())
+                    .is_some_and(|state| state.config.managed_only))
+        {
+            return Err(ShardError::InvalidConfig);
+        }
         let mut user_epochs =
             UserControlEpochs::new(user_capacity).map_err(|()| ShardError::InvalidConfig)?;
         if !idempotency.valid() {
@@ -1285,10 +1303,12 @@ impl Shard {
             None
         };
         let mut initial_sequence = Sequencer::new();
+        let mut managed_markets = BTreeMap::new();
         if let Some(image) = restored {
             initial_sequence = Sequencer::from_last_applied(image.snapshot_seq)
                 .map_err(|_| ShardError::InvalidConfig)?;
             markets = image.markets;
+            managed_markets = image.managed_markets;
             registry = image.registry;
             user_epochs = image.user_epochs;
             dedup = image.dedup;
@@ -1344,7 +1364,24 @@ impl Shard {
                     waiter.reset();
                     match msg {
                         Message::Formal(command, reply)
-                            if durable.as_ref().is_some_and(|gate| gate.group.is_some()) =>
+                            if durable.as_ref().is_some_and(|gate| gate.group.is_some())
+                                || (durable.is_some()
+                                    && place_state.is_some()
+                                    && (place_state
+                                        .as_ref()
+                                        .is_some_and(|state| state.config.managed_only)
+                                        || !managed_markets.is_empty()
+                                        || matches!(
+                                            &command.payload,
+                                            Command::CreateMarket(_)
+                                                | Command::UpdateMarket(_)
+                                                | Command::StartSession(_)
+                                                | Command::OpenMarket(_)
+                                                | Command::SuspendMarket(_)
+                                                | Command::ResumeMarket(_)
+                                                | Command::EndSession(_)
+                                                | Command::CloseMarket(_)
+                                        ))) =>
                         {
                             let gate = durable.as_mut().expect("已检查批处理模式");
                             if place_state.is_some() {
@@ -1357,6 +1394,7 @@ impl Shard {
                                         dedup: dedup.as_mut().expect("已配置幂等窗口"),
                                         seq: &mut seq,
                                         markets: &mut markets,
+                                        managed_markets: &mut managed_markets,
                                         registry: &mut registry,
                                         place: &mut place_state,
                                         routes: &worker_routes,
@@ -1459,6 +1497,9 @@ impl Shard {
                                     (Err(reason), _, _) => Err(FormalError::Rejected(reason)),
                                     (Ok(()), Some(window), Some(state)) => execute_place(
                                         PlaceExecutionContext {
+                                            managed: command
+                                                .market_id
+                                                .and_then(|id| managed_markets.get(&id)),
                                             identity: FormalIdentity {
                                                 shard,
                                                 cluster,
@@ -1518,12 +1559,19 @@ impl Shard {
                             let _ = reply.send(result);
                         }
                         Message::Order(market, id, reply) => {
-                            let _ = reply.send(
+                            let exists = !place_state
+                                .as_ref()
+                                .is_some_and(|state| state.config.managed_only)
+                                || managed_markets.contains_key(&market);
+                            let result = if exists {
                                 markets
                                     .get(&market)
                                     .map(|book| book.order(id).cloned())
-                                    .ok_or(RejectReason::MarketNotFound),
-                            );
+                                    .ok_or(RejectReason::MarketNotFound)
+                            } else {
+                                Err(RejectReason::MarketNotFound)
+                            };
+                            let _ = reply.send(result);
                         }
                         Message::Barrier(id, reply) => {
                             let _ = reply.send((id, seq.last_applied()));
@@ -1561,6 +1609,7 @@ impl Shard {
                                     primary_epoch,
                                     routes: Arc::clone(&worker_routes),
                                     markets: markets.clone(),
+                                    managed_markets: managed_markets.clone(),
                                     registry: registry.clone(),
                                     user_epochs,
                                     dedup,
@@ -1669,6 +1718,8 @@ struct PlaceRuntimeState {
 
 /// 正式限价命令所需的单写者状态。
 struct PlaceExecutionContext<'a> {
+    /// 市场管理状态；未启用市场管理的既有入口为空。
+    managed: Option<&'a matching_domain::ManagedMarket>,
     /// 根事件身份与事件容量。
     identity: FormalIdentity,
     /// 根命令序号分配器。
@@ -1856,6 +1907,8 @@ struct FormalGroupContext<'a> {
     seq: &'a mut Sequencer,
     /// 真实订单簿集合。
     markets: &'a mut BTreeMap<MarketId, ProductionOrderBook>,
+    /// 真实市场管理候选状态。
+    managed_markets: &'a mut BTreeMap<MarketId, matching_domain::ManagedMarket>,
     /// 真实预留登记表。
     registry: &'a mut Option<ReservationRegistry>,
     /// 真实限价接入状态。
@@ -1875,6 +1928,8 @@ struct FormalBatchCandidate {
     fence: FenceBatchCandidate,
     /// 订单簿候选。
     markets: BTreeMap<MarketId, ProductionOrderBook>,
+    /// 批次内独立的市场管理状态。
+    managed_markets: BTreeMap<MarketId, matching_domain::ManagedMarket>,
     /// 预留候选。
     registry: Option<ReservationRegistry>,
     /// 客户端身份及可信限价配置候选。
@@ -1904,6 +1959,7 @@ impl FormalBatchCandidate {
                 context.now,
             )?,
             markets: context.markets.clone(),
+            managed_markets: context.managed_markets.clone(),
             registry: context.registry.clone(),
             place,
         })
@@ -1983,6 +2039,36 @@ impl FormalBatchCandidate {
         if matches!(command.payload, Command::ApplyUserControlFenceShard(_)) {
             return self.fence.stage(command);
         }
+        if matches!(
+            command.payload,
+            Command::CreateMarket(_)
+                | Command::UpdateMarket(_)
+                | Command::StartSession(_)
+                | Command::OpenMarket(_)
+                | Command::SuspendMarket(_)
+                | Command::ResumeMarket(_)
+                | Command::EndSession(_)
+                | Command::CloseMarket(_)
+        ) {
+            return execute_market_management(
+                MarketManagementContext {
+                    identity: FormalIdentity {
+                        shard: self.fence.shard,
+                        cluster: self.fence.cluster,
+                        event_capacity: u64::from(u32::MAX) + 1,
+                    },
+                    routes,
+                    seq: &mut self.fence.seq,
+                    clock: &self.fence.clock,
+                    markets: &mut self.markets,
+                    managed_markets: &mut self.managed_markets,
+                    dedup: &mut self.fence.dedup,
+                    place: &mut self.place,
+                    registry: &mut self.registry,
+                },
+                command,
+            );
+        }
         if let Command::PlaceLimit(ref place) = command.payload {
             let market = command
                 .market_id
@@ -2004,8 +2090,9 @@ impl FormalBatchCandidate {
                 .place
                 .as_mut()
                 .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
-            return execute_place(
+            let result = execute_place(
                 PlaceExecutionContext {
+                    managed: self.managed_markets.get(&market),
                     identity: FormalIdentity {
                         shard: self.fence.shard,
                         cluster: self.fence.cluster,
@@ -2021,8 +2108,14 @@ impl FormalBatchCandidate {
                 },
                 command,
             );
+            if matches!(&result, Ok(execution) if matches!(execution.outcome, FormalOutcome::Placed(_)))
+                && let Some(managed) = self.managed_markets.get_mut(&market)
+            {
+                managed.record_referenced_history();
+            }
+            return result;
         }
-        execute_formal_idempotent(
+        execute_formal_guarded(
             routes,
             FormalIdentity {
                 shard: self.fence.shard,
@@ -2031,7 +2124,7 @@ impl FormalBatchCandidate {
             },
             &mut self.fence.seq,
             &self.fence.clock,
-            &mut self.markets,
+            (&mut self.markets, &self.managed_markets),
             &mut self.registry,
             (command, &mut self.fence.dedup, &mut self.place, &mut None),
         )
@@ -2047,7 +2140,7 @@ fn execute_formal_group(
     gate: &mut LocalDurableCommit,
     context: FormalGroupContext<'_>,
 ) -> Option<Message> {
-    let (limit, delay) = gate.group.expect("仅批量模式调用");
+    let (limit, delay) = gate.group.unwrap_or((1, 1));
     let deadline = Instant::now()
         .checked_add(Duration::from_micros(delay))
         .expect("批量时限越界");
@@ -2117,6 +2210,7 @@ fn execute_formal_group(
     *context.dedup = candidate.fence.dedup;
     *context.seq = candidate.fence.seq;
     *context.markets = candidate.markets;
+    *context.managed_markets = candidate.managed_markets;
     *context.registry = candidate.registry;
     *context.place = candidate.place;
     for (reply, result) in replies {
@@ -2125,12 +2219,173 @@ fn execute_formal_group(
     deferred
 }
 
+/// 活单存在时只允许移除价格带或在同一参考来源上放宽偏离范围。
+fn active_band_update_safe(
+    old: Option<matching_domain::PriceBandConfig>,
+    next: Option<matching_domain::PriceBandConfig>,
+) -> bool {
+    match (old, next) {
+        (_, None) => true,
+        (Some(old), Some(next)) => {
+            old.reference_kind == next.reference_kind
+                && next.max_deviation_bps >= old.max_deviation_bps
+        }
+        (None, Some(_)) => false,
+    }
+}
+
+/// 根据新参考来源的价格带，确认全部已有价格均在新边界内。
+fn active_band_revalidation_safe(
+    book: &ProductionOrderBook,
+    next: Option<matching_domain::PriceBandConfig>,
+    math: matching_domain::MarketMath,
+) -> Result<bool, RejectReason> {
+    let Some(next) = next else {
+        return Ok(false);
+    };
+    if !book.has_reference_price(next.reference_kind) {
+        return Ok(false);
+    }
+    let candidate = prepare_price_band_update(book, Some(next), math)?;
+    let Some((lower, upper)) = candidate.price_band_bounds()? else {
+        return Ok(false);
+    };
+    Ok(book.reservation_snapshots().iter().all(|(id, _)| {
+        if let Some(node) = book.order(*id) {
+            let price = node.original_order().price;
+            return price >= lower && price <= upper;
+        }
+        match book.stop_order(*id) {
+            Some((matching_domain::StopOrder::Limit(order), _)) => {
+                order.price >= lower && order.price <= upper
+            }
+            Some((matching_domain::StopOrder::Market(_), _)) => true,
+            None => false,
+        }
+    }))
+}
+
+/// 在副本中发布价格带，并在参考价已存在时预检边界算术。
+fn prepare_price_band_update(
+    book: &ProductionOrderBook,
+    band: Option<matching_domain::PriceBandConfig>,
+    math: matching_domain::MarketMath,
+) -> Result<ProductionOrderBook, RejectReason> {
+    let mut candidate = book.clone();
+    candidate.set_price_band_config(band.map(|value| (value, math)))?;
+    if band.is_some_and(|value| candidate.has_reference_price(value.reference_kind)) {
+        candidate.price_band_bounds()?;
+    }
+    Ok(candidate)
+}
+
+/// 校验已经确认存在的参考价能生成可表示的价格带边界。
+fn checked_price_band_reference(
+    book: &ProductionOrderBook,
+    band: Option<matching_domain::PriceBandConfig>,
+) -> Result<(), RejectReason> {
+    if let Some(band) = band {
+        assert!(
+            book.price_band_config()
+                .is_some_and(|(current, _)| current == band),
+            "市场价格带状态不一致"
+        );
+        book.price_band_bounds()?;
+    }
+    Ok(())
+}
+
+/// 校验未触发止损单的目标限制；未知成交金额使用原限制或报价预算作为上界。
+fn stop_order_fits_limits(
+    stop: &matching_domain::StopOrder,
+    old: matching_domain::OrderLimits,
+    next: matching_domain::OrderLimits,
+    math: matching_domain::MarketMath,
+) -> bool {
+    if stop.stop_price().get() % math.tick_size() != 0 {
+        return false;
+    }
+    match stop {
+        matching_domain::StopOrder::Limit(order) => {
+            order.qty >= next.min_qty
+                && order.qty <= next.max_qty
+                && math
+                    .trade_notional(order.price, order.qty)
+                    .is_ok_and(|amount| amount >= next.min_notional && amount <= next.max_notional)
+        }
+        matching_domain::StopOrder::Market(order) => match order.quantity {
+            matching_domain::StopMarketQuantity::Base(qty) => {
+                next.min_notional <= old.min_notional
+                    && next.max_notional >= old.max_notional
+                    && qty >= next.min_qty
+                    && qty <= next.max_qty
+                    && qty.get() % math.lot_size() == 0
+            }
+            matching_domain::StopMarketQuantity::Quote(budget) => {
+                next.min_qty <= old.min_qty
+                    && next.max_qty >= old.max_qty
+                    && next.min_notional <= old.min_notional
+                    && (next.max_notional >= old.max_notional
+                        || next.max_notional.get() >= budget.get())
+            }
+        },
+    }
+}
+
+/// 校验受管理市场的状态、数量和本金限制，不改变订单簿。
+fn managed_place_preflight(
+    managed: Option<&matching_domain::ManagedMarket>,
+    managed_only: bool,
+    place: &matching_domain::PlaceLimitOrder,
+    book: &ProductionOrderBook,
+) -> Result<(), RejectReason> {
+    let Some(managed) = managed else {
+        return if managed_only {
+            Err(RejectReason::MarketNotFound)
+        } else {
+            Ok(())
+        };
+    };
+    let order = &place.order;
+    let crosses = match order.side {
+        matching_domain::Side::Buy => book
+            .best_price(matching_domain::Side::Sell)
+            .is_some_and(|price| order.price >= price),
+        matching_domain::Side::Sell => book
+            .best_price(matching_domain::Side::Buy)
+            .is_some_and(|price| order.price <= price),
+    };
+    managed
+        .lifecycle()
+        .check_limit_tif(matching_domain::TimeInForce::Gtc, crosses)?;
+    let config = managed.config();
+    if order.qty < config.order_limits.min_qty || order.qty > config.order_limits.max_qty {
+        return Err(RejectReason::InvalidQty);
+    }
+    let math = config.validate().expect("已持久化市场配置必须有效");
+    let notional = math
+        .trade_notional(order.price, order.qty)
+        .map_err(|error| {
+            error
+                .to_reject_reason()
+                .expect("有效市场配置必须产生整数本金")
+        })?;
+    if notional < config.order_limits.min_notional {
+        return Err(RejectReason::MinNotional);
+    }
+    if notional > config.order_limits.max_notional {
+        return Err(RejectReason::MaxNotional);
+    }
+    Ok(())
+}
+
 /// 完成预检后执行限价候选，事件容量有效时才一次安装全部后态。
 fn execute_place(
     context: PlaceExecutionContext<'_>,
     command: CommandEnvelope,
 ) -> Result<FormalExecution, FormalError> {
     let PlaceExecutionContext {
+        managed,
         identity,
         seq,
         clock,
@@ -2203,20 +2458,35 @@ fn execute_place(
     }
     let cursor = TradeIdCursor::new(identity.cluster, identity.shard, n);
     let book = markets.get_mut(&market).expect("已验证市场存在");
-    let planned = place_candidate(
-        PlacePlanningContext {
-            policy,
-            keys: &state.config.keys,
-            command_id: command.command_id,
-            session: command.session_id,
-            now: clock.now(),
-        },
-        place,
-        book,
-        registry,
-        ids,
-        &cursor,
-    );
+    let planned = managed_place_preflight(managed, state.config.managed_only, place, book)
+        .and_then(|()| {
+            place_candidate(
+                PlacePlanningContext {
+                    policy,
+                    keys: &state.config.keys,
+                    command_id: command.command_id,
+                    session: command.session_id,
+                    now: clock.now(),
+                },
+                place,
+                book,
+                registry,
+                ids,
+                &cursor,
+            )
+        });
+    if let (Some(managed), Ok(candidate)) = (managed, &planned) {
+        let trade_count = candidate
+            .events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::Trade(_)))
+            .count();
+        assert!(
+            u64::try_from(trade_count).is_ok_and(|count| count
+                <= u64::from(managed.config().execution_limits.max_trades_per_command)),
+            "单命令成交数量超过市场安全上限，分片停止"
+        );
+    }
     let (mut outcome, mut payloads, candidate) = match planned {
         Ok(candidate) => (
             FormalOutcome::Placed(place.order.order_id),
@@ -2278,6 +2548,446 @@ fn execute_place(
         let _cursor = candidate.cursor;
     }
     window.insert_prepared(&command, prepared, &result);
+    Ok(result)
+}
+
+/// 市场管理命令在当前独占候选内需要的上下文。
+struct MarketManagementContext<'a> {
+    /// 根事件的分片和容量约束。
+    identity: FormalIdentity,
+    /// 不可变的路由视图。
+    routes: &'a RouteTable,
+    /// 候选序号分配器。
+    seq: &'a mut Sequencer,
+    /// 当前逻辑时钟。
+    clock: &'a LogicalClock,
+    /// 候选普通订单簿与止损簿。
+    markets: &'a mut BTreeMap<MarketId, ProductionOrderBook>,
+    /// 候选市场配置和生命周期。
+    managed_markets: &'a mut BTreeMap<MarketId, matching_domain::ManagedMarket>,
+    /// 候选命令幂等窗口。
+    dedup: &'a mut DedupWindow,
+    /// 可信下单风险策略。
+    place: &'a mut Option<PlaceRuntimeState>,
+    /// 活动订单关联的预留登记表。
+    registry: &'a mut Option<ReservationRegistry>,
+}
+
+/// 在独立候选中执行已接入的市场管理命令；外层负责 WAL 提交与安装。
+fn execute_market_management(
+    context: MarketManagementContext<'_>,
+    command: CommandEnvelope,
+) -> Result<FormalExecution, FormalError> {
+    let MarketManagementContext {
+        identity,
+        routes,
+        seq,
+        clock,
+        markets,
+        managed_markets,
+        dedup,
+        place,
+        registry,
+    } = context;
+    let market = command
+        .market_id
+        .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
+    let route_epoch = command
+        .route_epoch
+        .ok_or(FormalError::Rejected(RejectReason::StaleRouteEpoch))?;
+    routes
+        .validate(market, identity.shard, route_epoch)
+        .map_err(FormalError::Rejected)?;
+    let payload_market = match &command.payload {
+        Command::CreateMarket(input) => input.config.market_id,
+        Command::UpdateMarket(input) => input.config.market_id,
+        Command::StartSession(input) => input.market_id,
+        Command::OpenMarket(input) => input.market_id,
+        Command::SuspendMarket(input) => input.market_id,
+        Command::ResumeMarket(input) => input.market_id,
+        Command::EndSession(input) => input.market_id,
+        Command::CloseMarket(input) => input.market_id,
+        _ => return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination)),
+    };
+    if payload_market != market || command.user_id.is_some() {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    let book = markets
+        .get(&market)
+        .ok_or(FormalError::Rejected(RejectReason::MarketNotFound))?;
+    if let Some(result) = dedup
+        .lookup(&command)
+        .map_err(|()| FormalError::ProtocolError)?
+    {
+        dedup.remember_alias(&command);
+        return Ok(result);
+    }
+    let prepared = dedup.prepare(&command);
+    let empty = book.best_price(matching_domain::Side::Buy).is_none()
+        && book.best_price(matching_domain::Side::Sell).is_none()
+        && book.stop_orders(matching_domain::Side::Buy).is_empty()
+        && book.stop_orders(matching_domain::Side::Sell).is_empty();
+    let mut cleanup = None;
+    let mut policy_update = None;
+    let plan: Result<_, RejectReason> = match &command.payload {
+        Command::CreateMarket(input) => {
+            if managed_markets.contains_key(&market)
+                || !empty
+                || book.next_queue_priority() != 0
+                || book.next_stop_priority() != 0
+            {
+                Err(RejectReason::InvalidMarketStateTransition)
+            } else {
+                let config = &input.config;
+                let policy = place.as_ref().and_then(|p| p.config.policies.get(&market));
+                let expected_priority =
+                    matching_orderbook::QueuePriorityPolicy::try_with_synthetic_ceiling(
+                        config.execution_limits.priority_exhaustion_guard,
+                        config.execution_limits.synthetic_priority_ceiling,
+                    );
+                match (config.validate(), policy, expected_priority) {
+                    (Err(error), _, _) => Err(error.to_reject_reason()),
+                    (Ok(math), Some(policy), Ok(priority))
+                        if policy.market_math() == math
+                            && policy.fee_schedule_version()
+                                == config.active_fee_schedule_version
+                            && book.priority_policy() == priority =>
+                    {
+                        prepare_price_band_update(book, config.price_band, math)
+                            .and_then(|candidate| {
+                                matching_domain::ManagedMarket::new(config.clone())
+                                    .map_err(|_| RejectReason::InvalidOrderCombination)
+                                    .map(|state| (state, candidate))
+                            })
+                            .map(|(state, candidate)| {
+                                (
+                                    state,
+                                    Some(candidate),
+                                    vec![EngineEvent::MarketCreated { market_id: market }],
+                                )
+                            })
+                    }
+                    _ => Err(RejectReason::InvalidOrderCombination),
+                }
+            }
+        }
+        Command::UpdateMarket(input) => (|| {
+            let state = managed_markets
+                .get(&market)
+                .ok_or(RejectReason::MarketNotFound)?;
+            let config = &input.config;
+            let math = config
+                .validate()
+                .map_err(matching_domain::MarketConfigError::to_reject_reason)?;
+            let policy = place
+                .as_ref()
+                .and_then(|p| p.config.policies.get(&market))
+                .ok_or(RejectReason::InvalidOrderCombination)?;
+            let priority = matching_orderbook::QueuePriorityPolicy::try_with_synthetic_ceiling(
+                config.execution_limits.priority_exhaustion_guard,
+                config.execution_limits.synthetic_priority_ceiling,
+            )
+            .map_err(|_| RejectReason::InvalidOrderCombination)?;
+            let next_policy = policy
+                .with_market_math(math)
+                .map_err(|_| RejectReason::InvalidOrderCombination)?;
+            if policy.fee_schedule_version() != config.active_fee_schedule_version {
+                return Err(RejectReason::InvalidOrderCombination);
+            }
+            if !empty {
+                book.plan_mass_cancel(
+                    matching_domain::ShardCancelScope::Market { market_id: market },
+                    registry.as_ref().ok_or(RejectReason::InvalidReservation)?,
+                )?;
+                if !active_band_update_safe(state.config().price_band, config.price_band)
+                    && !active_band_revalidation_safe(book, config.price_band, math)?
+                {
+                    return Err(RejectReason::InvalidOrderCombination);
+                }
+            }
+            let reservations = book.reservation_snapshots();
+            let existing_orders_valid = if empty {
+                true
+            } else {
+                !reservations.is_empty()
+                    && reservations.iter().all(|(id, _)| {
+                        let Some(node) = book.order(*id) else {
+                            return book.stop_order(*id).is_some_and(|(stop, _)| {
+                                stop_order_fits_limits(
+                                    stop,
+                                    state.config().order_limits,
+                                    config.order_limits,
+                                    math,
+                                )
+                            });
+                        };
+                        let order = node.original_order();
+                        let limits = config.order_limits;
+                        order.qty >= limits.min_qty
+                            && order.qty <= limits.max_qty
+                            && math
+                                .trade_notional(order.price, order.qty)
+                                .is_ok_and(|notional| {
+                                    notional >= limits.min_notional
+                                        && notional <= limits.max_notional
+                                })
+                    })
+            };
+            let mut candidate = state.clone();
+            let has_referenced_history = state.has_referenced_history()
+                || book.next_queue_priority() != 0
+                || book.next_stop_priority() != 0
+                || [
+                    matching_domain::PriceReferenceKind::LastTrade,
+                    matching_domain::PriceReferenceKind::MarkPrice,
+                    matching_domain::PriceReferenceKind::IndexPrice,
+                    matching_domain::PriceReferenceKind::StaticOpening,
+                ]
+                .into_iter()
+                .any(|kind| book.has_reference_price(kind));
+            let events = candidate
+                .update_config(
+                    config.clone(),
+                    matching_domain::MarketConfigUpdateChecks {
+                        has_active_orders: !empty,
+                        has_referenced_history,
+                        existing_orders_valid,
+                        fee_version_available: true,
+                    },
+                )
+                .map_err(|_| RejectReason::InvalidOrderCombination)?;
+            let mut candidate_book = prepare_price_band_update(book, config.price_band, math)?;
+            candidate_book.update_priority_policy(priority)?;
+            policy_update = Some(next_policy);
+            Ok((candidate, Some(candidate_book), events))
+        })(),
+        Command::StartSession(input) => match managed_markets.get(&market) {
+            Some(state) => {
+                let mut candidate = state.clone();
+                candidate
+                    .start_session(input.new_session_id, empty)
+                    .map(|events| (candidate, None, events))
+            }
+            None => Err(RejectReason::MarketNotFound),
+        },
+        Command::OpenMarket(input) => match managed_markets.get(&market) {
+            Some(state) => {
+                let mut candidate = state.clone();
+                let reference = state
+                    .config()
+                    .price_band
+                    .is_none_or(|band| book.has_reference_price(band.reference_kind));
+                let revalidated = if empty || state.config().price_band.is_none() {
+                    Ok(true)
+                } else if !reference {
+                    Ok(false)
+                } else {
+                    registry
+                        .as_ref()
+                        .ok_or(RejectReason::InvalidReservation)
+                        .and_then(|registry| {
+                            book.plan_mass_cancel(
+                                matching_domain::ShardCancelScope::Market { market_id: market },
+                                registry,
+                            )
+                        })
+                        .and_then(|_| {
+                            active_band_revalidation_safe(
+                                book,
+                                state.config().price_band,
+                                state.config().validate().expect("已持久化市场配置必须有效"),
+                            )
+                        })
+                };
+                revalidated.and_then(|complete| {
+                    candidate
+                        .open(input.session_id, reference, complete)
+                        .and_then(|events| {
+                            checked_price_band_reference(book, state.config().price_band)
+                                .map(|()| (candidate, None, events))
+                        })
+                })
+            }
+            None => Err(RejectReason::MarketNotFound),
+        },
+        Command::SuspendMarket(_) => match managed_markets.get(&market) {
+            Some(state) => {
+                let mut candidate = state.clone();
+                candidate.suspend().map(|events| (candidate, None, events))
+            }
+            None => Err(RejectReason::MarketNotFound),
+        },
+        Command::ResumeMarket(_) => match managed_markets.get(&market) {
+            Some(state) => {
+                let mut candidate = state.clone();
+                let reference = state
+                    .config()
+                    .price_band
+                    .is_none_or(|band| book.has_reference_price(band.reference_kind));
+                candidate.resume(reference).and_then(|events| {
+                    checked_price_band_reference(book, state.config().price_band)
+                        .map(|()| (candidate, None, events))
+                })
+            }
+            None => Err(RejectReason::MarketNotFound),
+        },
+        Command::EndSession(input) => (|| {
+            let state = managed_markets
+                .get(&market)
+                .ok_or(RejectReason::MarketNotFound)?;
+            let mut candidate = state.clone();
+            candidate.end_session(input.session_id)?;
+            let mut candidate_registry = registry
+                .as_ref()
+                .ok_or(RejectReason::InvalidReservation)?
+                .clone();
+            let mut candidate_ids = place
+                .as_ref()
+                .ok_or(RejectReason::InvalidOrderCombination)?
+                .ids
+                .try_clone_preallocated()
+                .map_err(|()| RejectReason::EngineBusy)?;
+            let mut candidate_book = book.clone();
+            let plan = candidate_book.plan_end_session(
+                input.session_id,
+                input.session_id,
+                &candidate_registry,
+            )?;
+            let (_, mut events) = candidate_book
+                .apply_mass_cancel(&mut candidate_registry, plan)
+                .expect("独立候选的时段终结计划不能漂移");
+            for event in &events {
+                if let EngineEvent::OrderExpired { order_id, .. } = event {
+                    candidate_ids.terminal_in_market(market, *order_id);
+                }
+            }
+            events.push(EngineEvent::SessionEnded {
+                market_id: market,
+                session_id: input.session_id,
+            });
+            cleanup = Some((candidate_registry, candidate_ids));
+            Ok((candidate, Some(candidate_book), events))
+        })(),
+        Command::CloseMarket(_) => (|| {
+            let state = managed_markets
+                .get(&market)
+                .ok_or(RejectReason::MarketNotFound)?;
+            let mut candidate = state.clone();
+            let state_events = candidate.close(true)?;
+            let session = state
+                .lifecycle()
+                .session_id()
+                .ok_or(RejectReason::InvalidSession)?;
+            let mut candidate_registry = registry
+                .as_ref()
+                .ok_or(RejectReason::InvalidReservation)?
+                .clone();
+            let mut candidate_ids = place
+                .as_ref()
+                .ok_or(RejectReason::InvalidOrderCombination)?
+                .ids
+                .try_clone_preallocated()
+                .map_err(|()| RejectReason::EngineBusy)?;
+            let mut candidate_book = book.clone();
+            let close_plan = candidate_book.plan_market_close(session, &candidate_registry)?;
+            let (_, mut events) = candidate_book
+                .apply_mass_cancel(&mut candidate_registry, close_plan)
+                .expect("独立候选的关市计划不能漂移");
+            for event in &events {
+                match event {
+                    EngineEvent::OrderCanceled { order_id, .. }
+                    | EngineEvent::OrderExpired { order_id, .. } => {
+                        candidate_ids.terminal_in_market(market, *order_id)
+                    }
+                    _ => unreachable!("关市计划只生成订单终结事件"),
+                }
+            }
+            if state.lifecycle().session_active() {
+                events.push(EngineEvent::SessionEnded {
+                    market_id: market,
+                    session_id: session,
+                });
+            }
+            events.extend(state_events);
+            cleanup = Some((candidate_registry, candidate_ids));
+            Ok((candidate, Some(candidate_book), events))
+        })(),
+        _ => unreachable!("调用方仅传入已接入的市场命令"),
+    };
+    let (outcome, payloads, planned) = match plan {
+        Ok((state, book, events))
+            if u64::try_from(events.len())
+                .is_ok_and(|n| event_count_fits(n, identity.event_capacity)) =>
+        {
+            (FormalOutcome::MarketManaged, events, Some((state, book)))
+        }
+        Ok(_) => (
+            FormalOutcome::Rejected(RejectReason::ArithmeticOverflow),
+            vec![EngineEvent::CommandRejected {
+                reason: RejectReason::ArithmeticOverflow,
+            }],
+            None,
+        ),
+        Err(reason) => (
+            FormalOutcome::Rejected(reason),
+            vec![EngineEvent::CommandRejected { reason }],
+            None,
+        ),
+    };
+    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+    let events: Vec<_> = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| EventEnvelope {
+            cluster_id: identity.cluster,
+            shard_id: identity.shard,
+            shard_seq: n,
+            event_index: u32::try_from(index).expect("事件数量已预检"),
+            command_id: command.command_id,
+            engine_time: clock.now().get(),
+            market_id: Some(market),
+            payload,
+        })
+        .collect();
+    let (status, reject_reason) = match outcome {
+        FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(reason)),
+        _ => (CommandStatus::Succeeded, None),
+    };
+    let event_range = events.last().map(|event| (0, event.event_index));
+    let result = FormalExecution {
+        command_id: command.command_id,
+        seq: n,
+        outcome,
+        summary: CommandResultSummary {
+            status,
+            first_event_index: events.first().map(|event| event.event_index),
+            last_event_index: events.last().map(|event| event.event_index),
+            durable_seq: Some(n),
+            reject_reason,
+        },
+        event_range,
+        events,
+        deduplicated: false,
+    };
+    if let Some((state, candidate_book)) = planned {
+        if let Some(candidate_book) = candidate_book {
+            markets.insert(market, candidate_book);
+        }
+        managed_markets.insert(market, state);
+        if let Some(policy) = policy_update {
+            place
+                .as_mut()
+                .expect("更新候选已验证下单配置")
+                .config
+                .policies
+                .insert(market, policy);
+        }
+        if let Some((candidate_registry, candidate_ids)) = cleanup {
+            *registry = Some(candidate_registry);
+            place.as_mut().expect("关市候选已验证下单状态").ids = candidate_ids;
+        }
+    }
+    dedup.insert_prepared(&command, prepared, &result);
     Ok(result)
 }
 
@@ -2363,6 +3073,103 @@ fn execute_fence(
         deduplicated: false,
     };
     *epochs = candidate;
+    dedup.insert_prepared(&command, prepared, &result);
+    Ok(result)
+}
+
+/// 在候选订单簿及登记表上执行正式命令，完成事件封装后安装后态。
+fn execute_formal_guarded(
+    routes: &RouteTable,
+    identity: FormalIdentity,
+    seq: &mut Sequencer,
+    clock: &LogicalClock,
+    (markets, managed): (
+        &mut BTreeMap<MarketId, ProductionOrderBook>,
+        &BTreeMap<MarketId, matching_domain::ManagedMarket>,
+    ),
+    registry: &mut Option<ReservationRegistry>,
+    (command, dedup, place, durable): (
+        CommandEnvelope,
+        &mut DedupWindow,
+        &mut Option<PlaceRuntimeState>,
+        &mut Option<LocalDurableCommit>,
+    ),
+) -> Result<FormalExecution, FormalError> {
+    let market = command
+        .market_id
+        .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
+    let epoch = command
+        .route_epoch
+        .ok_or(FormalError::Rejected(RejectReason::StaleRouteEpoch))?;
+    routes
+        .validate(market, identity.shard, epoch)
+        .map_err(FormalError::Rejected)?;
+    if !markets.contains_key(&market) || registry.is_none() {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    if let Some(result) = dedup
+        .lookup(&command)
+        .map_err(|()| FormalError::ProtocolError)?
+    {
+        dedup.remember_alias(&command);
+        return Ok(result);
+    }
+    let Command::MassCancelShard(ref input) = command.payload else {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    };
+    if input.scope != (ShardCancelScope::Market { market_id: market }) || command.user_id.is_some()
+    {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    let reason = match managed.get(&market) {
+        Some(state) => state.lifecycle().check_cancel().err(),
+        None if place
+            .as_ref()
+            .is_some_and(|state| state.config.managed_only) =>
+        {
+            Some(RejectReason::MarketNotFound)
+        }
+        None => None,
+    };
+    let Some(reason) = reason else {
+        return execute_formal_idempotent(
+            routes,
+            identity,
+            seq,
+            clock,
+            markets,
+            registry,
+            (command, dedup, place, durable),
+        );
+    };
+    assert!(durable.is_none(), "受管理撤单拒绝必须在持久化候选中执行");
+    let prepared = dedup.prepare(&command);
+    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+    let event = EventEnvelope {
+        cluster_id: identity.cluster,
+        shard_id: identity.shard,
+        shard_seq: n,
+        event_index: 0,
+        command_id: command.command_id,
+        engine_time: clock.now().get(),
+        market_id: Some(market),
+        payload: EngineEvent::CommandRejected { reason },
+    };
+    let result = FormalExecution {
+        command_id: command.command_id,
+        seq: n,
+        outcome: FormalOutcome::Rejected(reason),
+        summary: CommandResultSummary {
+            status: CommandStatus::Rejected,
+            first_event_index: Some(0),
+            last_event_index: Some(0),
+            durable_seq: Some(n),
+            reject_reason: Some(reason),
+        },
+        events: vec![event],
+        event_range: Some((0, 0)),
+        deduplicated: false,
+    };
     dedup.insert_prepared(&command, prepared, &result);
     Ok(result)
 }
@@ -2523,9 +3330,10 @@ fn execute_formal(
         *registry = candidate_registry;
     }
     let (status, reject_reason) = match &outcome {
-        FormalOutcome::MassCancel(_) | FormalOutcome::UserFence(_) | FormalOutcome::Placed(_) => {
-            (CommandStatus::Succeeded, None)
-        }
+        FormalOutcome::MassCancel(_)
+        | FormalOutcome::UserFence(_)
+        | FormalOutcome::Placed(_)
+        | FormalOutcome::MarketManaged => (CommandStatus::Succeeded, None),
         FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(*reason)),
     };
     let summary = CommandResultSummary {
@@ -2685,6 +3493,823 @@ mod tests {
     use super::*;
     use crate::route_table::MarketRoute;
     use matching_orderbook::QueuePriorityPolicy;
+
+    #[test]
+    fn create_market_rejects_each_invalid_math_configuration_without_mutation() {
+        use matching_domain::{
+            ClosePolicy, ExecutionLimits, MarketConfig, OrderLimits, Qty, QuoteAmount,
+        };
+        let market = MarketId(90);
+        let original = MarketConfig {
+            market_id: market,
+            price_scale: 0,
+            qty_scale: 0,
+            quote_scale: 0,
+            tick_size: 1,
+            lot_size: 1,
+            order_limits: OrderLimits {
+                min_qty: Qty::try_new(1).unwrap(),
+                max_qty: Qty::try_new(10).unwrap(),
+                min_notional: QuoteAmount::new(1),
+                max_notional: QuoteAmount::new(100),
+            },
+            price_band: None,
+            active_fee_schedule_version: 1,
+            close_policy: ClosePolicy::CancelAll,
+            execution_limits: ExecutionLimits {
+                max_internal_actions_per_command: 10,
+                max_trades_per_command: 10,
+                priority_exhaustion_guard: 1,
+                synthetic_priority_ceiling: None,
+            },
+        };
+        let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1).unwrap());
+        book.bind_market(market).unwrap();
+        let mut books = BTreeMap::from([(market, book.clone())]);
+        let routes = RouteTable::new([MarketRoute {
+            market_id: market,
+            shard_id: ShardId(1),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let mut managed = BTreeMap::new();
+        let mut registry = None;
+        let mut place = None;
+        let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        for (index, reason) in [
+            RejectReason::MarketConfigInvalidTick,
+            RejectReason::MarketConfigInvalidLot,
+            RejectReason::MarketConfigUnsupportedScale,
+            RejectReason::MarketConfigNonIntegralQuoteUnit,
+            RejectReason::MarketConfigArithmeticOverflow,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut config = original.clone();
+            match index {
+                0 => config.tick_size = 0,
+                1 => config.lot_size = 0,
+                2 => config.quote_scale = 39,
+                3 => config.price_scale = 1,
+                4 => {
+                    config.quote_scale = 38;
+                    config.tick_size = 4;
+                }
+                _ => unreachable!(),
+            }
+            let id = index as u128 + 1;
+            let command = CommandEnvelope {
+                command_id: CommandId(id),
+                session_id: 1,
+                client_seq: id as u64,
+                market_id: Some(market),
+                user_id: None,
+                route_epoch: Some(1),
+                client_timestamp: None,
+                received_at_unix_ns: None,
+                payload: Command::CreateMarket(Box::new(matching_domain::CreateMarket { config })),
+            };
+            let outcome = execute_market_management(
+                MarketManagementContext {
+                    identity: FormalIdentity {
+                        shard: ShardId(1),
+                        cluster: ClusterId(1),
+                        event_capacity: 10,
+                    },
+                    routes: &routes,
+                    seq: &mut seq,
+                    clock: &LogicalClock::new(LogicalTime::new(0)),
+                    markets: &mut books,
+                    managed_markets: &mut managed,
+                    dedup: &mut dedup,
+                    place: &mut place,
+                    registry: &mut registry,
+                },
+                command,
+            )
+            .unwrap();
+            assert_eq!(outcome.outcome, FormalOutcome::Rejected(reason));
+            assert_eq!(books.get(&market), Some(&book));
+            assert!(managed.is_empty());
+        }
+    }
+
+    #[test]
+    fn stop_limit_config_validation_checks_full_quantity_and_notional() {
+        use matching_domain::{
+            OrderLimits, Price, Qty, QuoteAmount, StopLimitOrder, StopOrder, TimeInForce,
+            TriggerExpiry,
+        };
+        let limits = OrderLimits {
+            min_qty: Qty::try_new(1).unwrap(),
+            max_qty: Qty::try_new(5).unwrap(),
+            min_notional: QuoteAmount::new(10),
+            max_notional: QuoteAmount::new(50),
+        };
+        let math = matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        let stop = StopOrder::Limit(StopLimitOrder {
+            trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+            order_id: matching_domain::OrderId(1),
+            user_id: matching_domain::UserId(1),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
+            reservation_id: matching_domain::ReservationId(1),
+            fee_schedule_version: 1,
+            side: matching_domain::Side::Buy,
+            stop_price: Price::try_new(12).unwrap(),
+            price: Price::try_new(10).unwrap(),
+            qty: Qty::try_new(5).unwrap(),
+            child_tif: TimeInForce::Gtc,
+            trigger_expiry: TriggerExpiry::Gtc,
+        });
+        assert!(stop_order_fits_limits(&stop, limits, limits, math));
+        let mut tighter = limits;
+        tighter.max_notional = QuoteAmount::new(49);
+        assert!(!stop_order_fits_limits(&stop, limits, tighter, math));
+        let market = StopOrder::Market(matching_domain::StopMarketOrder {
+            trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+            market_protection: None,
+            order_id: matching_domain::OrderId(2),
+            user_id: matching_domain::UserId(1),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
+            reservation_id: matching_domain::ReservationId(2),
+            fee_schedule_version: 1,
+            side: matching_domain::Side::Buy,
+            stop_price: Price::try_new(12).unwrap(),
+            quantity: matching_domain::StopMarketQuantity::Base(Qty::try_new(5).unwrap()),
+            child_tif: TimeInForce::Ioc,
+            trigger_expiry: TriggerExpiry::Gtc,
+        });
+        assert!(stop_order_fits_limits(&market, limits, limits, math));
+        assert!(!stop_order_fits_limits(&market, limits, tighter, math));
+        let mut expanded = limits;
+        expanded.max_qty = Qty::try_new(6).unwrap();
+        assert!(stop_order_fits_limits(&market, limits, expanded, math));
+        expanded.max_qty = Qty::try_new(4).unwrap();
+        assert!(!stop_order_fits_limits(&market, limits, expanded, math));
+        let mut quote = market.clone();
+        if let StopOrder::Market(order) = &mut quote {
+            order.quantity = matching_domain::StopMarketQuantity::Quote(
+                matching_domain::QuoteBudget::try_new(40).unwrap(),
+            );
+        }
+        let mut relaxed = limits;
+        relaxed.max_qty = Qty::try_new(6).unwrap();
+        relaxed.max_notional = QuoteAmount::new(60);
+        assert!(stop_order_fits_limits(&quote, limits, relaxed, math));
+        assert!(stop_order_fits_limits(&market, limits, relaxed, math));
+        let mut narrowed = limits;
+        narrowed.max_notional = QuoteAmount::new(40);
+        assert!(stop_order_fits_limits(&quote, limits, narrowed, math));
+        narrowed.max_notional = QuoteAmount::new(39);
+        assert!(!stop_order_fits_limits(&quote, limits, narrowed, math));
+        relaxed.min_notional = QuoteAmount::new(11);
+        assert!(!stop_order_fits_limits(&quote, limits, relaxed, math));
+        assert!(!stop_order_fits_limits(&market, limits, relaxed, math));
+    }
+
+    #[test]
+    fn active_price_band_update_only_accepts_safe_relaxations() {
+        let old = matching_domain::PriceBandConfig {
+            reference_kind: matching_domain::PriceReferenceKind::LastTrade,
+            max_deviation_bps: 100,
+        };
+        let mut next = old;
+        next.max_deviation_bps = 101;
+        assert!(active_band_update_safe(Some(old), Some(next)));
+        assert!(active_band_update_safe(Some(old), None));
+        next.max_deviation_bps = 99;
+        assert!(!active_band_update_safe(Some(old), Some(next)));
+        next = old;
+        next.reference_kind = matching_domain::PriceReferenceKind::MarkPrice;
+        assert!(!active_band_update_safe(Some(old), Some(next)));
+        assert!(!active_band_update_safe(None, Some(old)));
+        assert!(active_band_update_safe(None, None));
+        let book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1).unwrap());
+        let math = matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        let mut narrower = old;
+        narrower.max_deviation_bps = 0;
+        assert_eq!(
+            active_band_revalidation_safe(&book, Some(narrower), math),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn price_band_update_rejects_reference_boundary_overflow_atomically() {
+        let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1).unwrap());
+        let math = matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        book.trigger_stops(
+            matching_domain::PriceReference {
+                kind: matching_domain::PriceReferenceKind::LastTrade,
+                source_seq: 1,
+                price: matching_domain::Price::try_new(i64::MAX).unwrap(),
+            },
+            LogicalTime::new(0),
+            1,
+            &math,
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+        let before = book.clone();
+        let band = matching_domain::PriceBandConfig {
+            reference_kind: matching_domain::PriceReferenceKind::LastTrade,
+            max_deviation_bps: 1,
+        };
+        assert_eq!(
+            prepare_price_band_update(&book, Some(band), math).err(),
+            Some(RejectReason::ArithmeticOverflow)
+        );
+        let mut activated = book.clone();
+        activated.set_price_band_config(Some((band, math))).unwrap();
+        assert_eq!(
+            checked_price_band_reference(&activated, Some(band)),
+            Err(RejectReason::ArithmeticOverflow)
+        );
+        assert_eq!(book, before);
+    }
+
+    #[test]
+    fn stop_limit_update_rejection_preserves_book_and_reservation() {
+        stop_management_replays(false, false, 0);
+    }
+
+    #[test]
+    fn stop_day_session_end_replays_expiry_and_reservation_transition() {
+        stop_management_replays(true, false, 0);
+    }
+
+    #[test]
+    fn stop_quote_configuration_update_and_close_replay() {
+        stop_management_replays(false, true, 0);
+    }
+
+    #[test]
+    fn active_market_can_remove_price_band_and_replay() {
+        stop_management_replays(false, false, 1);
+    }
+
+    #[test]
+    fn active_market_can_widen_price_band_and_replay() {
+        stop_management_replays(false, false, 2);
+    }
+
+    #[test]
+    fn active_market_can_narrow_price_band_when_stop_limit_remains_inside() {
+        stop_management_replays(false, false, 3);
+    }
+
+    #[test]
+    fn active_market_rejects_narrow_band_excluding_stop_limit_and_replays() {
+        stop_management_replays(false, false, 4);
+    }
+
+    #[test]
+    fn active_market_rejects_narrow_band_excluding_resting_order_and_replays() {
+        stop_management_replays(false, false, 5);
+    }
+
+    #[test]
+    fn active_market_can_narrow_band_when_resting_order_remains_inside() {
+        stop_management_replays(false, false, 6);
+    }
+
+    #[test]
+    fn active_market_can_enable_band_when_existing_stop_limit_fits() {
+        stop_management_replays(false, false, 7);
+    }
+
+    #[test]
+    fn active_market_can_change_band_reference_when_existing_orders_fit() {
+        stop_management_replays(false, false, 8);
+    }
+
+    #[test]
+    fn active_market_rejects_band_reference_without_price_and_replays() {
+        stop_management_replays(false, false, 9);
+    }
+
+    #[test]
+    fn active_market_reports_overflow_for_unrepresentable_new_band() {
+        stop_management_replays(false, false, 12);
+    }
+
+    #[test]
+    fn preopen_with_valid_existing_orders_can_open_with_price_band() {
+        stop_management_replays(false, false, 10);
+    }
+
+    #[test]
+    fn preopen_rejects_open_when_existing_price_is_outside_band() {
+        stop_management_replays(false, false, 11);
+    }
+
+    #[test]
+    fn preopen_rejects_open_with_broken_reservation_binding() {
+        stop_management_replays(false, false, 13);
+    }
+
+    fn stop_management_replays(day: bool, quote: bool, band: u8) {
+        use matching_domain::{
+            AssetId, AssetReserve, ClosePolicy, ExecutionLimits, MarketConfig, OrderLimits,
+            OriginSessionId, Price, Qty, QuoteAmount, Side, StopLimitOrder, StopOrder, TimeInForce,
+            TriggerExpiry, UserId,
+        };
+        use matching_risk::{LimitReservePolicy, ReservationStatus, RiskKeySet};
+        let market = MarketId(81);
+        let math = matching_domain::MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        let config = MarketConfig {
+            market_id: market,
+            price_scale: 0,
+            qty_scale: 0,
+            quote_scale: 0,
+            tick_size: 1,
+            lot_size: 1,
+            order_limits: OrderLimits {
+                min_qty: Qty::try_new(1).unwrap(),
+                max_qty: Qty::try_new(5).unwrap(),
+                min_notional: QuoteAmount::new(1),
+                max_notional: QuoteAmount::new(50),
+            },
+            price_band: (band != 0 && band != 7).then_some(matching_domain::PriceBandConfig {
+                reference_kind: matching_domain::PriceReferenceKind::LastTrade,
+                max_deviation_bps: if band == 4 || band == 5 { 1000 } else { 100 },
+            }),
+            active_fee_schedule_version: 1,
+            close_policy: ClosePolicy::CancelAll,
+            execution_limits: ExecutionLimits {
+                max_internal_actions_per_command: 10,
+                max_trades_per_command: 10,
+                priority_exhaustion_guard: 1,
+                synthetic_priority_ceiling: None,
+            },
+        };
+        let mut state = matching_domain::ManagedMarket::new(config.clone()).unwrap();
+        state.start_session(1, true).unwrap();
+        state.record_referenced_history();
+        let reservation = ReservationState {
+            reservation_id: ReservationId(1),
+            order_id: OrderId(1),
+            user_id: UserId(1),
+            market_id: market,
+            origin_session_id: OriginSessionId(1),
+            version: 0,
+            reserves: vec![AssetReserve {
+                asset: AssetId(2),
+                atoms: 50,
+            }],
+            status: ReservationStatus::Active,
+            fee_schedule_version: 1,
+            fee_tier_id: 1,
+        };
+        let stop = if quote {
+            StopOrder::Market(matching_domain::StopMarketOrder {
+                trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+                market_protection: None,
+                order_id: OrderId(1),
+                user_id: UserId(1),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
+                reservation_id: ReservationId(1),
+                fee_schedule_version: 1,
+                side: Side::Buy,
+                stop_price: Price::try_new(12).unwrap(),
+                quantity: matching_domain::StopMarketQuantity::Quote(
+                    matching_domain::QuoteBudget::try_new(50).unwrap(),
+                ),
+                child_tif: TimeInForce::Ioc,
+                trigger_expiry: TriggerExpiry::Gtc,
+            })
+        } else {
+            StopOrder::Limit(StopLimitOrder {
+                trigger_reference: matching_domain::PriceReferenceKind::LastTrade,
+                order_id: OrderId(1),
+                user_id: UserId(1),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
+                reservation_id: ReservationId(1),
+                fee_schedule_version: 1,
+                side: Side::Buy,
+                stop_price: Price::try_new(12).unwrap(),
+                price: Price::try_new(if band == 4 { 11 } else { 10 }).unwrap(),
+                qty: Qty::try_new(if band == 4 { 4 } else { 5 }).unwrap(),
+                child_tif: TimeInForce::Gtc,
+                trigger_expiry: if day {
+                    TriggerExpiry::Day { session_id: 1 }
+                } else {
+                    TriggerExpiry::Gtc
+                },
+            })
+        };
+        let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1).unwrap());
+        book.bind_market(market).unwrap();
+        if let Some(band) = config.price_band {
+            book.set_price_band_config(Some((band, math))).unwrap();
+        }
+        if config.price_band.is_some() || band == 7 {
+            book.trigger_stops(
+                matching_domain::PriceReference {
+                    kind: matching_domain::PriceReferenceKind::LastTrade,
+                    source_seq: 1,
+                    price: Price::try_new(10).unwrap(),
+                },
+                LogicalTime::new(0),
+                1,
+                &math,
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        }
+        if band == 8 || band == 12 {
+            book.trigger_stops(
+                matching_domain::PriceReference {
+                    kind: matching_domain::PriceReferenceKind::MarkPrice,
+                    source_seq: 1,
+                    price: Price::try_new(if band == 12 { i64::MAX } else { 10 }).unwrap(),
+                },
+                LogicalTime::new(0),
+                1,
+                &math,
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        }
+        if band == 5 || band == 6 {
+            book.rest_with_reservation(
+                matching_domain::LimitOrder {
+                    order_id: OrderId(1),
+                    user_id: UserId(1),
+                    stp_key: matching_domain::StpKey::new(0),
+                    stp_mode: matching_domain::StpMode::None,
+                    side: Side::Buy,
+                    price: Price::try_new(if band == 5 { 11 } else { 10 }).unwrap(),
+                    qty: Qty::try_new(4).unwrap(),
+                },
+                reservation.clone(),
+            )
+            .unwrap();
+        } else {
+            book.place_stop_with_reservation(stop, LogicalTime::new(0), 1, reservation.clone())
+                .unwrap();
+        }
+        if band == 11 {
+            book.trigger_stops(
+                matching_domain::PriceReference {
+                    kind: matching_domain::PriceReferenceKind::LastTrade,
+                    source_seq: 2,
+                    price: Price::try_new(9).unwrap(),
+                },
+                LogicalTime::new(0),
+                1,
+                &math,
+                &[],
+                |_| Ok(()),
+            )
+            .unwrap();
+        }
+        let mut books = BTreeMap::from([(market, book.clone())]);
+        let mut registry = Some(ReservationRegistry::new([reservation]).unwrap());
+        let before_registry = registry.clone();
+        let mut managed = BTreeMap::from([(market, state.clone())]);
+        let routes = RouteTable::new([MarketRoute {
+            market_id: market,
+            shard_id: ShardId(1),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let policy =
+            LimitReservePolicy::new((AssetId(1), 0), (AssetId(2), 0), math, 1, 1, 0).unwrap();
+        let settings = crate::PlaceSupportConfig::new(
+            RiskKeySet::new(1, []).unwrap(),
+            [(market, policy)],
+            crate::PlaceLimits {
+                active_orders: 8,
+                terminal_history: 8,
+                client_id_bytes: 32,
+            },
+        )
+        .unwrap();
+        let trusted = crate::SnapshotRestoreConfig {
+            cluster: ClusterId(1),
+            shard: ShardId(1),
+            primary_epoch: 7,
+            routes: routes.clone(),
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: Some(settings.clone()),
+            expect_registry: true,
+            max_markets: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let mut place = Some(PlaceRuntimeState {
+            config: settings,
+            ids: ClientOrderIds::with_max_id_bytes(8, 8, 32).unwrap(),
+        });
+        let mut window = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        let mut next = config;
+        next.order_limits.max_notional = QuoteAmount::new(49);
+        if band == 6 {
+            next.order_limits.max_notional = QuoteAmount::new(39);
+        }
+        if band == 4 || band == 5 {
+            next.order_limits.max_notional = QuoteAmount::new(60);
+            next.price_band.as_mut().unwrap().max_deviation_bps = 0;
+        }
+        if band == 9 || band == 12 {
+            next.order_limits.max_notional = QuoteAmount::new(60);
+            next.price_band.as_mut().unwrap().reference_kind =
+                matching_domain::PriceReferenceKind::MarkPrice;
+            if band == 12 {
+                next.price_band.as_mut().unwrap().max_deviation_bps = 1;
+            }
+        }
+        let command = CommandEnvelope {
+            command_id: CommandId(1),
+            session_id: 1,
+            client_seq: 1,
+            market_id: Some(market),
+            user_id: None,
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: Command::UpdateMarket(Box::new(matching_domain::UpdateMarket {
+                config: next,
+            })),
+        };
+        let mut replay_candidate = empty_recovery_candidate(
+            &trusted,
+            &[(market, QueuePriorityPolicy::try_new(1).unwrap())],
+            1,
+        )
+        .unwrap();
+        replay_candidate.image.markets = books.clone();
+        replay_candidate.image.managed_markets = managed.clone();
+        replay_candidate.image.registry = registry.clone();
+        let bytes = replay_candidate
+            .image
+            .encode_snapshot(trusted.max_bytes)
+            .unwrap();
+        replay_candidate.image = SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+        let wal_payload = matching_domain::encode_wal_command(&command).unwrap();
+        let decoded_command = matching_domain::decode_wal_command(&wal_payload).unwrap();
+        let result = execute_market_management(
+            MarketManagementContext {
+                identity: FormalIdentity {
+                    shard: ShardId(1),
+                    cluster: ClusterId(1),
+                    event_capacity: 10,
+                },
+                routes: &routes,
+                seq: &mut seq,
+                clock: &LogicalClock::new(LogicalTime::new(0)),
+                markets: &mut books,
+                managed_markets: &mut managed,
+                dedup: &mut window,
+                place: &mut place,
+                registry: &mut registry,
+            },
+            command,
+        )
+        .unwrap();
+        assert_eq!(
+            result.outcome,
+            FormalOutcome::Rejected(if band == 12 {
+                RejectReason::ArithmeticOverflow
+            } else {
+                RejectReason::InvalidOrderCombination
+            })
+        );
+        assert_eq!(books.get(&market), Some(&book));
+        assert_eq!(registry, before_registry);
+        assert_eq!(managed.get(&market), Some(&state));
+        if band == 13 {
+            let mut broken_registry = Some(ReservationRegistry::new([]).unwrap());
+            let invalid_open = CommandEnvelope {
+                command_id: CommandId(2),
+                session_id: 1,
+                client_seq: 2,
+                market_id: Some(market),
+                user_id: None,
+                route_epoch: Some(1),
+                client_timestamp: None,
+                received_at_unix_ns: None,
+                payload: Command::OpenMarket(matching_domain::OpenMarket {
+                    market_id: market,
+                    session_id: 1,
+                }),
+            };
+            let rejected = execute_market_management(
+                MarketManagementContext {
+                    identity: FormalIdentity {
+                        shard: ShardId(1),
+                        cluster: ClusterId(1),
+                        event_capacity: 10,
+                    },
+                    routes: &routes,
+                    seq: &mut seq,
+                    clock: &LogicalClock::new(LogicalTime::new(0)),
+                    markets: &mut books,
+                    managed_markets: &mut managed,
+                    dedup: &mut window,
+                    place: &mut place,
+                    registry: &mut broken_registry,
+                },
+                invalid_open,
+            )
+            .unwrap();
+            assert_eq!(
+                rejected.outcome,
+                FormalOutcome::Rejected(RejectReason::InvalidReservation)
+            );
+            assert_eq!(books.get(&market), Some(&book));
+            assert_eq!(managed.get(&market), Some(&state));
+            assert_eq!(broken_registry, Some(ReservationRegistry::new([]).unwrap()));
+            return;
+        }
+        let mut allowed = state.config().clone();
+        allowed.order_limits.max_notional = QuoteAmount::new(60);
+        if band == 1 {
+            allowed.price_band = None;
+        }
+        if band == 2 {
+            allowed.price_band.as_mut().unwrap().max_deviation_bps = 101;
+        }
+        if band == 3 || band == 6 {
+            allowed.price_band.as_mut().unwrap().max_deviation_bps = 0;
+        }
+        if band == 4 || band == 5 || band == 9 || band == 12 {
+            allowed.price_band = None;
+        }
+        if band == 7 {
+            allowed.price_band = Some(matching_domain::PriceBandConfig {
+                reference_kind: matching_domain::PriceReferenceKind::LastTrade,
+                max_deviation_bps: 0,
+            });
+        }
+        if band == 8 {
+            let price_band = allowed.price_band.as_mut().unwrap();
+            price_band.reference_kind = matching_domain::PriceReferenceKind::MarkPrice;
+            price_band.max_deviation_bps = 0;
+        }
+        let accepted_command = CommandEnvelope {
+            command_id: CommandId(2),
+            session_id: 1,
+            client_seq: 2,
+            market_id: Some(market),
+            user_id: None,
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: Command::UpdateMarket(Box::new(matching_domain::UpdateMarket {
+                config: allowed,
+            })),
+        };
+        let close_command = CommandEnvelope {
+            command_id: CommandId(3),
+            session_id: 1,
+            client_seq: 3,
+            market_id: Some(market),
+            user_id: None,
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: if band == 10 || band == 11 {
+                Command::OpenMarket(matching_domain::OpenMarket {
+                    market_id: market,
+                    session_id: 1,
+                })
+            } else if day {
+                Command::EndSession(matching_domain::EndSession {
+                    market_id: market,
+                    session_id: 1,
+                })
+            } else {
+                Command::CloseMarket(matching_domain::CloseMarket { market_id: market })
+            },
+        };
+        let mut executions = Vec::new();
+        for next_command in [accepted_command.clone(), close_command.clone()] {
+            executions.push(
+                execute_market_management(
+                    MarketManagementContext {
+                        identity: FormalIdentity {
+                            shard: ShardId(1),
+                            cluster: ClusterId(1),
+                            event_capacity: 10,
+                        },
+                        routes: &routes,
+                        seq: &mut seq,
+                        clock: &LogicalClock::new(LogicalTime::new(0)),
+                        markets: &mut books,
+                        managed_markets: &mut managed,
+                        dedup: &mut window,
+                        place: &mut place,
+                        registry: &mut registry,
+                    },
+                    next_command,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(executions[0].outcome, FormalOutcome::MarketManaged);
+        if band == 10 {
+            assert_eq!(executions[1].outcome, FormalOutcome::MarketManaged);
+        } else if band == 11 {
+            assert_eq!(
+                executions[1].outcome,
+                FormalOutcome::Rejected(RejectReason::InvalidMarketStateTransition)
+            );
+        } else if day {
+            assert!(matches!(
+                executions[1].events[0].payload,
+                EngineEvent::OrderExpired {
+                    order_id: OrderId(1),
+                    reason: matching_domain::ExpireReason::StopTriggerSessionEnded
+                }
+            ));
+        } else {
+            assert!(matches!(
+                executions[1].events[0].payload,
+                EngineEvent::OrderCanceled {
+                    order_id: OrderId(1),
+                    reason: matching_domain::CancelReason::MarketClosed,
+                    ..
+                }
+            ));
+        }
+        if band == 10 || band == 11 {
+            assert!(books[&market].stop_order(OrderId(1)).is_some());
+        } else {
+            assert!(books[&market].stop_order(OrderId(1)).is_none());
+            assert!(registry.as_ref().unwrap().is_pending_r2(ReservationId(1)));
+        }
+        replay_candidate.committed_through = 3;
+        let replayed = replay_snapshot_records(
+            replay_candidate,
+            vec![
+                crate::RecoveredCommand {
+                    shard_seq: 1,
+                    epoch: 7,
+                    engine_time: 0,
+                    command: decoded_command,
+                },
+                crate::RecoveredCommand {
+                    shard_seq: 2,
+                    epoch: 7,
+                    engine_time: 0,
+                    command: matching_domain::decode_wal_command(
+                        &matching_domain::encode_wal_command(&accepted_command).unwrap(),
+                    )
+                    .unwrap(),
+                },
+                crate::RecoveredCommand {
+                    shard_seq: 3,
+                    epoch: 7,
+                    engine_time: 0,
+                    command: matching_domain::decode_wal_command(
+                        &matching_domain::encode_wal_command(&close_command).unwrap(),
+                    )
+                    .unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(replayed.executions[0].events, result.events);
+        assert_eq!(replayed.executions[1].events, executions[0].events);
+        assert_eq!(replayed.executions[2].events, executions[1].events);
+        assert_eq!(replayed.image.markets, books);
+        assert_eq!(replayed.image.registry, registry);
+        assert_eq!(replayed.image.managed_markets, managed);
+        let mut live_image = SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+        live_image.snapshot_seq = seq.last_applied();
+        live_image.markets = books;
+        live_image.registry = registry;
+        live_image.managed_markets = managed;
+        live_image.dedup = Some(window);
+        live_image.place = place;
+        assert_eq!(
+            replayed.image.state_digest(trusted.max_bytes).unwrap(),
+            live_image.state_digest(trusted.max_bytes).unwrap()
+        );
+        let mut live_hash = crate::EventHasher::new();
+        for event in result
+            .events
+            .iter()
+            .chain(executions.iter().flat_map(|entry| entry.events.iter()))
+        {
+            live_hash.update(event).unwrap();
+        }
+        assert_eq!(replayed.event_hash, live_hash.finish());
+    }
 
     fn retry_busy<T>(mut f: impl FnMut() -> Result<T, ShardError>) -> T {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3452,6 +5077,7 @@ mod place_event_capacity_tests {
         let clock = LogicalClock::new(LogicalTime::new(0));
         let first = execute_place(
             PlaceExecutionContext {
+                managed: None,
                 identity: FormalIdentity {
                     cluster: ClusterId(1),
                     shard: ShardId(1),
@@ -3488,6 +5114,7 @@ mod place_event_capacity_tests {
         assert_eq!(state.ids, ids_before);
         let second = execute_place(
             PlaceExecutionContext {
+                managed: None,
                 identity: FormalIdentity {
                     cluster: ClusterId(1),
                     shard: ShardId(1),
@@ -3847,6 +5474,7 @@ mod group_sync_tests {
         let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
         let mut seq = Sequencer::new();
         let mut markets = BTreeMap::new();
+        let mut managed_markets = BTreeMap::new();
         let mut registry = Some(ReservationRegistry::new([]).unwrap());
         let registry_before = registry.clone();
         let mut place = None;
@@ -3861,6 +5489,7 @@ mod group_sync_tests {
                     dedup: &mut dedup,
                     seq: &mut seq,
                     markets: &mut markets,
+                    managed_markets: &mut managed_markets,
                     registry: &mut registry,
                     place: &mut place,
                     routes: &routes,
@@ -3958,6 +5587,7 @@ pub(crate) fn empty_recovery_candidate(
         primary_epoch: trusted.primary_epoch,
         routes: Arc::new(trusted.routes.clone()),
         markets,
+        managed_markets: BTreeMap::new(),
         registry: Some(registry),
         user_epochs,
         dedup: Some(dedup),
@@ -4007,6 +5637,33 @@ pub(crate) fn replay_snapshot_records(
             };
             let command = record.command;
             let result = match &command.payload {
+                Command::CreateMarket(_)
+                | Command::UpdateMarket(_)
+                | Command::StartSession(_)
+                | Command::OpenMarket(_)
+                | Command::SuspendMarket(_)
+                | Command::ResumeMarket(_)
+                | Command::EndSession(_)
+                | Command::CloseMarket(_) => {
+                    let window = image
+                        .dedup
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
+                    execute_market_management(
+                        MarketManagementContext {
+                            identity,
+                            routes: &image.routes,
+                            seq: &mut seq,
+                            clock: &clock,
+                            markets: &mut image.markets,
+                            managed_markets: &mut image.managed_markets,
+                            dedup: window,
+                            place: &mut image.place,
+                            registry: &mut image.registry,
+                        },
+                        command,
+                    )
+                }
                 Command::ApplyUserControlFenceShard(fence) => {
                     if fence.expected_primary_epoch != image.primary_epoch {
                         return Err(std::io::Error::new(
@@ -4058,8 +5715,9 @@ pub(crate) fn replay_snapshot_records(
                     if !image.markets.contains_key(&market) {
                         return Err(std::io::Error::other("重放市场不存在"));
                     }
-                    execute_place(
+                    let execution = execute_place(
                         PlaceExecutionContext {
+                            managed: image.managed_markets.get(&market),
                             identity,
                             seq: &mut seq,
                             clock: &clock,
@@ -4070,19 +5728,25 @@ pub(crate) fn replay_snapshot_records(
                             durable: &mut durable,
                         },
                         command,
-                    )
+                    );
+                    if matches!(&execution, Ok(value) if matches!(value.outcome, FormalOutcome::Placed(_)))
+                        && let Some(managed) = image.managed_markets.get_mut(&market)
+                    {
+                        managed.record_referenced_history();
+                    }
+                    execution
                 }
                 Command::MassCancelShard(_) => {
                     let window = image
                         .dedup
                         .as_mut()
                         .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
-                    execute_formal_idempotent(
+                    execute_formal_guarded(
                         &image.routes,
                         identity,
                         &mut seq,
                         &clock,
-                        &mut image.markets,
+                        (&mut image.markets, &image.managed_markets),
                         &mut image.registry,
                         (command, window, &mut image.place, &mut durable),
                     )

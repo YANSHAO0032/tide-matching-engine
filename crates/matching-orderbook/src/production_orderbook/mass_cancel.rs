@@ -23,6 +23,98 @@ pub struct ProductionMassCancelPlan {
 }
 
 impl ProductionOrderBook {
+    /// 在候选簿中终结指定交易时段的 DAY 订单，并预检预留归属迁移。
+    pub fn plan_end_session(
+        &self,
+        session_id: u64,
+        current_session_id: u64,
+        registry: &ReservationRegistry,
+    ) -> Result<ProductionMassCancelPlan, matching_domain::RejectReason> {
+        self.validate_registry_bindings(
+            registry,
+            self.reservations.iter().map(|(id, state)| (*id, state)),
+        )?;
+        let mut after_book = self.clone();
+        let expired = after_book.end_session(session_id, current_session_id)?;
+        let mut bindings = Vec::with_capacity(expired.len());
+        for order in &expired {
+            bindings.push(
+                self.reservations
+                    .get(&order.order_id)
+                    .ok_or(matching_domain::RejectReason::InvalidReservation)?,
+            );
+        }
+        let transition = registry.plan_binding_transitions(bindings, [])?;
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("新建的时段终结计划不能漂移");
+        let events = expired
+            .into_iter()
+            .map(|entry| EngineEvent::OrderExpired {
+                order_id: entry.order_id,
+                reason: entry.reason,
+            })
+            .collect();
+        Ok(ProductionMassCancelPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
+    }
+    /// 在副本中计划关市的全部活动订单终结，DAY 到期且其他订单按关市取消。
+    ///
+    /// 预留绑定迁入 PendingR2；不会声称资金已结算或已释放。
+    pub fn plan_market_close(
+        &self,
+        session_id: u64,
+        registry: &ReservationRegistry,
+    ) -> Result<ProductionMassCancelPlan, matching_domain::RejectReason> {
+        use matching_domain::{ExpireReason, TimeInForce, TriggerExpiry};
+        let mut plan = self.plan_mass_cancel(ShardCancelScope::All, registry)?;
+        for event in &mut plan.events {
+            let EngineEvent::OrderCanceled {
+                order_id, reason, ..
+            } = event
+            else {
+                unreachable!("批量终结计划只产生撤单事件");
+            };
+            let id = *order_id;
+            let expiry = if let Some(order) = self.order(id) {
+                match order.time_in_force() {
+                    TimeInForce::Day { session_id: day } if day == session_id => {
+                        Some(ExpireReason::SessionEnded)
+                    }
+                    TimeInForce::Day { .. } => {
+                        return Err(matching_domain::RejectReason::InvalidSession);
+                    }
+                    _ => None,
+                }
+            } else {
+                let (order, _) = self.stop_order(id).expect("关市计划中的 Stop 订单必须存在");
+                match order.trigger_expiry() {
+                    TriggerExpiry::Day { session_id: day } if day == session_id => {
+                        Some(ExpireReason::StopTriggerSessionEnded)
+                    }
+                    TriggerExpiry::Day { .. } => {
+                        return Err(matching_domain::RejectReason::InvalidSession);
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(reason) = expiry {
+                *event = EngineEvent::OrderExpired {
+                    order_id: id,
+                    reason,
+                };
+            } else {
+                *reason = CancelReason::MarketClosed;
+            }
+        }
+        Ok(plan)
+    }
     /// 只读枚举、排序并预检范围内的活动订单，不改变订单簿或预留登记表。
     pub fn plan_mass_cancel(
         &self,

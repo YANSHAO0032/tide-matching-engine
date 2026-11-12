@@ -74,10 +74,74 @@ fn place_bytes(config: &PlaceSupportConfig, limit: usize) -> Result<Vec<u8>, Sna
         w.u32(market.get())?;
         policy.write_snapshot(&mut w)?;
     }
+    if config.managed_only {
+        w.u8(1)?;
+    }
     Ok(w.finish())
 }
 
 impl SnapshotImage {
+    /// 核验市场管理状态与本地订单簿及价格带一致。
+    fn validate_managed_markets(&self) -> Result<(), SnapshotWireError> {
+        for (id, state) in &self.managed_markets {
+            let book = self.markets.get(id).ok_or(SnapshotWireError)?;
+            let math = state.config().validate().map_err(|_| SnapshotWireError)?;
+            let has_active_orders = book.best_price(matching_domain::Side::Buy).is_some()
+                || book.best_price(matching_domain::Side::Sell).is_some()
+                || !book.stop_orders(matching_domain::Side::Buy).is_empty()
+                || !book.stop_orders(matching_domain::Side::Sell).is_empty();
+            if let Some(band) = state.config().price_band {
+                let needs_reference = state.lifecycle().state()
+                    == matching_domain::MarketState::Open
+                    || (state.lifecycle().state() == matching_domain::MarketState::PreOpen
+                        && has_active_orders);
+                if needs_reference && !book.has_reference_price(band.reference_kind) {
+                    return Err(SnapshotWireError);
+                }
+                if book.has_reference_price(band.reference_kind) {
+                    book.price_band_bounds().map_err(|_| SnapshotWireError)?;
+                }
+            }
+            if !state.has_referenced_history()
+                && (book.next_queue_priority() != 0
+                    || book.next_stop_priority() != 0
+                    || book.best_price(matching_domain::Side::Buy).is_some()
+                    || book.best_price(matching_domain::Side::Sell).is_some()
+                    || !book.stop_orders(matching_domain::Side::Buy).is_empty()
+                    || !book.stop_orders(matching_domain::Side::Sell).is_empty())
+            {
+                return Err(SnapshotWireError);
+            }
+            let limits = state.config().execution_limits;
+            let priority = matching_orderbook::QueuePriorityPolicy::try_with_synthetic_ceiling(
+                limits.priority_exhaustion_guard,
+                limits.synthetic_priority_ceiling,
+            )
+            .map_err(|_| SnapshotWireError)?;
+            if book.priority_policy() != priority {
+                return Err(SnapshotWireError);
+            }
+            if let Some(place) = &self.place {
+                let policy = place.config.policies.get(id).ok_or(SnapshotWireError)?;
+                if policy.market_math() != math
+                    || policy.fee_schedule_version() != state.config().active_fee_schedule_version
+                {
+                    return Err(SnapshotWireError);
+                }
+            }
+            if state.config().market_id != *id
+                || book.price_band_config() != state.config().price_band.map(|band| (band, math))
+                || (state.lifecycle().state() == matching_domain::MarketState::Closed
+                    && (book.best_price(matching_domain::Side::Buy).is_some()
+                        || book.best_price(matching_domain::Side::Sell).is_some()
+                        || !book.stop_orders(matching_domain::Side::Buy).is_empty()
+                        || !book.stop_orders(matching_domain::Side::Sell).is_empty()))
+            {
+                return Err(SnapshotWireError);
+            }
+        }
+        Ok(())
+    }
     /// 计算当前可用业务状态的 SHA-256 摘要。
     pub fn state_digest(&self, limit: usize) -> Result<[u8; 32], SnapshotWireError> {
         use sha2::{Digest, Sha256};
@@ -85,6 +149,7 @@ impl SnapshotImage {
     }
     /// 按业务状态顺序编码快照，供后续状态摘要计算；不包含请求身份和物理槽位。
     pub fn canonical_state(&self, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
+        self.validate_managed_markets()?;
         let mut w = SnapshotEncoder::new(limit);
         w.u16(1)?;
         w.u16(self.cluster.get())?;
@@ -119,6 +184,15 @@ impl SnapshotImage {
                 w.u8(1)?;
                 w.bytes(&place_bytes(&place.config, limit)?)?;
                 place.ids.write_canonical_state(&mut w)?;
+            }
+        }
+        // 空集合保留旧版本的规范摘要，避免改变已提交快照的校验值。
+        if !self.managed_markets.is_empty() {
+            w.u8(1)?;
+            w.u32(u32::try_from(self.managed_markets.len()).map_err(|_| SnapshotWireError)?)?;
+            for (market, state) in &self.managed_markets {
+                w.u32(market.get())?;
+                state.write_snapshot(&mut w)?;
             }
         }
         Ok(w.finish())
@@ -226,7 +300,7 @@ impl SnapshotImage {
     /// 将独立内存镜像编码为有界确定性载荷；不提交或同步文件。
     pub fn encode_snapshot(&self, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
         let mut w = SnapshotEncoder::new(limit);
-        w.u16(2)?;
+        w.u16(3)?;
         w.bytes(env!("CARGO_PKG_VERSION").as_bytes())?;
         w.u128(self.request_id)?;
         w.u64(self.snapshot_seq)?;
@@ -263,6 +337,11 @@ impl SnapshotImage {
                 place.ids.write_snapshot(&mut w)?;
             }
         }
+        w.u32(u32::try_from(self.managed_markets.len()).map_err(|_| SnapshotWireError)?)?;
+        for (market, state) in &self.managed_markets {
+            w.u32(market.get())?;
+            state.write_snapshot(&mut w)?;
+        }
         w.bytes(&self.state_digest(limit)?)?;
         Ok(w.finish())
     }
@@ -272,7 +351,8 @@ impl SnapshotImage {
         config: &SnapshotRestoreConfig,
     ) -> Result<Self, SnapshotWireError> {
         let mut r = SnapshotDecoder::new(bytes, config.max_bytes)?;
-        if r.u16()? != 2 {
+        let version = r.u16()?;
+        if version != 2 && version != 3 {
             return Err(SnapshotWireError);
         }
         if r.bytes()? != env!("CARGO_PKG_VERSION").as_bytes() {
@@ -375,7 +455,8 @@ impl SnapshotImage {
         if dedup.is_some() != registry.is_some() {
             return Err(SnapshotWireError);
         }
-        let place = match r.u8()? {
+        let mut encoded_place = None;
+        let mut place = match r.u8()? {
             0 => {
                 if config.place.is_some() {
                     return Err(SnapshotWireError);
@@ -384,9 +465,7 @@ impl SnapshotImage {
             }
             1 => {
                 let expected = config.place.as_ref().ok_or(SnapshotWireError)?;
-                if r.bytes()? != place_bytes(expected, config.max_bytes)? {
-                    return Err(SnapshotWireError);
-                }
+                encoded_place = Some(r.bytes()?.to_vec());
                 let limits = expected.limits;
                 let ids = ClientOrderIds::read_snapshot(
                     &mut r,
@@ -395,12 +474,6 @@ impl SnapshotImage {
                     limits.client_id_bytes,
                 )?;
                 if registry.is_none()
-                    || expected.policies.iter().any(|(market, policy)| {
-                        markets.get(market).is_none_or(|book| {
-                            book.price_band_config()
-                                .is_some_and(|(_, math)| math != policy.market_math())
-                        })
-                    })
                     || !ids.validate_active(|market, id, user| {
                         markets
                             .get(&market)
@@ -417,6 +490,59 @@ impl SnapshotImage {
             }
             _ => return Err(SnapshotWireError),
         };
+        let mut managed_markets = BTreeMap::new();
+        if version == 3 {
+            let managed_count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+            if managed_count > config.max_markets || managed_count > markets.len() {
+                return Err(SnapshotWireError);
+            }
+            let mut previous = None;
+            for _ in 0..managed_count {
+                let market = MarketId::new(r.u32()?);
+                if previous.is_some_and(|old| old >= market) {
+                    return Err(SnapshotWireError);
+                }
+                previous = Some(market);
+                let state = matching_domain::ManagedMarket::read_snapshot(&mut r)?;
+                let book = markets.get(&market).ok_or(SnapshotWireError)?;
+                let math = state.config().validate().map_err(|_| SnapshotWireError)?;
+                if state.config().market_id != market
+                    || book.price_band_config()
+                        != state.config().price_band.map(|band| (band, math))
+                    || (state.lifecycle().state() == matching_domain::MarketState::Closed
+                        && (book.best_price(matching_domain::Side::Buy).is_some()
+                            || book.best_price(matching_domain::Side::Sell).is_some()
+                            || !book.stop_orders(matching_domain::Side::Buy).is_empty()
+                            || !book.stop_orders(matching_domain::Side::Sell).is_empty()))
+                {
+                    return Err(SnapshotWireError);
+                }
+                managed_markets.insert(market, state);
+            }
+        }
+        if let Some(place) = &mut place {
+            for (market, state) in &managed_markets {
+                let policy = place
+                    .config
+                    .policies
+                    .get_mut(market)
+                    .ok_or(SnapshotWireError)?;
+                *policy = policy
+                    .with_market_math(state.config().validate().map_err(|_| SnapshotWireError)?)
+                    .map_err(|_| SnapshotWireError)?;
+            }
+            if encoded_place.as_deref()
+                != Some(place_bytes(&place.config, config.max_bytes)?.as_slice())
+                || place.config.policies.iter().any(|(market, policy)| {
+                    markets.get(market).is_none_or(|book| {
+                        book.price_band_config()
+                            .is_some_and(|(_, math)| math != policy.market_math())
+                    })
+                })
+            {
+                return Err(SnapshotWireError);
+            }
+        }
         let digest: [u8; 32] = r.bytes()?.try_into().map_err(|_| SnapshotWireError)?;
         r.finish()?;
         let image = Self {
@@ -430,6 +556,7 @@ impl SnapshotImage {
             primary_epoch,
             routes: Arc::new(config.routes.clone()),
             markets,
+            managed_markets,
             registry,
             user_epochs,
             dedup,
@@ -444,6 +571,215 @@ impl SnapshotImage {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 市场配置与生命周期均属于快照和摘要的一部分，旧空状态仍可独立恢复。
+    #[test]
+    fn managed_market_snapshot_preserves_state_and_changes_digest() {
+        use matching_domain::{
+            ClosePolicy, ExecutionLimits, MarketConfig, OrderLimits, Qty, QuoteAmount,
+        };
+        let empty = SnapshotRestoreConfig {
+            cluster: ClusterId(2),
+            shard: ShardId(3),
+            primary_epoch: 7,
+            routes: RouteTable::new([]).unwrap(),
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: None,
+            expect_registry: true,
+            max_markets: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let mut image = super::super::empty_recovery_candidate(&empty, &[], 0)
+            .unwrap()
+            .image;
+        let market_id = MarketId(5);
+        let routes = RouteTable::new([crate::MarketRoute {
+            market_id,
+            shard_id: ShardId(3),
+            route_epoch: 1,
+            state: crate::RouteState::Active,
+        }])
+        .unwrap();
+        image.routes = Arc::new(routes.clone());
+        let mut book =
+            ProductionOrderBook::new(matching_orderbook::QueuePriorityPolicy::try_new(1).unwrap());
+        book.bind_market(market_id).unwrap();
+        image.markets.insert(market_id, book);
+        let config = MarketConfig {
+            market_id,
+            price_scale: 0,
+            qty_scale: 0,
+            quote_scale: 0,
+            tick_size: 1,
+            lot_size: 1,
+            order_limits: OrderLimits {
+                min_qty: Qty::try_new(1).unwrap(),
+                max_qty: Qty::try_new(10).unwrap(),
+                min_notional: QuoteAmount::new(1),
+                max_notional: QuoteAmount::new(100),
+            },
+            price_band: None,
+            active_fee_schedule_version: 1,
+            close_policy: ClosePolicy::CancelAll,
+            execution_limits: ExecutionLimits {
+                max_internal_actions_per_command: 10,
+                max_trades_per_command: 10,
+                priority_exhaustion_guard: 1,
+                synthetic_priority_ceiling: None,
+            },
+        };
+        let mut managed = matching_domain::ManagedMarket::new(config).unwrap();
+        managed.start_session(17, true).unwrap();
+        let before = image.state_digest(empty.max_bytes).unwrap();
+        image.managed_markets.insert(market_id, managed.clone());
+        assert_ne!(before, image.state_digest(empty.max_bytes).unwrap());
+        let state = image.managed_markets.get_mut(&market_id).unwrap();
+        let mut altered = state.config().clone();
+        altered.execution_limits.priority_exhaustion_guard = 2;
+        state
+            .update_config(
+                altered,
+                matching_domain::MarketConfigUpdateChecks {
+                    has_active_orders: false,
+                    has_referenced_history: false,
+                    existing_orders_valid: true,
+                    fee_version_available: true,
+                },
+            )
+            .unwrap();
+        assert!(image.state_digest(empty.max_bytes).is_err());
+        image.managed_markets.insert(market_id, managed.clone());
+        let bytes = image.encode_snapshot(empty.max_bytes).unwrap();
+        let trusted = SnapshotRestoreConfig { routes, ..empty };
+        let restored = SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+        assert_eq!(restored.managed_markets.get(&market_id), Some(&managed));
+        assert_eq!(
+            restored.state_digest(trusted.max_bytes).unwrap(),
+            image.state_digest(trusted.max_bytes).unwrap()
+        );
+        let mut restored = restored;
+        restored.start_allowed = true;
+        assert!(Shard::start_in_memory_from_snapshot(restored, &trusted).is_err());
+        let empty_book = image.markets[&market_id].clone();
+        image
+            .markets
+            .get_mut(&market_id)
+            .unwrap()
+            .rest(matching_domain::LimitOrder {
+                order_id: matching_domain::OrderId(1),
+                user_id: matching_domain::UserId(1),
+                stp_key: matching_domain::StpKey::new(0),
+                stp_mode: matching_domain::StpMode::None,
+                side: matching_domain::Side::Buy,
+                price: matching_domain::Price::try_new(10).unwrap(),
+                qty: Qty::try_new(1).unwrap(),
+            })
+            .unwrap();
+        assert!(image.state_digest(trusted.max_bytes).is_err());
+        image
+            .markets
+            .get_mut(&market_id)
+            .unwrap()
+            .cancel(matching_domain::OrderId(1))
+            .unwrap();
+        assert!(image.state_digest(trusted.max_bytes).is_err());
+        image
+            .managed_markets
+            .get_mut(&market_id)
+            .unwrap()
+            .record_referenced_history();
+        assert!(image.state_digest(trusted.max_bytes).is_ok());
+        let state = image.managed_markets.get_mut(&market_id).unwrap();
+        let mut band_config = state.config().clone();
+        band_config.price_band = Some(matching_domain::PriceBandConfig {
+            reference_kind: matching_domain::PriceReferenceKind::LastTrade,
+            max_deviation_bps: 100,
+        });
+        state
+            .update_config(
+                band_config.clone(),
+                matching_domain::MarketConfigUpdateChecks {
+                    has_active_orders: false,
+                    has_referenced_history: true,
+                    existing_orders_valid: true,
+                    fee_version_available: true,
+                },
+            )
+            .unwrap();
+        let book = image.markets.get_mut(&market_id).unwrap();
+        book.rest(matching_domain::LimitOrder {
+            order_id: matching_domain::OrderId(2),
+            user_id: matching_domain::UserId(1),
+            stp_key: matching_domain::StpKey::new(0),
+            stp_mode: matching_domain::StpMode::None,
+            side: matching_domain::Side::Buy,
+            price: matching_domain::Price::try_new(10).unwrap(),
+            qty: Qty::try_new(1).unwrap(),
+        })
+        .unwrap();
+        book.set_price_band_config(Some((
+            band_config.price_band.unwrap(),
+            band_config.validate().unwrap(),
+        )))
+        .unwrap();
+        assert!(image.state_digest(trusted.max_bytes).is_err());
+        let book = image.markets.get_mut(&market_id).unwrap();
+        book.set_price_band_config(None).unwrap();
+        let math = band_config.validate().unwrap();
+        book.trigger_stops(
+            matching_domain::PriceReference {
+                kind: matching_domain::PriceReferenceKind::LastTrade,
+                source_seq: 1,
+                price: matching_domain::Price::try_new(i64::MAX).unwrap(),
+            },
+            LogicalTime::new(0),
+            17,
+            &math,
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
+        book.set_price_band_config(Some((band_config.price_band.unwrap(), math)))
+            .unwrap();
+        assert!(image.state_digest(trusted.max_bytes).is_err());
+        image.markets.insert(market_id, empty_book);
+        let managed = image.managed_markets.remove(&market_id).unwrap();
+        image.managed_markets.insert(MarketId(6), managed);
+        assert!(image.encode_snapshot(trusted.max_bytes).is_err());
+    }
+
+    /// 空管理状态的新版镜像与既有版本摘要相容。
+    #[test]
+    fn version_two_snapshot_restores_with_empty_managed_state() {
+        let config = SnapshotRestoreConfig {
+            cluster: ClusterId(2),
+            shard: ShardId(3),
+            primary_epoch: 7,
+            routes: RouteTable::new([]).unwrap(),
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: None,
+            expect_registry: true,
+            max_markets: 0,
+            max_bytes: 1024 * 1024,
+        };
+        let image = super::super::empty_recovery_candidate(&config, &[], 0)
+            .unwrap()
+            .image;
+        let mut bytes = image.encode_snapshot(config.max_bytes).unwrap();
+        let count_start = bytes.len() - 40;
+        assert_eq!(&bytes[count_start..count_start + 4], &[0, 0, 0, 0]);
+        bytes.drain(count_start..count_start + 4);
+        bytes[1] = 2;
+        let restored = SnapshotImage::decode_snapshot(&bytes, &config).unwrap();
+        assert!(restored.managed_markets.is_empty());
+        assert_eq!(
+            restored.state_digest(config.max_bytes).unwrap(),
+            image.state_digest(config.max_bytes).unwrap()
+        );
+    }
     /// 检查软件 SHA-256 后端的标准输入与固定摘要。
     #[test]
     fn sha256_matches_standard_abc_vector() {

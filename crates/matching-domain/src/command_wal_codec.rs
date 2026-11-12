@@ -19,6 +19,41 @@ pub fn encode_wal_command(c: &CommandEnvelope) -> Result<Vec<u8>, CommandCodecEr
     w.opt(c.client_timestamp, |w, v| w.u64(v));
     w.opt(c.received_at_unix_ns, |w, v| w.u64(v));
     match &c.payload {
+        Command::CreateMarket(input) => {
+            w.u8(4);
+            encode_market_config(&mut w, &input.config)?;
+        }
+        Command::UpdateMarket(input) => {
+            w.u8(5);
+            encode_market_config(&mut w, &input.config)?;
+        }
+        Command::OpenMarket(input) => {
+            w.u8(6);
+            w.u32(input.market_id.get());
+            w.u64(input.session_id);
+        }
+        Command::SuspendMarket(input) => {
+            w.u8(7);
+            w.u32(input.market_id.get());
+        }
+        Command::ResumeMarket(input) => {
+            w.u8(8);
+            w.u32(input.market_id.get());
+        }
+        Command::EndSession(input) => {
+            w.u8(9);
+            w.u32(input.market_id.get());
+            w.u64(input.session_id);
+        }
+        Command::CloseMarket(input) => {
+            w.u8(10);
+            w.u32(input.market_id.get());
+        }
+        Command::StartSession(input) => {
+            w.u8(3);
+            w.u32(input.market_id.get());
+            w.u64(input.new_session_id);
+        }
         Command::ApplyUserControlFenceShard(f) => {
             w.u8(0);
             w.u128(f.parent_command_id.0);
@@ -118,6 +153,28 @@ pub fn encode_wal_command(c: &CommandEnvelope) -> Result<Vec<u8>, CommandCodecEr
     }
     Ok(w.0)
 }
+/// 将市场配置作为有界载荷写入命令，业务数值错误留给执行阶段。
+fn encode_market_config(
+    writer: &mut Writer,
+    config: &MarketConfig,
+) -> Result<(), CommandCodecError> {
+    let mut buffer = crate::snapshot_wire::SnapshotEncoder::new(256);
+    config
+        .write_command_config(&mut buffer)
+        .map_err(|_| CommandCodecError)?;
+    writer.bytes(&buffer.finish())
+}
+
+/// 重建市场配置的结构并拒绝额外字节，保留待业务校验的数值。
+fn decode_market_config(reader: &mut Reader<'_>) -> Result<MarketConfig, CommandCodecError> {
+    let bytes = reader.bytes()?;
+    let mut buffer =
+        crate::snapshot_wire::SnapshotDecoder::new(bytes, 256).map_err(|_| CommandCodecError)?;
+    let config = MarketConfig::read_command_config(&mut buffer).map_err(|_| CommandCodecError)?;
+    buffer.finish().map_err(|_| CommandCodecError)?;
+    Ok(config)
+}
+
 /// 从完整字节解码正式命令，拒绝尾部多余字节和未知版本。
 pub fn decode_wal_command(bytes: &[u8]) -> Result<CommandEnvelope, CommandCodecError> {
     if bytes.len() > MAX {
@@ -136,6 +193,33 @@ pub fn decode_wal_command(bytes: &[u8]) -> Result<CommandEnvelope, CommandCodecE
     let client_timestamp = r.opt(|r| r.u64())?;
     let received_at_unix_ns = r.opt(|r| r.u64())?;
     let payload = match r.u8()? {
+        4 => Command::CreateMarket(Box::new(CreateMarket {
+            config: decode_market_config(&mut r)?,
+        })),
+        5 => Command::UpdateMarket(Box::new(UpdateMarket {
+            config: decode_market_config(&mut r)?,
+        })),
+        6 => Command::OpenMarket(OpenMarket {
+            market_id: MarketId(r.u32()?),
+            session_id: r.u64()?,
+        }),
+        7 => Command::SuspendMarket(SuspendMarket {
+            market_id: MarketId(r.u32()?),
+        }),
+        8 => Command::ResumeMarket(ResumeMarket {
+            market_id: MarketId(r.u32()?),
+        }),
+        9 => Command::EndSession(EndSession {
+            market_id: MarketId(r.u32()?),
+            session_id: r.u64()?,
+        }),
+        10 => Command::CloseMarket(CloseMarket {
+            market_id: MarketId(r.u32()?),
+        }),
+        3 => Command::StartSession(StartSession {
+            market_id: MarketId(r.u32()?),
+            new_session_id: r.u64()?,
+        }),
         0 => Command::ApplyUserControlFenceShard(ApplyUserControlFenceShard {
             parent_command_id: CommandId(r.u128()?),
             user_id: UserId(r.u64()?),

@@ -58,3 +58,38 @@ struct LevelSnapshotEntry {
     total_visible_qty: u64,
 }
 mod trade_cursor;
+
+#[test]
+fn priority_policy_update_preserves_counters_and_is_atomic_at_both_boundaries() {
+    let old = QueuePriorityPolicy::try_with_synthetic_ceiling(1, Some(10)).unwrap();
+    let mut book = ProductionOrderBook::new(old);
+    book.queue_priority_allocator = crate::QueuePriorityAllocator::try_restore(old, 3).unwrap();
+    book.stop_priority_allocator = crate::StopPriorityAllocator::try_restore(old, 7).unwrap();
+    let before = book.clone();
+    let too_small = QueuePriorityPolicy::try_with_synthetic_ceiling(1, Some(6)).unwrap();
+    assert_eq!(
+        book.update_priority_policy(too_small),
+        Err(RejectReason::PrioritySpaceExhaustion)
+    );
+    assert_eq!(book, before);
+    book.queue_priority_allocator = crate::QueuePriorityAllocator::try_restore(old, 7).unwrap();
+    book.stop_priority_allocator = crate::StopPriorityAllocator::try_restore(old, 3).unwrap();
+    let before = book.clone();
+    assert_eq!(
+        book.update_priority_policy(too_small),
+        Err(RejectReason::PrioritySpaceExhaustion)
+    );
+    assert_eq!(book, before);
+    book.queue_priority_allocator = crate::QueuePriorityAllocator::try_restore(old, 3).unwrap();
+    book.stop_priority_allocator = crate::StopPriorityAllocator::try_restore(old, 7).unwrap();
+    let exact = QueuePriorityPolicy::try_with_synthetic_ceiling(1, Some(7)).unwrap();
+    book.update_priority_policy(exact).unwrap();
+    assert_eq!(book.next_queue_priority(), 3);
+    assert_eq!(book.next_stop_priority(), 7);
+    assert_eq!(book.priority_policy(), exact);
+    assert_eq!(book.stop_priority_allocator.policy(), &exact);
+    assert_eq!(
+        book.stop_priority_allocator.preflight_allocate(),
+        Err(RejectReason::PrioritySpaceExhaustion)
+    );
+}

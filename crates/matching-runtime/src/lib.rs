@@ -23,7 +23,7 @@ pub use place_config::{PlaceConfigError, PlaceLimits, PlaceSupportConfig};
 /// 本地持久前缀中的正式命令。
 pub use recovery::{
     RecoveredCommand, SnapshotRecoveryRecords, SnapshotReplayResult, recover_local_commands,
-    recover_snapshot_records,
+    recover_snapshot_records, recover_snapshot_records_with_genesis,
 };
 /// 显式路由与配置错误。
 pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable};

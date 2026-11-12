@@ -27,6 +27,54 @@ pub fn encode_event_for_hash(
         }
     }
     match &event.payload {
+        EngineEvent::OrderExpired { order_id, reason } => {
+            w.u8(19)?;
+            w.u128(order_id.get())?;
+            w.u16(*reason as u16)?;
+        }
+        EngineEvent::MarketCreated { market_id } => {
+            w.u8(15)?;
+            w.u32(market_id.get())?;
+        }
+        EngineEvent::MarketConfigUpdated { market_id } => {
+            w.u8(16)?;
+            w.u32(market_id.get())?;
+        }
+        EngineEvent::SessionStarted {
+            market_id,
+            session_id,
+        } => {
+            w.u8(17)?;
+            w.u32(market_id.get())?;
+            w.u64(*session_id)?;
+        }
+        EngineEvent::SessionEnded {
+            market_id,
+            session_id,
+        } => {
+            w.u8(18)?;
+            w.u32(market_id.get())?;
+            w.u64(*session_id)?;
+        }
+        EngineEvent::MarketStateChanged {
+            market_id,
+            old,
+            new,
+            reason,
+        } => {
+            w.u8(14)?;
+            w.u32(market_id.get())?;
+            let tag = |state| match state {
+                crate::MarketState::PreOpen => 0,
+                crate::MarketState::Open => 1,
+                crate::MarketState::Halted => 2,
+                crate::MarketState::Suspended => 3,
+                crate::MarketState::Closed => 4,
+            };
+            w.u8(tag(*old))?;
+            w.u8(tag(*new))?;
+            w.u16(*reason as u16)?;
+        }
         EngineEvent::UserControlEpochAdvanced { user_id, epoch } => {
             w.u8(0)?;
             w.u64(user_id.get())?;

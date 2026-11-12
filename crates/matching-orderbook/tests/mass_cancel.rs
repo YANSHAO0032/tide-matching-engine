@@ -102,6 +102,268 @@ fn math() -> matching_domain::MarketMath {
 }
 
 #[test]
+fn market_close_plans_expiry_and_cancellation_before_atomic_install() {
+    use matching_domain::{CancelReason, ExpireReason, RejectReason};
+    assert_eq!(CancelReason::MarketClosed as u16, 1104);
+    let mut production = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut reference = ReferenceOrderBook::new();
+    let a = state(1, 1, 1);
+    let b = state(2, 1, 1);
+    let c = state(3, 1, 1);
+    let d = state(4, 1, 1);
+    let e = state(5, 1, 1);
+    let f = state(6, 1, 1);
+    let mut registry = ReservationRegistry::new([
+        a.clone(),
+        b.clone(),
+        c.clone(),
+        d.clone(),
+        e.clone(),
+        f.clone(),
+    ])
+    .unwrap();
+    production
+        .rest_with_reservation(regular(1, 1), a.clone())
+        .unwrap();
+    production
+        .rest_timed_with_reservation(
+            regular(2, 1),
+            TimeInForce::Day { session_id: 7 },
+            LogicalTime::new(0),
+            7,
+            b.clone(),
+        )
+        .unwrap();
+    production
+        .place_stop_with_reservation(
+            base_stop(3, 1, TriggerExpiry::Day { session_id: 7 }),
+            LogicalTime::new(0),
+            7,
+            c.clone(),
+        )
+        .unwrap();
+    production
+        .place_stop_with_reservation(quote_stop(4, 1), LogicalTime::new(0), 7, d.clone())
+        .unwrap();
+    production
+        .place_iceberg_post_only_with_reservation(iceberg(5, 1), &math(), e.clone())
+        .unwrap();
+    production
+        .rest_timed_with_reservation(
+            regular(6, 1),
+            TimeInForce::Gtd {
+                expire_at: LogicalTime::new(10),
+            },
+            LogicalTime::new(0),
+            7,
+            f.clone(),
+        )
+        .unwrap();
+    reference.rest_with_reservation(regular(1, 1), a).unwrap();
+    reference
+        .rest_timed_with_reservation(
+            regular(2, 1),
+            TimeInForce::Day { session_id: 7 },
+            LogicalTime::new(0),
+            7,
+            b,
+        )
+        .unwrap();
+    reference
+        .place_stop_with_reservation(
+            base_stop(3, 1, TriggerExpiry::Day { session_id: 7 }),
+            LogicalTime::new(0),
+            7,
+            c,
+        )
+        .unwrap();
+    reference
+        .place_stop_with_reservation(quote_stop(4, 1), LogicalTime::new(0), 7, d)
+        .unwrap();
+    reference
+        .place_iceberg_post_only_with_reservation(iceberg(5, 1), &math(), e)
+        .unwrap();
+    reference
+        .rest_timed_with_reservation(
+            regular(6, 1),
+            TimeInForce::Gtd {
+                expire_at: LogicalTime::new(10),
+            },
+            LogicalTime::new(0),
+            7,
+            f,
+        )
+        .unwrap();
+    let before = production.clone();
+    let before_registry = registry.clone();
+    assert_eq!(
+        production.plan_market_close(8, &registry).unwrap_err(),
+        RejectReason::InvalidSession
+    );
+    assert_eq!(production, before);
+    assert_eq!(registry, before_registry);
+    let mut reference_registry = registry.clone();
+    let plan = production.plan_market_close(7, &registry).unwrap();
+    let reference_plan = reference.plan_market_close(7, &reference_registry).unwrap();
+    let (result, events) = production.apply_mass_cancel(&mut registry, plan).unwrap();
+    let (_, reference_events) = reference
+        .apply_mass_cancel(&mut reference_registry, reference_plan)
+        .unwrap();
+    assert_eq!(events, reference_events);
+    assert_eq!(result.canceled_orders, 6);
+    assert!(matches!(
+        events[0],
+        EngineEvent::OrderCanceled {
+            reason: CancelReason::MarketClosed,
+            ..
+        }
+    ));
+    assert_eq!(
+        events[1],
+        EngineEvent::OrderExpired {
+            order_id: OrderId(2),
+            reason: ExpireReason::SessionEnded
+        }
+    );
+    assert_eq!(
+        events[2],
+        EngineEvent::OrderExpired {
+            order_id: OrderId(3),
+            reason: ExpireReason::StopTriggerSessionEnded
+        }
+    );
+    assert!(matches!(
+        events[3],
+        EngineEvent::OrderCanceled {
+            reason: CancelReason::MarketClosed,
+            ..
+        }
+    ));
+    assert!(production.order(OrderId(1)).is_none());
+    assert!(production.order(OrderId(2)).is_none());
+    assert!(production.stop_order(OrderId(3)).is_none());
+    assert!(production.stop_order(OrderId(4)).is_none());
+    for event in &events[4..] {
+        assert!(matches!(
+            event,
+            EngineEvent::OrderCanceled {
+                reason: CancelReason::MarketClosed,
+                ..
+            }
+        ));
+    }
+    assert!(production.order(OrderId(5)).is_none());
+    assert!(production.order(OrderId(6)).is_none());
+    for id in 1..=6 {
+        assert!(registry.is_pending_r2(ReservationId(id + 100)));
+    }
+}
+
+#[test]
+fn end_session_only_expires_matching_day_orders_and_preserves_gtc() {
+    use matching_domain::ExpireReason;
+    let mut production = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut reference = ReferenceOrderBook::new();
+    let a = state(10, 1, 1);
+    let b = state(20, 1, 1);
+    let c = state(30, 1, 1);
+    production
+        .rest_with_reservation(regular(10, 1), a.clone())
+        .unwrap();
+    production
+        .rest_timed_with_reservation(
+            regular(20, 1),
+            TimeInForce::Day { session_id: 7 },
+            LogicalTime::new(0),
+            7,
+            b.clone(),
+        )
+        .unwrap();
+    production
+        .place_stop_with_reservation(
+            base_stop(30, 1, TriggerExpiry::Day { session_id: 7 }),
+            LogicalTime::new(0),
+            7,
+            c.clone(),
+        )
+        .unwrap();
+    reference
+        .rest_with_reservation(regular(10, 1), a.clone())
+        .unwrap();
+    reference
+        .rest_timed_with_reservation(
+            regular(20, 1),
+            TimeInForce::Day { session_id: 7 },
+            LogicalTime::new(0),
+            7,
+            b.clone(),
+        )
+        .unwrap();
+    reference
+        .place_stop_with_reservation(
+            base_stop(30, 1, TriggerExpiry::Day { session_id: 7 }),
+            LogicalTime::new(0),
+            7,
+            c.clone(),
+        )
+        .unwrap();
+    let mut registry = ReservationRegistry::new([a, b, c]).unwrap();
+    let mut ref_registry = registry.clone();
+    let before = production.clone();
+    assert_eq!(
+        production.plan_end_session(8, 7, &registry).unwrap_err(),
+        matching_domain::RejectReason::InvalidSession
+    );
+    assert_eq!(production, before);
+    let plan = production.plan_end_session(7, 7, &registry).unwrap();
+    let ref_plan = reference.plan_end_session(7, 7, &ref_registry).unwrap();
+    let (_, events) = production.apply_mass_cancel(&mut registry, plan).unwrap();
+    let (_, ref_events) = reference
+        .apply_mass_cancel(&mut ref_registry, ref_plan)
+        .unwrap();
+    assert_eq!(events, ref_events);
+    assert_eq!(
+        events,
+        vec![
+            EngineEvent::OrderExpired {
+                order_id: OrderId(20),
+                reason: ExpireReason::SessionEnded
+            },
+            EngineEvent::OrderExpired {
+                order_id: OrderId(30),
+                reason: ExpireReason::StopTriggerSessionEnded
+            }
+        ]
+    );
+    assert!(production.order(OrderId(10)).is_some());
+    assert!(!registry.is_pending_r2(ReservationId(110)));
+    assert!(registry.is_pending_r2(ReservationId(120)));
+    assert!(registry.is_pending_r2(ReservationId(130)));
+}
+
+#[test]
+fn market_close_plan_rejects_book_drift_without_further_mutation() {
+    let mut production = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let a = state(1, 1, 1);
+    let b = state(2, 1, 1);
+    let mut registry = ReservationRegistry::new([a.clone(), b.clone()]).unwrap();
+    production.rest_with_reservation(regular(1, 1), a).unwrap();
+    production.rest_with_reservation(regular(2, 1), b).unwrap();
+    let plan = production.plan_market_close(7, &registry).unwrap();
+    production.cancel(OrderId(2)).unwrap();
+    let before = production.clone();
+    let before_registry = registry.clone();
+    assert_eq!(
+        production
+            .apply_mass_cancel(&mut registry, plan)
+            .unwrap_err(),
+        ReservationApplyError::StateChanged
+    );
+    assert_eq!(production, before);
+    assert_eq!(registry, before_registry);
+}
+
+#[test]
 fn unprotected_base_market_registry_rejects_overflow_without_mutation() {
     let mut reference = ReferenceOrderBook::new();
     let mut production = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
