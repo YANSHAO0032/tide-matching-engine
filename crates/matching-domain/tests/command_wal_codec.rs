@@ -267,3 +267,70 @@ fn place_and_fence_have_stable_complete_golden_encoding() {
         assert_eq!(&decode_wal_command(expected).unwrap(), command);
     }
 }
+
+#[test]
+fn fee_schedule_update_wal_roundtrips_and_rejects_truncation() {
+    let schedule = FeeSchedule::new(
+        9,
+        FeeAssetPolicy::Quote,
+        [(
+            7,
+            FeeTier {
+                maker_bps: -2,
+                taker_bps: 8,
+                rounding: FeeRounding::Floor,
+            },
+        )],
+    )
+    .unwrap();
+    let command = envelope(Command::UpdateFeeSchedule(Box::new(UpdateFeeSchedule {
+        schedule,
+        history: Vec::new(),
+    })));
+    let bytes = encode_wal_command(&command).unwrap();
+    assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+    for n in 0..bytes.len() {
+        assert!(decode_wal_command(&bytes[..n]).is_err());
+    }
+}
+
+#[test]
+fn fee_schedule_update_carries_bootstrap_history_through_wal() {
+    let tier = FeeTier {
+        maker_bps: 1,
+        taker_bps: 2,
+        rounding: FeeRounding::Floor,
+    };
+    let old = FeeSchedule::new(1, FeeAssetPolicy::Quote, [(7, tier)]).unwrap();
+    let current = FeeSchedule::new(2, FeeAssetPolicy::Base, [(7, tier)]).unwrap();
+    let command = envelope(Command::UpdateFeeSchedule(Box::new(UpdateFeeSchedule {
+        schedule: current,
+        history: vec![old],
+    })));
+    let bytes = encode_wal_command(&command).unwrap();
+    assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+    for n in 0..bytes.len() {
+        assert!(decode_wal_command(&bytes[..n]).is_err());
+    }
+}
+
+#[test]
+fn bootstrap_history_rejects_duplicate_or_out_of_order_versions() {
+    let tier = FeeTier {
+        maker_bps: 1,
+        taker_bps: 2,
+        rounding: FeeRounding::Floor,
+    };
+    let schedule = |version| FeeSchedule::new(version, FeeAssetPolicy::Quote, [(7, tier)]).unwrap();
+    for history in [
+        vec![schedule(1), schedule(1)],
+        vec![schedule(2), schedule(1)],
+        vec![schedule(3)],
+    ] {
+        let command = envelope(Command::UpdateFeeSchedule(Box::new(UpdateFeeSchedule {
+            schedule: schedule(3),
+            history,
+        })));
+        assert!(encode_wal_command(&command).is_err());
+    }
+}

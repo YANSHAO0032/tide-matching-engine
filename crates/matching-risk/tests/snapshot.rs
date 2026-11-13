@@ -124,3 +124,33 @@ fn snapshot_trusted_place_policy_and_keys_roundtrip() {
         assert!(ok.is_err());
     }
 }
+
+#[test]
+fn released_empty_reservation_roundtrips_but_active_empty_is_rejected() {
+    let mut state = ReservationState {
+        reservation_id: ReservationId::new(80),
+        order_id: OrderId::new(81),
+        user_id: UserId::new(82),
+        market_id: MarketId(83),
+        origin_session_id: OriginSessionId(84),
+        version: 0,
+        reserves: vec![],
+        status: ReservationStatus::Released,
+        fee_schedule_version: 1,
+        fee_tier_id: 1,
+    };
+    let registry = matching_risk::ReservationRegistry::new([state.clone()]).unwrap();
+    let mut writer = SnapshotEncoder::new(1024);
+    registry.write_snapshot(&mut writer).unwrap();
+    let bytes = writer.finish();
+    let mut reader = SnapshotDecoder::new(&bytes, 1024).unwrap();
+    assert_eq!(
+        matching_risk::ReservationRegistry::read_snapshot(&mut reader).unwrap(),
+        registry
+    );
+    reader.finish().unwrap();
+    state.status = ReservationStatus::Active;
+    assert!(matching_risk::ReservationRegistry::new([state.clone()]).is_err());
+    let mut writer = SnapshotEncoder::new(1024);
+    assert!(encode_reservation_snapshot(&mut writer, &state).is_err());
+}

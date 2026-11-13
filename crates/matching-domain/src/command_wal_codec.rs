@@ -19,6 +19,15 @@ pub fn encode_wal_command(c: &CommandEnvelope) -> Result<Vec<u8>, CommandCodecEr
     w.opt(c.client_timestamp, |w, v| w.u64(v));
     w.opt(c.received_at_unix_ns, |w, v| w.u64(v));
     match &c.payload {
+        Command::UpdateFeeSchedule(input) => {
+            w.u8(11);
+            let mut snapshot = snapshot_wire::SnapshotEncoder::new(MAX);
+            FeeScheduleBook::from_history(input.history.clone(), input.schedule.clone())
+                .map_err(|_| CommandCodecError)?
+                .write_snapshot(&mut snapshot)
+                .map_err(|_| CommandCodecError)?;
+            w.bytes(&snapshot.finish())?;
+        }
         Command::CreateMarket(input) => {
             w.u8(4);
             encode_market_config(&mut w, &input.config)?;
@@ -193,6 +202,16 @@ pub fn decode_wal_command(bytes: &[u8]) -> Result<CommandEnvelope, CommandCodecE
     let client_timestamp = r.opt(|r| r.u64())?;
     let received_at_unix_ns = r.opt(|r| r.u64())?;
     let payload = match r.u8()? {
+        11 => {
+            let bytes = r.bytes()?;
+            let mut snapshot =
+                snapshot_wire::SnapshotDecoder::new(bytes, MAX).map_err(|_| CommandCodecError)?;
+            let book = FeeScheduleBook::read_snapshot(&mut snapshot, MAX / 13, MAX / 21)
+                .map_err(|_| CommandCodecError)?;
+            snapshot.finish().map_err(|_| CommandCodecError)?;
+            let (history, schedule) = book.into_history();
+            Command::UpdateFeeSchedule(Box::new(UpdateFeeSchedule { schedule, history }))
+        }
         4 => Command::CreateMarket(Box::new(CreateMarket {
             config: decode_market_config(&mut r)?,
         })),

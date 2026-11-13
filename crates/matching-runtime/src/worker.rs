@@ -117,6 +117,11 @@ pub struct FormalExecution {
 /// 正式命令的有类型结果，不作为业务事件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormalOutcome {
+    /// 费率版本已更新。
+    FeeScheduleUpdated(
+        /// 已生效的版本号。
+        u64,
+    ),
     /// 市场管理命令成功，详细变化按事件顺序返回。
     MarketManaged,
     /// 正式限价命令成功接收的订单身份。
@@ -1298,7 +1303,11 @@ impl Shard {
                 place.limits.client_id_bytes,
             )
             .map_err(|()| ShardError::InvalidConfig)?;
-            Some(PlaceRuntimeState { config: place, ids })
+            Some(PlaceRuntimeState {
+                config: place,
+                ids,
+                fee_book: None,
+            })
         } else {
             None
         };
@@ -1374,6 +1383,7 @@ impl Shard {
                                         || matches!(
                                             &command.payload,
                                             Command::CreateMarket(_)
+                                                | Command::UpdateFeeSchedule(_)
                                                 | Command::UpdateMarket(_)
                                                 | Command::StartSession(_)
                                                 | Command::OpenMarket(_)
@@ -1545,7 +1555,7 @@ impl Shard {
                                         &clock,
                                         &mut markets,
                                         &mut registry,
-                                        (command, &mut durable),
+                                        (command, &mut durable, false),
                                     )
                                     .map_err(FormalError::Rejected),
                                 }
@@ -1591,6 +1601,7 @@ impl Shard {
                                     .map(|state| {
                                         Ok::<_, SnapshotError>(PlaceRuntimeState {
                                             config: state.config.clone(),
+                                            fee_book: state.fee_book.clone(),
                                             ids: state
                                                 .ids
                                                 .try_clone_preallocated()
@@ -1714,6 +1725,8 @@ struct PlaceRuntimeState {
     config: PlaceSupportConfig,
     /// 与活动订单及终结历史同步的客户端身份。
     ids: ClientOrderIds,
+    /// 单写者持有的持久费率版本候选。
+    fee_book: Option<matching_domain::FeeScheduleBook>,
 }
 
 /// 正式限价命令所需的单写者状态。
@@ -1945,6 +1958,7 @@ impl FormalBatchCandidate {
                 Ok(PlaceRuntimeState {
                     config: state.config.clone(),
                     ids: state.ids.try_clone_preallocated()?,
+                    fee_book: state.fee_book.clone(),
                 })
             })
             .transpose()?;
@@ -2038,6 +2052,26 @@ impl FormalBatchCandidate {
     ) -> Result<FormalExecution, FormalError> {
         if matches!(command.payload, Command::ApplyUserControlFenceShard(_)) {
             return self.fence.stage(command);
+        }
+        if matches!(command.payload, Command::UpdateFeeSchedule(_)) {
+            return execute_fee_schedule_update(
+                FormalIdentity {
+                    shard: self.fence.shard,
+                    cluster: self.fence.cluster,
+                    event_capacity: u64::from(u32::MAX) + 1,
+                },
+                routes,
+                &mut self.fence.seq,
+                &self.fence.clock,
+                &mut self.fence.dedup,
+                FeeUpdateState {
+                    place: &mut self.place,
+                    managed_markets: &self.managed_markets,
+                    markets: &self.markets,
+                    registry: &self.registry,
+                },
+                command,
+            );
         }
         if matches!(
             command.payload,
@@ -2460,20 +2494,31 @@ fn execute_place(
     let book = markets.get_mut(&market).expect("已验证市场存在");
     let planned = managed_place_preflight(managed, state.config.managed_only, place, book)
         .and_then(|()| {
-            place_candidate(
-                PlacePlanningContext {
-                    policy,
-                    keys: &state.config.keys,
-                    command_id: command.command_id,
-                    session: command.session_id,
-                    now: clock.now(),
-                },
-                place,
-                book,
-                registry,
-                ids,
-                &cursor,
-            )
+            let context = PlacePlanningContext {
+                policy,
+                keys: &state.config.keys,
+                command_id: command.command_id,
+                session: command.session_id,
+                now: clock.now(),
+            };
+            if let Some(fees) = &state.fee_book {
+                crate::place_candidate::place_candidate_with_fees(
+                    (
+                        context,
+                        fees,
+                        managed.map_or(fees.active_version(), |m| {
+                            m.config().active_fee_schedule_version
+                        }),
+                    ),
+                    place,
+                    book,
+                    registry,
+                    ids,
+                    &cursor,
+                )
+            } else {
+                place_candidate(context, place, book, registry, ids, &cursor)
+            }
         });
     if let (Some(managed), Ok(candidate)) = (managed, &planned) {
         let trade_count = candidate
@@ -2548,6 +2593,145 @@ fn execute_place(
         let _cursor = candidate.cursor;
     }
     window.insert_prepared(&command, prepared, &result);
+    Ok(result)
+}
+
+/// 费率更新需要检查的分片状态。
+struct FeeUpdateState<'a> {
+    /// 保存候选费率簿的下单配置。
+    place: &'a mut Option<PlaceRuntimeState>,
+    /// 受管理市场及其版本引用。
+    managed_markets: &'a BTreeMap<MarketId, matching_domain::ManagedMarket>,
+    /// 用于核验活动订单影子的市场簿。
+    markets: &'a BTreeMap<MarketId, ProductionOrderBook>,
+    /// 活动及等待后置处理的预留。
+    registry: &'a Option<ReservationRegistry>,
+}
+
+/// 在隔离候选中发布费率版本，并保持前置拒绝不占序号。
+fn execute_fee_schedule_update(
+    identity: FormalIdentity,
+    routes: &RouteTable,
+    seq: &mut Sequencer,
+    clock: &LogicalClock,
+    dedup: &mut DedupWindow,
+    FeeUpdateState {
+        place,
+        managed_markets,
+        markets,
+        registry,
+    }: FeeUpdateState<'_>,
+    command: CommandEnvelope,
+) -> Result<FormalExecution, FormalError> {
+    let market = command
+        .market_id
+        .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
+    let epoch = command
+        .route_epoch
+        .ok_or(FormalError::Rejected(RejectReason::StaleRouteEpoch))?;
+    routes
+        .validate(market, identity.shard, epoch)
+        .map_err(FormalError::Rejected)?;
+    if command.user_id.is_some() {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
+    let Command::UpdateFeeSchedule(input) = &command.payload else {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    };
+    let state = place
+        .as_mut()
+        .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
+    if !state.config.policies.contains_key(&market) {
+        return Err(FormalError::Rejected(RejectReason::MarketNotFound));
+    }
+    if let Some(result) = dedup
+        .lookup(&command)
+        .map_err(|()| FormalError::ProtocolError)?
+    {
+        dedup.remember_alias(&command);
+        return Ok(result);
+    }
+    let prepared = dedup.prepare(&command);
+    let version = input.schedule.version();
+    let candidate = match &state.fee_book {
+        None => matching_domain::FeeScheduleBook::from_history(
+            input.history.clone(),
+            input.schedule.clone(),
+        ),
+        Some(_) if !input.history.is_empty() => Err(RejectReason::InvalidOrderCombination),
+        Some(book) => {
+            let mut next = book.clone();
+            next.activate(input.schedule.clone()).map(|()| next)
+        }
+    };
+    let candidate = candidate.and_then(|book| {
+        if registry
+            .as_ref()
+            .is_some_and(|registry| registry.validate_fee_references(&book).is_err())
+            || managed_markets.values().any(|market| {
+                book.schedule(market.config().active_fee_schedule_version)
+                    .is_err()
+            })
+            || markets.values().any(|market| {
+                market
+                    .reservation_snapshots()
+                    .iter()
+                    .any(|(_, reservation)| {
+                        book.resolve(reservation.fee_schedule_version, reservation.fee_tier_id)
+                            .is_err()
+                    })
+            })
+        {
+            return Err(RejectReason::FeeScheduleMismatch);
+        }
+        Ok(book)
+    });
+    let (outcome, payload, next_book) = match candidate {
+        Ok(book) => (
+            FormalOutcome::FeeScheduleUpdated(version),
+            EngineEvent::FeeScheduleUpdated { version },
+            Some(book),
+        ),
+        Err(reason) => (
+            FormalOutcome::Rejected(reason),
+            EngineEvent::CommandRejected { reason },
+            None,
+        ),
+    };
+    let n = seq.allocate().expect("分片序号耗尽，停止处理");
+    let event = EventEnvelope {
+        cluster_id: identity.cluster,
+        shard_id: identity.shard,
+        shard_seq: n,
+        event_index: 0,
+        command_id: command.command_id,
+        engine_time: clock.now().get(),
+        market_id: Some(market),
+        payload,
+    };
+    let (status, reject_reason) = match outcome {
+        FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(reason)),
+        _ => (CommandStatus::Succeeded, None),
+    };
+    let result = FormalExecution {
+        command_id: command.command_id,
+        seq: n,
+        outcome,
+        summary: CommandResultSummary {
+            status,
+            first_event_index: Some(0),
+            last_event_index: Some(0),
+            durable_seq: Some(n),
+            reject_reason,
+        },
+        event_range: Some((0, 0)),
+        events: vec![event],
+        deduplicated: false,
+    };
+    if let Some(book) = next_book {
+        state.fee_book = Some(book);
+    }
+    dedup.insert_prepared(&command, prepared, &result);
     Ok(result)
 }
 
@@ -2640,6 +2824,15 @@ fn execute_market_management(
             } else {
                 let config = &input.config;
                 let policy = place.as_ref().and_then(|p| p.config.policies.get(&market));
+                let version_available = place
+                    .as_ref()
+                    .and_then(|p| p.fee_book.as_ref())
+                    .map(|fees| fees.schedule(config.active_fee_schedule_version).is_ok())
+                    .unwrap_or_else(|| {
+                        policy.is_some_and(|p| {
+                            p.fee_schedule_version() == config.active_fee_schedule_version
+                        })
+                    });
                 let expected_priority =
                     matching_orderbook::QueuePriorityPolicy::try_with_synthetic_ceiling(
                         config.execution_limits.priority_exhaustion_guard,
@@ -2649,8 +2842,7 @@ fn execute_market_management(
                     (Err(error), _, _) => Err(error.to_reject_reason()),
                     (Ok(math), Some(policy), Ok(priority))
                         if policy.market_math() == math
-                            && policy.fee_schedule_version()
-                                == config.active_fee_schedule_version
+                            && version_available
                             && book.priority_policy() == priority =>
                     {
                         prepare_price_band_update(book, config.price_band, math)
@@ -2691,7 +2883,14 @@ fn execute_market_management(
             let next_policy = policy
                 .with_market_math(math)
                 .map_err(|_| RejectReason::InvalidOrderCombination)?;
-            if policy.fee_schedule_version() != config.active_fee_schedule_version {
+            let version_available = place
+                .as_ref()
+                .and_then(|p| p.fee_book.as_ref())
+                .map(|fees| fees.schedule(config.active_fee_schedule_version).is_ok())
+                .unwrap_or_else(|| {
+                    policy.fee_schedule_version() == config.active_fee_schedule_version
+                });
+            if !version_available {
                 return Err(RejectReason::InvalidOrderCombination);
             }
             if !empty {
@@ -2861,6 +3060,14 @@ fn execute_market_management(
                     candidate_ids.terminal_in_market(market, *order_id);
                 }
             }
+            if place.as_ref().is_some_and(|p| p.fee_book.is_some()) {
+                events = crate::place_candidate::release_terminal_reservations(
+                    book,
+                    &candidate_book,
+                    &mut candidate_registry,
+                    events,
+                )?;
+            }
             events.push(EngineEvent::SessionEnded {
                 market_id: market,
                 session_id: input.session_id,
@@ -2901,6 +3108,14 @@ fn execute_market_management(
                     }
                     _ => unreachable!("关市计划只生成订单终结事件"),
                 }
+            }
+            if place.as_ref().is_some_and(|p| p.fee_book.is_some()) {
+                events = crate::place_candidate::release_terminal_reservations(
+                    book,
+                    &candidate_book,
+                    &mut candidate_registry,
+                    events,
+                )?;
             }
             if state.lifecycle().session_active() {
                 events.push(EngineEvent::SessionEnded {
@@ -3221,7 +3436,13 @@ fn execute_formal_idempotent(
         clock,
         markets,
         registry,
-        (command.clone(), durable),
+        (
+            command.clone(),
+            durable,
+            place_state
+                .as_ref()
+                .is_some_and(|state| state.fee_book.is_some()),
+        ),
     )
     .map_err(FormalError::Rejected)?;
     if let (Some(ids), Some(state)) = (candidate_ids.as_mut(), place_state.as_mut()) {
@@ -3244,7 +3465,7 @@ fn execute_formal(
     clock: &LogicalClock,
     markets: &mut BTreeMap<MarketId, ProductionOrderBook>,
     registry: &mut Option<ReservationRegistry>,
-    (command, durable): (CommandEnvelope, &mut Option<LocalDurableCommit>),
+    (command, durable, settle_r2): (CommandEnvelope, &mut Option<LocalDurableCommit>, bool),
 ) -> Result<FormalExecution, RejectReason> {
     let market = command
         .market_id
@@ -3288,9 +3509,18 @@ fn execute_formal(
     let mut candidate_registry = registry.clone();
     let (mut outcome, events) = match candidate.plan_mass_cancel(input.scope, &candidate_registry) {
         Ok(plan) => {
-            let (result, events) = candidate
+            let (result, mut events) = candidate
                 .apply_mass_cancel(&mut candidate_registry, plan)
                 .expect("新生成的批量撤单计划发生状态漂移");
+            if settle_r2 {
+                events = crate::place_candidate::release_terminal_reservations(
+                    book,
+                    &candidate,
+                    &mut candidate_registry,
+                    events,
+                )
+                .expect("批量撤单真实预留释放失败，分片停止");
+            }
             (FormalOutcome::MassCancel(result), events)
         }
         Err(RejectReason::InvalidReservation | RejectReason::InvalidQty) => {
@@ -3333,6 +3563,7 @@ fn execute_formal(
         FormalOutcome::MassCancel(_)
         | FormalOutcome::UserFence(_)
         | FormalOutcome::Placed(_)
+        | FormalOutcome::FeeScheduleUpdated(_)
         | FormalOutcome::MarketManaged => (CommandStatus::Succeeded, None),
         FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(*reason)),
     };
@@ -4012,6 +4243,7 @@ mod tests {
         let mut place = Some(PlaceRuntimeState {
             config: settings,
             ids: ClientOrderIds::with_max_id_bytes(8, 8, 32).unwrap(),
+            fee_book: None,
         });
         let mut window = DedupWindow::new(IdempotencyConfig::default()).unwrap();
         let mut seq = Sequencer::new();
@@ -4814,7 +5046,7 @@ mod tests {
                 &LogicalClock::new(LogicalTime::new(0)),
                 &mut books,
                 &mut registry,
-                (command, &mut None),
+                (command, &mut None, false),
             )
         }));
         assert!(result.is_err());
@@ -4953,7 +5185,11 @@ mod place_event_capacity_tests {
         )
         .unwrap();
         let ids = ClientOrderIds::with_max_id_bytes(2, 2, 32).unwrap();
-        let mut state = PlaceRuntimeState { config, ids };
+        let mut state = PlaceRuntimeState {
+            config,
+            ids,
+            fee_book: None,
+        };
         let ids_before = state.ids.clone();
         let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(100).unwrap());
         book.bind_market(market).unwrap();
@@ -5566,6 +5802,7 @@ pub(crate) fn empty_recovery_candidate(
         Some(PlaceRuntimeState {
             config: config.clone(),
             ids,
+            fee_book: None,
         })
     } else {
         None
@@ -5637,6 +5874,12 @@ pub(crate) fn replay_snapshot_records(
             };
             let command = record.command;
             let result = match &command.payload {
+                Command::UpdateFeeSchedule(_) => {
+                    let window = image.dedup.as_mut().ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
+                    execute_fee_schedule_update(identity, &image.routes, &mut seq, &clock, window,
+                        FeeUpdateState { place: &mut image.place, managed_markets: &image.managed_markets,
+                            markets: &image.markets, registry: &image.registry }, command)
+                }
                 Command::CreateMarket(_)
                 | Command::UpdateMarket(_)
                 | Command::StartSession(_)

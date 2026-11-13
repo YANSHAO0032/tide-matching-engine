@@ -8,6 +8,7 @@ use matching_domain::{
 };
 use matching_risk::{ReservationApplyError, ReservationRegistry, ReservationState};
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 已移出触发簿的订单及其待接续预留；只有实际挂入普通簿才重新关联预留。
 pub(crate) type TriggeredStop = (
@@ -28,11 +29,269 @@ pub struct ProductionTriggerRegistryPlan {
     after_book: ProductionOrderBook,
     /// 已处理订单终结归属的登记表后态。
     after_registry: ReservationRegistry,
-    /// 原序触发、成交和终结事件。
+    /// 原序触发、成交与终结事件；真实 R2 候选还包含结算和释放。
     events: Vec<EngineEvent>,
 }
 
+/// 将结算预检错误映射到既有稳定拒绝原因。
+fn stop_settlement_error(error: matching_risk::SettlementPlanError) -> RejectReason {
+    use matching_risk::SettlementPlanError;
+    match error {
+        SettlementPlanError::Reservation(reason) | SettlementPlanError::FeeSchedule(reason) => {
+            reason
+        }
+        SettlementPlanError::Overflow
+        | SettlementPlanError::AssetScale(matching_risk::AssetScaleError::Overflow) => {
+            RejectReason::ArithmeticOverflow
+        }
+        SettlementPlanError::Math(error) => error
+            .to_reject_reason()
+            .unwrap_or(RejectReason::InvalidReservation),
+        _ => RejectReason::InvalidReservation,
+    }
+}
+
+/// 只识别能证明订单终结的事件及对应的稳定释放原因。
+fn stop_terminal_event(
+    event: &EngineEvent,
+) -> Result<Option<(matching_domain::OrderId, ReservationReleaseReason)>, RejectReason> {
+    use matching_domain::CancelReason;
+    Ok(match event {
+        EngineEvent::TriggeredOrderRejected { order_id, .. } => {
+            Some((*order_id, ReservationReleaseReason::TriggerRejected))
+        }
+        EngineEvent::OrderCanceled {
+            order_id, reason, ..
+        } => Some((
+            *order_id,
+            match reason {
+                CancelReason::SelfTradePreventionMaker
+                | CancelReason::SelfTradePreventionTaker
+                | CancelReason::SelfTradePreventionBoth => {
+                    ReservationReleaseReason::SelfTradePrevention
+                }
+                CancelReason::IocRemainder => ReservationReleaseReason::IocRemainder,
+                _ => return Err(RejectReason::InvalidOrderCombination),
+            },
+        )),
+        EngineEvent::MarketProtectionTriggered { order_id, .. } => {
+            Some((*order_id, ReservationReleaseReason::MarketProtection))
+        }
+        EngineEvent::OrderFilled { order_id } => {
+            Some((*order_id, ReservationReleaseReason::FilledRemainder))
+        }
+        _ => None,
+    })
+}
+
+/// 对已经从簿中移除且等待 R2 的单个预留，原子修改候选并输出真实剩余。
+fn release_pending_stop(
+    plan: &mut ProductionTriggerRegistryPlan,
+    identities: &BTreeMap<matching_domain::OrderId, matching_domain::ReservationId>,
+    id: matching_domain::OrderId,
+    reason: ReservationReleaseReason,
+    output: &mut Vec<EngineEvent>,
+) -> Result<(), RejectReason> {
+    let reservation = *identities
+        .get(&id)
+        .ok_or(RejectReason::InvalidReservation)?;
+    if !plan.after_registry.is_pending_r2(reservation) {
+        return Ok(());
+    }
+    let r2 = plan.after_registry.plan_r2(&[], &[reservation])?;
+    let book = plan.after_book.plan_r2_shadow_update(&r2)?;
+    let releases = r2.releases().to_vec();
+    plan.after_registry
+        .apply_r2(r2)
+        .map_err(|_| RejectReason::InvalidReservation)?;
+    plan.after_book = book;
+    output.extend(releases.into_iter().map(|release| release.to_event(reason)));
+    Ok(())
+}
+
+/// 市价 child 无成交且未生成其他终结事件时，在下一次触发前释放其剩余。
+fn flush_untraded_stops(
+    plan: &mut ProductionTriggerRegistryPlan,
+    identities: &BTreeMap<matching_domain::OrderId, matching_domain::ReservationId>,
+    last_trade: &BTreeMap<matching_domain::OrderId, usize>,
+    terminal_event: &BTreeMap<matching_domain::OrderId, (usize, ReservationReleaseReason)>,
+    triggered: &mut BTreeSet<matching_domain::OrderId>,
+    output: &mut Vec<EngineEvent>,
+) -> Result<(), RejectReason> {
+    let ids: Vec<_> = triggered.iter().copied().collect();
+    for id in ids {
+        if last_trade.contains_key(&id) || terminal_event.contains_key(&id) {
+            continue;
+        }
+        let reservation = *identities
+            .get(&id)
+            .ok_or(RejectReason::InvalidReservation)?;
+        if plan.after_registry.is_pending_r2(reservation) {
+            if !matches!(
+                plan.before_book.stop_order(id),
+                Some((StopOrder::Market(_), _))
+            ) {
+                return Err(RejectReason::InvalidReservation);
+            }
+            release_pending_stop(
+                plan,
+                identities,
+                id,
+                ReservationReleaseReason::IocRemainder,
+                output,
+            )?;
+        }
+        triggered.remove(&id);
+    }
+    Ok(())
+}
+
 impl ProductionOrderBook {
+    /// 在同一隔离候选中预演止损级联、成交结算和终结预留释放。
+    /// 调用方仍须提供完整 Trigger-R1、预分配且全局唯一的 `trade_ids`，
+    /// 并在持久提交后才发布事件。
+    pub fn plan_trigger_stops_with_r2(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        settlement: matching_risk::TradeSettlementContext<'_>,
+        registry: &ReservationRegistry,
+        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<ProductionTriggerRegistryPlan, RejectReason> {
+        if self.market_id() != Some(settlement.market_id) || *context.math != settlement.math {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let mut plan =
+            self.plan_trigger_stops_with_registry(reference, context, registry, trigger_r1)?;
+        let identities: BTreeMap<_, _> = self
+            .reservation_snapshots()
+            .into_iter()
+            .map(|(order, state)| (order, state.reservation_id))
+            .collect();
+        let mut last_trade = BTreeMap::new();
+        let mut terminal_event = BTreeMap::new();
+        let mut seen_trades = BTreeSet::new();
+        for (index, event) in plan.events.iter().enumerate() {
+            if let EngineEvent::Trade(trade) = event {
+                if !seen_trades.insert(trade.trade_id) {
+                    return Err(RejectReason::InvalidOrderCombination);
+                }
+                last_trade.insert(trade.maker_order_id, index);
+                last_trade.insert(trade.taker_order_id, index);
+            }
+            if let Some((id, reason)) = stop_terminal_event(event)? {
+                terminal_event.entry(id).or_insert((index, reason));
+            }
+        }
+        let mut deferred: BTreeMap<_, Vec<EngineEvent>> = BTreeMap::new();
+        let mut triggered = BTreeSet::new();
+        let mut output = Vec::new();
+        for (index, event) in std::mem::take(&mut plan.events).into_iter().enumerate() {
+            if let EngineEvent::StopTriggered { order_id, .. } = &event {
+                flush_untraded_stops(
+                    &mut plan,
+                    &identities,
+                    &last_trade,
+                    &terminal_event,
+                    &mut triggered,
+                    &mut output,
+                )?;
+                triggered.insert(*order_id);
+            }
+            if let EngineEvent::Trade(trade) = &event {
+                let maker = *identities
+                    .get(&trade.maker_order_id)
+                    .ok_or(RejectReason::InvalidReservation)?;
+                let taker = *identities
+                    .get(&trade.taker_order_id)
+                    .ok_or(RejectReason::InvalidReservation)?;
+                let mut terminal = Vec::new();
+                for (id, reservation) in
+                    [(trade.maker_order_id, maker), (trade.taker_order_id, taker)]
+                {
+                    if last_trade.get(&id) == Some(&index)
+                        && plan.after_registry.is_pending_r2(reservation)
+                    {
+                        terminal.push(reservation);
+                    }
+                }
+                let trade_context = matching_risk::TradeSettlementContext {
+                    market_id: settlement.market_id,
+                    math: settlement.math,
+                    base: settlement.base,
+                    quote: settlement.quote,
+                    fees: settlement.fees,
+                };
+                let candidate = plan
+                    .after_book
+                    .plan_trade_r2_candidate(
+                        &plan.after_registry,
+                        trade_context,
+                        trade,
+                        maker,
+                        taker,
+                        &terminal,
+                    )
+                    .map_err(stop_settlement_error)?;
+                let (delta, releases) = plan
+                    .after_book
+                    .apply_trade_r2_candidate(&mut plan.after_registry, candidate)
+                    .map_err(|_| RejectReason::InvalidReservation)?;
+                output.push(event.clone());
+                output.push(EngineEvent::SettlementDelta(delta.to_event_payload()));
+                for release in releases {
+                    let (later, reason) = terminal_event
+                        .get(&release.order_id)
+                        .copied()
+                        .filter(|(position, _)| *position > index)
+                        .map_or(
+                            (false, ReservationReleaseReason::FilledRemainder),
+                            |(_, reason)| (true, reason),
+                        );
+                    let id = release.order_id;
+                    let event = release.to_event(reason);
+                    if later {
+                        deferred.entry(id).or_default().push(event);
+                    } else {
+                        output.push(event);
+                    }
+                }
+                continue;
+            }
+            let terminal = stop_terminal_event(&event)?;
+            output.push(event);
+            if let Some((id, reason)) = terminal {
+                release_pending_stop(&mut plan, &identities, id, reason, &mut output)?;
+                if let Some(events) = deferred.remove(&id) {
+                    output.extend(events);
+                }
+                triggered.remove(&id);
+            }
+        }
+        flush_untraded_stops(
+            &mut plan,
+            &identities,
+            &last_trade,
+            &terminal_event,
+            &mut triggered,
+            &mut output,
+        )?;
+        if !deferred.is_empty() {
+            return Err(RejectReason::InvalidReservation);
+        }
+        for (id, reservation) in identities {
+            if registry.is_pending_r2(reservation) {
+                continue;
+            }
+            if plan.after_registry.is_pending_r2(reservation)
+                && plan.after_book.reservation_state(id).is_none()
+            {
+                return Err(RejectReason::InvalidReservation);
+            }
+        }
+        plan.events = output;
+        Ok(plan)
+    }
     /// 在副本上完成 Stop 级联并预检所有终结订单的 PendingR2 归属。
     pub fn plan_trigger_stops_with_registry(
         &self,
@@ -445,6 +704,7 @@ impl ProductionOrderBook {
             order_id: order.order_id(),
             reservation_id: order.reservation_id(),
             reason: ReservationReleaseReason::TriggerRejected,
+            released: None,
         });
     }
 

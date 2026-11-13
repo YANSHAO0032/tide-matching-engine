@@ -21,6 +21,16 @@ pub enum OrderRemaining {
 /// 它不是完整持久化事件封装：不携带市场事件序列、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
+    /// 单笔真实成交的本金与费用结算变动。
+    SettlementDelta(
+        /// 成交、双方本金、费用和预留身份。
+        crate::SettlementDelta,
+    ),
+    /// 新费率版本已生效。
+    FeeScheduleUpdated {
+        /// 生效的费率版本号。
+        version: u64,
+    },
     /// 订单因到期或交易时段结束而终结。
     OrderExpired {
         /// 已终结的订单身份。
@@ -148,6 +158,8 @@ pub enum EngineEvent {
         reservation_id: ReservationId,
         /// 释放发生的稳定业务原因。
         reason: ReservationReleaseReason,
+        /// 真实 R2 释放的资产及金额；旧版止损事件没有金额载荷。
+        released: Option<Vec<crate::AssetReserve>>,
     },
     /// 一笔已提交的成交及其挂单/吃单方载荷。
     Trade(TradeEvent),

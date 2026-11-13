@@ -83,6 +83,16 @@ fn place_bytes(config: &PlaceSupportConfig, limit: usize) -> Result<Vec<u8>, Sna
 impl SnapshotImage {
     /// 核验市场管理状态与本地订单簿及价格带一致。
     fn validate_managed_markets(&self) -> Result<(), SnapshotWireError> {
+        if let (Some(fees), Some(registry)) = (
+            self.place
+                .as_ref()
+                .and_then(|place| place.fee_book.as_ref()),
+            self.registry.as_ref(),
+        ) {
+            registry
+                .validate_fee_references(fees)
+                .map_err(|_| SnapshotWireError)?;
+        }
         for (id, state) in &self.managed_markets {
             let book = self.markets.get(id).ok_or(SnapshotWireError)?;
             let math = state.config().validate().map_err(|_| SnapshotWireError)?;
@@ -123,9 +133,17 @@ impl SnapshotImage {
             }
             if let Some(place) = &self.place {
                 let policy = place.config.policies.get(id).ok_or(SnapshotWireError)?;
-                if policy.market_math() != math
-                    || policy.fee_schedule_version() != state.config().active_fee_schedule_version
-                {
+                let fee_version_available = place
+                    .fee_book
+                    .as_ref()
+                    .map(|fees| {
+                        fees.schedule(state.config().active_fee_schedule_version)
+                            .is_ok()
+                    })
+                    .unwrap_or_else(|| {
+                        policy.fee_schedule_version() == state.config().active_fee_schedule_version
+                    });
+                if policy.market_math() != math || !fee_version_available {
                     return Err(SnapshotWireError);
                 }
             }
@@ -194,6 +212,14 @@ impl SnapshotImage {
                 w.u32(market.get())?;
                 state.write_snapshot(&mut w)?;
             }
+        }
+        if let Some(book) = self
+            .place
+            .as_ref()
+            .and_then(|place| place.fee_book.as_ref())
+        {
+            w.u8(2)?;
+            book.write_snapshot(&mut w)?;
         }
         Ok(w.finish())
     }
@@ -300,7 +326,11 @@ impl SnapshotImage {
     /// 将独立内存镜像编码为有界确定性载荷；不提交或同步文件。
     pub fn encode_snapshot(&self, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
         let mut w = SnapshotEncoder::new(limit);
-        w.u16(3)?;
+        let fee_book = self
+            .place
+            .as_ref()
+            .and_then(|place| place.fee_book.as_ref());
+        w.u16(if fee_book.is_some() { 4 } else { 3 })?;
         w.bytes(env!("CARGO_PKG_VERSION").as_bytes())?;
         w.u128(self.request_id)?;
         w.u64(self.snapshot_seq)?;
@@ -342,6 +372,9 @@ impl SnapshotImage {
             w.u32(market.get())?;
             state.write_snapshot(&mut w)?;
         }
+        if let Some(book) = fee_book {
+            book.write_snapshot(&mut w)?;
+        }
         w.bytes(&self.state_digest(limit)?)?;
         Ok(w.finish())
     }
@@ -352,7 +385,7 @@ impl SnapshotImage {
     ) -> Result<Self, SnapshotWireError> {
         let mut r = SnapshotDecoder::new(bytes, config.max_bytes)?;
         let version = r.u16()?;
-        if version != 2 && version != 3 {
+        if version != 2 && version != 3 && version != 4 {
             return Err(SnapshotWireError);
         }
         if r.bytes()? != env!("CARGO_PKG_VERSION").as_bytes() {
@@ -486,12 +519,13 @@ impl SnapshotImage {
                 Some(PlaceRuntimeState {
                     config: expected.clone(),
                     ids,
+                    fee_book: None,
                 })
             }
             _ => return Err(SnapshotWireError),
         };
         let mut managed_markets = BTreeMap::new();
-        if version == 3 {
+        if version >= 3 {
             let managed_count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
             if managed_count > config.max_markets || managed_count > markets.len() {
                 return Err(SnapshotWireError);
@@ -519,6 +553,14 @@ impl SnapshotImage {
                 }
                 managed_markets.insert(market, state);
             }
+        }
+        if version == 4 {
+            let state = place.as_mut().ok_or(SnapshotWireError)?;
+            state.fee_book = Some(matching_domain::FeeScheduleBook::read_snapshot(
+                &mut r,
+                config.max_bytes / 13,
+                config.max_bytes / 21,
+            )?);
         }
         if let Some(place) = &mut place {
             for (market, state) in &managed_markets {

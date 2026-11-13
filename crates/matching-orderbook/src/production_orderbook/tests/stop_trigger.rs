@@ -235,6 +235,7 @@ fn trigger_r1_insufficient_reservation_has_zero_trades_and_removes_stop_first() 
                 order_id: OrderId::new(1),
                 reservation_id: ReservationId::new(1_001),
                 reason: ReservationReleaseReason::TriggerRejected,
+                released: None,
             },
         ]
     );
@@ -292,6 +293,7 @@ fn trigger_r1_fee_schedule_mismatch_has_zero_trades_and_releases_reservation() {
                 order_id: released,
                 reservation_id,
                 reason: ReservationReleaseReason::TriggerRejected,
+                released: None,
             },
         ] if *order_id == OrderId::new(1)
             && *rejected == OrderId::new(1)

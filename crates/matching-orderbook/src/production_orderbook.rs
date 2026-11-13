@@ -17,7 +17,7 @@ mod expiry;
 mod iceberg;
 mod market_binding;
 /// 可信市场绑定失败。
-pub use market_binding::MarketBindingError;
+pub use market_binding::{MarketBindingError, ProductionTradeR2Plan};
 mod limit_execution;
 mod market_by_base;
 mod market_by_quote;

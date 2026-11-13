@@ -48,8 +48,21 @@ pub(crate) fn place_candidate(
     place: &PlaceLimitOrder,
     book: &ProductionOrderBook,
     registry: &ReservationRegistry,
+    candidate_ids: ClientOrderIds,
+    cursor: &TradeIdCursor,
+) -> Result<PlaceCandidate, RejectReason> {
+    place_candidate_inner(context, place, book, registry, candidate_ids, cursor, None)
+}
+
+/// 由可信版本费率或旧策略构造独立下单候选。
+fn place_candidate_inner(
+    context: PlacePlanningContext<'_>,
+    place: &PlaceLimitOrder,
+    book: &ProductionOrderBook,
+    registry: &ReservationRegistry,
     mut candidate_ids: ClientOrderIds,
     cursor: &TradeIdCursor,
+    fees: Option<(&matching_domain::FeeScheduleBook, u64)>,
 ) -> Result<PlaceCandidate, RejectReason> {
     let PlacePlanningContext {
         policy,
@@ -70,23 +83,45 @@ pub(crate) fn place_candidate(
     if !order.qty.get().is_multiple_of(math.lot_size()) {
         return Err(RejectReason::InvalidLot);
     }
-    let required_reserves = policy
-        .required_reserves(order.side, order.price, order.qty)
-        .map_err(|e| match e {
-            LimitReserveError::Math(error) => error
-                .to_reject_reason()
-                .expect("已验证市场配置不能产生非整数本金"),
-            LimitReserveError::Overflow => RejectReason::ArithmeticOverflow,
-            LimitReserveError::InvalidPolicy => RejectReason::InvalidReservation,
-        })?;
+    let (fee_schedule_version, fee_tier_id, required_reserves) = if let Some((fees, version)) = fees
+    {
+        if place.reservation.fee_schedule_version != version {
+            return Err(RejectReason::FeeScheduleMismatch);
+        }
+        let tier = place.reservation.fee_tier_id;
+        let required = policy.required_versioned_reserves(
+            fees,
+            version,
+            tier,
+            order.side,
+            order.price,
+            order.qty,
+        )?;
+        (version, tier, required)
+    } else {
+        let required = policy
+            .required_reserves(order.side, order.price, order.qty)
+            .map_err(|e| match e {
+                LimitReserveError::Math(error) => error
+                    .to_reject_reason()
+                    .expect("已验证市场配置不能产生非整数本金"),
+                LimitReserveError::Overflow => RejectReason::ArithmeticOverflow,
+                LimitReserveError::InvalidPolicy => RejectReason::InvalidReservation,
+            })?;
+        (
+            policy.fee_schedule_version(),
+            policy.fee_tier_id(),
+            required,
+        )
+    };
     let expected = ExpectedNewReservation {
         command_id,
         order_id: order.order_id,
         user_id: order.user_id,
         market_id: market,
         origin_session_id: OriginSessionId::new(session),
-        fee_schedule_version: policy.fee_schedule_version(),
-        fee_tier_id: policy.fee_tier_id(),
+        fee_schedule_version,
+        fee_tier_id,
         required_reserves,
     };
     let plan = registry.plan_new_reservation(keys, &expected, &place.reservation)?;
@@ -192,6 +227,252 @@ fn maker_fill_event(order_id: OrderId, remaining: u64) -> Result<EngineEvent, Re
             remaining: Qty::try_new(remaining)?,
         })
     }
+}
+
+/// 对本次订单终结新产生的待处理归属计算真实释放，保留原事件顺序。
+pub(crate) fn release_terminal_reservations(
+    before: &ProductionOrderBook,
+    after: &ProductionOrderBook,
+    registry: &mut ReservationRegistry,
+    events: Vec<EngineEvent>,
+) -> Result<Vec<EngineEvent>, RejectReason> {
+    use matching_domain::{CancelReason, ReservationReleaseReason};
+    let terminal =
+        |event: &EngineEvent| -> Result<Option<(OrderId, ReservationReleaseReason)>, RejectReason> {
+            match event {
+                EngineEvent::OrderCanceled {
+                    order_id,
+                    reason: CancelReason::MassCancel,
+                    ..
+                } => Ok(Some((*order_id, ReservationReleaseReason::MassCancel))),
+                EngineEvent::OrderCanceled {
+                    order_id,
+                    reason: CancelReason::MarketClosed,
+                    ..
+                } => Ok(Some((*order_id, ReservationReleaseReason::MarketClosed))),
+                EngineEvent::OrderExpired {
+                    order_id,
+                    reason: matching_domain::ExpireReason::MarketClosed,
+                } => Ok(Some((*order_id, ReservationReleaseReason::MarketClosed))),
+                EngineEvent::OrderExpired { order_id, .. } => {
+                    Ok(Some((*order_id, ReservationReleaseReason::Expired)))
+                }
+                EngineEvent::OrderCanceled { .. } => Err(RejectReason::InvalidOrderCombination),
+                _ => Ok(None),
+            }
+        };
+    let mut ids = Vec::new();
+    let mut reasons = BTreeMap::new();
+    for event in &events {
+        if let Some((order_id, reason)) = terminal(event)? {
+            let state = before
+                .reservation_state(order_id)
+                .ok_or(RejectReason::InvalidReservation)?;
+            if !registry.is_pending_r2(state.reservation_id) {
+                return Err(RejectReason::InvalidReservation);
+            }
+            ids.push(state.reservation_id);
+            if reasons.insert(order_id, reason).is_some() {
+                return Err(RejectReason::InvalidReservation);
+            }
+        }
+    }
+    let plan = registry.plan_r2(&[], &ids)?;
+    let next_book = after.plan_r2_shadow_update(&plan)?;
+    if next_book != *after {
+        return Err(RejectReason::InvalidReservation);
+    }
+    let mut releases = BTreeMap::new();
+    for release in plan.releases() {
+        releases.insert(
+            release.order_id,
+            release.to_event(
+                *reasons
+                    .get(&release.order_id)
+                    .ok_or(RejectReason::InvalidReservation)?,
+            ),
+        );
+    }
+    let mut output = Vec::new();
+    for event in events {
+        let id = terminal(&event)?.map(|(id, _)| id);
+        output.push(event);
+        if let Some(id) = id
+            && let Some(release) = releases.remove(&id)
+        {
+            output.push(release);
+        }
+    }
+    if !releases.is_empty() {
+        return Err(RejectReason::InvalidReservation);
+    }
+    registry
+        .apply_r2(plan)
+        .map_err(|_| RejectReason::InvalidReservation)?;
+    Ok(output)
+}
+
+/// 将成交逐笔转换为隔离的结算候选；调用方仍须执行版本费率 R1 和持久提交。
+pub(crate) fn place_candidate_with_fees(
+    input: (
+        PlacePlanningContext<'_>,
+        &matching_domain::FeeScheduleBook,
+        u64,
+    ),
+    place: &PlaceLimitOrder,
+    book: &ProductionOrderBook,
+    registry: &ReservationRegistry,
+    ids: ClientOrderIds,
+    cursor: &TradeIdCursor,
+) -> Result<PlaceCandidate, RejectReason> {
+    use matching_domain::{ReservationId, ReservationReleaseReason};
+    use matching_risk::{SettlementAsset, SettlementPlanError, TradeSettlementContext};
+    let (context, fees, version) = input;
+    let math = context.policy.market_math();
+    let (base, quote) = context.policy.assets();
+    let market_id = book.market_id().ok_or(RejectReason::MarketNotFound)?;
+    let mut reservation_ids = BTreeMap::new();
+    for (order_id, state) in book.reservation_snapshots() {
+        reservation_ids.insert(order_id, state.reservation_id);
+    }
+    reservation_ids.insert(place.order.order_id, place.reservation.reservation_id);
+    let mut candidate = place_candidate_inner(
+        context,
+        place,
+        book,
+        registry,
+        ids,
+        cursor,
+        Some((fees, version)),
+    )?;
+    let mut last_trade = BTreeMap::new();
+    for (index, event) in candidate.events.iter().enumerate() {
+        if let EngineEvent::Trade(trade) = event {
+            last_trade.insert(trade.maker_order_id, index);
+            last_trade.insert(trade.taker_order_id, index);
+        }
+    }
+    let mut pending_releases: BTreeMap<OrderId, Vec<matching_risk::SettlementRelease>> =
+        BTreeMap::new();
+    let mut events = Vec::new();
+    for (index, event) in std::mem::take(&mut candidate.events)
+        .into_iter()
+        .enumerate()
+    {
+        match &event {
+            EngineEvent::Trade(trade) => {
+                let maker = *reservation_ids
+                    .get(&trade.maker_order_id)
+                    .ok_or(RejectReason::InvalidReservation)?;
+                let taker = *reservation_ids
+                    .get(&trade.taker_order_id)
+                    .ok_or(RejectReason::InvalidReservation)?;
+                let mut terminal: Vec<ReservationId> = Vec::new();
+                for (id, reservation) in
+                    [(trade.maker_order_id, maker), (trade.taker_order_id, taker)]
+                {
+                    if last_trade.get(&id) == Some(&index)
+                        && candidate.registry.is_pending_r2(reservation)
+                    {
+                        terminal.push(reservation);
+                    }
+                }
+                let plan = candidate
+                    .book
+                    .plan_trade_r2_candidate(
+                        &candidate.registry,
+                        TradeSettlementContext {
+                            market_id,
+                            math,
+                            base: SettlementAsset {
+                                asset: base,
+                                scale: math.qty_scale(),
+                            },
+                            quote: SettlementAsset {
+                                asset: quote,
+                                scale: math.quote_scale(),
+                            },
+                            fees,
+                        },
+                        trade,
+                        maker,
+                        taker,
+                        &terminal,
+                    )
+                    .map_err(|error| match error {
+                        SettlementPlanError::Reservation(reason)
+                        | SettlementPlanError::FeeSchedule(reason) => reason,
+                        SettlementPlanError::Overflow => RejectReason::ArithmeticOverflow,
+                        _ => RejectReason::InvalidReservation,
+                    })?;
+                let (settlement, releases) = candidate
+                    .book
+                    .apply_trade_r2_candidate(&mut candidate.registry, plan)
+                    .map_err(|_| RejectReason::InvalidReservation)?;
+                events.push(event.clone());
+                events.push(EngineEvent::SettlementDelta(settlement.to_event_payload()));
+                for release in releases {
+                    pending_releases
+                        .entry(release.order_id)
+                        .or_default()
+                        .push(release);
+                }
+            }
+            EngineEvent::OrderCanceled {
+                order_id, reason, ..
+            } => {
+                if !matches!(
+                    reason,
+                    matching_domain::CancelReason::SelfTradePreventionMaker
+                        | matching_domain::CancelReason::SelfTradePreventionTaker
+                        | matching_domain::CancelReason::SelfTradePreventionBoth
+                ) {
+                    return Err(RejectReason::InvalidOrderCombination);
+                }
+                let reservation = *reservation_ids
+                    .get(order_id)
+                    .ok_or(RejectReason::InvalidReservation)?;
+                if candidate.registry.is_pending_r2(reservation) {
+                    let plan = candidate.registry.plan_r2(&[], &[reservation])?;
+                    let next = candidate.book.plan_r2_shadow_update(&plan)?;
+                    let releases = plan.releases().to_vec();
+                    candidate
+                        .registry
+                        .apply_r2(plan)
+                        .map_err(|_| RejectReason::InvalidReservation)?;
+                    candidate.book = next;
+                    pending_releases
+                        .entry(*order_id)
+                        .or_default()
+                        .extend(releases);
+                }
+                events.push(event.clone());
+                if let Some(releases) = pending_releases.remove(order_id) {
+                    events.extend(
+                        releases
+                            .into_iter()
+                            .map(|r| r.to_event(ReservationReleaseReason::SelfTradePrevention)),
+                    );
+                }
+            }
+            EngineEvent::OrderFilled { order_id } => {
+                events.push(event.clone());
+                if let Some(releases) = pending_releases.remove(order_id) {
+                    events.extend(
+                        releases
+                            .into_iter()
+                            .map(|r| r.to_event(ReservationReleaseReason::FilledRemainder)),
+                    );
+                }
+            }
+            _ => events.push(event),
+        }
+    }
+    if !pending_releases.is_empty() {
+        return Err(RejectReason::InvalidReservation);
+    }
+    candidate.events = events;
+    Ok(candidate)
 }
 #[cfg(test)]
 mod tests {
@@ -461,6 +742,348 @@ mod integration_tests {
         assert_eq!(
             x.ids.lookup(UserId(1), "c1"),
             Some((MarketId(1), OrderId(1)))
+        );
+    }
+
+    #[test]
+    fn fee_backed_multiple_makers_settle_and_release_after_lifecycle() {
+        use matching_domain::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
+        let (p, k, b, r, i, c) = setup();
+        let fees = FeeScheduleBook::new(
+            FeeSchedule::new(
+                9,
+                FeeAssetPolicy::Quote,
+                [(
+                    10,
+                    FeeTier {
+                        maker_bps: 0,
+                        taker_bps: 0,
+                        rounding: FeeRounding::TowardZero,
+                    },
+                )],
+            )
+            .unwrap(),
+        );
+        let run = |id,
+                   side,
+                   qty,
+                   book: &ProductionOrderBook,
+                   registry: &ReservationRegistry,
+                   ids: &ClientOrderIds,
+                   cursor: &TradeIdCursor| {
+            place_candidate_with_fees(
+                (
+                    PlacePlanningContext {
+                        policy: &p,
+                        keys: &k,
+                        command_id: CommandId(id),
+                        session: 1,
+                        now: LogicalTime::new(0),
+                    },
+                    &fees,
+                    fees.active_version(),
+                ),
+                &order(id as u64, id as u64, side, qty, false),
+                book,
+                registry,
+                ids.try_clone_preallocated().unwrap(),
+                cursor,
+            )
+        };
+        let a = run(1, Side::Sell, 2, &b, &r, &i, &c).unwrap();
+        let b = run(2, Side::Sell, 2, &a.book, &a.registry, &a.ids, &a.cursor).unwrap();
+        let x = run(3, Side::Buy, 3, &b.book, &b.registry, &b.ids, &b.cursor).unwrap();
+        assert_eq!(
+            x.events
+                .iter()
+                .filter(|e| matches!(e, EngineEvent::Trade(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            x.events
+                .iter()
+                .filter(|e| matches!(e, EngineEvent::SettlementDelta(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            x.registry.get(ReservationId(1)).unwrap().status,
+            matching_risk::ReservationStatus::Released
+        );
+        assert_eq!(
+            x.registry.get(ReservationId(3)).unwrap().status,
+            matching_risk::ReservationStatus::Released
+        );
+        assert_eq!(
+            x.registry.get(ReservationId(2)).unwrap().reserves[0].atoms,
+            1
+        );
+        assert_eq!(
+            x.book.reservation_state(OrderId(2)),
+            x.registry.get(ReservationId(2))
+        );
+    }
+
+    #[test]
+    fn fee_backed_stp_releases_canceled_order_without_false_trade() {
+        use matching_domain::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
+        let (p, k, b, r, i, c) = setup();
+        let fees = FeeScheduleBook::new(
+            FeeSchedule::new(
+                9,
+                FeeAssetPolicy::Quote,
+                [(
+                    10,
+                    FeeTier {
+                        maker_bps: 0,
+                        taker_bps: 0,
+                        rounding: FeeRounding::TowardZero,
+                    },
+                )],
+            )
+            .unwrap(),
+        );
+        let run = |place: &PlaceLimitOrder,
+                   b: &ProductionOrderBook,
+                   r: &ReservationRegistry,
+                   i: &ClientOrderIds,
+                   c: &TradeIdCursor| {
+            place_candidate_with_fees(
+                (
+                    PlacePlanningContext {
+                        policy: &p,
+                        keys: &k,
+                        command_id: place.reservation.command_id,
+                        session: 1,
+                        now: LogicalTime::new(0),
+                    },
+                    &fees,
+                    fees.active_version(),
+                ),
+                place,
+                b,
+                r,
+                i.try_clone_preallocated().unwrap(),
+                c,
+            )
+        };
+        let a = run(&order(1, 9, Side::Sell, 2, false), &b, &r, &i, &c).unwrap();
+        let mut taker = order(2, 9, Side::Buy, 1, false);
+        taker.order.stp_mode = StpMode::CancelMaker;
+        let x = run(&taker, &a.book, &a.registry, &a.ids, &a.cursor).unwrap();
+        assert!(
+            !x.events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Trade(_) | EngineEvent::SettlementDelta(_)))
+        );
+        assert!(x.events.iter().any(|e| matches!(e, EngineEvent::ReservationReleased {
+            order_id: OrderId(1), reason: matching_domain::ReservationReleaseReason::SelfTradePrevention,
+            released: Some(assets), .. } if assets[0].atoms == 2)));
+        assert_eq!(
+            x.registry.get(ReservationId(1)).unwrap().status,
+            matching_risk::ReservationStatus::Released
+        );
+        assert_eq!(
+            x.book.reservation_state(OrderId(2)),
+            x.registry.get(ReservationId(2))
+        );
+    }
+
+    #[test]
+    fn fee_backed_candidate_rejects_stale_signed_version_without_mutation() {
+        use matching_domain::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
+        let (p, k, b, r, i, c) = setup();
+        let mut fees = FeeScheduleBook::new(
+            FeeSchedule::new(
+                9,
+                FeeAssetPolicy::Quote,
+                [(
+                    10,
+                    FeeTier {
+                        maker_bps: 0,
+                        taker_bps: 0,
+                        rounding: FeeRounding::TowardZero,
+                    },
+                )],
+            )
+            .unwrap(),
+        );
+        fees.activate(
+            FeeSchedule::new(
+                10,
+                FeeAssetPolicy::Quote,
+                [(
+                    10,
+                    FeeTier {
+                        maker_bps: 0,
+                        taker_bps: 0,
+                        rounding: FeeRounding::TowardZero,
+                    },
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let original = (b.clone(), r.clone(), i.clone(), c.clone());
+        let result = place_candidate_with_fees(
+            (
+                PlacePlanningContext {
+                    policy: &p,
+                    keys: &k,
+                    command_id: CommandId(1),
+                    session: 1,
+                    now: LogicalTime::new(0),
+                },
+                &fees,
+                fees.active_version(),
+            ),
+            &order(1, 1, Side::Sell, 2, false),
+            &b,
+            &r,
+            i.try_clone_preallocated().unwrap(),
+            &c,
+        );
+        assert!(matches!(result, Err(RejectReason::FeeScheduleMismatch)));
+        assert_eq!((b, r, i, c), original);
+    }
+
+    #[test]
+    fn managed_market_uses_its_pinned_fee_version_even_when_book_is_newer() {
+        use matching_domain::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
+        let (p, k, b, r, i, c) = setup();
+        let tier = FeeTier {
+            maker_bps: 0,
+            taker_bps: 0,
+            rounding: FeeRounding::Floor,
+        };
+        let mut fees =
+            FeeScheduleBook::new(FeeSchedule::new(9, FeeAssetPolicy::Quote, [(10, tier)]).unwrap());
+        fees.activate(FeeSchedule::new(10, FeeAssetPolicy::Quote, [(10, tier)]).unwrap())
+            .unwrap();
+        let accepted = place_candidate_with_fees(
+            (
+                PlacePlanningContext {
+                    policy: &p,
+                    keys: &k,
+                    command_id: CommandId(1),
+                    session: 1,
+                    now: LogicalTime::new(0),
+                },
+                &fees,
+                9,
+            ),
+            &order(1, 1, Side::Sell, 2, false),
+            &b,
+            &r,
+            i.try_clone_preallocated().unwrap(),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(
+            accepted
+                .registry
+                .get(ReservationId(1))
+                .unwrap()
+                .fee_schedule_version,
+            9
+        );
+    }
+
+    #[test]
+    fn mass_cancel_releases_only_newly_canceled_reservations() {
+        use matching_domain::{ReservationReleaseReason, ShardCancelScope};
+        let (p, k, b, r, i, c) = setup();
+        let accepted = place_candidate(
+            PlacePlanningContext {
+                policy: &p,
+                keys: &k,
+                command_id: CommandId(1),
+                session: 1,
+                now: LogicalTime::new(0),
+            },
+            &order(1, 1, Side::Sell, 2, false),
+            &b,
+            &r,
+            i.try_clone_preallocated().unwrap(),
+            &c,
+        )
+        .unwrap();
+        let mut next_book = accepted.book.clone();
+        let mut next_registry = accepted.registry.clone();
+        let plan = next_book
+            .plan_mass_cancel(
+                ShardCancelScope::Market {
+                    market_id: MarketId(1),
+                },
+                &next_registry,
+            )
+            .unwrap();
+        let (_, events) = next_book
+            .apply_mass_cancel(&mut next_registry, plan)
+            .unwrap();
+        let result =
+            release_terminal_reservations(&accepted.book, &next_book, &mut next_registry, events)
+                .unwrap();
+        assert!(
+            matches!(result.as_slice(), [EngineEvent::OrderCanceled { order_id: OrderId(1), .. },
+            EngineEvent::ReservationReleased { order_id: OrderId(1), reason: ReservationReleaseReason::MassCancel,
+                released: Some(assets), .. }] if assets[0].atoms == 2)
+        );
+        assert_eq!(
+            next_registry.get(ReservationId(1)).unwrap().status,
+            matching_risk::ReservationStatus::Released
+        );
+        assert_eq!(
+            accepted.registry.get(ReservationId(1)).unwrap().status,
+            matching_risk::ReservationStatus::Active
+        );
+    }
+
+    #[test]
+    fn end_session_releases_day_reservation_after_expiry_event() {
+        use matching_domain::{ExpireReason, ReservationReleaseReason};
+        let (p, k, mut book, registry, ids, cursor) = setup();
+        let place = order(1, 1, Side::Sell, 2, false);
+        let accepted = place_candidate(
+            PlacePlanningContext {
+                policy: &p,
+                keys: &k,
+                command_id: CommandId(1),
+                session: 9,
+                now: LogicalTime::new(0),
+            },
+            &place,
+            &book,
+            &registry,
+            ids.try_clone_preallocated().unwrap(),
+            &cursor,
+        )
+        .unwrap();
+        let mut next_registry = accepted.registry.clone();
+        book.rest_timed_with_reservation(
+            place.order,
+            TimeInForce::Day { session_id: 9 },
+            LogicalTime::new(0),
+            9,
+            next_registry.get(ReservationId(1)).unwrap().clone(),
+        )
+        .unwrap();
+        let mut next_book = book.clone();
+        let plan = next_book.plan_end_session(9, 9, &next_registry).unwrap();
+        let (_, events) = next_book
+            .apply_mass_cancel(&mut next_registry, plan)
+            .unwrap();
+        let result =
+            release_terminal_reservations(&book, &next_book, &mut next_registry, events).unwrap();
+        assert!(
+            matches!(result.as_slice(), [EngineEvent::OrderExpired { order_id: OrderId(1), reason: ExpireReason::SessionEnded },
+            EngineEvent::ReservationReleased { order_id: OrderId(1), reason: ReservationReleaseReason::Expired,
+                released: Some(assets), .. }] if assets[0].atoms == 2)
+        );
+        assert_eq!(
+            next_registry.get(ReservationId(1)).unwrap().status,
+            matching_risk::ReservationStatus::Released
         );
     }
     #[test]

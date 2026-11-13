@@ -23,6 +23,10 @@ impl SnapshotEncoder {
             limit,
         }
     }
+    /// 返回当前还允许追加的字节数。
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        self.limit - self.bytes.len()
+    }
     /// 追加一字节整数。
     pub fn u8(&mut self, value: u8) -> Result<(), SnapshotWireError> {
         self.raw(&[value])

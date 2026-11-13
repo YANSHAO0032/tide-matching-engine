@@ -10,7 +10,7 @@ pub fn encode_reservation_snapshot(
     writer: &mut SnapshotEncoder,
     state: &ReservationState,
 ) -> Result<(), SnapshotWireError> {
-    if state.reserves.is_empty()
+    if (state.reserves.is_empty() && state.status != ReservationStatus::Released)
         || state.reserves.iter().any(|r| r.atoms == 0)
         || state.reserves.windows(2).any(|r| r[0].asset >= r[1].asset)
     {
@@ -37,7 +37,7 @@ pub fn encode_reservation_snapshot(
     writer.bytes(&w.finish())
 }
 
-/// 恢复预留状态并重新校验资产顺序与严格正原子数。
+/// 恢复预留状态并校验资产顺序及正原子数；已释放状态允许空余额。
 pub fn decode_reservation_snapshot(
     reader: &mut SnapshotDecoder<'_>,
 ) -> Result<ReservationState, SnapshotWireError> {
@@ -50,7 +50,7 @@ pub fn decode_reservation_snapshot(
     let origin_session_id = OriginSessionId(r.u64()?);
     let version = r.u64()?;
     let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
-    if count == 0 || count > r.remaining() / 20 {
+    if count > r.remaining() / 20 {
         return Err(SnapshotWireError);
     }
     let mut reserves = Vec::new();
@@ -72,6 +72,9 @@ pub fn decode_reservation_snapshot(
         1 => ReservationStatus::Released,
         _ => return Err(SnapshotWireError),
     };
+    if reserves.is_empty() && status != ReservationStatus::Released {
+        return Err(SnapshotWireError);
+    }
     let fee_schedule_version = r.u64()?;
     let fee_tier_id = r.u32()?;
     r.finish()?;

@@ -1115,6 +1115,30 @@ fn unsupported_management_command_does_not_allocate_sequence_or_write_wal() {
         }
     };
     assert!(reply.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+    let mut fee_command = command;
+    fee_command.payload =
+        Command::UpdateFeeSchedule(Box::new(matching_domain::UpdateFeeSchedule {
+            history: Vec::new(),
+            schedule: matching_domain::FeeSchedule::new(
+                1,
+                matching_domain::FeeAssetPolicy::Quote,
+                [(
+                    1,
+                    matching_domain::FeeTier {
+                        maker_bps: 0,
+                        taker_bps: 0,
+                        rounding: matching_domain::FeeRounding::TowardZero,
+                    },
+                )],
+            )
+            .unwrap(),
+        }));
+    assert!(
+        retry(|| shard.handle().submit_command(fee_command.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
     assert!(
         matching_persistence::scan_segments(temp.0.join("wal"))
             .unwrap()
@@ -1126,6 +1150,15 @@ fn unsupported_management_command_does_not_allocate_sequence_or_write_wal() {
 
 #[test]
 fn committed_start_session_with_invalid_route_fails_closed() {
+    committed_unsupported_management_fails_closed(false);
+}
+
+#[test]
+fn committed_fee_update_without_trusted_place_state_fails_closed() {
+    committed_unsupported_management_fails_closed(true);
+}
+
+fn committed_unsupported_management_fails_closed(fee_update: bool) {
     use matching_persistence::{
         DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
         Profile, RegisteredAppender, ReplicationMode, SegmentWriter, WalRecord,
@@ -1144,10 +1177,29 @@ fn committed_start_session_with_invalid_route_fails_closed() {
         route_epoch: Some(1),
         client_timestamp: None,
         received_at_unix_ns: None,
-        payload: Command::StartSession(StartSession {
-            market_id: MarketId(4),
-            new_session_id: 9,
-        }),
+        payload: if fee_update {
+            Command::UpdateFeeSchedule(Box::new(matching_domain::UpdateFeeSchedule {
+                history: Vec::new(),
+                schedule: matching_domain::FeeSchedule::new(
+                    1,
+                    matching_domain::FeeAssetPolicy::Quote,
+                    [(
+                        1,
+                        matching_domain::FeeTier {
+                            maker_bps: 0,
+                            taker_bps: 0,
+                            rounding: matching_domain::FeeRounding::TowardZero,
+                        },
+                    )],
+                )
+                .unwrap(),
+            }))
+        } else {
+            Command::StartSession(StartSession {
+                market_id: MarketId(4),
+                new_session_id: 9,
+            })
+        },
     };
     let writer = SegmentWriter::new(&wal, 4096).unwrap();
     let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();

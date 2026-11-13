@@ -11,7 +11,11 @@ pub fn encode_event_for_hash(
     writer: &mut SnapshotEncoder,
     event: &EventEnvelope,
 ) -> Result<(), SnapshotWireError> {
-    let mut w = SnapshotEncoder::new(1024);
+    let capacity = writer
+        .remaining_capacity()
+        .checked_sub(4)
+        .ok_or(SnapshotWireError)?;
+    let mut w = SnapshotEncoder::new(capacity);
     w.u8(1)?;
     w.u16(event.cluster_id.get())?;
     w.u16(event.shard_id.get())?;
@@ -27,6 +31,28 @@ pub fn encode_event_for_hash(
         }
     }
     match &event.payload {
+        EngineEvent::SettlementDelta(value) => {
+            w.u8(21)?;
+            w.u128(value.trade_id.get())?;
+            w.u64(value.maker_user.get())?;
+            w.u64(value.taker_user.get())?;
+            w.u32(value.base_asset.get())?;
+            w.u32(value.quote_asset.get())?;
+            w.raw_bytes(&value.base_delta.get().to_be_bytes())?;
+            w.raw_bytes(&value.quote_delta.get().to_be_bytes())?;
+            for fee in [&value.maker_fee, &value.taker_fee] {
+                w.u32(fee.asset.get())?;
+                w.raw_bytes(&fee.amount.get().to_be_bytes())?;
+                w.u64(fee.fee_schedule_version)?;
+                w.u32(fee.fee_tier_id)?;
+            }
+            w.u128(value.maker_reservation_id.get())?;
+            w.u128(value.taker_reservation_id.get())?;
+        }
+        EngineEvent::FeeScheduleUpdated { version } => {
+            w.u8(20)?;
+            w.u64(*version)?;
+        }
         EngineEvent::OrderExpired { order_id, reason } => {
             w.u8(19)?;
             w.u128(order_id.get())?;
@@ -156,11 +182,19 @@ pub fn encode_event_for_hash(
             order_id,
             reservation_id,
             reason,
+            released,
         } => {
-            w.u8(10)?;
+            w.u8(if released.is_some() { 22 } else { 10 })?;
             w.u128(order_id.get())?;
             w.u128(reservation_id.get())?;
             w.u16(*reason as u16)?;
+            if let Some(assets) = released {
+                w.u32(u32::try_from(assets.len()).map_err(|_| SnapshotWireError)?)?;
+                for asset in assets {
+                    w.u32(asset.asset.get())?;
+                    w.u128(asset.atoms)?;
+                }
+            }
         }
         EngineEvent::Trade(trade) => {
             w.u8(11)?;

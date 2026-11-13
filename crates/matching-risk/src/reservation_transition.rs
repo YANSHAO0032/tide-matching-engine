@@ -142,7 +142,155 @@ pub struct ReservationRegistry {
     bindings: BTreeMap<ReservationId, ReservationBinding>,
 }
 
+/// 一笔结算对某个预留资产的扣减。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettlementDebit {
+    /// 扣减的预留身份。
+    pub reservation_id: ReservationId,
+    /// 扣减的资产身份。
+    pub asset: matching_domain::AssetId,
+    /// 严格正的扣减原子数量。
+    pub atoms: u128,
+}
+
+/// 终结时待释放的真实剩余资产。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettlementRelease {
+    /// 预留所属的终结订单身份。
+    pub order_id: matching_domain::OrderId,
+    /// 已终结的预留身份。
+    pub reservation_id: ReservationId,
+    /// 按资产排序且数量严格正的剩余资产。
+    pub reserves: Vec<AssetReserve>,
+}
+
+impl SettlementRelease {
+    /// 构造真实释放事件；调用方须在原子提交后才能发布。
+    pub fn to_event(
+        &self,
+        reason: matching_domain::ReservationReleaseReason,
+    ) -> matching_domain::EngineEvent {
+        matching_domain::EngineEvent::ReservationReleased {
+            order_id: self.order_id,
+            reservation_id: self.reservation_id,
+            reason,
+            released: Some(self.reserves.clone()),
+        }
+    }
+}
+
+/// R2 预检冻结的完整前态与候选后态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedR2 {
+    /// 用于检测提交前漂移的完整前态。
+    before: ReservationRegistry,
+    /// 原子安装的完整候选后态。
+    after: ReservationRegistry,
+    /// 按预留身份排序的非空真实释放。
+    releases: Vec<SettlementRelease>,
+}
+impl PlannedR2 {
+    /// 读取候选预检时的预留前态。
+    pub fn before_state(&self, id: ReservationId) -> Option<&ReservationState> {
+        self.before.get(id)
+    }
+    /// 读取候选结算后的预留状态。
+    pub fn after_state(&self, id: ReservationId) -> Option<&ReservationState> {
+        self.after.get(id)
+    }
+    /// 借用预检所得的真实释放，不代表其已提交或已发布。
+    pub fn releases(&self) -> &[SettlementRelease] {
+        &self.releases
+    }
+}
+
 impl ReservationRegistry {
+    /// 在隔离副本中预检扣减及终结；调用方还须原子同步订单簿和事件。
+    pub fn plan_r2(
+        &self,
+        debits: &[SettlementDebit],
+        terminal: &[ReservationId],
+    ) -> Result<PlannedR2, RejectReason> {
+        self.validate_bindings(&self.bindings)?;
+        let mut totals = BTreeMap::new();
+        let mut touched = BTreeSet::new();
+        let mut terminated = BTreeSet::new();
+        for id in terminal {
+            if !terminated.insert(*id) {
+                return Err(RejectReason::InvalidReservation);
+            }
+            touched.insert(*id);
+        }
+        for debit in debits {
+            if debit.atoms == 0 {
+                return Err(RejectReason::InvalidReservation);
+            }
+            let value = totals
+                .entry((debit.reservation_id, debit.asset))
+                .or_insert(0_u128);
+            *value = value
+                .checked_add(debit.atoms)
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            touched.insert(debit.reservation_id);
+        }
+        let mut after = self.clone();
+        let mut releases = Vec::new();
+        for id in touched {
+            let state = after
+                .states
+                .get_mut(&id)
+                .ok_or(RejectReason::InvalidReservation)?;
+            if state.status != ReservationStatus::Active || !after.bindings.contains_key(&id) {
+                return Err(RejectReason::InvalidReservation);
+            }
+            for ((_, asset), atoms) in totals.range(
+                (id, matching_domain::AssetId::new(0))
+                    ..=(id, matching_domain::AssetId::new(u32::MAX)),
+            ) {
+                let index = state
+                    .reserves
+                    .binary_search_by_key(asset, |entry| entry.asset)
+                    .map_err(|_| RejectReason::InsufficientReservation)?;
+                state.reserves[index].atoms = state.reserves[index]
+                    .atoms
+                    .checked_sub(*atoms)
+                    .ok_or(RejectReason::InsufficientReservation)?;
+            }
+            state.reserves.retain(|entry| entry.atoms != 0);
+            state.version = state
+                .version
+                .checked_add(1)
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            if terminated.contains(&id) {
+                if !state.reserves.is_empty() {
+                    releases.push(SettlementRelease {
+                        order_id: state.order_id,
+                        reservation_id: id,
+                        reserves: std::mem::take(&mut state.reserves),
+                    });
+                }
+                state.status = ReservationStatus::Released;
+                after.bindings.remove(&id);
+            } else if state.reserves.is_empty() {
+                return Err(RejectReason::InsufficientReservation);
+            }
+        }
+        after.validate_bindings(&after.bindings)?;
+        Ok(PlannedR2 {
+            before: self.clone(),
+            after,
+            releases,
+        })
+    }
+
+    /// 前态一致时一次安装候选；漂移时不做任何变更。
+    pub fn apply_r2(&mut self, plan: PlannedR2) -> Result<(), ReservationApplyError> {
+        if *self != plan.before {
+            return Err(ReservationApplyError::StateChanged);
+        }
+        *self = plan.after;
+        Ok(())
+    }
     /// 按预留身份顺序保存金融状态及待后置处理归属。
     pub fn write_snapshot(
         &self,
@@ -272,7 +420,9 @@ impl ReservationRegistry {
         let mut ordered = BTreeMap::new();
         let mut bindings = BTreeMap::new();
         for state in states {
-            validate_reserves(&state.reserves)?;
+            if state.status != ReservationStatus::Released || !state.reserves.is_empty() {
+                validate_reserves(&state.reserves)?;
+            }
             if state.status == ReservationStatus::Active {
                 let binding = if pending.remove(&state.reservation_id) {
                     ReservationBinding::PendingR2
@@ -304,6 +454,21 @@ impl ReservationRegistry {
     /// 查询归属是否等待后置资金处理；这不表示已扣减或已释放资金。
     pub fn is_pending_r2(&self, id: ReservationId) -> bool {
         self.bindings.get(&id) == Some(&ReservationBinding::PendingR2)
+    }
+
+    /// 活动预留包含等待 R2 的归属，均必须保留其锁定费率版本及层级。
+    pub fn validate_fee_references(
+        &self,
+        fees: &matching_domain::FeeScheduleBook,
+    ) -> Result<(), RejectReason> {
+        for state in self
+            .states
+            .values()
+            .filter(|state| state.status == ReservationStatus::Active)
+        {
+            fees.resolve(state.fee_schedule_version, state.fee_tier_id)?;
+        }
+        Ok(())
     }
 
     /// 核验真实活动绑定和签名，冻结同单资金调整，不改变登记表。
