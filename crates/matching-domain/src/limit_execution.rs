@@ -11,6 +11,8 @@ pub enum CancelReason {
     MassCancel = 1102,
     /// 市场关闭时终结非 DAY 活动订单。
     MarketClosed = 1104,
+    /// 熔断开关按策略撤销订单。
+    KillSwitch = 1105,
     /// 自成交防护按 CancelMaker 终结挂单。
     SelfTradePreventionMaker = 1106,
     /// 自成交防护按 CancelTaker 终结吃单余量。
@@ -19,6 +21,8 @@ pub enum CancelReason {
     SelfTradePreventionBoth = 1108,
     /// 旧订单在原子撤单替换成功时终结。
     CancelReplace = 1109,
+    /// 开市前参考价变化后订单超出价格带。
+    PriceBandRevalidation = 1113,
     /// IOC 完成立即可执行成交后，取消尚未入簿的余量。
     IocRemainder = 1114,
 }

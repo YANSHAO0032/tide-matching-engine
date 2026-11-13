@@ -250,6 +250,19 @@ pub(crate) fn release_terminal_reservations(
                     reason: CancelReason::MarketClosed,
                     ..
                 } => Ok(Some((*order_id, ReservationReleaseReason::MarketClosed))),
+                EngineEvent::OrderCanceled {
+                    order_id,
+                    reason: CancelReason::KillSwitch,
+                    ..
+                } => Ok(Some((*order_id, ReservationReleaseReason::KillSwitch))),
+                EngineEvent::OrderCanceled {
+                    order_id,
+                    reason: CancelReason::PriceBandRevalidation,
+                    ..
+                } => Ok(Some((
+                    *order_id,
+                    ReservationReleaseReason::PriceBandRevalidation,
+                ))),
                 EngineEvent::OrderExpired {
                     order_id,
                     reason: matching_domain::ExpireReason::MarketClosed,
@@ -987,6 +1000,45 @@ mod integration_tests {
                 .unwrap()
                 .fee_schedule_version,
             9
+        );
+    }
+
+    #[test]
+    fn preopen_revalidation_releases_actual_reserve_after_cancel() {
+        use matching_domain::{CancelReason, ReservationReleaseReason};
+        let (p, k, b, r, i, c) = setup();
+        let accepted = place_candidate(
+            PlacePlanningContext {
+                policy: &p,
+                keys: &k,
+                command_id: CommandId(1),
+                session: 1,
+                now: LogicalTime::new(0),
+            },
+            &order(1, 1, Side::Sell, 2, false),
+            &b,
+            &r,
+            i.try_clone_preallocated().unwrap(),
+            &c,
+        )
+        .unwrap();
+        let mut next_book = accepted.book.clone();
+        let mut next_registry = accepted.registry.clone();
+        let plan = next_book
+            .plan_preopen_revalidation(
+                Price::try_new(11).unwrap(),
+                Price::try_new(20).unwrap(),
+                &next_registry,
+            )
+            .unwrap();
+        let (_, events) = next_book
+            .apply_mass_cancel(&mut next_registry, plan)
+            .unwrap();
+        let result =
+            release_terminal_reservations(&accepted.book, &next_book, &mut next_registry, events)
+                .unwrap();
+        assert!(
+            matches!(result.as_slice(), [EngineEvent::OrderCanceled { reason: CancelReason::PriceBandRevalidation, .. }, EngineEvent::ReservationReleased { reason: ReservationReleaseReason::PriceBandRevalidation, released: Some(assets), .. }] if assets[0].atoms == 2)
         );
     }
 

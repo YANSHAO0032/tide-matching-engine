@@ -19,6 +19,32 @@ pub fn encode_wal_command(c: &CommandEnvelope) -> Result<Vec<u8>, CommandCodecEr
     w.opt(c.client_timestamp, |w, v| w.u64(v));
     w.opt(c.received_at_unix_ns, |w, v| w.u64(v));
     match &c.payload {
+        Command::ShardKillSwitch(input) => {
+            w.u8(15);
+            w.u16(input.target_shard_id.get());
+            w.u128(input.parent_command_id.get());
+            w.u64(input.expected_primary_epoch);
+            w.u8(u8::from(input.active));
+            w.u8(u8::from(input.cancel_all));
+        }
+        Command::TriggerCircuitBreaker(input) => {
+            w.u8(14);
+            w.u32(input.market_id.get());
+            w.u16(input.reason as u16);
+        }
+        Command::MarketKillSwitch(input) => {
+            w.u8(13);
+            w.u32(input.market_id.get());
+            w.u8(u8::from(input.active));
+            w.u8(u8::from(input.cancel_all));
+        }
+        Command::UpdateReferencePrice(input) => {
+            w.u8(12);
+            w.u32(input.market_id.get());
+            w.u8(input.kind as u8);
+            w.i64(input.price.get());
+            w.u64(input.source_seq);
+        }
         Command::UpdateFeeSchedule(input) => {
             w.u8(11);
             let mut snapshot = snapshot_wire::SnapshotEncoder::new(MAX);
@@ -202,6 +228,57 @@ pub fn decode_wal_command(bytes: &[u8]) -> Result<CommandEnvelope, CommandCodecE
     let client_timestamp = r.opt(|r| r.u64())?;
     let received_at_unix_ns = r.opt(|r| r.u64())?;
     let payload = match r.u8()? {
+        15 => Command::ShardKillSwitch(ShardKillSwitch {
+            target_shard_id: ShardId(r.u16()?),
+            parent_command_id: CommandId(r.u128()?),
+            expected_primary_epoch: r.u64()?,
+            active: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CommandCodecError),
+            },
+            cancel_all: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CommandCodecError),
+            },
+        }),
+        14 => Command::TriggerCircuitBreaker(TriggerCircuitBreaker {
+            market_id: MarketId(r.u32()?),
+            reason: match r.u16()? {
+                1501 => CircuitBreakerReason::PriceDeviation,
+                1502 => CircuitBreakerReason::ReferenceUnavailable,
+                1503 => CircuitBreakerReason::VolatilityLimit,
+                1504 => CircuitBreakerReason::InternalSafety,
+                1505 => CircuitBreakerReason::ManualRiskSignal,
+                _ => return Err(CommandCodecError),
+            },
+        }),
+        13 => Command::MarketKillSwitch(MarketKillSwitch {
+            market_id: MarketId(r.u32()?),
+            active: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CommandCodecError),
+            },
+            cancel_all: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CommandCodecError),
+            },
+        }),
+        12 => Command::UpdateReferencePrice(UpdateReferencePrice {
+            market_id: MarketId(r.u32()?),
+            kind: match r.u8()? {
+                1 => PriceReferenceKind::LastTrade,
+                2 => PriceReferenceKind::MarkPrice,
+                3 => PriceReferenceKind::IndexPrice,
+                4 => PriceReferenceKind::StaticOpening,
+                _ => return Err(CommandCodecError),
+            },
+            price: Price::try_new(r.i64()?).map_err(|_| CommandCodecError)?,
+            source_seq: r.u64()?,
+        }),
         11 => {
             let bytes = r.bytes()?;
             let mut snapshot =
@@ -364,6 +441,9 @@ impl Writer {
     fn u8(&mut self, v: u8) {
         self.0.push(v)
     }
+    fn u16(&mut self, v: u16) {
+        self.0.extend_from_slice(&v.to_be_bytes())
+    }
     fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_be_bytes())
     }
@@ -416,6 +496,9 @@ impl Reader<'_> {
     }
     fn u8(&mut self) -> Result<u8, CommandCodecError> {
         Ok(self.take::<1>()?[0])
+    }
+    fn u16(&mut self) -> Result<u16, CommandCodecError> {
+        Ok(u16::from_be_bytes(self.take()?))
     }
     fn u32(&mut self) -> Result<u32, CommandCodecError> {
         Ok(u32::from_be_bytes(self.take()?))

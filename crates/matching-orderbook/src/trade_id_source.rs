@@ -14,6 +14,8 @@ pub(crate) enum TradeIdSource<'a> {
         cursor: TradeIdCursor,
         /// 是否曾因游标耗尽导致根命令必须失败。
         exhausted: bool,
+        /// 单根命令剩余的成交安全额度；为空表示仅受游标本身限制。
+        remaining: Option<u32>,
     },
 }
 
@@ -28,6 +30,16 @@ impl<'a> TradeIdSource<'a> {
         Self::Cursor {
             cursor,
             exhausted: false,
+            remaining: None,
+        }
+    }
+
+    /// 创建带成交上限的根命令游标；超限属于必须停止分片的安全错误。
+    pub(crate) fn cursor_limited(cursor: TradeIdCursor, limit: u32) -> Self {
+        Self::Cursor {
+            cursor,
+            exhausted: false,
+            remaining: Some(limit),
         }
     }
 
@@ -39,10 +51,17 @@ impl<'a> TradeIdSource<'a> {
                 *position = position.checked_add(1).expect("预置 TradeId 索引溢出");
                 Ok(id)
             }
-            Self::Cursor { cursor, exhausted } => {
+            Self::Cursor {
+                cursor,
+                exhausted,
+                remaining,
+            } => {
+                assert!(*remaining != Some(0), "止损级联超过成交上限，分片停止");
                 let result = cursor.next_trade_id();
                 if result.is_err() {
                     *exhausted = true;
+                } else if let Some(left) = remaining {
+                    *left = left.checked_sub(1).expect("成交额度已经预检");
                 }
                 result
             }

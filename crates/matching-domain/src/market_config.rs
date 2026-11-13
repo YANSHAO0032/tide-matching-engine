@@ -136,6 +136,8 @@ pub struct ManagedMarket {
     lifecycle: crate::MarketLifecycle,
     /// 是否存在需要按原精度解释的历史金额。
     referenced_history: bool,
+    /// 市场范围熔断开关的持久业务状态。
+    kill_switch_active: bool,
 }
 
 impl ManagedMarket {
@@ -188,7 +190,12 @@ impl ManagedMarket {
         writer: &mut crate::snapshot_wire::SnapshotEncoder,
     ) -> Result<(), crate::snapshot_wire::SnapshotWireError> {
         let mut buffer = crate::snapshot_wire::SnapshotEncoder::new(512);
-        buffer.u8(if self.referenced_history { 1 } else { 2 })?;
+        buffer.u8(match (self.referenced_history, self.kill_switch_active) {
+            (true, false) => 1,
+            (false, false) => 2,
+            (true, true) => 3,
+            (false, true) => 4,
+        })?;
         self.config.write_snapshot(&mut buffer)?;
         self.lifecycle.write_snapshot(&mut buffer)?;
         writer.raw_bytes(&buffer.finish())
@@ -197,9 +204,11 @@ impl ManagedMarket {
     pub fn read_snapshot(
         reader: &mut crate::snapshot_wire::SnapshotDecoder<'_>,
     ) -> Result<Self, crate::snapshot_wire::SnapshotWireError> {
-        let referenced_history = match reader.u8()? {
-            1 => true,
-            2 => false,
+        let (referenced_history, kill_switch_active) = match reader.u8()? {
+            1 => (true, false),
+            2 => (false, false),
+            3 => (true, true),
+            4 => (false, true),
             _ => return Err(crate::snapshot_wire::SnapshotWireError),
         };
         let config = MarketConfig::read_snapshot(reader)?;
@@ -208,6 +217,7 @@ impl ManagedMarket {
             config,
             lifecycle,
             referenced_history,
+            kill_switch_active,
         })
     }
     /// 用有效配置建立关闭的空候选状态。
@@ -217,6 +227,7 @@ impl ManagedMarket {
             config,
             lifecycle: crate::MarketLifecycle::new_closed(),
             referenced_history: false,
+            kill_switch_active: false,
         })
     }
     /// 返回当前生命周期。
@@ -226,6 +237,16 @@ impl ManagedMarket {
     /// 返回市场配置。
     pub const fn config(&self) -> &MarketConfig {
         &self.config
+    }
+    /// 查询当前市场范围熔断开关状态。
+    pub const fn kill_switch_active(&self) -> bool {
+        self.kill_switch_active
+    }
+    /// 修改市场范围熔断开关，返回状态是否发生变化；调用方负责持久化和事件。
+    pub fn set_kill_switch(&mut self, active: bool) -> bool {
+        let changed = self.kill_switch_active != active;
+        self.kill_switch_active = active;
+        changed
     }
     /// 返回当前市场是否已记录需保留精度的历史金额。
     pub const fn has_referenced_history(&self) -> bool {
@@ -305,17 +326,53 @@ impl ManagedMarket {
         candidate.suspend()?;
         self.install_transition(candidate, old, crate::MarketStateReason::Admin)
     }
+    /// 原子触发确定性熔断，并按协议顺序发出原因及市场状态事件。
+    pub fn trigger_circuit_breaker(
+        &mut self,
+        reason: crate::CircuitBreakerReason,
+    ) -> Result<Vec<crate::EngineEvent>, crate::RejectReason> {
+        let old = self.lifecycle.state();
+        let mut candidate = self.lifecycle;
+        candidate.halt()?;
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(2)
+            .map_err(|_| crate::RejectReason::EngineBusy)?;
+        events.push(crate::EngineEvent::CircuitBreakerTriggered {
+            market_id: self.config.market_id,
+            reason,
+        });
+        events.push(crate::EngineEvent::MarketStateChanged {
+            market_id: self.config.market_id,
+            old,
+            new: candidate.state(),
+            reason: crate::MarketStateReason::CircuitBreaker,
+        });
+        self.lifecycle = candidate;
+        Ok(events)
+    }
     /// 仅在价格带参考有效时恢复已暂停的候选市场。
     pub fn resume(
         &mut self,
         valid_reference: bool,
     ) -> Result<Vec<crate::EngineEvent>, crate::RejectReason> {
-        let old = self.lifecycle.state();
-        let mut candidate = self.lifecycle;
-        candidate.resume()?;
+        self.resume_after_revalidation(valid_reference, false)
+    }
+    /// 从开市前的熔断恢复时，调用方须提供同一候选中的重校验结果。
+    pub fn resume_after_revalidation(
+        &mut self,
+        valid_reference: bool,
+        revalidation_complete: bool,
+    ) -> Result<Vec<crate::EngineEvent>, crate::RejectReason> {
         if self.config.price_band.is_some() && !valid_reference {
             return Err(crate::RejectReason::ReferencePriceUnavailable);
         }
+        if self.lifecycle.preopen_revalidation_required() && !revalidation_complete {
+            return Err(crate::RejectReason::InvalidMarketStateTransition);
+        }
+        let old = self.lifecycle.state();
+        let mut candidate = self.lifecycle;
+        candidate.resume_after_revalidation(revalidation_complete)?;
         self.install_transition(candidate, old, crate::MarketStateReason::Admin)
     }
     /// 在普通簿和 StopBook 的候选清理完成后将市场置为关闭。

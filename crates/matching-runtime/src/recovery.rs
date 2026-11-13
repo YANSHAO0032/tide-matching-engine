@@ -60,6 +60,20 @@ pub fn recover_snapshot_records_with_genesis(
         matching_orderbook::QueuePriorityPolicy,
     )],
 ) -> io::Result<Option<SnapshotRecoveryRecords>> {
+    if let Some(lease) = config
+        .place
+        .as_ref()
+        .and_then(|place| place.primary_lease.as_ref())
+    {
+        lease
+            .verify(config.cluster, config.shard, config.primary_epoch)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "可信主节点租约身份或纪元不匹配",
+                )
+            })?;
+    }
     let snapshot =
         match crate::SnapshotImage::read_recovery_candidate(snapshot_dir, manager, config)? {
             Some(snapshot) => snapshot,

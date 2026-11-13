@@ -100,7 +100,7 @@ pub use market_config::{
 };
 /// 市场生命周期及其状态。
 pub use market_lifecycle::{
-    MarketLifecycle, MarketMathUpdateError, MarketState, MarketStateReason,
+    CircuitBreakerReason, MarketLifecycle, MarketMathUpdateError, MarketState, MarketStateReason,
     validate_market_math_update,
 };
 
@@ -119,8 +119,9 @@ pub use cancel_replace::{
 /// 正式命令及事件的进程内身份封装。
 pub use command_event::{
     ApplyUserControlFenceShard, CloseMarket, Command, CommandEnvelope, CommandResultSummary,
-    CommandStatus, CreateMarket, EndSession, EventEnvelope, OpenMarket, PlaceLimitOrder,
-    ResumeMarket, StartSession, SuspendMarket, UpdateFeeSchedule, UpdateMarket, UserFenceAction,
+    CommandStatus, CreateMarket, EndSession, EventEnvelope, KillScope, MarketKillSwitch,
+    OpenMarket, PlaceLimitOrder, ResumeMarket, ShardKillSwitch, StartSession, SuspendMarket,
+    TriggerCircuitBreaker, UpdateFeeSchedule, UpdateMarket, UpdateReferencePrice, UserFenceAction,
 };
 /// 正式命令的版本化持久编码与解码。
 pub use command_wal_codec::{CommandCodecError, decode_wal_command, encode_wal_command};

@@ -2,6 +2,30 @@
 use matching_domain::{MarketLifecycle, MarketState, RejectReason};
 
 #[test]
+fn halt_preserves_preopen_revalidation_requirement_in_snapshot() {
+    use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
+    let mut lifecycle = MarketLifecycle::new_closed();
+    lifecycle.start_session(1).unwrap();
+    lifecycle.halt().unwrap();
+    assert!(lifecycle.preopen_revalidation_required());
+    let mut writer = SnapshotEncoder::new(32);
+    lifecycle.write_snapshot(&mut writer).unwrap();
+    let bytes = writer.finish();
+    let mut reader = SnapshotDecoder::new(&bytes, 32).unwrap();
+    let restored = MarketLifecycle::read_snapshot(&mut reader).unwrap();
+    assert_eq!(restored, lifecycle);
+    assert_eq!(
+        lifecycle.resume(),
+        Err(RejectReason::InvalidMarketStateTransition)
+    );
+    let mut normal = MarketLifecycle::new_closed();
+    normal.start_session(1).unwrap();
+    normal.open(1).unwrap();
+    normal.halt().unwrap();
+    assert!(!normal.preopen_revalidation_required());
+}
+
+#[test]
 fn ended_session_is_persisted_and_cannot_end_twice() {
     use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
     let mut market = MarketLifecycle::new_closed();

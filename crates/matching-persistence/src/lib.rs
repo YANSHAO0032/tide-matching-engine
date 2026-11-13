@@ -14,7 +14,7 @@ pub use durability::{
     DurableAppender, DurableBatcher, Profile, RegisteredAppender, ReplicationMode,
 };
 pub use manifest::{ManifestIntent, ManifestManager, ManifestState, ManifestStorage};
-pub use manifest_file::FileManifestStorage;
+pub use manifest_file::{FileManifestStorage, sync_directory};
 pub use record::{WalError, WalRecord};
 pub use recovery::{
     recover_committed, recover_local, recover_local_with_manifest, repair_local_wal,

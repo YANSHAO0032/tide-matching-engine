@@ -5,6 +5,71 @@ use matching_domain::{
 };
 
 #[test]
+fn kill_switch_event_hash_distinguishes_scope_and_action() {
+    use matching_domain::{KillScope, encode_event_for_hash};
+    let mut event = EventEnvelope {
+        cluster_id: ClusterId(1),
+        shard_id: ShardId(2),
+        shard_seq: 3,
+        event_index: 4,
+        command_id: CommandId(5),
+        engine_time: 6,
+        market_id: Some(MarketId(7)),
+        payload: EngineEvent::KillSwitchActivated {
+            scope: KillScope::Market(MarketId(7)),
+        },
+    };
+    let encode = |event: &EventEnvelope| {
+        let mut w = SnapshotEncoder::new(256);
+        encode_event_for_hash(&mut w, event).unwrap();
+        w.finish()
+    };
+    let active = encode(&event);
+    event.payload = EngineEvent::KillSwitchCleared {
+        scope: KillScope::Market(MarketId(7)),
+    };
+    assert_ne!(encode(&event), active);
+    event.payload = EngineEvent::KillSwitchActivated {
+        scope: KillScope::Market(MarketId(8)),
+    };
+    assert_ne!(encode(&event), active);
+}
+
+#[test]
+fn circuit_breaker_event_hash_covers_market_and_reason() {
+    use matching_domain::{CircuitBreakerReason, encode_event_for_hash};
+    let mut event = EventEnvelope {
+        cluster_id: ClusterId(1),
+        shard_id: ShardId(2),
+        shard_seq: 3,
+        event_index: 4,
+        command_id: CommandId(5),
+        engine_time: 6,
+        market_id: Some(MarketId(7)),
+        payload: EngineEvent::CircuitBreakerTriggered {
+            market_id: MarketId(7),
+            reason: CircuitBreakerReason::ManualRiskSignal,
+        },
+    };
+    let encode = |event: &EventEnvelope| {
+        let mut w = SnapshotEncoder::new(256);
+        encode_event_for_hash(&mut w, event).unwrap();
+        w.finish()
+    };
+    let expected = encode(&event);
+    event.payload = EngineEvent::CircuitBreakerTriggered {
+        market_id: MarketId(7),
+        reason: CircuitBreakerReason::InternalSafety,
+    };
+    assert_ne!(encode(&event), expected);
+    event.payload = EngineEvent::CircuitBreakerTriggered {
+        market_id: MarketId(8),
+        reason: CircuitBreakerReason::ManualRiskSignal,
+    };
+    assert_ne!(encode(&event), expected);
+}
+
+#[test]
 fn release_amounts_have_distinct_encoding_and_preserve_legacy_bytes() {
     use matching_domain::{
         AssetId, AssetReserve, ReservationId, ReservationReleaseReason, encode_event_for_hash,

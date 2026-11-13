@@ -21,6 +21,23 @@ pub enum OrderRemaining {
 /// 它不是完整持久化事件封装：不携带市场事件序列、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
+    /// 确定性的市场熔断已触发。
+    CircuitBreakerTriggered {
+        /// 触发熔断的市场。
+        market_id: MarketId,
+        /// 固定协议原因。
+        reason: crate::CircuitBreakerReason,
+    },
+    /// 已激活指定范围的熔断开关。
+    KillSwitchActivated {
+        /// 激活的业务范围。
+        scope: crate::KillScope,
+    },
+    /// 已清除指定范围的熔断开关。
+    KillSwitchCleared {
+        /// 清除的业务范围。
+        scope: crate::KillScope,
+    },
     /// 单笔真实成交的本金与费用结算变动。
     SettlementDelta(
         /// 成交、双方本金、费用和预留身份。

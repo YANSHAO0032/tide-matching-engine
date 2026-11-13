@@ -83,6 +83,84 @@ fn samples() -> Vec<CommandEnvelope> {
 }
 
 #[test]
+fn shard_kill_switch_wal_roundtrips_fencing_and_parent() {
+    let mut command = envelope(Command::ShardKillSwitch(ShardKillSwitch {
+        target_shard_id: ShardId(8),
+        parent_command_id: CommandId(9),
+        expected_primary_epoch: 10,
+        active: true,
+        cancel_all: true,
+    }));
+    command.market_id = None;
+    command.route_epoch = None;
+    let bytes = encode_wal_command(&command).unwrap();
+    assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+    for n in 0..bytes.len() {
+        assert!(decode_wal_command(&bytes[..n]).is_err());
+    }
+}
+
+#[test]
+fn circuit_breaker_command_roundtrips_every_reason() {
+    for reason in [
+        CircuitBreakerReason::PriceDeviation,
+        CircuitBreakerReason::ReferenceUnavailable,
+        CircuitBreakerReason::VolatilityLimit,
+        CircuitBreakerReason::InternalSafety,
+        CircuitBreakerReason::ManualRiskSignal,
+    ] {
+        let command = envelope(Command::TriggerCircuitBreaker(TriggerCircuitBreaker {
+            market_id: MarketId(4),
+            reason,
+        }));
+        let bytes = encode_wal_command(&command).unwrap();
+        assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+        for n in 0..bytes.len() {
+            assert!(decode_wal_command(&bytes[..n]).is_err());
+        }
+    }
+}
+
+#[test]
+fn market_kill_switch_wal_roundtrips_and_rejects_truncation() {
+    for active in [false, true] {
+        for cancel_all in [false, true] {
+            let command = envelope(Command::MarketKillSwitch(MarketKillSwitch {
+                market_id: MarketId(4),
+                active,
+                cancel_all,
+            }));
+            let bytes = encode_wal_command(&command).unwrap();
+            assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+            for n in 0..bytes.len() {
+                assert!(decode_wal_command(&bytes[..n]).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn reference_update_wal_preserves_source_and_rejects_truncation() {
+    for kind in [
+        PriceReferenceKind::MarkPrice,
+        PriceReferenceKind::IndexPrice,
+        PriceReferenceKind::StaticOpening,
+    ] {
+        let command = envelope(Command::UpdateReferencePrice(UpdateReferencePrice {
+            market_id: MarketId(4),
+            kind,
+            price: Price::try_new(123).unwrap(),
+            source_seq: 45,
+        }));
+        let bytes = encode_wal_command(&command).unwrap();
+        assert_eq!(decode_wal_command(&bytes).unwrap(), command);
+        for n in 0..bytes.len() {
+            assert!(decode_wal_command(&bytes[..n]).is_err());
+        }
+    }
+}
+
+#[test]
 fn start_session_wal_preserves_market_and_session() {
     let command = envelope(Command::StartSession(StartSession {
         market_id: MarketId(4),

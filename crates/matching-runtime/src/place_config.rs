@@ -29,6 +29,8 @@ pub struct PlaceSupportConfig {
     pub(crate) limits: PlaceLimits,
     /// 是否要求市场先通过持久管理命令创建。
     pub(crate) managed_only: bool,
+    /// 启动时持有的单机主节点排他租约；不进入业务快照。
+    pub(crate) primary_lease: Option<std::sync::Arc<crate::PrimaryLease>>,
 }
 
 /// 正式下单配置不满足市场唯一性或容量约束。
@@ -60,11 +62,17 @@ impl PlaceSupportConfig {
             policies: ordered,
             limits,
             managed_only: false,
+            primary_lease: None,
         })
     }
     /// 要求正式业务变更仅作用于已创建的受管理市场。
     pub fn require_managed_markets(mut self) -> Self {
         self.managed_only = true;
+        self
+    }
+    /// 将可信主节点租约绑定到分片生命周期；租约身份在启动时校验。
+    pub fn with_primary_lease(mut self, lease: std::sync::Arc<crate::PrimaryLease>) -> Self {
+        self.primary_lease = Some(lease);
         self
     }
 }

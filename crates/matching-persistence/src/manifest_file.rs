@@ -188,7 +188,7 @@ impl ManifestStorage for FileManifestStorage {
 }
 
 /// 同步目录项；Windows 目录句柄需显式目录访问标志。
-pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+pub fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;

@@ -57,12 +57,32 @@ pub enum MarketStateReason {
     Created = 1401,
     /// 管理员操作。
     Admin = 1402,
+    /// 确定性的熔断规则触发。
+    CircuitBreaker = 1403,
+    /// 熔断开关触发。
+    KillSwitch = 1404,
     /// 当前交易时段结束。
     SessionEnded = 1405,
     /// 新交易时段开始。
     SessionStarted = 1408,
     /// 开始连续撮合。
     Opened = 1409,
+}
+
+/// 熔断事件的稳定原因编号。
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CircuitBreakerReason {
+    /// 价格偏离触发。
+    PriceDeviation = 1501,
+    /// 所需参考价格不可用。
+    ReferenceUnavailable = 1502,
+    /// 波动限制触发。
+    VolatilityLimit = 1503,
+    /// 确定性的内部安全条件触发。
+    InternalSafety = 1504,
+    /// 持久化的人工风控信号触发。
+    ManualRiskSignal = 1505,
 }
 
 /// 市场状态与当前交易时段；不拥有订单簿或预留状态。
@@ -76,6 +96,8 @@ pub struct MarketLifecycle {
     session_id: Option<u64>,
     /// 当前时段是否尚未结束。
     session_active: bool,
+    /// 风控停止是否发生在仍须重校验的开市前状态。
+    preopen_revalidation_required: bool,
 }
 
 impl MarketLifecycle {
@@ -85,6 +107,7 @@ impl MarketLifecycle {
             state: MarketState::Closed,
             session_id: None,
             session_active: false,
+            preopen_revalidation_required: false,
         }
     }
     /// 返回当前状态。
@@ -99,6 +122,10 @@ impl MarketLifecycle {
     pub const fn session_active(&self) -> bool {
         self.session_active
     }
+    /// 风控停止发生于 PreOpen，恢复前须重新校验现有订单。
+    pub const fn preopen_revalidation_required(&self) -> bool {
+        self.preopen_revalidation_required
+    }
     /// 以版本、状态标记和可选交易时段编码生命周期。
     pub fn write_snapshot(
         &self,
@@ -106,7 +133,12 @@ impl MarketLifecycle {
     ) -> Result<(), crate::snapshot_wire::SnapshotWireError> {
         let mut buffer = crate::snapshot_wire::SnapshotEncoder::new(12);
         let legacy = self.session_active == (self.state != MarketState::Closed);
-        buffer.u8(if legacy { 1 } else { 2 })?;
+        buffer.u8(match (self.preopen_revalidation_required, legacy) {
+            (false, true) => 1,
+            (false, false) => 2,
+            (true, true) => 3,
+            (true, false) => 4,
+        })?;
         buffer.u8(match self.state {
             MarketState::PreOpen => 0,
             MarketState::Open => 1,
@@ -132,7 +164,7 @@ impl MarketLifecycle {
     ) -> Result<Self, crate::snapshot_wire::SnapshotWireError> {
         use crate::snapshot_wire::SnapshotWireError;
         let version = reader.u8()?;
-        if version != 1 && version != 2 {
+        if !(1..=4).contains(&version) {
             return Err(SnapshotWireError);
         }
         let state = match reader.u8()? {
@@ -151,7 +183,7 @@ impl MarketLifecycle {
         if state != MarketState::Closed && session_id.is_none() {
             return Err(SnapshotWireError);
         }
-        let session_active = if version == 1 {
+        let session_active = if version == 1 || version == 3 {
             state != MarketState::Closed
         } else {
             match reader.u8()? {
@@ -163,10 +195,15 @@ impl MarketLifecycle {
         if session_active && (session_id.is_none() || state == MarketState::Closed) {
             return Err(SnapshotWireError);
         }
+        let preopen_revalidation_required = version >= 3;
+        if preopen_revalidation_required && state != MarketState::Halted {
+            return Err(SnapshotWireError);
+        }
         Ok(Self {
             state,
             session_id,
             session_active,
+            preopen_revalidation_required,
         })
     }
     /// 校验限价下单许可；交叉结果须由当前订单簿独立计算。
@@ -251,8 +288,27 @@ impl MarketLifecycle {
         self.state = MarketState::Suspended;
         Ok(())
     }
+    /// 将活动市场切换为风控暂停；关闭和已停止的状态不能重复触发。
+    pub fn halt(&mut self) -> Result<(), RejectReason> {
+        if !matches!(
+            self.state,
+            MarketState::PreOpen | MarketState::Open | MarketState::Suspended
+        ) {
+            return Err(RejectReason::InvalidMarketStateTransition);
+        }
+        self.preopen_revalidation_required = self.state == MarketState::PreOpen;
+        self.state = MarketState::Halted;
+        Ok(())
+    }
     /// 从风险暂停或人工暂停恢复连续撮合。
     pub fn resume(&mut self) -> Result<(), RejectReason> {
+        self.resume_after_revalidation(false)
+    }
+    /// 从开市前熔断恢复时要求调用方确认已完成重校验。
+    pub(crate) fn resume_after_revalidation(&mut self, complete: bool) -> Result<(), RejectReason> {
+        if self.preopen_revalidation_required && !complete {
+            return Err(RejectReason::InvalidMarketStateTransition);
+        }
         if !matches!(self.state, MarketState::Halted | MarketState::Suspended) {
             return Err(RejectReason::InvalidMarketStateTransition);
         }
@@ -260,6 +316,7 @@ impl MarketLifecycle {
             return Err(RejectReason::InvalidSession);
         }
         self.state = MarketState::Open;
+        self.preopen_revalidation_required = false;
         Ok(())
     }
     /// 将非关闭状态转换为关闭状态；调用方须同时原子清理市场。
@@ -268,6 +325,7 @@ impl MarketLifecycle {
             return Err(RejectReason::InvalidMarketStateTransition);
         }
         self.state = MarketState::Closed;
+        self.preopen_revalidation_required = false;
         self.session_active = false;
         Ok(())
     }

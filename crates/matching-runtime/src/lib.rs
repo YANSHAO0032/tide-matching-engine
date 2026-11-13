@@ -1,6 +1,9 @@
 //! 单写者分片执行、有界消息入口、路由、序号及有限正式命令编排。
 
 mod client_order_id;
+mod control_store;
+/// 可信文件目录中的单机排他主节点租约。
+pub use control_store::{ControlCoordinator, ControlStore, LeaseError, PrimaryLease};
 mod event_hash;
 mod idempotency;
 /// 原序业务事件的确定性摘要。
