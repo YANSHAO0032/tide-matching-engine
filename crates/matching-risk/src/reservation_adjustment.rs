@@ -115,7 +115,7 @@ pub struct ReservationState {
     pub origin_session_id: OriginSessionId,
     /// 用于拒绝陈旧授权的单调版本。
     pub version: u64,
-    /// 按资产严格升序保存的已锁定原子数量。
+    /// 按资产严格升序保存的已锁定原子数量；已释放状态允许为空。
     pub reserves: Vec<AssetReserve>,
     /// 当前预留是否仍被引擎接管。
     pub status: ReservationStatus,

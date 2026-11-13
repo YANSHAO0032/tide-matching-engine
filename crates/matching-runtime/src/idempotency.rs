@@ -83,6 +83,9 @@ fn outcome_matches(command: &Command, outcome: &FormalOutcome) -> bool {
             *epoch >= fence.new_epoch
         }
         (Command::MassCancelShard(_), FormalOutcome::MassCancel(_)) => true,
+        (Command::UpdateFeeSchedule(input), FormalOutcome::FeeScheduleUpdated(version)) => {
+            input.schedule.version() == *version
+        }
         (
             Command::CreateMarket(_)
             | Command::UpdateMarket(_)
@@ -189,6 +192,10 @@ impl DedupWindow {
             w.bytes(&command)?;
             w.u64(entry.seq)?;
             match entry.outcome {
+                FormalOutcome::FeeScheduleUpdated(version) => {
+                    w.u8(5)?;
+                    w.u64(version)?;
+                }
                 FormalOutcome::MarketManaged => w.u8(4)?,
                 FormalOutcome::Placed(id) => {
                     w.u8(0)?;
@@ -307,6 +314,7 @@ impl DedupWindow {
                 }),
                 3 => FormalOutcome::Rejected(decode_reject_reason(&mut r)?),
                 4 => FormalOutcome::MarketManaged,
+                5 => FormalOutcome::FeeScheduleUpdated(r.u64()?),
                 _ => return Err(SnapshotWireError),
             };
             if !outcome_matches(&command.payload, &outcome) {

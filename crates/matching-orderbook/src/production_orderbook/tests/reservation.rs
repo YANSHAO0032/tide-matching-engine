@@ -378,3 +378,196 @@ fn market_base_and_quote_full_fills_clear_shadow_state() {
         assert_eq!(validate_book(&book), Ok(()));
     }
 }
+
+#[test]
+fn settlement_shadow_update_requires_matching_plan_and_preserves_priority() {
+    use matching_risk::{ReservationRegistry, SettlementDebit};
+    let mut book = ProductionOrderBook::new(policy());
+    book.bind_market(MarketId::new(7)).unwrap();
+    book.rest_with_reservation(order(1, Side::Buy, 90, 2), state(1))
+        .unwrap();
+    let mut registry = ReservationRegistry::new([state(1)]).unwrap();
+    let plan = registry
+        .plan_r2(
+            &[SettlementDebit {
+                reservation_id: state(1).reservation_id,
+                asset: AssetId::new(1),
+                atoms: 100,
+            }],
+            &[],
+        )
+        .unwrap();
+    let original = book.clone();
+    let next = book.plan_r2_shadow_update(&plan).unwrap();
+    assert_eq!(book, original);
+    assert_eq!(next.next_queue_priority(), book.next_queue_priority());
+    assert_eq!(
+        next.reservation_state(OrderId::new(1)).unwrap().reserves[0].atoms,
+        400
+    );
+    registry.apply_r2(plan).unwrap();
+    assert_eq!(
+        next.reservation_state(OrderId::new(1)),
+        registry.get(state(1).reservation_id)
+    );
+    let invalid = registry.plan_r2(&[], &[state(1).reservation_id]).unwrap();
+    let before = next.clone();
+    assert!(next.plan_r2_shadow_update(&invalid).is_err());
+    assert_eq!(next, before);
+    assert!(
+        book.plan_r2_shadow_update(&registry.plan_r2(&[], &[state(1).reservation_id]).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn trade_r2_candidate_installs_registry_and_book_together() {
+    use matching_domain::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
+    use matching_risk::{ReservationRegistry, SettlementAsset, TradeSettlementContext};
+    let mut book = ProductionOrderBook::new(policy());
+    book.bind_market(MarketId::new(7)).unwrap();
+    book.rest_with_reservation(order(1, Side::Sell, 100, 2), state(1))
+        .unwrap();
+    let mut taker = state(2);
+    taker.reserves = vec![AssetReserve {
+        asset: AssetId(2),
+        atoms: 200,
+    }];
+    let mut registry =
+        ReservationRegistry::new_with_pending_r2([state(1), taker], [state(2).reservation_id])
+            .unwrap();
+    let fees = FeeScheduleBook::new(
+        FeeSchedule::new(
+            1,
+            FeeAssetPolicy::Quote,
+            [(
+                0,
+                FeeTier {
+                    maker_bps: 0,
+                    taker_bps: 0,
+                    rounding: FeeRounding::TowardZero,
+                },
+            )],
+        )
+        .unwrap(),
+    );
+    let context = TradeSettlementContext {
+        market_id: MarketId(7),
+        math: MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+        base: SettlementAsset {
+            asset: AssetId(1),
+            scale: 0,
+        },
+        quote: SettlementAsset {
+            asset: AssetId(2),
+            scale: 0,
+        },
+        fees: &fees,
+    };
+    let trade = TradeEvent {
+        trade_id: TradeId::new(1),
+        maker_order_id: OrderId(1),
+        taker_order_id: OrderId(2),
+        price: Price::try_new(100).unwrap(),
+        qty: Qty::try_new(1).unwrap(),
+        maker_side: Side::Sell,
+    };
+    let before = book.clone();
+    let before_registry = registry.clone();
+    let plan = book
+        .plan_trade_r2_candidate(
+            &registry,
+            context,
+            &trade,
+            state(1).reservation_id,
+            state(2).reservation_id,
+            &[state(2).reservation_id],
+        )
+        .unwrap();
+    assert_eq!(book, before);
+    assert_eq!(registry, before_registry);
+    let (_, releases) = book.apply_trade_r2_candidate(&mut registry, plan).unwrap();
+    assert_eq!(
+        book.reservation_state(OrderId(1)).unwrap().reserves[0].atoms,
+        499
+    );
+    assert_eq!(
+        book.reservation_state(OrderId(1)),
+        registry.get(state(1).reservation_id)
+    );
+    assert_eq!(
+        registry.get(state(2).reservation_id).unwrap().status,
+        matching_risk::ReservationStatus::Released
+    );
+    assert_eq!(releases[0].reserves[0].atoms, 100);
+    assert_eq!(book.next_queue_priority(), before.next_queue_priority());
+
+    let context = || TradeSettlementContext {
+        market_id: MarketId(7),
+        math: MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+        base: SettlementAsset {
+            asset: AssetId(1),
+            scale: 0,
+        },
+        quote: SettlementAsset {
+            asset: AssetId(2),
+            scale: 0,
+        },
+        fees: &fees,
+    };
+    let plan = before
+        .plan_trade_r2_candidate(
+            &before_registry,
+            context(),
+            &trade,
+            state(1).reservation_id,
+            state(2).reservation_id,
+            &[state(2).reservation_id],
+        )
+        .unwrap();
+    let mut changed_book = before.clone();
+    changed_book
+        .rest_with_reservation(order(3, Side::Sell, 101, 1), state(3))
+        .unwrap();
+    let changed_snapshot = changed_book.clone();
+    let mut unchanged_registry = before_registry.clone();
+    assert!(
+        changed_book
+            .apply_trade_r2_candidate(&mut unchanged_registry, plan)
+            .is_err()
+    );
+    assert_eq!(changed_book, changed_snapshot);
+    assert_eq!(unchanged_registry, before_registry);
+
+    let plan = before
+        .plan_trade_r2_candidate(
+            &before_registry,
+            context(),
+            &trade,
+            state(1).reservation_id,
+            state(2).reservation_id,
+            &[state(2).reservation_id],
+        )
+        .unwrap();
+    let mut changed_registry = before_registry.clone();
+    let update = changed_registry
+        .plan_r2(
+            &[matching_risk::SettlementDebit {
+                reservation_id: state(1).reservation_id,
+                asset: AssetId(1),
+                atoms: 1,
+            }],
+            &[],
+        )
+        .unwrap();
+    changed_registry.apply_r2(update).unwrap();
+    let changed_snapshot = changed_registry.clone();
+    let mut unchanged_book = before.clone();
+    assert!(
+        unchanged_book
+            .apply_trade_r2_candidate(&mut changed_registry, plan)
+            .is_err()
+    );
+    assert_eq!(unchanged_book, before);
+    assert_eq!(changed_registry, changed_snapshot);
+}

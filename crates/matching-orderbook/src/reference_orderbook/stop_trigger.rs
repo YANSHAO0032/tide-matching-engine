@@ -420,6 +420,7 @@ impl ReferenceOrderBook {
             order_id: order.order_id(),
             reservation_id: order.reservation_id(),
             reason: ReservationReleaseReason::TriggerRejected,
+            released: None,
         });
     }
 

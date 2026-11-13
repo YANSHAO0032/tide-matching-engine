@@ -88,6 +88,14 @@ pub struct UpdateMarket {
     /// 更新后的完整市场配置。
     pub config: crate::MarketConfig,
 }
+/// 发布新的费率版本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateFeeSchedule {
+    /// 待发布的完整费率配置。
+    pub schedule: crate::FeeSchedule,
+    /// 首次初始化时按版本升序提供的历史配置；后续更新必须为空。
+    pub history: Vec<crate::FeeSchedule>,
+}
 /// 开放指定市场的当前交易时段。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenMarket {
@@ -126,6 +134,11 @@ pub struct CloseMarket {
 /// 当前具有实际载荷的正式业务命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// 发布新的费率版本。
+    UpdateFeeSchedule(
+        /// 完整费率配置。
+        Box<UpdateFeeSchedule>,
+    ),
     /// 创建市场及其初始配置。
     CreateMarket(
         /// 完整初始配置。

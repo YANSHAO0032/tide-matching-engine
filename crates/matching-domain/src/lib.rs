@@ -2,6 +2,14 @@
 //!
 //! 当前提供撮合所需的领域子集与命令载荷编码，不包含完整资金账本或 WAL 恢复。
 
+/// 版本化费率配置及其有界快照。
+pub mod fee_schedule;
+pub use fee_schedule::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
+
+/// 成交结算及双方费用的确定性载荷。
+pub mod settlement;
+pub use settlement::{FeeDelta, SettlementDelta};
+
 /// 改单绝对目标、显式补丁与纯候选计算。
 pub mod amend_order;
 /// 撤单替换的独立新订单、资金过渡及拒绝结果。
@@ -112,7 +120,7 @@ pub use cancel_replace::{
 pub use command_event::{
     ApplyUserControlFenceShard, CloseMarket, Command, CommandEnvelope, CommandResultSummary,
     CommandStatus, CreateMarket, EndSession, EventEnvelope, OpenMarket, PlaceLimitOrder,
-    ResumeMarket, StartSession, SuspendMarket, UpdateMarket, UserFenceAction,
+    ResumeMarket, StartSession, SuspendMarket, UpdateFeeSchedule, UpdateMarket, UserFenceAction,
 };
 /// 正式命令的版本化持久编码与解码。
 pub use command_wal_codec::{CommandCodecError, decode_wal_command, encode_wal_command};

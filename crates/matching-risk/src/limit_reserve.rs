@@ -2,7 +2,7 @@
 
 use matching_domain::{AssetId, AssetReserve, MarketMath, MathError, Price, Qty, Side};
 
-/// 仅支持报价资产计费：买方额外预留，卖方从成交所得扣除。
+/// 保存可信市场资产和数值规则，并提供静态或版本化费率预留计算。
 ///
 /// `MarketMath` 的数量单位必须是基础资产原子单位，报价金额单位必须是
 /// 报价资产原子单位。每手分别向上取整，以覆盖拆分成交的费用上界。
@@ -113,6 +113,11 @@ impl LimitReservePolicy {
         self.math
     }
 
+    /// 返回策略绑定的基础资产和报价资产身份。
+    pub const fn assets(&self) -> (AssetId, AssetId) {
+        (self.base, self.quote)
+    }
+
     /// 在资产精度不变时更新市场数值规则，保留可信资产和费率配置。
     /// 调用方须先校验历史金额引用及市场状态。
     pub fn with_market_math(&self, math: MarketMath) -> Result<Self, LimitReserveError> {
@@ -131,6 +136,214 @@ impl LimitReservePolicy {
     /// 返回锁定的费率层级。
     pub const fn fee_tier_id(&self) -> u32 {
         self.fee_tier_id
+    }
+
+    /// 按锁定版本和两种成交角色的费用上界计算限价预留。
+    /// 按最小 lot 分别向上取整，以覆盖任意合法成交拆分。
+    pub fn required_versioned_reserves(
+        &self,
+        fees: &matching_domain::FeeScheduleBook,
+        version: u64,
+        tier_id: u32,
+        side: Side,
+        price: Price,
+        qty: Qty,
+    ) -> Result<Vec<AssetReserve>, matching_domain::RejectReason> {
+        use matching_domain::{FeeAssetPolicy, RejectReason};
+        let schedule = fees.schedule(version)?;
+        let tier = fees.resolve(version, tier_id)?;
+        let rate = u128::try_from(tier.maker_bps.max(tier.taker_bps).max(0))
+            .map_err(|_| RejectReason::ArithmeticOverflow)?;
+        let lot_qty = self.math.lot_size();
+        if !qty.get().is_multiple_of(lot_qty) {
+            return Err(RejectReason::InvalidLot);
+        }
+        let lot = Qty::try_new(lot_qty)?;
+        let per_lot = self
+            .math
+            .trade_notional(price, lot)
+            .map_err(|error| {
+                error
+                    .to_reject_reason()
+                    .unwrap_or(RejectReason::InvalidReservation)
+            })?
+            .get();
+        let lots = u128::from(qty.get() / lot_qty);
+        let quote = per_lot
+            .checked_mul(lots)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let base = u128::from(qty.get());
+        let maximum_sell_notional = || -> Result<u128, RejectReason> {
+            let tick = self.math.tick_size();
+            let max_price = Price::try_new(i64::MAX - (i64::MAX % tick))?;
+            self.math
+                .trade_notional(max_price, lot)
+                .map(|value| value.get())
+                .map_err(|error| {
+                    error
+                        .to_reject_reason()
+                        .unwrap_or(RejectReason::InvalidReservation)
+                })
+        };
+        let basis = match schedule.asset_policy() {
+            FeeAssetPolicy::Base => u128::from(lot_qty),
+            FeeAssetPolicy::Quote if side == Side::Sell && rate > 10_000 => {
+                maximum_sell_notional()?
+            }
+            FeeAssetPolicy::Quote => per_lot,
+            FeeAssetPolicy::Third(_) => return Err(RejectReason::InvalidReservation),
+            FeeAssetPolicy::ThirdPriced {
+                asset,
+                quote_asset,
+                numerator,
+                denominator,
+            } => {
+                if asset == self.base || quote_asset != self.quote {
+                    return Err(RejectReason::InvalidReservation);
+                }
+                let minimum_price = Price::try_new(self.math.tick_size())?;
+                let minimum = self
+                    .math
+                    .trade_notional(minimum_price, lot)
+                    .map_err(|error| {
+                        error
+                            .to_reject_reason()
+                            .unwrap_or(RejectReason::InvalidReservation)
+                    })?
+                    .get();
+                crate::asset_scale::convert_ratio_exact(minimum, numerator, denominator)
+                    .map_err(|_| RejectReason::InvalidReservation)?;
+                let quote_basis = if side == Side::Sell && rate > 0 {
+                    maximum_sell_notional()?
+                } else {
+                    per_lot
+                };
+                crate::asset_scale::convert_ratio_exact(quote_basis, numerator, denominator)
+                    .map_err(|_| RejectReason::ArithmeticOverflow)?
+            }
+        };
+        let product = basis
+            .checked_mul(rate)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let fee_per_lot = (product / 10_000)
+            .checked_add(u128::from(product % 10_000 != 0))
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let fee = fee_per_lot
+            .checked_mul(lots)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let mut amounts = std::collections::BTreeMap::new();
+        match side {
+            Side::Buy => {
+                amounts.insert(self.quote, quote);
+            }
+            Side::Sell => {
+                amounts.insert(self.base, base);
+            }
+        }
+        let extra = match (side, schedule.asset_policy()) {
+            (Side::Buy, FeeAssetPolicy::Quote) => Some((self.quote, fee)),
+            (Side::Sell, FeeAssetPolicy::Base) => Some((self.base, fee)),
+            (Side::Buy, FeeAssetPolicy::Base) if fee > base => Some((self.base, fee - base)),
+            (Side::Sell, FeeAssetPolicy::Quote) if rate > 10_000 => Some((
+                self.quote,
+                fee_per_lot
+                    .checked_sub(basis)
+                    .ok_or(RejectReason::ArithmeticOverflow)?
+                    .checked_mul(lots)
+                    .ok_or(RejectReason::ArithmeticOverflow)?,
+            )),
+            (_, FeeAssetPolicy::ThirdPriced { asset, .. }) => Some((asset, fee)),
+            _ => None,
+        };
+        if let Some((asset, value)) = extra
+            && value != 0
+        {
+            let amount = amounts.entry(asset).or_insert(0_u128);
+            *amount = amount
+                .checked_add(value)
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+        }
+        Ok(amounts
+            .into_iter()
+            .map(|(asset, atoms)| AssetReserve { asset, atoms })
+            .collect())
+    }
+
+    /// 按最小可成交本金划分预算，保守覆盖任意成交拆分所需的费用。
+    pub fn required_quote_budget_reserves(
+        &self,
+        fees: &matching_domain::FeeScheduleBook,
+        version: u64,
+        tier_id: u32,
+        budget: matching_domain::QuoteBudget,
+    ) -> Result<Vec<AssetReserve>, matching_domain::RejectReason> {
+        use matching_domain::{FeeAssetPolicy, RejectReason};
+        let schedule = fees.schedule(version)?;
+        let tier = fees.resolve(version, tier_id)?;
+        let rate = u128::try_from(tier.maker_bps.max(tier.taker_bps).max(0))
+            .map_err(|_| RejectReason::ArithmeticOverflow)?;
+        let lot = Qty::try_new(self.math.lot_size())?;
+        let min = self
+            .math
+            .trade_notional(Price::try_new(self.math.tick_size())?, lot)
+            .map_err(|error| {
+                error
+                    .to_reject_reason()
+                    .unwrap_or(RejectReason::InvalidReservation)
+            })?
+            .get();
+        let units = budget.get() / min;
+        let (asset, basis) = match schedule.asset_policy() {
+            FeeAssetPolicy::Base => (self.base, u128::from(self.math.lot_size())),
+            FeeAssetPolicy::Quote => (self.quote, min),
+            FeeAssetPolicy::Third(_) => return Err(RejectReason::InvalidReservation),
+            FeeAssetPolicy::ThirdPriced {
+                asset,
+                quote_asset,
+                numerator,
+                denominator,
+            } => {
+                if asset == self.base || quote_asset != self.quote {
+                    return Err(RejectReason::InvalidReservation);
+                }
+                (
+                    asset,
+                    crate::asset_scale::convert_ratio_exact(min, numerator, denominator)
+                        .map_err(|_| RejectReason::InvalidReservation)?,
+                )
+            }
+        };
+        let product = basis
+            .checked_mul(rate)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let per_unit = (product / 10_000)
+            .checked_add(u128::from(product % 10_000 != 0))
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let extra = if asset == self.base {
+            if per_unit > basis {
+                per_unit
+                    .checked_sub(basis)
+                    .ok_or(RejectReason::ArithmeticOverflow)?
+            } else {
+                0
+            }
+        } else {
+            per_unit
+        };
+        let extra = extra
+            .checked_mul(units)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+        let mut amounts = std::collections::BTreeMap::from([(self.quote, budget.get())]);
+        if extra > 0 {
+            let value = amounts.entry(asset).or_insert(0_u128);
+            *value = value
+                .checked_add(extra)
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+        }
+        Ok(amounts
+            .into_iter()
+            .map(|(asset, atoms)| AssetReserve { asset, atoms })
+            .collect())
     }
 
     /// 根据真实订单价格和数量计算按资产排序的需求。
