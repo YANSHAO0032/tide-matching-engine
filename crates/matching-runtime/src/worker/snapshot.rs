@@ -221,6 +221,13 @@ impl SnapshotImage {
             w.u8(2)?;
             book.write_snapshot(&mut w)?;
         }
+        if self
+            .place
+            .as_ref()
+            .is_some_and(|place| place.shard_kill_active)
+        {
+            w.u8(3)?;
+        }
         Ok(w.finish())
     }
     /// 选择最新可校验快照；损坏或缺失时尝试清单记录的上一份。
@@ -330,7 +337,16 @@ impl SnapshotImage {
             .place
             .as_ref()
             .and_then(|place| place.fee_book.as_ref());
-        w.u16(if fee_book.is_some() { 4 } else { 3 })?;
+        let shard_kill_active = self
+            .place
+            .as_ref()
+            .is_some_and(|place| place.shard_kill_active);
+        w.u16(match (fee_book.is_some(), shard_kill_active) {
+            (false, false) => 3,
+            (true, false) => 4,
+            (false, true) => 5,
+            (true, true) => 6,
+        })?;
         w.bytes(env!("CARGO_PKG_VERSION").as_bytes())?;
         w.u128(self.request_id)?;
         w.u64(self.snapshot_seq)?;
@@ -385,7 +401,7 @@ impl SnapshotImage {
     ) -> Result<Self, SnapshotWireError> {
         let mut r = SnapshotDecoder::new(bytes, config.max_bytes)?;
         let version = r.u16()?;
-        if version != 2 && version != 3 && version != 4 {
+        if !(2..=6).contains(&version) {
             return Err(SnapshotWireError);
         }
         if r.bytes()? != env!("CARGO_PKG_VERSION").as_bytes() {
@@ -397,9 +413,18 @@ impl SnapshotImage {
         let shard = ShardId::new(r.u16()?);
         let now = LogicalTime::new(r.u64()?);
         let primary_epoch = r.u64()?;
+        let historical_epoch_allowed = config
+            .place
+            .as_ref()
+            .and_then(|place| place.primary_lease.as_ref())
+            .is_some_and(|lease| {
+                primary_epoch > 0
+                    && primary_epoch <= config.primary_epoch
+                    && lease.verify(cluster, shard, config.primary_epoch).is_ok()
+            });
         if cluster != config.cluster
             || shard != config.shard
-            || primary_epoch != config.primary_epoch
+            || (primary_epoch != config.primary_epoch && !historical_epoch_allowed)
             || r.bytes()? != route_bytes(&config.routes, config.max_bytes)?
         {
             return Err(SnapshotWireError);
@@ -520,6 +545,7 @@ impl SnapshotImage {
                     config: expected.clone(),
                     ids,
                     fee_book: None,
+                    shard_kill_active: false,
                 })
             }
             _ => return Err(SnapshotWireError),
@@ -554,13 +580,16 @@ impl SnapshotImage {
                 managed_markets.insert(market, state);
             }
         }
-        if version == 4 {
+        if version == 4 || version == 6 {
             let state = place.as_mut().ok_or(SnapshotWireError)?;
             state.fee_book = Some(matching_domain::FeeScheduleBook::read_snapshot(
                 &mut r,
                 config.max_bytes / 13,
                 config.max_bytes / 21,
             )?);
+        }
+        if version >= 5 {
+            place.as_mut().ok_or(SnapshotWireError)?.shard_kill_active = true;
         }
         if let Some(place) = &mut place {
             for (market, state) in &managed_markets {
@@ -588,6 +617,7 @@ impl SnapshotImage {
         let digest: [u8; 32] = r.bytes()?.try_into().map_err(|_| SnapshotWireError)?;
         r.finish()?;
         let image = Self {
+            genesis_baseline: false,
             origin: None,
             start_allowed: false,
             request_id,
@@ -614,6 +644,192 @@ impl SnapshotImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_sequence_snapshot_rejects_older_wal_epoch() {
+        use matching_domain::{
+            ApplyUserControlFenceShard, AssetId, Command, CommandEnvelope, CommandId, MarketMath,
+            UserFenceAction, UserId,
+        };
+        use matching_risk::{LimitReservePolicy, RiskKeySet};
+        let path = std::env::temp_dir().join(format!(
+            "tide-t28-epoch-{}-{:?}.lease",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = crate::ControlStore::new(&path, ClusterId(2), ShardId(3));
+        drop(store.acquire_primary().unwrap());
+        drop(store.acquire_primary().unwrap());
+        let lease = Arc::new(store.acquire_primary().unwrap());
+        let market = MarketId(5);
+        let routes = RouteTable::new([crate::MarketRoute {
+            market_id: market,
+            shard_id: ShardId(3),
+            route_epoch: 1,
+            state: crate::RouteState::Active,
+        }])
+        .unwrap();
+        let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        let policy =
+            LimitReservePolicy::new((AssetId(1), 0), (AssetId(2), 0), math, 1, 1, 0).unwrap();
+        let place = crate::PlaceSupportConfig::new(
+            RiskKeySet::new(1, []).unwrap(),
+            [(market, policy)],
+            crate::PlaceLimits {
+                active_orders: 8,
+                terminal_history: 8,
+                client_id_bytes: 32,
+            },
+        )
+        .unwrap()
+        .with_primary_lease(lease.clone());
+        let trusted = SnapshotRestoreConfig {
+            cluster: ClusterId(2),
+            shard: ShardId(3),
+            primary_epoch: 3,
+            routes,
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: Some(place),
+            expect_registry: true,
+            max_markets: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let mut candidate = super::super::empty_recovery_candidate(
+            &trusted,
+            &[(
+                market,
+                matching_orderbook::QueuePriorityPolicy::try_new(1).unwrap(),
+            )],
+            1,
+        )
+        .unwrap();
+        candidate.image.primary_epoch = 2;
+        let bytes = candidate.image.encode_snapshot(trusted.max_bytes).unwrap();
+        candidate.image = SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+        let cmd = CommandEnvelope {
+            command_id: CommandId(1),
+            session_id: 1,
+            client_seq: 1,
+            market_id: None,
+            user_id: Some(UserId(1)),
+            route_epoch: None,
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: Command::ApplyUserControlFenceShard(ApplyUserControlFenceShard {
+                parent_command_id: CommandId(1),
+                user_id: UserId(1),
+                new_epoch: 1,
+                action: UserFenceAction::FenceOnly,
+                expected_primary_epoch: 1,
+            }),
+        };
+        let result = super::super::replay_snapshot_records(
+            candidate,
+            vec![crate::RecoveredCommand {
+                shard_seq: 1,
+                epoch: 1,
+                engine_time: 0,
+                command: cmd,
+            }],
+        );
+        assert!(result.is_err());
+        drop(trusted);
+        drop(lease);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shard_kill_state_is_in_snapshot_and_digest_with_or_without_fee_book() {
+        use matching_domain::{
+            AssetId, FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier, MarketMath,
+        };
+        use matching_risk::{LimitReservePolicy, RiskKeySet};
+        let market = MarketId(5);
+        let routes = RouteTable::new([crate::MarketRoute {
+            market_id: market,
+            shard_id: ShardId(3),
+            route_epoch: 1,
+            state: crate::RouteState::Active,
+        }])
+        .unwrap();
+        let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+        let policy =
+            LimitReservePolicy::new((AssetId(1), 0), (AssetId(2), 0), math, 1, 1, 0).unwrap();
+        let place = crate::PlaceSupportConfig::new(
+            RiskKeySet::new(1, []).unwrap(),
+            [(market, policy)],
+            crate::PlaceLimits {
+                active_orders: 8,
+                terminal_history: 8,
+                client_id_bytes: 32,
+            },
+        )
+        .unwrap();
+        let trusted = SnapshotRestoreConfig {
+            cluster: ClusterId(2),
+            shard: ShardId(3),
+            primary_epoch: 7,
+            routes,
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: Some(place),
+            expect_registry: true,
+            max_markets: 1,
+            max_bytes: 1024 * 1024,
+        };
+        for fee in [false, true] {
+            let mut image = super::super::empty_recovery_candidate(
+                &trusted,
+                &[(
+                    market,
+                    matching_orderbook::QueuePriorityPolicy::try_new(1).unwrap(),
+                )],
+                0,
+            )
+            .unwrap()
+            .image;
+            if fee {
+                image.place.as_mut().unwrap().fee_book = Some(FeeScheduleBook::new(
+                    FeeSchedule::new(
+                        1,
+                        FeeAssetPolicy::Quote,
+                        [(
+                            1,
+                            FeeTier {
+                                maker_bps: 0,
+                                taker_bps: 0,
+                                rounding: FeeRounding::Floor,
+                            },
+                        )],
+                    )
+                    .unwrap(),
+                ));
+            }
+            let inactive_digest = image.state_digest(trusted.max_bytes).unwrap();
+            let inactive = image.encode_snapshot(trusted.max_bytes).unwrap();
+            assert_eq!(
+                u16::from_be_bytes([inactive[0], inactive[1]]),
+                if fee { 4 } else { 3 }
+            );
+            image.place.as_mut().unwrap().shard_kill_active = true;
+            assert_ne!(
+                image.state_digest(trusted.max_bytes).unwrap(),
+                inactive_digest
+            );
+            let active = image.encode_snapshot(trusted.max_bytes).unwrap();
+            assert_eq!(
+                u16::from_be_bytes([active[0], active[1]]),
+                if fee { 6 } else { 5 }
+            );
+            let restored = SnapshotImage::decode_snapshot(&active, &trusted).unwrap();
+            assert!(restored.place.as_ref().unwrap().shard_kill_active);
+            assert_eq!(
+                restored.state_digest(trusted.max_bytes).unwrap(),
+                image.state_digest(trusted.max_bytes).unwrap()
+            );
+        }
+    }
 
     /// 市场配置与生命周期均属于快照和摘要的一部分，旧空状态仍可独立恢复。
     #[test]

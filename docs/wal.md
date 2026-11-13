@@ -62,7 +62,7 @@ flowchart TD
 
 ## 分片运行时接入边界
 
-`start_durable_fence_only` 支持 `FenceOnly`；`start_with_durable_place_support` 另支持正式普通限价 GTC/PostOnly 与市场范围 `MassCancelShard`。另外，`start_group_fence_only` 和 `start_group_place_support` 分别提供相同支持范围的 `GroupCommit` 入口。四者均固定开发环境和 `LocalDurable`，初始逻辑时间为零、预留登记表为空；支持下单的入口自行创建空订单簿。启动时需要两个不同的已有目录：WAL 目录必须为空，manifest 目录必须对应空的初始状态。启动前会按实际文件身份拒绝同一目录及路径别名；WAL 目录不应放置 manifest 文件，扫描器只接受 segment 文件。目录路径须由可信启动环境保护，身份检查与打开之间不防范恶意替换链接。新入口不接受现有 WAL 续写，不持久化启动策略、市场路由或可信风险配置。
+`start_durable_fence_only` 支持 `FenceOnly`；`start_with_durable_place_support` 另支持正式普通限价 GTC/PostOnly 与市场范围 `MassCancelShard`。另外，`start_group_fence_only` 和 `start_group_place_support` 分别提供相同支持范围的 `GroupCommit` 入口。下单持久入口还支持市场参考价更新、市场范围 Kill Switch 和显式市场熔断信号；分片范围 Kill Switch 需要显式绑定可信本地排他主节点租约。四者均固定开发环境和 `LocalDurable`，初始逻辑时间为零、预留登记表为空；支持下单的入口自行创建空订单簿。启动时需要两个不同的已有目录：WAL 目录必须为空，manifest 目录必须对应空的初始状态。启动前会按实际文件身份拒绝同一目录及路径别名；WAL 目录不应放置 manifest 文件，扫描器只接受 segment 文件。目录路径须由可信启动环境保护，身份检查与打开之间不防范恶意替换链接。新入口不接受现有 WAL 续写，不持久化启动策略、市场路由或可信风险配置。
 
 市场路由、用户控制等前置检查以及命令去重在分配序号前执行；重复命中返回原摘要，不再写入 WAL 或重发事件。首次命令分配序号后依次追加 WAL、同步文件和目录、登记 manifest 水位，只有本地连续提交水位覆盖该序号后才安装状态并返回事件。写入、同步或登记失败使分片停止并关闭入口，不应将失败解释为业务拒绝；登记表模式拒绝绕过此路径的低层 Mutation。旧的进程内启动入口仍不写 WAL。
 

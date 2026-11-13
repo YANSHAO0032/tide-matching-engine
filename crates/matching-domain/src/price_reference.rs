@@ -37,6 +37,16 @@ pub struct PriceReferenceState {
 }
 
 impl PriceReferenceState {
+    /// 接受外部来源的单调更新；最近成交价只能由真实成交推进。
+    pub fn advance_external(
+        &mut self,
+        reference: PriceReference,
+    ) -> Result<Option<Price>, RejectReason> {
+        if reference.kind == PriceReferenceKind::LastTrade {
+            return Err(RejectReason::InvalidReferencePriceSource);
+        }
+        self.advance(reference)
+    }
     /// 返回一个来源已接受的最新更新。
     pub fn latest(&self, kind: PriceReferenceKind) -> Option<PriceReference> {
         self.latest.get(&kind).copied()
@@ -93,6 +103,37 @@ impl PriceReferenceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_updates_reject_last_trade_and_stale_without_mutation() {
+        let mut state = PriceReferenceState::default();
+        let last_trade = PriceReference {
+            kind: PriceReferenceKind::LastTrade,
+            source_seq: 1,
+            price: Price::try_new(100).unwrap(),
+        };
+        assert_eq!(
+            state.advance_external(last_trade),
+            Err(RejectReason::InvalidReferencePriceSource)
+        );
+        assert_eq!(state.latest(PriceReferenceKind::LastTrade), None);
+        let mark = PriceReference {
+            kind: PriceReferenceKind::MarkPrice,
+            ..last_trade
+        };
+        assert_eq!(state.advance_external(mark), Ok(None));
+        let before = state.clone();
+        assert_eq!(
+            state.advance_external(mark),
+            Err(RejectReason::StaleReferencePriceUpdate)
+        );
+        assert_eq!(state, before);
+        let opening = PriceReference {
+            kind: PriceReferenceKind::StaticOpening,
+            ..last_trade
+        };
+        assert_eq!(state.advance_external(opening), Ok(None));
+    }
 
     #[test]
     fn price_reference_kind_codes_and_source_sequence_are_stable() {

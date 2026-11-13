@@ -31,6 +31,35 @@ pub fn encode_event_for_hash(
         }
     }
     match &event.payload {
+        EngineEvent::CircuitBreakerTriggered { market_id, reason } => {
+            w.u8(24)?;
+            w.u32(market_id.get())?;
+            w.u16(*reason as u16)?;
+        }
+        EngineEvent::KillSwitchActivated { scope } | EngineEvent::KillSwitchCleared { scope } => {
+            w.u8(
+                if matches!(event.payload, EngineEvent::KillSwitchActivated { .. }) {
+                    22
+                } else {
+                    23
+                },
+            )?;
+            match scope {
+                crate::KillScope::Global => w.u8(0)?,
+                crate::KillScope::Shard(id) => {
+                    w.u8(1)?;
+                    w.u16(id.get())?;
+                }
+                crate::KillScope::Market(id) => {
+                    w.u8(2)?;
+                    w.u32(id.get())?;
+                }
+                crate::KillScope::User(id) => {
+                    w.u8(3)?;
+                    w.u64(id.get())?;
+                }
+            }
+        }
         EngineEvent::SettlementDelta(value) => {
             w.u8(21)?;
             w.u128(value.trade_id.get())?;

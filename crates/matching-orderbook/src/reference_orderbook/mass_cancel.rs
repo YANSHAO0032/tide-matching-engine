@@ -23,6 +23,65 @@ pub struct ReferenceMassCancelPlan {
 }
 
 impl ReferenceOrderBook {
+    /// 在独立参考 Vec 中按价格和同价原序预演开市前价格带重校验。
+    /// 本计划只迁移预留归属，真实释放与参考价更新由调用方共同提交。
+    pub fn plan_preopen_revalidation(
+        &self,
+        lower: matching_domain::Price,
+        upper: matching_domain::Price,
+        registry: &ReservationRegistry,
+    ) -> Result<ReferenceMassCancelPlan, matching_domain::RejectReason> {
+        if lower > upper {
+            return Err(matching_domain::RejectReason::InvalidPrice);
+        }
+        registry
+            .validate_order_bindings(self.reservations.iter().map(|(id, state)| (*id, state)))?;
+        let mut targets = Vec::new();
+        for order in self
+            .orders(matching_domain::Side::Sell)
+            .into_iter()
+            .chain(self.orders(matching_domain::Side::Buy))
+        {
+            let original = order.original_order();
+            if original.price >= lower && original.price <= upper {
+                continue;
+            }
+            let state = self
+                .reservations
+                .get(&original.order_id)
+                .ok_or(matching_domain::RejectReason::InvalidReservation)?;
+            targets.push((
+                original.order_id,
+                OrderRemaining::Base(Qty::try_new(order.total_remaining())?),
+                state,
+            ));
+        }
+        let transition =
+            registry.plan_binding_transitions(targets.iter().map(|(_, _, state)| *state), [])?;
+        let mut after_book = self.clone();
+        for (id, _, _) in &targets {
+            after_book.cancel(*id).expect("参考计划中的订单必须存在");
+        }
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("新建的预留计划不能漂移");
+        let events = targets
+            .into_iter()
+            .map(|(order_id, remaining, _)| EngineEvent::OrderCanceled {
+                order_id,
+                remaining,
+                reason: CancelReason::PriceBandRevalidation,
+            })
+            .collect();
+        Ok(ReferenceMassCancelPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
+    }
     /// 在独立参考簿候选中终结指定时段的 DAY 订单并预检预留迁移。
     pub fn plan_end_session(
         &self,

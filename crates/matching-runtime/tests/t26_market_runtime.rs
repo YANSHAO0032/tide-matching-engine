@@ -458,6 +458,44 @@ fn invalid_create_configurations_are_durable_and_replayed() {
         );
         results.push(result);
     }
+    for (id, payload) in [
+        (
+            7,
+            Command::CreateMarket(Box::new(CreateMarket {
+                config: config.clone(),
+            })),
+        ),
+        (
+            8,
+            Command::UpdateReferencePrice(matching_domain::UpdateReferencePrice {
+                market_id: market,
+                kind: matching_domain::PriceReferenceKind::StaticOpening,
+                price: matching_domain::Price::try_new(10).unwrap(),
+                source_seq: 1,
+            }),
+        ),
+    ] {
+        let command = CommandEnvelope {
+            command_id: CommandId(id),
+            session_id: 1,
+            client_seq: id as u64,
+            market_id: Some(market),
+            user_id: None,
+            route_epoch: Some(1),
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload,
+        };
+        let result = retry(|| shard.handle().submit_command(command.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            matching_runtime::FormalOutcome::MarketManaged
+        );
+        results.push(result);
+    }
     let digest = retry(|| shard.handle().take_snapshot(1))
         .recv_timeout(Duration::from_secs(5))
         .unwrap()

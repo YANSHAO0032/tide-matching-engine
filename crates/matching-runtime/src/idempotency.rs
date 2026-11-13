@@ -51,10 +51,15 @@ pub(crate) struct PreparedIntent {
 }
 impl From<&CommandEnvelope> for Intent {
     fn from(c: &CommandEnvelope) -> Self {
+        let mut payload = c.payload.clone();
+        if let Command::ShardKillSwitch(ref mut control) = payload {
+            // 主节点纪元是重试的 fencing 元数据，不属于稳定业务意图。
+            control.expected_primary_epoch = 0;
+        }
         Self {
             market: c.market_id,
             user: c.user_id,
-            payload: c.payload.clone(),
+            payload,
         }
     }
 }
@@ -83,11 +88,15 @@ fn outcome_matches(command: &Command, outcome: &FormalOutcome) -> bool {
             *epoch >= fence.new_epoch
         }
         (Command::MassCancelShard(_), FormalOutcome::MassCancel(_)) => true,
+        (Command::ShardKillSwitch(_), FormalOutcome::ShardControl) => true,
         (Command::UpdateFeeSchedule(input), FormalOutcome::FeeScheduleUpdated(version)) => {
             input.schedule.version() == *version
         }
         (
             Command::CreateMarket(_)
+            | Command::TriggerCircuitBreaker(_)
+            | Command::MarketKillSwitch(_)
+            | Command::UpdateReferencePrice(_)
             | Command::UpdateMarket(_)
             | Command::StartSession(_)
             | Command::OpenMarket(_)
@@ -197,6 +206,7 @@ impl DedupWindow {
                     w.u64(version)?;
                 }
                 FormalOutcome::MarketManaged => w.u8(4)?,
+                FormalOutcome::ShardControl => w.u8(6)?,
                 FormalOutcome::Placed(id) => {
                     w.u8(0)?;
                     w.u128(id.get())?
@@ -315,6 +325,7 @@ impl DedupWindow {
                 3 => FormalOutcome::Rejected(decode_reject_reason(&mut r)?),
                 4 => FormalOutcome::MarketManaged,
                 5 => FormalOutcome::FeeScheduleUpdated(r.u64()?),
+                6 => FormalOutcome::ShardControl,
                 _ => return Err(SnapshotWireError),
             };
             if !outcome_matches(&command.payload, &outcome) {
@@ -460,9 +471,18 @@ impl DedupWindow {
             return Err(());
         }
         if let Some(entry) = self.entries.iter().find(|e| e.command_id == c.command_id) {
+            let payload_matches = match (&entry.intent.payload, &c.payload) {
+                (Command::ShardKillSwitch(left), Command::ShardKillSwitch(right)) => {
+                    left.target_shard_id == right.target_shard_id
+                        && left.parent_command_id == right.parent_command_id
+                        && left.active == right.active
+                        && left.cancel_all == right.cancel_all
+                }
+                (left, right) => left == right,
+            };
             if entry.intent.market != c.market_id
                 || entry.intent.user != c.user_id
-                || entry.intent.payload != c.payload
+                || !payload_matches
             {
                 return Err(());
             }
@@ -568,6 +588,28 @@ impl DedupWindow {
 mod tests {
     use super::*;
     use matching_domain::{MassCancelShard, ShardCancelScope, ShardMassCancelResult};
+    #[test]
+    fn shard_control_intent_ignores_refreshed_epoch_but_not_policy() {
+        let mut command = cmd(1, 1, 1, 1);
+        command.market_id = None;
+        command.route_epoch = None;
+        command.payload = Command::ShardKillSwitch(matching_domain::ShardKillSwitch {
+            target_shard_id: matching_domain::ShardId(1),
+            parent_command_id: CommandId(7),
+            expected_primary_epoch: 1,
+            active: true,
+            cancel_all: true,
+        });
+        let first = Intent::from(&command);
+        if let Command::ShardKillSwitch(ref mut value) = command.payload {
+            value.expected_primary_epoch = 2;
+        }
+        assert_eq!(first, Intent::from(&command));
+        if let Command::ShardKillSwitch(ref mut value) = command.payload {
+            value.cancel_all = false;
+        }
+        assert_ne!(first, Intent::from(&command));
+    }
     /// 构造带指定身份与市场的测试命令。
     fn cmd(id: u128, session: u64, seq: u64, market: u32) -> CommandEnvelope {
         CommandEnvelope {

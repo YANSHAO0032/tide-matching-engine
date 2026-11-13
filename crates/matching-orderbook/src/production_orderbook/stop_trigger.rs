@@ -161,8 +161,139 @@ impl ProductionOrderBook {
         if self.market_id() != Some(settlement.market_id) || *context.math != settlement.math {
             return Err(RejectReason::InvalidReservation);
         }
-        let mut plan =
+        let plan =
             self.plan_trigger_stops_with_registry(reference, context, registry, trigger_r1)?;
+        self.finish_trigger_r2(plan, settlement, registry)
+    }
+
+    /// 使用根命令游标预演止损级联，仅为真实成交分配身份。
+    /// 计划和游标都不会修改输入；调用方负责将它们与持久提交一起安装。
+    pub fn plan_trigger_stops_with_r2_and_cursor(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        settlement: matching_risk::TradeSettlementContext<'_>,
+        registry: &ReservationRegistry,
+        cursor: &matching_domain::TradeIdCursor,
+        mut trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<
+        (
+            ProductionTriggerRegistryPlan,
+            matching_domain::TradeIdCursor,
+        ),
+        RejectReason,
+    > {
+        self.plan_trigger_stops_with_r2_and_cursor_checked(
+            reference,
+            context,
+            settlement,
+            registry,
+            cursor,
+            |order, _| trigger_r1(order),
+        )
+    }
+
+    /// 在每次 child 执行前暴露当前候选簿，供调用方校验市场状态与交叉限制。
+    pub fn plan_trigger_stops_with_r2_and_cursor_checked(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        settlement: matching_risk::TradeSettlementContext<'_>,
+        registry: &ReservationRegistry,
+        cursor: &matching_domain::TradeIdCursor,
+        trigger_r1: impl FnMut(&StopOrder, &ProductionOrderBook) -> Result<(), RejectReason>,
+    ) -> Result<
+        (
+            ProductionTriggerRegistryPlan,
+            matching_domain::TradeIdCursor,
+        ),
+        RejectReason,
+    > {
+        self.plan_trigger_stops_with_r2_and_cursor_inner(
+            reference,
+            context,
+            settlement,
+            registry,
+            (cursor, None),
+            trigger_r1,
+        )
+    }
+
+    /// 按配置限制内部动作和真实成交；超限立即停止分片并丢弃完整候选。
+    pub fn plan_trigger_stops_with_r2_and_cursor_limited(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        settlement: matching_risk::TradeSettlementContext<'_>,
+        registry: &ReservationRegistry,
+        (cursor, limits): (&matching_domain::TradeIdCursor, (u32, u32)),
+        trigger_r1: impl FnMut(&StopOrder, &ProductionOrderBook) -> Result<(), RejectReason>,
+    ) -> Result<
+        (
+            ProductionTriggerRegistryPlan,
+            matching_domain::TradeIdCursor,
+        ),
+        RejectReason,
+    > {
+        self.plan_trigger_stops_with_r2_and_cursor_inner(
+            reference,
+            context,
+            settlement,
+            registry,
+            (cursor, Some(limits)),
+            trigger_r1,
+        )
+    }
+
+    /// 在隔离候选中统一执行带限额或不带限额的触发和结算。
+    fn plan_trigger_stops_with_r2_and_cursor_inner(
+        &self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        settlement: matching_risk::TradeSettlementContext<'_>,
+        registry: &ReservationRegistry,
+        (cursor, limits): (&matching_domain::TradeIdCursor, Option<(u32, u32)>),
+        trigger_r1: impl FnMut(&StopOrder, &ProductionOrderBook) -> Result<(), RejectReason>,
+    ) -> Result<
+        (
+            ProductionTriggerRegistryPlan,
+            matching_domain::TradeIdCursor,
+        ),
+        RejectReason,
+    > {
+        if self.market_id() != Some(settlement.market_id) || *context.math != settlement.math {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let mut after_book = self.clone();
+        let mut after_registry = registry.clone();
+        let mut after_cursor = cursor.clone();
+        let events = after_book.trigger_stops_with_registry_and_cursor_checked(
+            reference,
+            context,
+            &mut after_registry,
+            (&mut after_cursor, limits),
+            trigger_r1,
+        )?;
+        let plan = ProductionTriggerRegistryPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        };
+        Ok((
+            self.finish_trigger_r2(plan, settlement, registry)?,
+            after_cursor,
+        ))
+    }
+
+    /// 将已完成撮合及归属迁移的候选转换为真实结算和释放事件。
+    fn finish_trigger_r2(
+        &self,
+        mut plan: ProductionTriggerRegistryPlan,
+        settlement: matching_risk::TradeSettlementContext<'_>,
+        registry: &ReservationRegistry,
+    ) -> Result<ProductionTriggerRegistryPlan, RejectReason> {
         let identities: BTreeMap<_, _> = self
             .reservation_snapshots()
             .into_iter()
@@ -716,16 +847,41 @@ impl ProductionOrderBook {
         current_session_id: u64,
         math: &MarketMath,
         cursor: &mut matching_domain::TradeIdCursor,
-        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+        mut trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        self.trigger_stops_with_cursor_checked(
+            reference,
+            now,
+            current_session_id,
+            math,
+            (cursor, None),
+            |order, _| trigger_r1(order),
+        )
+    }
+
+    /// 在触发前向校验回调提供当前候选簿。
+    fn trigger_stops_with_cursor_checked(
+        &mut self,
+        reference: PriceReference,
+        now: LogicalTime,
+        current_session_id: u64,
+        math: &MarketMath,
+        (cursor, limits): (&mut matching_domain::TradeIdCursor, Option<(u32, u32)>),
+        trigger_r1: impl FnMut(&StopOrder, &ProductionOrderBook) -> Result<(), RejectReason>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         let mut candidate = self.clone();
-        let mut source = crate::trade_id_source::TradeIdSource::cursor(cursor.clone());
+        let mut source = match limits {
+            Some((_, max_trades)) => {
+                crate::trade_id_source::TradeIdSource::cursor_limited(cursor.clone(), max_trades)
+            }
+            None => crate::trade_id_source::TradeIdSource::cursor(cursor.clone()),
+        };
         let events = candidate.trigger_stops_cursor_inner(
             reference,
             now,
             current_session_id,
             math,
-            &mut source,
+            (&mut source, limits.map(|(max_actions, _)| max_actions)),
             trigger_r1,
         )?;
         *cursor = source.into_cursor().expect("命令游标来源必须存在");
@@ -845,8 +1001,8 @@ impl ProductionOrderBook {
         now: LogicalTime,
         current_session_id: u64,
         math: &MarketMath,
-        source: &mut crate::trade_id_source::TradeIdSource<'_>,
-        mut trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+        (source, max_actions): (&mut crate::trade_id_source::TradeIdSource<'_>, Option<u32>),
+        mut trigger_r1: impl FnMut(&StopOrder, &ProductionOrderBook) -> Result<(), RejectReason>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         if let Some((_, configured_math)) = self.price_band {
             assert_eq!(&configured_math, math, "市场数值配置不一致");
@@ -875,8 +1031,15 @@ impl ProductionOrderBook {
         };
         let mut pending = VecDeque::from(self.collect_triggered_stops(reference)?);
         let mut events = Vec::new();
+        let mut action_count = 0_u32;
 
         while let Some((order, _priority, triggered, reservation)) = pending.pop_front() {
+            if let Some(limit) = max_actions {
+                action_count = action_count
+                    .checked_add(1)
+                    .expect("止损动作计数溢出，分片停止");
+                assert!(action_count <= limit, "止损级联超过内部动作上限，分片停止");
+            }
             events.push(triggered);
             let validation = self
                 .validate_triggered_child_tif(&order, now, current_session_id)
@@ -889,7 +1052,7 @@ impl ProductionOrderBook {
                     }
                     _ => Ok(()),
                 })
-                .and_then(|()| trigger_r1(&order));
+                .and_then(|()| trigger_r1(&order, self));
             if let Err(reason) = validation {
                 Self::append_trigger_rejection(&mut events, &order, reason);
                 continue;
@@ -979,7 +1142,25 @@ impl ProductionOrderBook {
         context: crate::TriggerRegistryContext<'_>,
         registry: &mut ReservationRegistry,
         cursor: &mut matching_domain::TradeIdCursor,
-        trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+        mut trigger_r1: impl FnMut(&StopOrder) -> Result<(), RejectReason>,
+    ) -> Result<Vec<EngineEvent>, RejectReason> {
+        self.trigger_stops_with_registry_and_cursor_checked(
+            reference,
+            context,
+            registry,
+            (cursor, None),
+            |order, _| trigger_r1(order),
+        )
+    }
+
+    /// 在候选簿、登记表与游标中执行可观察候选簿的触发校验。
+    fn trigger_stops_with_registry_and_cursor_checked(
+        &mut self,
+        reference: PriceReference,
+        context: crate::TriggerRegistryContext<'_>,
+        registry: &mut ReservationRegistry,
+        (cursor, limits): (&mut matching_domain::TradeIdCursor, Option<(u32, u32)>),
+        trigger_r1: impl FnMut(&StopOrder, &ProductionOrderBook) -> Result<(), RejectReason>,
     ) -> Result<Vec<EngineEvent>, RejectReason> {
         self.validate_registry_bindings(
             registry,
@@ -987,12 +1168,12 @@ impl ProductionOrderBook {
         )?;
         let mut candidate_book = self.clone();
         let mut candidate_cursor = cursor.clone();
-        let mut events = candidate_book.trigger_stops_with_cursor(
+        let mut events = candidate_book.trigger_stops_with_cursor_checked(
             reference,
             context.now,
             context.current_session_id,
             context.math,
-            &mut candidate_cursor,
+            (&mut candidate_cursor, limits),
             trigger_r1,
         )?;
         events.retain(|event| !matches!(event, EngineEvent::ReservationReleased { .. }));

@@ -20,10 +20,14 @@ pub enum ReservationReleaseReason {
     MarketProtection = 1306,
     /// 市场关闭导致订单终结。
     MarketClosed = 1307,
+    /// 熔断开关撤单后释放真实剩余预留。
+    KillSwitch = 1308,
     /// 自成交防护终结订单后释放真实剩余预留。
     SelfTradePrevention = 1309,
     /// 立即执行的订单终结后释放未使用预留。
     IocRemainder = 1310,
+    /// 开市前价格带重校验撤单后释放真实剩余预留。
+    PriceBandRevalidation = 1311,
 }
 
 #[cfg(test)]

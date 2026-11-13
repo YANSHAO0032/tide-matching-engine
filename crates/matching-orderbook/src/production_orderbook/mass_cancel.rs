@@ -23,6 +23,83 @@ pub struct ProductionMassCancelPlan {
 }
 
 impl ProductionOrderBook {
+    /// 预演熔断开关按策略终结市场内所有活动订单。
+    pub fn plan_kill_switch_cancel(
+        &self,
+        registry: &ReservationRegistry,
+    ) -> Result<ProductionMassCancelPlan, matching_domain::RejectReason> {
+        let mut plan = self.plan_mass_cancel(ShardCancelScope::All, registry)?;
+        for event in &mut plan.events {
+            if let EngineEvent::OrderCanceled { reason, .. } = event {
+                *reason = CancelReason::KillSwitch;
+            }
+        }
+        Ok(plan)
+    }
+    /// 按卖盘升价、买盘降价及价档链表顺序预演开市前普通挂单重校验。
+    ///
+    /// 边界须来自同一参考更新候选；本计划只迁移预留归属至 PendingR2，
+    /// 调用方仍须在同一持久候选中完成真实释放及参考价更新。
+    pub fn plan_preopen_revalidation(
+        &self,
+        lower: matching_domain::Price,
+        upper: matching_domain::Price,
+        registry: &ReservationRegistry,
+    ) -> Result<ProductionMassCancelPlan, matching_domain::RejectReason> {
+        if lower > upper {
+            return Err(matching_domain::RejectReason::InvalidPrice);
+        }
+        self.validate_registry_bindings(
+            registry,
+            self.reservations.iter().map(|(id, state)| (*id, state)),
+        )?;
+        let mut targets = Vec::new();
+        for (price, level) in self.asks.iter().chain(self.bids.iter().rev()) {
+            if *price >= lower && *price <= upper {
+                continue;
+            }
+            let mut current = level.head();
+            while let Some(index) = current {
+                let node = self.arena.get(index).expect("价档引用的订单必须存在");
+                let id = node.original_order().order_id;
+                let state = self
+                    .reservations
+                    .get(&id)
+                    .ok_or(matching_domain::RejectReason::InvalidReservation)?;
+                targets.push((
+                    id,
+                    OrderRemaining::Base(Qty::try_new(node.total_remaining())?),
+                    state,
+                ));
+                current = node.next();
+            }
+        }
+        let transition =
+            registry.plan_binding_transitions(targets.iter().map(|(_, _, state)| *state), [])?;
+        let mut after_book = self.clone();
+        for (id, _, _) in &targets {
+            after_book.cancel(*id).expect("计划中的普通订单必须存在");
+        }
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("新建的预留计划不能漂移");
+        let events = targets
+            .into_iter()
+            .map(|(order_id, remaining, _)| EngineEvent::OrderCanceled {
+                order_id,
+                remaining,
+                reason: CancelReason::PriceBandRevalidation,
+            })
+            .collect();
+        Ok(ProductionMassCancelPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events,
+        })
+    }
     /// 在候选簿中终结指定交易时段的 DAY 订单，并预检预留归属迁移。
     pub fn plan_end_session(
         &self,

@@ -16,6 +16,8 @@ pub enum RejectReason {
     MarketClosed = 1005,
     /// 开市前的限价订单将穿越对手最优价。
     PreOpenWouldCross = 1006,
+    /// 熔断开关已激活，禁止新增或改单。
+    KillSwitchActive = 1007,
     /// 市场正在迁移，入口暂不接收该市场的变更。
     MigrationInProgress = 1008,
     /// 请求携带的路由版本或分片归属已经失效。

@@ -611,6 +611,7 @@ pub fn decode_reject_reason(
         1004 => MarketSuspended,
         1005 => MarketClosed,
         1006 => PreOpenWouldCross,
+        1007 => KillSwitchActive,
         1008 => MigrationInProgress,
         1009 => StaleRouteEpoch,
         1010 => InvalidMarketStateTransition,

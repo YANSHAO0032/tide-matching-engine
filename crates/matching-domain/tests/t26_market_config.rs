@@ -30,6 +30,93 @@ fn config() -> MarketConfig {
 }
 
 #[test]
+fn circuit_breaker_halts_and_returns_stable_events_atomically() {
+    use matching_domain::{
+        CircuitBreakerReason, EngineEvent, ManagedMarket, MarketState, MarketStateReason,
+        RejectReason,
+    };
+    let mut market = ManagedMarket::new(config()).unwrap();
+    let before = market.clone();
+    assert_eq!(
+        market.trigger_circuit_breaker(CircuitBreakerReason::ManualRiskSignal),
+        Err(RejectReason::InvalidMarketStateTransition)
+    );
+    assert_eq!(market, before);
+    market.start_session(1, true).unwrap();
+    market.open(1, true, true).unwrap();
+    let events = market
+        .trigger_circuit_breaker(CircuitBreakerReason::ManualRiskSignal)
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            EngineEvent::CircuitBreakerTriggered {
+                market_id: MarketId(7),
+                reason: CircuitBreakerReason::ManualRiskSignal
+            },
+            EngineEvent::MarketStateChanged {
+                market_id: MarketId(7),
+                old: MarketState::Open,
+                new: MarketState::Halted,
+                reason: MarketStateReason::CircuitBreaker
+            }
+        ]
+    );
+    let before = market.clone();
+    assert_eq!(
+        market.trigger_circuit_breaker(CircuitBreakerReason::ManualRiskSignal),
+        Err(RejectReason::InvalidMarketStateTransition)
+    );
+    assert_eq!(market, before);
+    market.resume(true).unwrap();
+    assert_eq!(market.lifecycle().state(), MarketState::Open);
+}
+
+#[test]
+fn preopen_halt_requires_explicit_revalidation_before_resume() {
+    use matching_domain::{CircuitBreakerReason, ManagedMarket, RejectReason};
+    let mut market = ManagedMarket::new(config()).unwrap();
+    market.start_session(1, true).unwrap();
+    market
+        .trigger_circuit_breaker(CircuitBreakerReason::ManualRiskSignal)
+        .unwrap();
+    let before = market.clone();
+    assert_eq!(
+        market.resume(true),
+        Err(RejectReason::InvalidMarketStateTransition)
+    );
+    assert_eq!(market, before);
+    market.resume_after_revalidation(true, true).unwrap();
+}
+
+#[test]
+fn market_kill_state_roundtrips_and_preserves_inactive_snapshot_bytes() {
+    use matching_domain::{
+        ManagedMarket,
+        snapshot_wire::{SnapshotDecoder, SnapshotEncoder},
+    };
+    let mut market = ManagedMarket::new(config()).unwrap();
+    let mut before = SnapshotEncoder::new(512);
+    market.write_snapshot(&mut before).unwrap();
+    let original = before.finish();
+    assert!(!market.kill_switch_active());
+    assert!(market.set_kill_switch(true));
+    assert!(!market.set_kill_switch(true));
+    let mut encoder = SnapshotEncoder::new(512);
+    market.write_snapshot(&mut encoder).unwrap();
+    let active = encoder.finish();
+    let mut reader = SnapshotDecoder::new(&active, 512).unwrap();
+    let restored = ManagedMarket::read_snapshot(&mut reader).unwrap();
+    reader.finish().unwrap();
+    assert!(restored.kill_switch_active());
+    assert_eq!(restored, market);
+    assert!(market.set_kill_switch(false));
+    let mut after = SnapshotEncoder::new(512);
+    market.write_snapshot(&mut after).unwrap();
+    assert_eq!(after.finish(), original);
+}
+
+#[test]
 fn market_tracks_referenced_history_across_snapshots() {
     use matching_domain::{
         ManagedMarket,

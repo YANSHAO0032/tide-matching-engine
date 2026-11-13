@@ -131,9 +131,78 @@ pub struct CloseMarket {
     pub market_id: MarketId,
 }
 
+/// 外部参考价格的持久更新；LastTrade 只能由真实成交产生。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateReferencePrice {
+    /// 参考价所属市场。
+    pub market_id: MarketId,
+    /// 参考价格来源。
+    pub kind: crate::PriceReferenceKind,
+    /// 严格正的参考价格。
+    pub price: crate::Price,
+    /// 同一来源单调递增的序号。
+    pub source_seq: u64,
+}
+
+/// 市场路由的熔断开关命令。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketKillSwitch {
+    /// 目标市场。
+    pub market_id: MarketId,
+    /// 激活或清除开关。
+    pub active: bool,
+    /// 激活时在同一候选中撤销全部活动订单。
+    pub cancel_all: bool,
+}
+
+/// 协调者派生的分片范围熔断开关命令。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardKillSwitch {
+    /// 目标分片身份。
+    pub target_shard_id: ShardId,
+    /// 父控制操作身份。
+    pub parent_command_id: CommandId,
+    /// 必须与当前主节点租约一致的纪元。
+    pub expected_primary_epoch: u64,
+    /// 激活或清除开关。
+    pub active: bool,
+    /// 激活时撤销分片内全部活动订单。
+    pub cancel_all: bool,
+}
+
+/// 持久化的市场熔断信号。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerCircuitBreaker {
+    /// 目标市场。
+    pub market_id: MarketId,
+    /// 已冻结的熔断原因。
+    pub reason: crate::CircuitBreakerReason,
+}
+
+/// 熔断开关的业务作用范围。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KillScope {
+    /// 全局范围，须通过跨分片协调器。
+    Global,
+    /// 指定分片范围，须验证主节点租约。
+    Shard(ShardId),
+    /// 指定市场范围，须验证市场路由。
+    Market(MarketId),
+    /// 指定用户范围，须通过跨分片协调器。
+    User(UserId),
+}
+
 /// 当前具有实际载荷的正式业务命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// 修改经租约授权的分片范围熔断开关。
+    ShardKillSwitch(ShardKillSwitch),
+    /// 触发市场熔断。
+    TriggerCircuitBreaker(TriggerCircuitBreaker),
+    /// 修改市场范围熔断开关。
+    MarketKillSwitch(MarketKillSwitch),
+    /// 更新市场参考价格。
+    UpdateReferencePrice(UpdateReferencePrice),
     /// 发布新的费率版本。
     UpdateFeeSchedule(
         /// 完整费率配置。

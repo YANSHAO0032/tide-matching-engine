@@ -102,6 +102,234 @@ fn math() -> matching_domain::MarketMath {
 }
 
 #[test]
+fn external_reference_candidate_checks_source_sequence_and_keeps_original() {
+    use matching_domain::{PriceReference, RejectReason};
+    let book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let opening = PriceReference {
+        kind: PriceReferenceKind::StaticOpening,
+        source_seq: 1,
+        price: Price::try_new(10).unwrap(),
+    };
+    let candidate = book
+        .plan_external_reference_without_trigger(opening)
+        .unwrap();
+    assert!(!book.has_reference_price(PriceReferenceKind::StaticOpening));
+    assert!(candidate.has_reference_price(PriceReferenceKind::StaticOpening));
+    assert_eq!(
+        candidate.plan_external_reference_without_trigger(opening),
+        Err(RejectReason::StaleReferencePriceUpdate)
+    );
+    let last = PriceReference {
+        kind: PriceReferenceKind::LastTrade,
+        ..opening
+    };
+    assert_eq!(
+        book.plan_external_reference_without_trigger(last),
+        Err(RejectReason::InvalidReferencePriceSource)
+    );
+    let mark = PriceReference {
+        kind: PriceReferenceKind::MarkPrice,
+        ..opening
+    };
+    let mut with_stop = book.plan_external_reference_without_trigger(mark).unwrap();
+    let mut stop = quote_stop(1, 1);
+    if let StopOrder::Market(ref mut order) = stop {
+        order.trigger_reference = PriceReferenceKind::MarkPrice;
+    }
+    with_stop
+        .place_stop_with_reservation(stop, LogicalTime::new(0), 1, state(1, 1, 1))
+        .unwrap();
+    let unrelated = PriceReference {
+        kind: PriceReferenceKind::IndexPrice,
+        ..opening
+    };
+    assert!(
+        with_stop
+            .plan_external_reference_without_trigger(unrelated)
+            .is_ok()
+    );
+    let below = PriceReference {
+        source_seq: 2,
+        price: Price::try_new(11).unwrap(),
+        ..mark
+    };
+    assert!(
+        with_stop
+            .plan_external_reference_without_trigger(below)
+            .is_ok()
+    );
+    let crossing = PriceReference {
+        source_seq: 2,
+        price: Price::try_new(12).unwrap(),
+        ..mark
+    };
+    assert_eq!(
+        with_stop.plan_external_reference_without_trigger(crossing),
+        Err(RejectReason::InvalidOrderCombination)
+    );
+    let mut sell_book = book.plan_external_reference_without_trigger(mark).unwrap();
+    let mut sell_stop = base_stop(2, 2, TriggerExpiry::Gtc);
+    if let StopOrder::Market(ref mut order) = sell_stop {
+        order.trigger_reference = PriceReferenceKind::MarkPrice;
+    }
+    sell_book
+        .place_stop_with_reservation(sell_stop, LogicalTime::new(0), 1, state(2, 2, 1))
+        .unwrap();
+    let above = PriceReference {
+        source_seq: 2,
+        price: Price::try_new(9).unwrap(),
+        ..mark
+    };
+    assert!(
+        sell_book
+            .plan_external_reference_without_trigger(above)
+            .is_ok()
+    );
+    let touching = PriceReference {
+        source_seq: 2,
+        price: Price::try_new(8).unwrap(),
+        ..mark
+    };
+    assert_eq!(
+        sell_book.plan_external_reference_without_trigger(touching),
+        Err(RejectReason::InvalidOrderCombination)
+    );
+    assert!(
+        with_stop
+            .plan_external_reference_without_trigger(opening)
+            .is_ok()
+    );
+    let mut with_band = book.clone();
+    with_band
+        .set_price_band_config(Some((
+            matching_domain::PriceBandConfig {
+                reference_kind: PriceReferenceKind::StaticOpening,
+                max_deviation_bps: 1,
+            },
+            math(),
+        )))
+        .unwrap();
+    let huge = PriceReference {
+        price: Price::try_new(i64::MAX).unwrap(),
+        ..opening
+    };
+    let original = with_band.clone();
+    assert_eq!(
+        with_band.plan_external_reference_without_trigger(huge),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(with_band, original);
+}
+
+#[test]
+fn preopen_revalidation_cancels_outside_band_in_book_order_atomically() {
+    use matching_domain::CancelReason;
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let states = [
+        state(1, 1, 1),
+        state(2, 2, 1),
+        state(3, 3, 1),
+        state(4, 4, 1),
+        state(5, 5, 1),
+    ];
+    let mut registry = ReservationRegistry::new(states.clone()).unwrap();
+    for (index, price) in [8, 9, 10].into_iter().enumerate() {
+        let mut order = regular((index + 1) as u128, (index + 1) as u64);
+        order.price = Price::try_new(price).unwrap();
+        book.rest_with_reservation(order, states[index].clone())
+            .unwrap();
+    }
+    for (index, state) in states.iter().enumerate().skip(3) {
+        let mut order = regular((index + 1) as u128, (index + 1) as u64);
+        order.side = Side::Sell;
+        order.price = Price::try_new(21).unwrap();
+        book.rest_with_reservation(order, state.clone()).unwrap();
+    }
+    let before = book.clone();
+    let original_registry = registry.clone();
+    let mut reference = ReferenceOrderBook::new();
+    for (index, price) in [8, 9, 10].into_iter().enumerate() {
+        let mut order = regular((index + 1) as u128, (index + 1) as u64);
+        order.price = Price::try_new(price).unwrap();
+        reference
+            .rest_with_reservation(order, states[index].clone())
+            .unwrap();
+    }
+    for (index, state) in states.iter().enumerate().skip(3) {
+        let mut order = regular((index + 1) as u128, (index + 1) as u64);
+        order.side = Side::Sell;
+        order.price = Price::try_new(21).unwrap();
+        reference
+            .rest_with_reservation(order, state.clone())
+            .unwrap();
+    }
+    let mut reference_registry = original_registry.clone();
+    let reference_plan = reference
+        .plan_preopen_revalidation(
+            Price::try_new(10).unwrap(),
+            Price::try_new(20).unwrap(),
+            &reference_registry,
+        )
+        .unwrap();
+    let plan = book
+        .plan_preopen_revalidation(
+            Price::try_new(10).unwrap(),
+            Price::try_new(20).unwrap(),
+            &registry,
+        )
+        .unwrap();
+    assert_eq!(book, before);
+    assert_eq!(registry, original_registry);
+    let mut drifted_book = book.clone();
+    drifted_book.cancel(OrderId::new(3)).unwrap();
+    let drifted_before = drifted_book.clone();
+    let mut drifted_registry = registry.clone();
+    assert_eq!(
+        drifted_book.apply_mass_cancel(&mut drifted_registry, plan.clone()),
+        Err(ReservationApplyError::StateChanged)
+    );
+    assert_eq!(drifted_book, drifted_before);
+    assert_eq!(drifted_registry, original_registry);
+    assert_eq!(
+        book.plan_preopen_revalidation(
+            Price::try_new(20).unwrap(),
+            Price::try_new(10).unwrap(),
+            &registry
+        ),
+        Err(matching_domain::RejectReason::InvalidPrice)
+    );
+    let (_, events) = book.apply_mass_cancel(&mut registry, plan).unwrap();
+    let (_, expected_events) = reference
+        .apply_mass_cancel(&mut reference_registry, reference_plan)
+        .unwrap();
+    assert_eq!(events, expected_events);
+    assert_eq!(registry, reference_registry);
+    let ids: Vec<_> = events
+        .iter()
+        .map(|event| match event {
+            EngineEvent::OrderCanceled {
+                order_id,
+                reason: CancelReason::PriceBandRevalidation,
+                ..
+            } => *order_id,
+            other => panic!("unexpected event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            OrderId::new(4),
+            OrderId::new(5),
+            OrderId::new(2),
+            OrderId::new(1)
+        ]
+    );
+    assert!(book.order(OrderId::new(3)).is_some());
+    assert!(registry.is_pending_r2(ReservationId::new(101)));
+    assert!(registry.is_pending_r2(ReservationId::new(102)));
+}
+
+#[test]
 fn market_close_plans_expiry_and_cancellation_before_atomic_install() {
     use matching_domain::{CancelReason, ExpireReason, RejectReason};
     assert_eq!(CancelReason::MarketClosed as u16, 1104);
