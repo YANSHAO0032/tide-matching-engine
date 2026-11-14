@@ -25,8 +25,9 @@ pub use idempotency::IdempotencyConfig;
 pub use place_config::{PlaceConfigError, PlaceLimits, PlaceSupportConfig};
 /// 本地持久前缀中的正式命令。
 pub use recovery::{
-    RecoveredCommand, SnapshotRecoveryRecords, SnapshotReplayResult, recover_local_commands,
-    recover_snapshot_records, recover_snapshot_records_with_genesis,
+    CommittedMarketDataReplay, RecoveredCommand, SnapshotRecoveryRecords, SnapshotReplayResult,
+    recover_local_commands, recover_market_data_from_genesis, recover_snapshot_records,
+    recover_snapshot_records_with_genesis,
 };
 /// 显式路由与配置错误。
 pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable};
@@ -34,11 +35,19 @@ pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable}
 pub use wait_strategy::WaitStrategy;
 /// 单写者工作线程及其结果。
 pub use worker::{
-    Execution, FormalError, FormalExecution, FormalOutcome, Mutation, MutationEnvelope,
-    MutationOutcome, Shard, ShardConfig, ShardError, ShardHandle, SnapshotError, SnapshotImage,
-    SnapshotRecoveryCandidate, SnapshotRestoreConfig, SnapshotWriter, SnapshotWriterError,
+    Execution, FormalError, FormalExecution, FormalOutcome, MarketDataOpenDetail, Mutation,
+    MutationEnvelope, MutationOutcome, Shard, ShardConfig, ShardError, ShardHandle, SnapshotError,
+    SnapshotImage, SnapshotRecoveryCandidate, SnapshotRestoreConfig, SnapshotWriter,
+    SnapshotWriterError,
 };
 mod router;
 
 /// 基于显式快照的多分片路由及其错误。
 pub use router::{Router, RouterError};
+
+mod market_data;
+/// 市场行情源与逐订单构建器。
+pub use market_data::{
+    MarketDataState, MarketProjector, MarketSource, MboBuilder, MboChange, MboError, MboMessage,
+    SourceEvent, SourcePayload,
+};

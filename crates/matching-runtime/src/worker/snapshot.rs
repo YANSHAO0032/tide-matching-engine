@@ -228,6 +228,27 @@ impl SnapshotImage {
         {
             w.u8(3)?;
         }
+        if let Some(data) = self
+            .place
+            .as_ref()
+            .and_then(|place| place.market_data.as_ref())
+        {
+            data.validate_books(&self.markets)
+                .map_err(|_| SnapshotWireError)?;
+            if data.last_applied_shard_seq() != self.snapshot_seq {
+                return Err(SnapshotWireError);
+            }
+            let watermarks = data.market_watermarks();
+            if watermarks.len() != self.markets.len() || watermarks.keys().ne(self.markets.keys()) {
+                return Err(SnapshotWireError);
+            }
+            w.u8(4)?;
+            w.u32(u32::try_from(watermarks.len()).map_err(|_| SnapshotWireError)?)?;
+            for (market, seq) in watermarks {
+                w.u32(market.0)?;
+                w.u64(seq)?;
+            }
+        }
         Ok(w.finish())
     }
     /// 选择最新可校验快照；损坏或缺失时尝试清单记录的上一份。
@@ -341,12 +362,22 @@ impl SnapshotImage {
             .place
             .as_ref()
             .is_some_and(|place| place.shard_kill_active);
-        w.u16(match (fee_book.is_some(), shard_kill_active) {
-            (false, false) => 3,
-            (true, false) => 4,
-            (false, true) => 5,
-            (true, true) => 6,
-        })?;
+        let market_data = self
+            .place
+            .as_ref()
+            .and_then(|place| place.market_data.as_ref());
+        w.u16(
+            match (market_data.is_some(), fee_book.is_some(), shard_kill_active) {
+                (false, false, false) => 3,
+                (false, true, false) => 4,
+                (false, false, true) => 5,
+                (false, true, true) => 6,
+                (true, false, false) => 7,
+                (true, true, false) => 8,
+                (true, false, true) => 9,
+                (true, true, true) => 10,
+            },
+        )?;
         w.bytes(env!("CARGO_PKG_VERSION").as_bytes())?;
         w.u128(self.request_id)?;
         w.u64(self.snapshot_seq)?;
@@ -391,6 +422,19 @@ impl SnapshotImage {
         if let Some(book) = fee_book {
             book.write_snapshot(&mut w)?;
         }
+        if let Some(data) = market_data {
+            let watermarks = data.market_watermarks();
+            w.u32(u32::try_from(watermarks.len()).map_err(|_| SnapshotWireError)?)?;
+            for (market, seq) in watermarks {
+                w.u32(market.0)?;
+                w.u64(seq)?;
+            }
+            w.bytes(
+                &data
+                    .encode_checkpoint(limit)
+                    .map_err(|_| SnapshotWireError)?,
+            )?;
+        }
         w.bytes(&self.state_digest(limit)?)?;
         Ok(w.finish())
     }
@@ -401,7 +445,7 @@ impl SnapshotImage {
     ) -> Result<Self, SnapshotWireError> {
         let mut r = SnapshotDecoder::new(bytes, config.max_bytes)?;
         let version = r.u16()?;
-        if !(2..=6).contains(&version) {
+        if !(2..=10).contains(&version) {
             return Err(SnapshotWireError);
         }
         if r.bytes()? != env!("CARGO_PKG_VERSION").as_bytes() {
@@ -542,6 +586,7 @@ impl SnapshotImage {
                     return Err(SnapshotWireError);
                 }
                 Some(PlaceRuntimeState {
+                    market_data: None,
                     config: expected.clone(),
                     ids,
                     fee_book: None,
@@ -580,7 +625,7 @@ impl SnapshotImage {
                 managed_markets.insert(market, state);
             }
         }
-        if version == 4 || version == 6 {
+        if matches!(version, 4 | 6 | 8 | 10) {
             let state = place.as_mut().ok_or(SnapshotWireError)?;
             state.fee_book = Some(matching_domain::FeeScheduleBook::read_snapshot(
                 &mut r,
@@ -588,8 +633,39 @@ impl SnapshotImage {
                 config.max_bytes / 21,
             )?);
         }
-        if version >= 5 {
+        if matches!(version, 5 | 6 | 9 | 10) {
             place.as_mut().ok_or(SnapshotWireError)?.shard_kill_active = true;
+        }
+        if version >= 7 {
+            let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+            if count != markets.len() || count > config.max_markets || count > r.remaining() / 12 {
+                return Err(SnapshotWireError);
+            }
+            let mut watermarks = BTreeMap::new();
+            for _ in 0..count {
+                let market = MarketId(r.u32()?);
+                let seq = r.u64()?;
+                if watermarks.insert(market, seq).is_some() {
+                    return Err(SnapshotWireError);
+                }
+            }
+            if watermarks.keys().ne(markets.keys()) {
+                return Err(SnapshotWireError);
+            }
+            let bytes = r.bytes()?;
+            let data = crate::MarketDataState::decode_checkpoint(
+                bytes,
+                config.max_bytes,
+                snapshot_seq,
+                &watermarks,
+            )
+            .map_err(|_| SnapshotWireError)?;
+            if data.last_applied_shard_seq() != snapshot_seq
+                || data.market_watermarks() != watermarks
+            {
+                return Err(SnapshotWireError);
+            }
+            place.as_mut().ok_or(SnapshotWireError)?.market_data = Some(data);
         }
         if let Some(place) = &mut place {
             for (market, state) in &managed_markets {
@@ -789,6 +865,8 @@ mod tests {
             )
             .unwrap()
             .image;
+            // 本测试固定旧格式的开关兼容性；新行情快照另有独立测试。
+            image.place.as_mut().unwrap().market_data = None;
             if fee {
                 image.place.as_mut().unwrap().fee_book = Some(FeeScheduleBook::new(
                     FeeSchedule::new(

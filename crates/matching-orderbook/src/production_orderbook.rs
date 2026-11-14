@@ -36,7 +36,7 @@ pub use cancel_replace_view::ProductionBookWithout;
 use expiry::RegularExpiryIndex;
 pub use mass_cancel::ProductionMassCancelPlan;
 pub use reservation_place::{ProductionMarketPlan, ProductionPlaceOrder, ProductionPlacePlan};
-pub use stop_trigger::ProductionTriggerRegistryPlan;
+pub use stop_trigger::{ProductionTriggerRegistryPlan, TriggeredChildOpen};
 
 /// 指明已预检的余量将追加到既有档位还是新建档位。
 ///
@@ -307,6 +307,28 @@ impl ProductionOrderBook {
             Side::Buy => self.bids.last_key_value().map(|(price, _)| *price),
             Side::Sell => self.asks.first_key_value().map(|(price, _)| *price),
         }
+    }
+
+    /// 按价格优先及价档链表顺序读取当前可见挂单，不包含未触发止损单。
+    pub fn visible_orders(&self, side: Side) -> Vec<&OrderNode> {
+        let levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let mut ordered: Vec<_> = levels.values().collect();
+        if side == Side::Buy {
+            ordered.reverse();
+        }
+        let mut result = Vec::new();
+        for level in ordered {
+            let mut current = level.head();
+            while let Some(index) = current {
+                let node = self.arena.get(index).expect("可见价档引用的订单必须存在");
+                result.push(node);
+                current = node.next();
+            }
+        }
+        result
     }
 
     /// 经单键标识符查找借用 Arena 节点；未知标识符返回 None。

@@ -20,6 +20,30 @@ pub struct SnapshotReplayResult {
     pub event_hash: [u8; 32],
 }
 
+/// 由清单验证的快照和后续已提交 WAL 重建的单市场行情片段。
+pub struct CommittedMarketDataReplay {
+    /// 快照位置的逐订单视图。
+    initial: crate::MboBuilder,
+    /// 快照后按市场原序重建的源事件。
+    events: Vec<crate::SourceEvent>,
+    /// 消费完整提交后缀后的逐订单视图。
+    final_builder: crate::MboBuilder,
+}
+impl CommittedMarketDataReplay {
+    /// 返回已验证快照中的初始视图。
+    pub fn initial_builder(&self) -> &crate::MboBuilder {
+        &self.initial
+    }
+    /// 返回已提交后缀生成的源事件。
+    pub fn events(&self) -> &[crate::SourceEvent] {
+        &self.events
+    }
+    /// 返回消费源事件后的视图。
+    pub fn final_builder(&self) -> &crate::MboBuilder {
+        &self.final_builder
+    }
+}
+
 impl SnapshotRecoveryRecords {
     /// 借用已验证的快照候选。
     pub fn snapshot(&self) -> &crate::SnapshotRecoveryCandidate {
@@ -33,6 +57,104 @@ impl SnapshotRecoveryRecords {
     pub fn replay(self) -> io::Result<SnapshotReplayResult> {
         crate::worker::replay_snapshot_records(self.snapshot, self.commands)
     }
+    /// 从可信快照及完整已提交 WAL 后缀重建并核验单市场行情。
+    ///
+    /// 旧快照未包含行情视图时拒绝；结果不包含快照以前的源历史。
+    pub fn replay_market_data(
+        self,
+        market: matching_domain::MarketId,
+    ) -> io::Result<CommittedMarketDataReplay> {
+        let initial = self
+            .snapshot
+            .image
+            .market_data_builder(market)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "快照缺少市场行情视图"))?;
+        let replayed = self.replay()?;
+        let mut builder = initial.clone();
+        let mut events = Vec::new();
+        for execution in &replayed.executions {
+            if let Some(batch) = execution.market_data_source.get(&market) {
+                events
+                    .try_reserve(batch.len())
+                    .map_err(|_| io::Error::other("行情重放容量不足"))?;
+                for event in batch {
+                    builder.apply(event).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "行情源重放失败")
+                    })?;
+                    events.push(event.clone());
+                }
+            }
+        }
+        let expected = replayed.image.market_data_builder(market).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "重放镜像缺少市场行情视图")
+        })?;
+        if builder != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "行情重放状态不一致",
+            ));
+        }
+        Ok(CommittedMarketDataReplay {
+            initial,
+            events,
+            final_builder: builder,
+        })
+    }
+}
+
+/// 从完整创世 WAL 重建已提交行情源；任何已回收的前缀均拒绝。
+///
+/// 调用方须独占 WAL 目录，并提供与最初启动完全一致的可信配置和市场策略。
+/// 已登记过快照的分片被拒绝，避免将旧版本快照升级后的源历史错误重建为创世历史。
+/// 此入口不保存消费者游标，也不能替代独立持久行情日志。
+pub fn recover_market_data_from_genesis(
+    wal: impl AsRef<Path>,
+    manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,
+    config: &crate::SnapshotRestoreConfig,
+    policies: &[(
+        matching_domain::MarketId,
+        matching_orderbook::QueuePriorityPolicy,
+    )],
+) -> io::Result<SnapshotReplayResult> {
+    if config.place.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "缺少行情所需的下单配置",
+        ));
+    }
+    if manager.state().latest_snapshot.is_some() || manager.state().previous_snapshot.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "已登记快照，无法证明行情源从创世连续生成",
+        ));
+    }
+    if let Some(lease) = config
+        .place
+        .as_ref()
+        .and_then(|place| place.primary_lease.as_ref())
+    {
+        lease
+            .verify(config.cluster, config.shard, config.primary_epoch)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "可信主节点租约身份或纪元不匹配",
+                )
+            })?;
+    }
+    let records = matching_persistence::recover_local_with_manifest(
+        wal,
+        manager,
+        0,
+        config.cluster.get(),
+        config.shard.get(),
+    )?;
+    let candidate = crate::worker::empty_recovery_candidate(
+        config,
+        policies,
+        manager.state().local_durable_seq,
+    )?;
+    crate::worker::replay_snapshot_records(candidate, decode_records(records)?)
 }
 
 /// 持有同一严格清单锁选择快照并读取后续 WAL，不执行命令或更改文件。

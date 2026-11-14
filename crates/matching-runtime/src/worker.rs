@@ -95,6 +95,21 @@ pub struct Execution {
     pub result: Result<MutationOutcome, RejectReason>,
 }
 
+/// 正式挂单事件在实际入簿时的可见订单详情。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketDataOpenDetail {
+    /// 对应根命令中的业务事件索引。
+    pub event_index: u32,
+    /// 实际入簿的订单身份。
+    pub order_id: OrderId,
+    /// 入簿方向。
+    pub side: matching_domain::Side,
+    /// 入簿价格。
+    pub price: matching_domain::Price,
+    /// 入簿时可见的剩余数量。
+    pub visible: matching_domain::Qty,
+}
+
 /// 正式命令的进程内执行结果。
 #[derive(Debug)]
 pub struct FormalExecution {
@@ -108,6 +123,12 @@ pub struct FormalExecution {
     pub summary: CommandResultSummary,
     /// 按业务原序封装的事件。
     pub events: Vec<EventEnvelope>,
+    /// 止损级联的中间挂单详情；去重响应不重发该轨迹。
+    pub market_data_child_opens: Vec<matching_orderbook::production_orderbook::TriggeredChildOpen>,
+    /// 正式挂单事件对应的真实可见详情；去重响应不重发。
+    pub market_data_open_details: Vec<MarketDataOpenDetail>,
+    /// 按市场分组的行情源候选；仅持久提交后可对外消费。
+    pub market_data_source: BTreeMap<MarketId, Vec<crate::SourceEvent>>,
     /// 首次执行事件的闭区间；零事件时为空。
     pub event_range: Option<(u32, u32)>,
     /// 此次响应是否来自已执行命令的窗口缓存。
@@ -235,6 +256,19 @@ pub struct SnapshotImage {
     place: Option<PlaceRuntimeState>,
 }
 impl SnapshotImage {
+    /// 获取快照中的逐订单视图副本；市场或行情状态缺失时返回空。
+    /// 只有经清单验证的快照才能证明其持久性。
+    pub fn market_data_builder(&self, market: MarketId) -> Option<crate::MboBuilder> {
+        self.place.as_ref()?.market_data.as_ref()?.builder(market)
+    }
+    /// 返回市场快照中的最后行情源序号；市场或行情状态缺失时返回空。
+    pub fn market_event_seq(&self, market: MarketId) -> Option<u64> {
+        self.place
+            .as_ref()?
+            .market_data
+            .as_ref()?
+            .market_event_seq(market)
+    }
     /// 返回请求身份。
     pub fn request_id(&self) -> u128 {
         self.request_id
@@ -1308,6 +1342,14 @@ impl Shard {
             )
             .map_err(|()| ShardError::InvalidConfig)?;
             Some(PlaceRuntimeState {
+                market_data: if durable.is_some() {
+                    Some(
+                        crate::MarketDataState::new(markets.keys().copied())
+                            .map_err(|_| ShardError::InvalidConfig)?,
+                    )
+                } else {
+                    None
+                },
                 config: place,
                 ids,
                 fee_book: None,
@@ -1387,28 +1429,7 @@ impl Shard {
                     match msg {
                         Message::Formal(command, reply)
                             if durable.as_ref().is_some_and(|gate| gate.group.is_some())
-                                || (durable.is_some()
-                                    && place_state.is_some()
-                                    && (place_state
-                                        .as_ref()
-                                        .is_some_and(|state| state.config.managed_only)
-                                        || !managed_markets.is_empty()
-                                        || matches!(
-                                            &command.payload,
-                                            Command::CreateMarket(_)
-                                                | Command::ShardKillSwitch(_)
-                                                | Command::TriggerCircuitBreaker(_)
-                                                | Command::MarketKillSwitch(_)
-                                                | Command::UpdateReferencePrice(_)
-                                                | Command::UpdateFeeSchedule(_)
-                                                | Command::UpdateMarket(_)
-                                                | Command::StartSession(_)
-                                                | Command::OpenMarket(_)
-                                                | Command::SuspendMarket(_)
-                                                | Command::ResumeMarket(_)
-                                                | Command::EndSession(_)
-                                                | Command::CloseMarket(_)
-                                        ))) =>
+                                || (durable.is_some() && place_state.is_some()) =>
                         {
                             let gate = durable.as_mut().expect("已检查批处理模式");
                             if place_state.is_some() {
@@ -1617,6 +1638,7 @@ impl Shard {
                                     .as_ref()
                                     .map(|state| {
                                         Ok::<_, SnapshotError>(PlaceRuntimeState {
+                                            market_data: state.market_data.clone(),
                                             config: state.config.clone(),
                                             fee_book: state.fee_book.clone(),
                                             shard_kill_active: state.shard_kill_active,
@@ -1748,6 +1770,8 @@ struct PlaceRuntimeState {
     fee_book: Option<matching_domain::FeeScheduleBook>,
     /// 分片范围熔断开关的持久状态。
     shard_kill_active: bool,
+    /// 与持久命令候选共同推进的行情状态；旧快照可暂时没有此状态。
+    market_data: Option<crate::MarketDataState>,
 }
 
 /// 正式限价命令所需的单写者状态。
@@ -1977,6 +2001,7 @@ impl FormalBatchCandidate {
             .as_ref()
             .map(|state| {
                 Ok(PlaceRuntimeState {
+                    market_data: state.market_data.clone(),
                     config: state.config.clone(),
                     ids: state.ids.try_clone_preallocated()?,
                     fee_book: state.fee_book.clone(),
@@ -2068,6 +2093,53 @@ impl FormalBatchCandidate {
     }
     /// 按单写者实际顺序在候选状态中预检与执行命令。
     fn stage(
+        &mut self,
+        command: CommandEnvelope,
+        routes: &RouteTable,
+    ) -> Result<FormalExecution, FormalError> {
+        let bootstrap = if self
+            .place
+            .as_ref()
+            .is_some_and(|state| state.market_data.is_none())
+        {
+            Some(
+                crate::MarketDataState::bootstrap_legacy(
+                    &self.markets,
+                    self.fence.seq.last_applied(),
+                )
+                .expect("旧快照行情初始化失败，分片停止"),
+            )
+        } else {
+            None
+        };
+        let mut result = self.stage_inner(command, routes)?;
+        let mut bootstrap_events = BTreeMap::new();
+        if !result.deduplicated
+            && let Some((data, events)) = bootstrap
+        {
+            self.place.as_mut().expect("已检查下单状态").market_data = Some(data);
+            bootstrap_events = events;
+        }
+        if let Some(data) = self
+            .place
+            .as_mut()
+            .and_then(|state| state.market_data.as_mut())
+        {
+            let updates = data
+                .apply(&result)
+                .expect("行情候选与撮合结果不一致，分片停止");
+            for (market, events) in updates {
+                bootstrap_events
+                    .entry(market)
+                    .or_insert_with(Vec::new)
+                    .extend(events);
+            }
+            result.market_data_source = bootstrap_events;
+        }
+        Ok(result)
+    }
+    /// 执行业务候选；行情候选由调用方在同一批次中推进。
+    fn stage_inner(
         &mut self,
         command: CommandEnvelope,
         routes: &RouteTable,
@@ -2624,6 +2696,25 @@ fn execute_place(
         FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(reason)),
         _ => (CommandStatus::Succeeded, None),
     };
+    let mut open_details = Vec::new();
+    if !overflow && let Some(candidate) = &candidate {
+        for event in &events {
+            if let EngineEvent::OrderOpened { order_id } = event.payload {
+                let node = candidate
+                    .book
+                    .order(order_id)
+                    .expect("挂单事件必须有对应候选订单");
+                open_details.push(MarketDataOpenDetail {
+                    event_index: event.event_index,
+                    order_id,
+                    side: node.original_order().side,
+                    price: node.original_order().price,
+                    visible: matching_domain::Qty::try_new(node.visible_remaining())
+                        .expect("挂单可见量必须为正"),
+                });
+            }
+        }
+    }
     let result = FormalExecution {
         command_id: command.command_id,
         seq: n,
@@ -2637,6 +2728,9 @@ fn execute_place(
         },
         event_range: events.last().map(|event| (0, event.event_index)),
         events,
+        market_data_child_opens: Vec::new(),
+        market_data_open_details: open_details,
+        market_data_source: Default::default(),
         deduplicated: false,
     };
     if !overflow && let Some(candidate) = candidate {
@@ -2779,6 +2873,9 @@ fn execute_fee_schedule_update(
         },
         event_range: Some((0, 0)),
         events: vec![event],
+        market_data_child_opens: Vec::new(),
+        market_data_open_details: Vec::new(),
+        market_data_source: Default::default(),
         deduplicated: false,
     };
     if let Some(book) = next_book {
@@ -2960,6 +3057,9 @@ fn execute_shard_kill(
         },
         event_range,
         events,
+        market_data_child_opens: Vec::new(),
+        market_data_open_details: Vec::new(),
+        market_data_source: Default::default(),
         deduplicated: false,
     };
     if reason.is_none() {
@@ -3053,6 +3153,7 @@ fn execute_market_management(
         && book.stop_orders(matching_domain::Side::Buy).is_empty()
         && book.stop_orders(matching_domain::Side::Sell).is_empty();
     let mut cleanup = None;
+    let mut child_opens = Vec::new();
     let mut policy_update = None;
     let plan: Result<_, RejectReason> = match &command.payload {
         Command::TriggerCircuitBreaker(input) => match managed_markets.get(&market) {
@@ -3203,7 +3304,7 @@ fn execute_market_management(
                     .session_id()
                     .ok_or(RejectReason::InvalidSession)?;
                 let limits = state.config().execution_limits;
-                let (plan, _) = working.plan_trigger_stops_with_r2_and_cursor_limited(
+                let (plan, _, mut opens) = working.plan_trigger_stops_with_r2_and_cursor_traced_limited(
                     reference,
                     matching_orderbook::TriggerRegistryContext { now: clock.now(), current_session_id: session, math: &math, trade_ids: &[] },
                     matching_risk::TradeSettlementContext { market_id: market, math, base: matching_risk::SettlementAsset { asset: base, scale: math.qty_scale() }, quote: matching_risk::SettlementAsset { asset: quote, scale: math.quote_scale() }, fees },
@@ -3231,6 +3332,13 @@ fn execute_market_management(
                 let triggered = after
                     .apply_trigger_stops_with_registry(&mut candidate_registry, plan)
                     .expect("独立止损候选不能漂移");
+                for open in &mut opens {
+                    open.after_event_count = open
+                        .after_event_count
+                        .checked_add(events.len())
+                        .ok_or(RejectReason::ArithmeticOverflow)?;
+                }
+                child_opens = opens;
                 assert!(
                     triggered
                         .iter()
@@ -3674,6 +3782,9 @@ fn execute_market_management(
         _ => (CommandStatus::Succeeded, None),
     };
     let event_range = events.last().map(|event| (0, event.event_index));
+    if planned.is_none() {
+        child_opens.clear();
+    }
     let result = FormalExecution {
         command_id: command.command_id,
         seq: n,
@@ -3687,6 +3798,9 @@ fn execute_market_management(
         },
         event_range,
         events,
+        market_data_child_opens: child_opens,
+        market_data_open_details: Vec::new(),
+        market_data_source: Default::default(),
         deduplicated: false,
     };
     if let Some((state, candidate_book)) = planned {
@@ -3790,6 +3904,9 @@ fn execute_fence(
         summary,
         events: vec![event],
         event_range: Some((0, 0)),
+        market_data_child_opens: Vec::new(),
+        market_data_open_details: Vec::new(),
+        market_data_source: Default::default(),
         deduplicated: false,
     };
     *epochs = candidate;
@@ -3888,6 +4005,9 @@ fn execute_formal_guarded(
         },
         events: vec![event],
         event_range: Some((0, 0)),
+        market_data_child_opens: Vec::new(),
+        market_data_open_details: Vec::new(),
+        market_data_source: Default::default(),
         deduplicated: false,
     };
     dedup.insert_prepared(&command, prepared, &result);
@@ -4087,6 +4207,9 @@ fn execute_formal(
         summary,
         event_range: wrapped.last().map(|event| (0, event.event_index)),
         events: wrapped,
+        market_data_child_opens: Vec::new(),
+        market_data_open_details: Vec::new(),
+        market_data_source: Default::default(),
         deduplicated: false,
     })
 }
@@ -4988,6 +5111,7 @@ mod tests {
             max_bytes: 1024 * 1024,
         };
         let mut place = Some(PlaceRuntimeState {
+            market_data: None,
             config: settings,
             ids: ClientOrderIds::with_max_id_bytes(8, 8, 32).unwrap(),
             fee_book: None,
@@ -5044,6 +5168,7 @@ mod tests {
             replay_candidate.image.registry = registry.clone();
             let state_place = place.as_ref().unwrap();
             replay_candidate.image.place = Some(PlaceRuntimeState {
+                market_data: state_place.market_data.clone(),
                 config: state_place.config.clone(),
                 ids: state_place.ids.try_clone_preallocated().unwrap(),
                 fee_book: state_place.fee_book.clone(),
@@ -5096,6 +5221,20 @@ mod tests {
             }
             if band == 14 || band == 16 || band == 18 {
                 assert!(books[&market].order(OrderId(1)).is_some());
+                assert_eq!(result.market_data_child_opens.len(), 1);
+                assert_eq!(result.market_data_child_opens[0].order_id, OrderId(1));
+                assert!(result.market_data_child_opens[0].after_event_count <= result.events.len());
+                let mut projector = crate::MarketProjector::new(market);
+                let source = projector
+                    .apply_formal_execution(&result, |_, _| None)
+                    .unwrap();
+                assert!(source.iter().any(|event| matches!(
+                    event.payload,
+                    crate::SourcePayload::OrderAdded {
+                        order_id: OrderId(1),
+                        ..
+                    }
+                )));
             } else if band == 15 {
                 assert!(
                     result
@@ -5185,12 +5324,17 @@ mod tests {
             assert_eq!(replayed.image.markets, books);
             assert_eq!(replayed.image.registry, registry);
             let mut live = SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+            // 直接调用管理函数的夹具自行执行与正式分片相同的旧快照行情初始化。
+            let (mut live_data, _) =
+                crate::MarketDataState::bootstrap_legacy(&live.markets, live.snapshot_seq).unwrap();
+            live_data.apply(&result).unwrap();
             live.snapshot_seq = seq.last_applied();
             live.markets = books;
             live.registry = registry;
             live.managed_markets = managed;
             live.dedup = Some(window);
             live.place = place;
+            live.place.as_mut().unwrap().market_data = Some(live_data);
             assert_eq!(
                 replayed.image.state_digest(trusted.max_bytes).unwrap(),
                 live.state_digest(trusted.max_bytes).unwrap()
@@ -5241,6 +5385,8 @@ mod tests {
         replay_candidate.image.markets = books.clone();
         replay_candidate.image.managed_markets = managed.clone();
         replay_candidate.image.registry = registry.clone();
+        // 此夹具直接注入已有活单且没有行情历史，按旧快照路径验证管理重放。
+        replay_candidate.image.place.as_mut().unwrap().market_data = None;
         let bytes = replay_candidate
             .image
             .encode_snapshot(trusted.max_bytes)
@@ -5477,12 +5623,21 @@ mod tests {
         assert_eq!(replayed.image.registry, registry);
         assert_eq!(replayed.image.managed_markets, managed);
         let mut live_image = SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+        // 直接调用管理函数的夹具重现旧快照显式行情初始化及逐命令推进。
+        let (mut live_data, _) =
+            crate::MarketDataState::bootstrap_legacy(&live_image.markets, live_image.snapshot_seq)
+                .unwrap();
+        live_data.apply(&result).unwrap();
+        for execution in &executions {
+            live_data.apply(execution).unwrap();
+        }
         live_image.snapshot_seq = seq.last_applied();
         live_image.markets = books;
         live_image.registry = registry;
         live_image.managed_markets = managed;
         live_image.dedup = Some(window);
         live_image.place = place;
+        live_image.place.as_mut().unwrap().market_data = Some(live_data);
         assert_eq!(
             replayed.image.state_digest(trusted.max_bytes).unwrap(),
             live_image.state_digest(trusted.max_bytes).unwrap()
@@ -6141,6 +6296,7 @@ mod place_event_capacity_tests {
         .unwrap();
         let ids = ClientOrderIds::with_max_id_bytes(2, 2, 32).unwrap();
         let mut state = PlaceRuntimeState {
+            market_data: None,
             config,
             ids,
             fee_book: None,
@@ -6756,6 +6912,10 @@ pub(crate) fn empty_recovery_candidate(
         )
         .map_err(|()| std::io::Error::other("客户端身份容量无效"))?;
         Some(PlaceRuntimeState {
+            market_data: Some(
+                crate::MarketDataState::new(markets.keys().copied())
+                    .map_err(|_| std::io::Error::other("行情市场无效"))?,
+            ),
             config: config.clone(),
             ids,
             fee_book: None,
@@ -6849,13 +7009,30 @@ pub(crate) fn replay_snapshot_records(
             }
             previous_epoch = Some(record.epoch);
             image.primary_epoch = record.epoch;
+            let bootstrap = if image
+                .place
+                .as_ref()
+                .is_some_and(|place| place.market_data.is_none())
+            {
+                Some(
+                    crate::MarketDataState::bootstrap_legacy(&image.markets, seq.last_applied())
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "旧快照行情初始化失败",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             let identity = FormalIdentity {
                 cluster: image.cluster,
                 shard: image.shard,
                 event_capacity: u64::from(u32::MAX) + 1,
             };
             let command = record.command;
-            let result = match &command.payload {
+            let mut result = match &command.payload {
                 Command::ShardKillSwitch(_) => {
                     let window = image.dedup.as_mut().ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
                     execute_shard_kill(ShardKillContext { identity, epoch: image.primary_epoch, seq: &mut seq, clock: &clock, markets: &mut image.markets, registry: &mut image.registry, place: &mut image.place, dedup: window, require_lease: false }, command)
@@ -6995,6 +7172,27 @@ pub(crate) fn replay_snapshot_records(
                     std::io::ErrorKind::InvalidData,
                     "重放结果序号或去重状态不一致",
                 ));
+            }
+            let mut bootstrap_events = BTreeMap::new();
+            if let Some((data, events)) = bootstrap {
+                image.place.as_mut().expect("已检查下单状态").market_data = Some(data);
+                bootstrap_events = events;
+            }
+            if let Some(data) = image
+                .place
+                .as_mut()
+                .and_then(|place| place.market_data.as_mut())
+            {
+                let updates = data.apply(&result).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "行情候选重放失败")
+                })?;
+                for (market, events) in updates {
+                    bootstrap_events
+                        .entry(market)
+                        .or_insert_with(Vec::new)
+                        .extend(events);
+                }
+                result.market_data_source = bootstrap_events;
             }
             for event in &result.events {
                 event_hasher
