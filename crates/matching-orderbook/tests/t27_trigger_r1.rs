@@ -330,6 +330,23 @@ fn trigger_trade_settles_both_sides_and_failure_keeps_original_state() {
             },
         );
         if !succeeds {
+            let traced_failure = book.plan_trigger_stops_with_r2_and_cursor_traced(
+                reference(2, 11),
+                context(),
+                settlement(),
+                &registry,
+                &cursor,
+                |order| match order {
+                    StopOrder::Limit(child) => {
+                        check_stop_limit_reservation(&policy, &fees, &registry, MarketId(7), child)
+                    }
+                    _ => Err(RejectReason::InvalidOrderCombination),
+                },
+            );
+            assert_eq!(
+                traced_failure.unwrap_err(),
+                RejectReason::InsufficientReservation
+            );
             assert_eq!(result.unwrap_err(), RejectReason::InsufficientReservation);
             assert_eq!(
                 cursor_result.unwrap_err(),
@@ -342,6 +359,60 @@ fn trigger_trade_settles_both_sides_and_failure_keeps_original_state() {
         let (cursor_plan, after_cursor) = cursor_result.unwrap();
         assert_eq!(cursor_plan, plan);
         assert_eq!(after_cursor.next_index(), if stp { 1 } else { 2 });
+        if stp {
+            let (traced_plan, traced_cursor, opens) = book
+                .plan_trigger_stops_with_r2_and_cursor_traced(
+                    reference(2, 11),
+                    context(),
+                    settlement(),
+                    &registry,
+                    &cursor,
+                    |order| match order {
+                        StopOrder::Limit(child) => check_stop_limit_reservation(
+                            &policy,
+                            &fees,
+                            &registry,
+                            MarketId(7),
+                            child,
+                        ),
+                        _ => Err(RejectReason::InvalidOrderCombination),
+                    },
+                )
+                .unwrap();
+            assert_eq!(traced_plan, cursor_plan);
+            assert_eq!(traced_cursor, after_cursor);
+            assert_eq!(opens.len(), 1);
+            assert_eq!(
+                (opens[0].order_id, opens[0].visible),
+                (OrderId(1), Qty::try_new(2).unwrap())
+            );
+            let mut probe_book = book.clone();
+            let mut probe_registry = registry.clone();
+            let final_events = probe_book
+                .apply_trigger_stops_with_registry(&mut probe_registry, traced_plan)
+                .unwrap();
+            assert_eq!(opens[0].after_event_count, final_events.len());
+            let (_, _, limited_opens) = book
+                .plan_trigger_stops_with_r2_and_cursor_traced_limited(
+                    reference(2, 11),
+                    context(),
+                    settlement(),
+                    &registry,
+                    (&cursor, (10, 10)),
+                    |order, _| match order {
+                        StopOrder::Limit(child) => check_stop_limit_reservation(
+                            &policy,
+                            &fees,
+                            &registry,
+                            MarketId(7),
+                            child,
+                        ),
+                        _ => Err(RejectReason::InvalidOrderCombination),
+                    },
+                )
+                .unwrap();
+            assert_eq!(limited_opens, opens);
+        }
         if !stp {
             let exhausted = matching_domain::TradeIdCursor::with_next_index(
                 matching_domain::ClusterId(0),

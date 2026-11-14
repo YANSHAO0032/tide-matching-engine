@@ -186,6 +186,21 @@ fn stop_descendant_shares_cursor_and_overflow_preserves_complete_state() {
         TradeIdCursor::with_next_index(ClusterId(7), ShardId(9), 12, u64::from(u32::MAX)).unwrap();
     let mut exhausted_r = exhausted_p.clone();
     let before_cursor = exhausted_p.clone();
+    let mut traced_book = before_p.clone();
+    let mut traced_cursor = before_cursor.clone();
+    assert_eq!(
+        traced_book.trigger_stops_with_cursor_traced(
+            reference(2, 110),
+            LogicalTime::new(1),
+            1,
+            &math,
+            &mut traced_cursor,
+            |_| Ok(())
+        ),
+        Err(RejectReason::ArithmeticOverflow)
+    );
+    assert_eq!(traced_book, before_p);
+    assert_eq!(traced_cursor, before_cursor);
     assert_eq!(
         p.trigger_stops_with_cursor(
             reference(2, 110),
@@ -501,4 +516,165 @@ fn market_cursor_matches_legacy_for_both_models() {
             assert_eq!(rc.next_index(), 2);
         }
     }
+}
+
+#[test]
+fn stop_child_open_trace_records_intermediate_resting_order() {
+    use matching_domain::{
+        LogicalTime, MarketMath, PriceReferenceKind, ReservationId, StopLimitOrder, StopOrder,
+        TimeInForce, TriggerExpiry,
+    };
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let stop = StopOrder::Limit(StopLimitOrder {
+        trigger_reference: PriceReferenceKind::LastTrade,
+        order_id: OrderId(11),
+        user_id: UserId(1),
+        stp_key: StpKey::new(0),
+        stp_mode: StpMode::None,
+        reservation_id: ReservationId(99),
+        fee_schedule_version: 1,
+        side: Side::Buy,
+        stop_price: Price::try_new(105).unwrap(),
+        price: Price::try_new(104).unwrap(),
+        qty: Qty::try_new(3).unwrap(),
+        child_tif: TimeInForce::Gtc,
+        trigger_expiry: TriggerExpiry::Gtc,
+    });
+    book.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    let mut cursor = TradeIdCursor::new(ClusterId(7), ShardId(9), 12);
+    book.trigger_stops_with_cursor(
+        reference(1, 100),
+        LogicalTime::new(1),
+        1,
+        &math,
+        &mut cursor,
+        |_| Ok(()),
+    )
+    .unwrap();
+    let (events, opens) = book
+        .trigger_stops_with_cursor_traced(
+            reference(2, 105),
+            LogicalTime::new(1),
+            1,
+            &math,
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        EngineEvent::StopTriggered {
+            order_id: OrderId(11),
+            ..
+        }
+    )));
+    assert_eq!(opens.len(), 1);
+    assert_eq!(opens[0].after_event_count, events.len());
+    assert_eq!(
+        (
+            opens[0].order_id,
+            opens[0].side,
+            opens[0].price,
+            opens[0].visible
+        ),
+        (
+            OrderId(11),
+            Side::Buy,
+            Price::try_new(104).unwrap(),
+            Qty::try_new(3).unwrap()
+        )
+    );
+}
+
+#[test]
+fn stop_trace_keeps_open_before_later_child_consumes_it() {
+    use matching_domain::{
+        LogicalTime, MarketMath, PriceReferenceKind, ReservationId, StopLimitOrder, StopOrder,
+        TimeInForce, TriggerExpiry,
+    };
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let math = MarketMath::try_new(0, 0, 0, 1, 1).unwrap();
+    let mut cursor = TradeIdCursor::new(ClusterId(7), ShardId(9), 15);
+    let reference = |kind, seq, price| matching_domain::PriceReference {
+        kind,
+        source_seq: seq,
+        price: Price::try_new(price).unwrap(),
+    };
+    for reference in [
+        reference(PriceReferenceKind::MarkPrice, 1, 101),
+        reference(PriceReferenceKind::LastTrade, 1, 99),
+    ] {
+        book.trigger_stops_with_cursor(
+            reference,
+            LogicalTime::new(1),
+            1,
+            &math,
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    }
+    let mut maker = order(90, 90, Side::Buy);
+    maker.price = Price::try_new(100).unwrap();
+    maker.qty = Qty::try_new(1).unwrap();
+    book.rest(maker).unwrap();
+    let stop = |id, side, kind, limit| {
+        StopOrder::Limit(StopLimitOrder {
+            trigger_reference: kind,
+            order_id: OrderId(id),
+            user_id: UserId(id as u64),
+            stp_key: StpKey::new(0),
+            stp_mode: StpMode::None,
+            reservation_id: ReservationId(id + 100),
+            fee_schedule_version: 1,
+            side,
+            stop_price: Price::try_new(100).unwrap(),
+            price: Price::try_new(limit).unwrap(),
+            qty: Qty::try_new(1).unwrap(),
+            child_tif: TimeInForce::Gtc,
+            trigger_expiry: TriggerExpiry::Gtc,
+        })
+    };
+    for stop in [
+        stop(1, Side::Sell, PriceReferenceKind::MarkPrice, 110),
+        stop(2, Side::Sell, PriceReferenceKind::MarkPrice, 100),
+        stop(3, Side::Buy, PriceReferenceKind::LastTrade, 110),
+    ] {
+        book.place_stop(stop, LogicalTime::new(1), 1).unwrap();
+    }
+    let (events, opens) = book
+        .trigger_stops_with_cursor_traced(
+            reference(PriceReferenceKind::MarkPrice, 2, 100),
+            LogicalTime::new(1),
+            1,
+            &math,
+            &mut cursor,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let opening = opens
+        .iter()
+        .find(|opening| opening.order_id == OrderId(1))
+        .unwrap();
+    let later_trade = events.iter().position(|event| matches!(event, EngineEvent::Trade(trade) if trade.maker_order_id == OrderId(1))).unwrap();
+    assert!(opening.after_event_count <= later_trade);
+    assert!(book.order(OrderId(1)).is_none());
+}
+
+#[test]
+fn visible_order_view_follows_price_and_fifo() {
+    let mut book = ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap());
+    let mut lower = order(5, 5, Side::Buy);
+    lower.price = Price::try_new(99).unwrap();
+    book.rest(lower).unwrap();
+    book.rest(order(2, 2, Side::Buy)).unwrap();
+    book.rest(order(1, 1, Side::Buy)).unwrap();
+    assert_eq!(
+        book.visible_orders(Side::Buy)
+            .iter()
+            .map(|node| node.original_order().order_id)
+            .collect::<Vec<_>>(),
+        vec![OrderId(2), OrderId(1), OrderId(5)]
+    );
 }

@@ -493,6 +493,9 @@ impl DedupWindow {
                 summary: entry.summary.clone(),
                 events: Vec::new(),
                 event_range: entry.event_range,
+                market_data_child_opens: Vec::new(),
+                market_data_open_details: Vec::new(),
+                market_data_source: Default::default(),
                 deduplicated: true,
             }));
         }
@@ -643,6 +646,9 @@ mod tests {
             },
             events: Vec::new(),
             event_range: Some((0, 0)),
+            market_data_child_opens: Vec::new(),
+            market_data_open_details: Vec::new(),
+            market_data_source: Default::default(),
             deduplicated: false,
         }
     }

@@ -913,6 +913,29 @@ fn run(group: bool, kill: u8) {
         max_bytes: 1024 * 1024,
     };
     let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(temp.0.join("manifest")).unwrap();
+    let market_replay = matching_runtime::recover_snapshot_records_with_genesis(
+        temp.0.join("wal"),
+        &snapshots,
+        &manager,
+        &trusted,
+        &[(market, QueuePriorityPolicy::try_new(1).unwrap())],
+    )
+    .unwrap()
+    .unwrap()
+    .replay_market_data(market)
+    .unwrap();
+    let expected_sources: Vec<_> = results
+        .iter()
+        .flat_map(|execution| {
+            execution
+                .market_data_source
+                .get(&market)
+                .into_iter()
+                .flatten()
+                .cloned()
+        })
+        .collect();
+    assert_eq!(market_replay.events(), expected_sources);
     let replay = matching_runtime::recover_snapshot_records_with_genesis(
         temp.0.join("wal"),
         &snapshots,
@@ -924,8 +947,52 @@ fn run(group: bool, kill: u8) {
     .unwrap()
     .replay()
     .unwrap();
+    let full_replay = matching_runtime::recover_market_data_from_genesis(
+        temp.0.join("wal"),
+        &manager,
+        &trusted,
+        &[(market, QueuePriorityPolicy::try_new(1).unwrap())],
+    )
+    .unwrap();
+    for (actual, expected) in full_replay.executions.iter().zip(&results) {
+        assert_eq!(actual.market_data_source, expected.market_data_source);
+    }
+    assert_eq!(full_replay.executions.len(), results.len());
     assert_eq!(replay.image.state_digest(1024 * 1024).unwrap(), digest);
     assert_eq!(replay.executions.len(), results.len());
+    if kill == 0 {
+        let placed = results
+            .iter()
+            .find(|result| result.command_id == CommandId(4))
+            .unwrap();
+        assert_eq!(placed.market_data_source[&market][0].sequence, 1);
+        let replayed_place = replay
+            .executions
+            .iter()
+            .find(|result| result.command_id == CommandId(4))
+            .unwrap();
+        assert_eq!(placed.market_data_source, replayed_place.market_data_source);
+        let mut live_projector = matching_runtime::MarketProjector::new(market);
+        let mut replay_projector = matching_runtime::MarketProjector::new(market);
+        let mut live_builder = matching_runtime::MboBuilder::new(market);
+        let mut replay_builder = matching_runtime::MboBuilder::new(market);
+        let detail = |_, _| None;
+        for (live, recovered) in results.iter().zip(&replay.executions) {
+            let live_events = live_projector.apply_formal_execution(live, detail).unwrap();
+            let replay_events = replay_projector
+                .apply_formal_execution(recovered, detail)
+                .unwrap();
+            assert_eq!(live_events, replay_events);
+            for (a, b) in live_events.iter().zip(&replay_events) {
+                assert_eq!(
+                    live_builder.apply(a).unwrap(),
+                    replay_builder.apply(b).unwrap()
+                );
+            }
+        }
+        assert_eq!(live_builder.digest(), replay_builder.digest());
+        assert!(live_builder.visible_depth(Side::Buy).unwrap().is_empty());
+    }
     let mut hash = matching_runtime::EventHasher::new();
     for (actual, expected) in replay.executions.iter().zip(&results) {
         assert_eq!(actual.events, expected.events);
@@ -944,6 +1011,15 @@ fn run(group: bool, kill: u8) {
             matching_persistence::FileManifestStorage,
         >::open_recovery(temp.0.join("manifest"))
         .unwrap();
+        assert!(
+            matching_runtime::recover_market_data_from_genesis(
+                temp.0.join("wal"),
+                &manager,
+                &trusted,
+                &[(market, QueuePriorityPolicy::try_new(1).unwrap())],
+            )
+            .is_err()
+        );
         assert!(
             matching_runtime::recover_snapshot_records_with_genesis(
                 temp.0.join("wal"),

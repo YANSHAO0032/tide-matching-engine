@@ -184,6 +184,8 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         .unwrap()
         .unwrap();
     let digest = image.state_digest(1024 * 1024).unwrap();
+    assert_eq!(image.market_event_seq(MarketId(1)), Some(2));
+    assert_eq!(image.market_event_seq(MarketId(2)), Some(2));
     shard.shutdown(Duration::from_secs(5)).unwrap();
     let trusted = matching_runtime::SnapshotRestoreConfig {
         cluster,
@@ -197,6 +199,11 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         max_markets: 2,
         max_bytes: 1024 * 1024,
     };
+    let bytes = image.encode_snapshot(trusted.max_bytes).unwrap();
+    let decoded = matching_runtime::SnapshotImage::decode_snapshot(&bytes, &trusted).unwrap();
+    assert_eq!(decoded.market_event_seq(MarketId(1)), Some(2));
+    assert_eq!(decoded.market_event_seq(MarketId(2)), Some(2));
+    drop(decoded);
     let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(temp.0.join("manifest")).unwrap();
     let replay = matching_runtime::recover_snapshot_records_with_genesis(
         temp.0.join("wal"),
@@ -210,6 +217,35 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
     .replay()
     .unwrap();
     assert_eq!(replay.image.state_digest(1024 * 1024).unwrap(), digest);
+    for market in [MarketId(1), MarketId(2)] {
+        let mut live_projector = matching_runtime::MarketProjector::new(market);
+        let mut replay_projector = matching_runtime::MarketProjector::new(market);
+        let mut builder = matching_runtime::MboBuilder::new(market);
+        for (expected, actual) in live.iter().zip(&replay.executions) {
+            if !matches!(
+                expected.outcome,
+                matching_runtime::FormalOutcome::ShardControl
+            ) && expected
+                .events
+                .first()
+                .is_some_and(|event| event.market_id != Some(market))
+            {
+                continue;
+            }
+            let opened = |_, _| None;
+            let live_source = live_projector
+                .apply_formal_execution(expected, opened)
+                .unwrap();
+            let replay_source = replay_projector
+                .apply_formal_execution(actual, opened)
+                .unwrap();
+            assert_eq!(live_source, replay_source);
+            for event in &live_source {
+                builder.apply(event).unwrap();
+            }
+        }
+        assert!(builder.visible_depth(Side::Sell).unwrap().is_empty());
+    }
     let mut hash = matching_runtime::EventHasher::new();
     assert_eq!(replay.executions.len(), live.len());
     for (actual, expected) in replay.executions.iter().zip(&live) {
@@ -320,6 +356,7 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         accepted.outcome,
         matching_runtime::FormalOutcome::Placed(OrderId(4))
     ));
+    assert_eq!(accepted.market_data_source[&MarketId(1)][0].sequence, 3);
     let mut writer =
         matching_runtime::SnapshotWriter::start(recovered.handle(), snapshots.clone(), 1024 * 1024)
             .unwrap();
@@ -327,6 +364,7 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
+    assert_eq!(checkpoint.market_event_seq(MarketId(1)), Some(3));
     writer
         .submit(2, checkpoint)
         .unwrap()
@@ -336,6 +374,20 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
     writer.shutdown().unwrap();
     recovered.shutdown(Duration::from_secs(5)).unwrap();
     drop(recovered);
+    let manager = matching_persistence::ManifestManager::<
+        matching_persistence::FileManifestStorage,
+    >::open_recovery(temp.0.join("manifest"))
+    .unwrap();
+    assert!(
+        matching_runtime::recover_market_data_from_genesis(
+            temp.0.join("wal"),
+            &manager,
+            &trusted,
+            &policies,
+        )
+        .is_err()
+    );
+    drop(manager);
     drop(replay);
     drop(image);
     let routes = trusted.routes.clone();
@@ -383,6 +435,26 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
             .unwrap()
             .is_some()
     );
+    let cancel = CommandEnvelope {
+        command_id: CommandId(99),
+        session_id: 9,
+        client_seq: 1,
+        market_id: Some(MarketId(1)),
+        user_id: None,
+        route_epoch: Some(1),
+        client_timestamp: None,
+        received_at_unix_ns: None,
+        payload: Command::MassCancelShard(MassCancelShard {
+            scope: ShardCancelScope::Market {
+                market_id: MarketId(1),
+            },
+        }),
+    };
+    let canceled = retry(|| restarted.handle().submit_command(cancel.clone()))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(canceled.market_data_source[&MarketId(1)][0].sequence, 4);
     let (id, action) = ControlCoordinator::shard_kill_subcommand(&next, CommandId(52), true, false);
     let control = CommandEnvelope {
         command_id: id,
@@ -434,6 +506,41 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         max_markets: 2,
         max_bytes: 1024 * 1024,
     };
+    let manager = matching_persistence::ManifestManager::<
+        matching_persistence::FileManifestStorage,
+    >::open_recovery(temp.0.join("manifest"))
+    .unwrap();
+    let records = matching_runtime::recover_snapshot_records_with_genesis(
+        temp.0.join("wal"),
+        &snapshots,
+        &manager,
+        &third_trusted,
+        &policies,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        matching_runtime::recover_snapshot_records_with_genesis(
+            temp.0.join("wal"),
+            &snapshots,
+            &manager,
+            &third_trusted,
+            &policies,
+        )
+        .unwrap()
+        .unwrap()
+        .replay_market_data(MarketId(999))
+        .is_err()
+    );
+    let replayed = records.replay_market_data(MarketId(1)).unwrap();
+    assert_eq!(replayed.events(), canceled.market_data_source[&MarketId(1)]);
+    let mut builder = replayed.initial_builder().clone();
+    for event in replayed.events() {
+        builder.apply(event).unwrap();
+    }
+    assert_eq!(builder.digest(), replayed.final_builder().digest());
+    drop(replayed);
+    drop(manager);
     let mut last = Shard::recover_group_local_with_genesis(
         temp.0.join("wal"),
         temp.0.join("manifest"),
@@ -443,6 +550,12 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         (4, 10_000),
     )
     .unwrap();
+    let restored_image = retry(|| last.handle().take_snapshot(3))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_image.market_event_seq(MarketId(1)), Some(4));
+    drop(restored_image);
     let duplicate = retry(|| last.handle().submit_command(control.clone()))
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
