@@ -820,6 +820,18 @@ pub enum MboChange {
         order_id: OrderId,
     },
 }
+/// 快照中一笔公开可见订单。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MboOrder {
+    /// 订单身份。
+    pub order_id: OrderId,
+    /// 订单方向。
+    pub side: Side,
+    /// 挂单价格。
+    pub price: Price,
+    /// 可见数量。
+    pub visible: Qty,
+}
 /// 恢复或消费时检测到不连续或无效状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MboError {
@@ -829,7 +841,7 @@ pub enum MboError {
     InvalidOrder,
     /// 序号、事件位置或可见数量聚合溢出。
     Overflow,
-    /// 检查点格式、容量、摘要或可信水位不匹配。
+    /// 检查点或逐订单快照的格式、容量、摘要或可信水位不匹配。
     InvalidCheckpoint,
     /// 无法分配有界批次的存储空间。
     Capacity,
@@ -849,6 +861,86 @@ pub struct MboBuilder {
     orders: BTreeMap<OrderId, (Side, Price, Qty, u64)>,
 }
 impl MboBuilder {
+    /// 返回价格优先且同价按挂入次序排列的可见订单。
+    pub fn visible_orders(&self) -> Vec<MboOrder> {
+        let mut entries: Vec<_> = self
+            .orders
+            .iter()
+            .map(|(id, (side, price, visible, arrival))| {
+                (
+                    MboOrder {
+                        order_id: *id,
+                        side: *side,
+                        price: *price,
+                        visible: *visible,
+                    },
+                    *arrival,
+                )
+            })
+            .collect();
+        entries.sort_unstable_by(|(a, aa), (b, ba)| {
+            let sa = match a.side {
+                Side::Buy => 0,
+                Side::Sell => 1,
+            };
+            let sb = match b.side {
+                Side::Buy => 0,
+                Side::Sell => 1,
+            };
+            sa.cmp(&sb)
+                .then_with(|| match a.side {
+                    Side::Buy => b.price.cmp(&a.price),
+                    Side::Sell => a.price.cmp(&b.price),
+                })
+                .then_with(|| aa.cmp(ba))
+        });
+        entries.into_iter().map(|(order, _)| order).collect()
+    }
+    /// 返回此构建器所属市场。
+    pub fn market_id(&self) -> MarketId {
+        self.market
+    }
+    /// 在过滤源事件后的逐订单流中应用下一条消息。
+    pub(crate) fn apply_feed_message(&mut self, message: &MboMessage) -> Result<(), MboError> {
+        if message.market_id != self.market
+            || self.feed.checked_add(1) != Some(message.feed_seq)
+            || message.source_seq <= self.source
+        {
+            return Err(MboError::SourceGap);
+        }
+        let payload = match message.change {
+            MboChange::Added {
+                order_id,
+                side,
+                price,
+                visible,
+            } => SourcePayload::OrderAdded {
+                order_id,
+                side,
+                price,
+                visible,
+            },
+            MboChange::Reduced { order_id, visible } => {
+                SourcePayload::OrderReduced { order_id, visible }
+            }
+            MboChange::Removed { order_id } => SourcePayload::OrderRemoved { order_id },
+        };
+        let mut next = self.clone();
+        next.source = message.source_seq - 1;
+        next.apply(&SourceEvent {
+            market_id: self.market,
+            sequence: message.source_seq,
+            payload,
+        })?;
+        next.visible_depth(Side::Buy)?;
+        next.visible_depth(Side::Sell)?;
+        *self = next;
+        Ok(())
+    }
+    /// 返回已消费的市场源水位和逐订单流水位。
+    pub fn watermarks(&self) -> (u64, u64) {
+        (self.source, self.feed)
+    }
     /// 创建空市场的构建器。
     pub fn new(market: MarketId) -> Self {
         Self {

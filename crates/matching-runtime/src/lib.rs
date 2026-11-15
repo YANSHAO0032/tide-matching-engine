@@ -48,9 +48,13 @@ pub use router::{Router, RouterError};
 mod feeds;
 mod market_data;
 /// 独立公开行情流及其构建器。
-pub use feeds::{BboMessage, BestLevel, FeedBuilder, FeedOutput, MbpMessage, PublicTrade};
+pub use feeds::{
+    BboMessage, BestLevel, FeedBuilder, FeedCursor, FeedOutput, FeedSeqSnapshot, L2Client,
+    L2Snapshot, L3Client, L3Snapshot, MarketMigrationBoundary, MbpMessage, PublicTrade,
+    ResumeError,
+};
 /// 市场行情源与逐订单构建器。
 pub use market_data::{
     MarketDataState, MarketProjector, MarketSource, MboBuilder, MboChange, MboError, MboMessage,
-    SourceEvent, SourcePayload,
+    MboOrder, SourceEvent, SourcePayload,
 };
