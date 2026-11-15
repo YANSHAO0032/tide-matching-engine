@@ -28,8 +28,15 @@ pub enum SourcePayload {
         /// 订单身份。
         order_id: OrderId,
     },
-    /// 真实成交，不产生逐订单消息。
+    /// 不含逻辑时间的兼容成交载荷；不产生逐订单消息，不能用于公开成交构建。
     TradeOccurred(TradeEvent),
+    /// 携带逻辑时间的真实成交；不产生逐订单消息。
+    TimedTradeOccurred {
+        /// 成交详情。
+        trade: TradeEvent,
+        /// 命令执行时的逻辑时间。
+        engine_time: u64,
+    },
     /// 不改变逐订单视图的管理边界。
     Boundary,
 }
@@ -80,8 +87,13 @@ impl SourceEvent {
                     w.u8(3)?;
                     w.u128(order_id.0)?;
                 }
-                SourcePayload::TradeOccurred(trade) => {
-                    w.u8(4)?;
+                SourcePayload::TradeOccurred(trade)
+                | SourcePayload::TimedTradeOccurred { trade, .. } => {
+                    w.u8(if matches!(self.payload, SourcePayload::TradeOccurred(_)) {
+                        4
+                    } else {
+                        6
+                    })?;
                     w.u128(trade.trade_id.0)?;
                     w.u128(trade.maker_order_id.0)?;
                     w.u128(trade.taker_order_id.0)?;
@@ -91,6 +103,9 @@ impl SourceEvent {
                         Side::Buy => 0,
                         Side::Sell => 1,
                     })?;
+                    if let SourcePayload::TimedTradeOccurred { engine_time, .. } = &self.payload {
+                        w.u64(*engine_time)?;
+                    }
                 }
                 SourcePayload::Boundary => w.u8(5)?,
             }
@@ -131,14 +146,24 @@ impl SourceEvent {
                 3 => SourcePayload::OrderRemoved {
                     order_id: OrderId(r.u128()?),
                 },
-                4 => SourcePayload::TradeOccurred(TradeEvent {
-                    trade_id: matching_domain::TradeId(r.u128()?),
-                    maker_order_id: OrderId(r.u128()?),
-                    taker_order_id: OrderId(r.u128()?),
-                    price: Price::try_new(r.i64()?).map_err(|_| SnapshotWireError)?,
-                    qty: Qty::try_new(r.u64()?).map_err(|_| SnapshotWireError)?,
-                    maker_side: side(r.u8()?)?,
-                }),
+                tag @ (4 | 6) => {
+                    let trade = TradeEvent {
+                        trade_id: matching_domain::TradeId(r.u128()?),
+                        maker_order_id: OrderId(r.u128()?),
+                        taker_order_id: OrderId(r.u128()?),
+                        price: Price::try_new(r.i64()?).map_err(|_| SnapshotWireError)?,
+                        qty: Qty::try_new(r.u64()?).map_err(|_| SnapshotWireError)?,
+                        maker_side: side(r.u8()?)?,
+                    };
+                    if tag == 4 {
+                        SourcePayload::TradeOccurred(trade)
+                    } else {
+                        SourcePayload::TimedTradeOccurred {
+                            trade,
+                            engine_time: r.u64()?,
+                        }
+                    }
+                }
                 5 => SourcePayload::Boundary,
                 _ => return Err(SnapshotWireError),
             };
@@ -489,7 +514,8 @@ impl MarketProjector {
             payloads.push(event.payload.clone());
             original_indices.push(index);
         }
-        self.apply_engine_events_with_child_opens(
+        let mut candidate = self.clone();
+        let mut result = candidate.apply_engine_events_with_child_opens(
             &payloads,
             &execution.market_data_child_opens,
             |index, id| {
@@ -498,7 +524,18 @@ impl MarketProjector {
                     .copied()
                     .or_else(|| opened(original_indices[index], id))
             },
-        )
+        )?;
+        let engine_time = identity.map(|(_, _, time)| time);
+        for event in &mut result {
+            if let SourcePayload::TradeOccurred(trade) = &event.payload {
+                event.payload = SourcePayload::TimedTradeOccurred {
+                    trade: trade.clone(),
+                    engine_time: engine_time.ok_or(MboError::InvalidSource)?,
+                };
+            }
+        }
+        *self = candidate;
+        Ok(result)
     }
     /// 查询当前候选中的订单方向、价格和可见量。
     pub fn visible_order(&self, id: OrderId) -> Option<(Side, Price, Qty)> {
@@ -531,6 +568,7 @@ impl MarketProjector {
         })
     }
     /// 将止损候选提供的中间挂单轨迹插入对应事件位置，再以同一原子候选投影。
+    /// 输入不含事件信封，因此成交源载荷不含逻辑时间。
     pub fn apply_engine_events_with_child_opens<F>(
         &mut self,
         events: &[matching_domain::EngineEvent],
@@ -589,6 +627,7 @@ impl MarketProjector {
         })
     }
     /// 按事件原序投影，在全部检查通过后安装候选；挂单详情必须对应事件位置并来自可信候选。
+    /// 输入不含事件信封，因此成交源载荷不含逻辑时间；正式执行入口另行补入信封时间。
     pub fn apply_engine_events<F>(
         &mut self,
         events: &[matching_domain::EngineEvent],
@@ -794,7 +833,7 @@ pub enum MboError {
     InvalidCheckpoint,
     /// 无法分配有界批次的存储空间。
     Capacity,
-    /// 行情源编码、字段或容量无效。
+    /// 行情源编码或字段无效，或者无法构造完整公开行情。
     InvalidSource,
 }
 /// 逐订单构建器的完整进程内状态。
@@ -1007,7 +1046,9 @@ impl MboBuilder {
                     order_id: *order_id,
                 })
             }
-            SourcePayload::TradeOccurred(_) | SourcePayload::Boundary => None,
+            SourcePayload::TradeOccurred(_)
+            | SourcePayload::TimedTradeOccurred { .. }
+            | SourcePayload::Boundary => None,
         };
         let feed = if change.is_some() {
             self.feed.checked_add(1).ok_or(MboError::Overflow)?

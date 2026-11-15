@@ -656,6 +656,38 @@ fn signed_orders_replay(group: bool) {
     assert_eq!(replay.executions[7].events, stp_maker.events);
     assert_eq!(replay.executions[8].events, stp_taker.events);
     assert_eq!(replay.image.state_digest(1024 * 1024).unwrap(), digest);
+    let mut live_feed = matching_runtime::FeedBuilder::new(market);
+    let mut replay_feed = matching_runtime::FeedBuilder::new(market);
+    let live = [
+        &updated, &maker, &maker2, &updated2, &rejected, &taker, &updated3, &stp_maker, &stp_taker,
+    ];
+    let mut trades = Vec::new();
+    for (expected, recovered) in live.into_iter().zip(&replay.executions) {
+        let source = expected
+            .market_data_source
+            .get(&market)
+            .into_iter()
+            .flatten();
+        let recovered_source = recovered
+            .market_data_source
+            .get(&market)
+            .into_iter()
+            .flatten();
+        assert_eq!(expected.market_data_source, recovered.market_data_source);
+        for (a, b) in source.zip(recovered_source) {
+            let output = live_feed.apply(a).unwrap();
+            assert_eq!(output, replay_feed.apply(b).unwrap());
+            if let Some(trade) = output.trade {
+                trades.push(trade);
+            }
+        }
+    }
+    assert_eq!(live_feed, replay_feed);
+    assert_eq!(trades.len(), 2);
+    for (index, trade) in trades.iter().enumerate() {
+        assert_eq!(trade.feed_seq, index as u64 + 1);
+        assert_eq!(trade.engine_time, taker.events[0].engine_time);
+    }
     let mut hash = matching_runtime::EventHasher::new();
     for event in updated
         .events
