@@ -45,7 +45,10 @@ mod router;
 /// 基于显式快照的多分片路由及其错误。
 pub use router::{Router, RouterError};
 
+mod feeds;
 mod market_data;
+/// 独立公开行情流及其构建器。
+pub use feeds::{BboMessage, BestLevel, FeedBuilder, FeedOutput, MbpMessage, PublicTrade};
 /// 市场行情源与逐订单构建器。
 pub use market_data::{
     MarketDataState, MarketProjector, MarketSource, MboBuilder, MboChange, MboError, MboMessage,

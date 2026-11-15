@@ -73,7 +73,7 @@ impl ProductionOrderBook {
     ///
     /// # 不变量断言
     ///
-    /// TradeId 数量不足或内部簿结构损坏时，在提交前故障时停止处理。
+    /// TradeId 数量不足或内部簿结构损坏时，在提交前停止处理。
     /// TradeId 的全局唯一性由调用方保证，多余标识符不使用。
     pub fn place_limit_ioc(
         &mut self,
@@ -93,7 +93,7 @@ impl ProductionOrderBook {
     ///
     /// # 不变量断言
     ///
-    /// 完整成交需要的 TradeId 不足或内部簿结构损坏时，在提交前故障时停止处理。
+    /// 完整成交需要的 TradeId 不足或内部簿结构损坏时，在提交前停止处理。
     /// TradeId 的全局唯一性由调用方保证，多余标识符不使用。
     pub fn place_limit_fok(
         &mut self,

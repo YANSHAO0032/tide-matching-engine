@@ -976,6 +976,8 @@ fn run(group: bool, kill: u8) {
         let mut replay_projector = matching_runtime::MarketProjector::new(market);
         let mut live_builder = matching_runtime::MboBuilder::new(market);
         let mut replay_builder = matching_runtime::MboBuilder::new(market);
+        let mut live_feeds = matching_runtime::FeedBuilder::new(market);
+        let mut replay_feeds = matching_runtime::FeedBuilder::new(market);
         let detail = |_, _| None;
         for (live, recovered) in results.iter().zip(&replay.executions) {
             let live_events = live_projector.apply_formal_execution(live, detail).unwrap();
@@ -988,9 +990,17 @@ fn run(group: bool, kill: u8) {
                     live_builder.apply(a).unwrap(),
                     replay_builder.apply(b).unwrap()
                 );
+                assert_eq!(live_feeds.apply(a).unwrap(), replay_feeds.apply(b).unwrap());
             }
         }
         assert_eq!(live_builder.digest(), replay_builder.digest());
+        assert_eq!(live_feeds, replay_feeds);
+        for side in [Side::Buy, Side::Sell] {
+            assert_eq!(
+                live_feeds.depth(side),
+                live_builder.visible_depth(side).unwrap()
+            );
+        }
         assert!(live_builder.visible_depth(Side::Buy).unwrap().is_empty());
     }
     let mut hash = matching_runtime::EventHasher::new();
