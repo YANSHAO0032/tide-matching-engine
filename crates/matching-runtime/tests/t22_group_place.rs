@@ -415,13 +415,58 @@ fn group_place_and_mass_cancel_write_before_reply() {
     if let Command::PlaceLimit(place) = &mut next.payload {
         place.client_order_id = Some("client-4".into());
     }
+    // 断连恢复可能遇到已经入队但尚未读取回复的旧会话命令。
+    let next_reply = retry(|| restarted.handle().submit_command(next.clone()));
+    let session_path = base.join("group-session.log");
+    let mut session = matching_runtime::SessionControlJournal::create(
+        &session_path,
+        UserId(7),
+        matching_domain::OriginSessionId(11),
+        99,
+        vec![matching_runtime::SessionTarget {
+            market,
+            route_epoch: 1,
+            command_id: CommandId(5),
+        }],
+        1,
+    )
+    .unwrap();
+    session.disconnect().unwrap();
+    let result = matching_runtime::dispatch_session_cancel(
+        &mut session,
+        market,
+        &restarted.handle(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
     assert_eq!(
-        retry(|| restarted.handle().submit_command(next.clone()))
+        next_reply
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap()
             .seq,
         4
     );
+    assert_eq!(result.canceled_orders, 1);
+    let after = retry(|| restarted.handle().take_snapshot(3))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let after_digest = after.state_digest(1024 * 1024).unwrap();
     restarted.shutdown(Duration::from_secs(5)).unwrap();
+    let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(base.join("manifest")).unwrap();
+    let replay = matching_runtime::recover_snapshot_records(
+        base.join("wal"),
+        &snapshot_dir,
+        &manager,
+        &restore,
+    )
+    .unwrap()
+    .unwrap()
+    .replay()
+    .unwrap();
+    assert_eq!(
+        replay.image.state_digest(1024 * 1024).unwrap(),
+        after_digest
+    );
 }

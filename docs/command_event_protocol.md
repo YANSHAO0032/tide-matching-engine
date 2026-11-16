@@ -6,7 +6,8 @@
 
 | 命令或范围 | 当前支持 |
 |---|---|
-| 市场范围 `MassCancelShard` | 在持有真实 `ReservationRegistry` 的分片中执行；`market_id`、scope 市场和路由版本须一致，当前仅支持无 envelope 用户身份的市场范围。 |
+| 市场范围 `MassCancelShard` | 在持有真实 `ReservationRegistry` 的分片中执行；`market_id`、scope 市场和路由版本须一致，envelope 用户身份须为空。 |
+| 来源会话范围 `MassCancelShard` | 可信控制调用方指定单市场路由；按用户和持久来源会话筛选该市场订单，envelope 用户身份须为空。持久目标与重试边界见[网关说明](gateway.md)。 |
 | 其他 MassCancel 范围 | 未通过正式入口开放；跨市场和用户控制须等待相应路由及控制契约。 |
 | 普通限价 GTC / PostOnly | 使用可信市场资金策略、签名密钥和容量配置；不支持正式市价、IOC/FOK、冰山或 Stop 下单。市场存在未触发 Stop 时拒绝此下单。 |
 | 用户控制 FenceOnly | 校验期望主节点 epoch，更新本分片用户下限；FenceAndCancelAll 当前拒绝。 |

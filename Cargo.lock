@@ -248,6 +248,7 @@ dependencies = [
  "matching-domain",
  "matching-orderbook",
  "matching-persistence",
+ "matching-protocol",
  "matching-risk",
  "same-file",
  "sha2",

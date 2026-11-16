@@ -448,6 +448,8 @@ impl Default for ShardConfig {
 
 /// 分片入口与线程所有权；订单簿仅存在于工作线程中。
 pub struct Shard {
+    /// 正式业务入口是否在回复前完成本地持久提交。
+    durable_formal: bool,
     /// 当前工作线程专属的快照来源凭据。
     snapshot_origin: Arc<()>,
     /// 限制本分片同时存在的快照后台写入器数量。
@@ -660,6 +662,7 @@ impl Shard {
     /// 创建可并发克隆的外部生产者句柄。
     pub fn handle(&self) -> ShardHandle {
         ShardHandle {
+            durable_formal: self.durable_formal,
             snapshot_origin: Arc::clone(&self.snapshot_origin),
             snapshot_writer_active: Arc::clone(&self.snapshot_writer_active),
             producer: self.producer.clone(),
@@ -1409,6 +1412,7 @@ impl Shard {
         let worker_failed = Arc::clone(&failed);
         let drop_requested = Arc::new(AtomicBool::new(false));
         let worker_drop = Arc::clone(&drop_requested);
+        let durable_formal = durable.is_some() && place_state.is_some();
         let join = thread::spawn(move || {
             // 所有权与工作线程同寿命，排空后才释放。
             let _ownership = ownership;
@@ -1724,6 +1728,7 @@ impl Shard {
         });
         let thread = join.thread().clone();
         Ok(Self {
+            durable_formal,
             snapshot_origin,
             snapshot_writer_active,
             producer,
@@ -3954,8 +3959,7 @@ fn execute_formal_guarded(
     let Command::MassCancelShard(ref input) = command.payload else {
         return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
     };
-    if input.scope != (ShardCancelScope::Market { market_id: market }) || command.user_id.is_some()
-    {
+    if !valid_market_cancel_scope(input.scope, market, command.user_id) {
         return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
     }
     let reason = match managed.get(&market) {
@@ -4082,6 +4086,20 @@ fn execute_formal_idempotent(
     Ok(result)
 }
 
+/// 仅允许可信控制入口按市场执行本市场撤单或指定用户来源会话撤单。
+fn valid_market_cancel_scope(
+    scope: ShardCancelScope,
+    market: MarketId,
+    user: Option<matching_domain::UserId>,
+) -> bool {
+    user.is_none()
+        && match scope {
+            ShardCancelScope::Market { market_id } => market_id == market,
+            ShardCancelScope::Session { .. } => true,
+            _ => false,
+        }
+}
+
 /// 在候选状态中完成业务执行及事件封装。
 fn execute_formal(
     routes: &RouteTable,
@@ -4100,8 +4118,7 @@ fn execute_formal(
     let Command::MassCancelShard(input) = command.payload else {
         return Err(RejectReason::InvalidOrderCombination);
     };
-    if input.scope != (ShardCancelScope::Market { market_id: market }) || command.user_id.is_some()
-    {
+    if !valid_market_cancel_scope(input.scope, market, command.user_id) {
         return Err(RejectReason::InvalidOrderCombination);
     }
     let book = markets
@@ -4222,6 +4239,8 @@ fn event_count_fits(count: u64, capacity: u64) -> bool {
 /// 可克隆的有界生产者，只能投递消息，不可访问撮合状态。
 #[derive(Clone)]
 pub struct ShardHandle {
+    /// 该入口是否提供正式命令的本地持久回复。
+    durable_formal: bool,
     /// 用于验证镜像来自本工作线程的凭据。
     snapshot_origin: Arc<()>,
     /// 当前分片写入器持有标志。
@@ -4239,6 +4258,10 @@ pub struct ShardHandle {
 }
 
 impl ShardHandle {
+    /// 会话协调仅能使用带持久正式业务入口的句柄。
+    pub(crate) fn has_durable_formal(&self) -> bool {
+        self.durable_formal
+    }
     /// 读取句柄归属分片。
     pub(crate) fn shard_id(&self) -> ShardId {
         self.shard_id
