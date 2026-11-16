@@ -106,6 +106,57 @@ fn sync_failure_halts_future_appends_without_advancing_commit() {
     assert!(batch.append_at(&record(1), Instant::now()).is_err());
     assert_eq!(batch.committed(), 0);
     assert!(batch.append_at(&record(2), Instant::now()).is_err());
+    let metrics = batch.metrics();
+    assert_eq!(metrics.append().buckets.iter().sum::<u64>(), 1);
+    assert_eq!(metrics.sync().buckets.iter().sum::<u64>(), 1);
+    assert!(!metrics.sync().overflow);
+}
+
+#[test]
+fn group_commit_metrics_follow_real_nonempty_batches_and_failed_syncs() {
+    let mut batch = DurableBatcher::new_with_config(
+        Appender::default(),
+        config(
+            DurabilityMode::GroupCommit {
+                max_batch: 2,
+                max_delay_micros: 100,
+            },
+            ReplicationMode::LocalDurable,
+        ),
+        1,
+    )
+    .unwrap();
+    let metrics = batch.metrics();
+    let now = Instant::now();
+    batch.flush().unwrap();
+    batch.append_at(&record(1), now).unwrap();
+    assert_eq!(metrics.batch_size().buckets.iter().sum::<u64>(), 0);
+    batch.append_at(&record(2), now).unwrap();
+    batch.append_at(&record(3), now).unwrap();
+    batch.flush().unwrap();
+    let sizes = metrics.batch_size();
+    assert_eq!(sizes.buckets.iter().sum::<u64>(), 2);
+    assert_eq!(sizes.sum, 3);
+    assert_eq!(metrics.batch_wait().buckets.iter().sum::<u64>(), 2);
+    let mut failed = DurableBatcher::new_with_config(
+        Appender {
+            fail_sync: true,
+            ..Appender::default()
+        },
+        config(
+            DurabilityMode::GroupCommit {
+                max_batch: 1,
+                max_delay_micros: 100,
+            },
+            ReplicationMode::LocalDurable,
+        ),
+        1,
+    )
+    .unwrap();
+    let failed_metrics = failed.metrics();
+    assert!(failed.append_at(&record(1), now).is_err());
+    assert_eq!(failed_metrics.batch_size().sum, 1);
+    assert_eq!(failed_metrics.batch_wait().buckets.iter().sum::<u64>(), 1);
 }
 
 #[test]

@@ -137,6 +137,15 @@ pub struct ProductionOrderBook {
 }
 
 impl ProductionOrderBook {
+    /// 返回普通与未触发止损订单总数及普通买卖价档总数。
+    ///
+    /// 只读取容器长度；数量不可表示时返回 `None`。
+    pub fn observation_counts(&self) -> Option<(usize, usize)> {
+        Some((
+            self.orders.len().checked_add(self.stop_book.len())?,
+            self.bids.len().checked_add(self.asks.len())?,
+        ))
+    }
     /// 返回当前市场普通及 Stop 优先级分配器共用的策略。
     pub fn priority_policy(&self) -> QueuePriorityPolicy {
         *self.queue_priority_allocator.policy()

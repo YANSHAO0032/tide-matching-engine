@@ -59,6 +59,46 @@ fn journal(path: &std::path::Path) -> SessionControlJournal {
 }
 
 #[test]
+fn failed_authentication_is_audited_without_credentials_and_audit_failure_is_visible() {
+    let dir = t22_support::TestDirectory::new();
+    let path = dir.0.join("auth-audit.log");
+    let mut audit = matching_runtime::AuditLog::create(&path, 1).unwrap();
+    let failed = GatewaySession::open_audited(
+        &Auth,
+        7,
+        b"sensitive-password",
+        journal(&dir.0.join("auth-a.log")),
+        (2, 32),
+        &mut audit,
+        123,
+    );
+    assert!(matches!(failed, Err(GatewayError::Unauthorized)));
+    assert_eq!(
+        audit.records()[0].action,
+        matching_runtime::AuditAction::AuthenticationFailure
+    );
+    assert_eq!(audit.records()[0].command_id, 123);
+    drop(audit);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        !bytes
+            .windows(b"sensitive-password".len())
+            .any(|x| x == b"sensitive-password")
+    );
+    let mut audit = matching_runtime::AuditLog::open(&path, 1).unwrap();
+    let failed = GatewaySession::open_audited(
+        &Auth,
+        7,
+        b"wrong",
+        journal(&dir.0.join("auth-b.log")),
+        (2, 32),
+        &mut audit,
+        124,
+    );
+    assert!(matches!(failed, Err(GatewayError::Journal(_))));
+}
+
+#[test]
 fn authentication_and_idempotency_are_checked_before_risk_authorization() {
     let dir = t22_support::TestDirectory::new();
     let session = journal(&dir.0.join("bad.log"));

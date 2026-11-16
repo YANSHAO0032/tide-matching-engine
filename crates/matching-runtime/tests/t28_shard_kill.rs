@@ -31,7 +31,9 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
     let cluster = ClusterId(41);
     let shard_id = ShardId(41);
     let store = ControlStore::new(temp.0.join("primary.lease"), cluster, shard_id);
-    let lease = std::sync::Arc::new(store.acquire_primary().unwrap());
+    let mut audit =
+        matching_runtime::AuditLog::create(temp.0.join("control-audit.log"), 6).unwrap();
+    let lease = std::sync::Arc::new(audit.acquire_primary(12, 900, &store).unwrap());
     let epoch = lease.epoch();
     let routes = RouteTable::new([
         MarketRoute {
@@ -76,6 +78,15 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         ((temp.0.join("wal"), temp.0.join("manifest")), (4, 10_000)),
     )
     .unwrap();
+    let health = matching_runtime::Health::new_primary(vec![shard.handle()]).unwrap();
+    for dependency in [
+        matching_runtime::HealthDependency::Recovery,
+        matching_runtime::HealthDependency::Persistence,
+        matching_runtime::HealthDependency::Control,
+    ] {
+        health.set_healthy(dependency, true);
+    }
+    assert!(health.ready());
     let mut live = Vec::new();
     for (id, market) in [(1_u128, MarketId(2)), (2, MarketId(1))] {
         let user = UserId(id as u64);
@@ -143,10 +154,22 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         received_at_unix_ns: None,
         payload: Command::ShardKillSwitch(action),
     };
-    let killed = retry(|| shard.handle().submit_command(control.clone()))
-        .recv_timeout(Duration::from_secs(5))
+    let killed = audit
+        .dispatch(12, &shard.handle(), control.clone(), Duration::from_secs(5))
         .unwrap()
         .unwrap();
+    assert_eq!(audit.records()[1].primary_epoch, Some(epoch));
+    assert_eq!(audit.records()[2].primary_epoch, Some(epoch));
+    assert_eq!(audit.records()[2].scope, Some((cluster.0, shard_id.0)));
+    assert_eq!(
+        audit.records()[2].action,
+        matching_runtime::AuditAction::KillSwitch
+    );
+    assert_eq!(
+        audit.records()[3].outcome,
+        matching_runtime::AuditOutcome::Succeeded
+    );
+    assert!(!health.ready());
     let cancellations: Vec<_> = killed
         .events
         .iter()
@@ -187,6 +210,7 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
     assert_eq!(image.market_event_seq(MarketId(1)), Some(2));
     assert_eq!(image.market_event_seq(MarketId(2)), Some(2));
     shard.shutdown(Duration::from_secs(5)).unwrap();
+    assert!(!health.ready());
     let trusted = matching_runtime::SnapshotRestoreConfig {
         cluster,
         shard: shard_id,
@@ -265,6 +289,15 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         (4, 10_000),
     )
     .unwrap();
+    let recovered_health = matching_runtime::Health::new_primary(vec![recovered.handle()]).unwrap();
+    for dependency in [
+        matching_runtime::HealthDependency::Recovery,
+        matching_runtime::HealthDependency::Persistence,
+        matching_runtime::HealthDependency::Control,
+    ] {
+        recovered_health.set_healthy(dependency, true);
+    }
+    assert!(!recovered_health.ready());
     let mut token = ReservationToken {
         token_id: 3,
         command_id: CommandId(3),
@@ -331,10 +364,25 @@ fn shard_kill_cancels_markets_in_order_and_replays() {
         received_at_unix_ns: None,
         payload: Command::ShardKillSwitch(clear),
     };
-    retry(|| recovered.handle().submit_command(clear.clone()))
-        .recv_timeout(Duration::from_secs(5))
+    audit
+        .dispatch(
+            12,
+            &recovered.handle(),
+            clear.clone(),
+            Duration::from_secs(5),
+        )
         .unwrap()
         .unwrap();
+    assert_eq!(audit.records()[4].primary_epoch, Some(epoch));
+    assert_eq!(
+        audit.records()[4].action,
+        matching_runtime::AuditAction::KillSwitch
+    );
+    assert_eq!(
+        audit.records()[5].outcome,
+        matching_runtime::AuditOutcome::Succeeded
+    );
+    assert!(recovered_health.ready());
     let mut accepted = order;
     accepted.command_id = CommandId(4);
     accepted.client_seq = 2;

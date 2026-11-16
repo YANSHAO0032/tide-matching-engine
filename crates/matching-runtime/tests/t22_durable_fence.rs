@@ -182,6 +182,16 @@ fn append_error_stops_shard_without_reply_or_followup_acceptance() {
         base.join("manifest"),
     )
     .unwrap();
+    let health = matching_runtime::Health::new(vec![shard.handle()]).unwrap();
+    assert_eq!(health.durability(), "local");
+    for dependency in [
+        matching_runtime::HealthDependency::Recovery,
+        matching_runtime::HealthDependency::Persistence,
+        matching_runtime::HealthDependency::Control,
+    ] {
+        health.set_healthy(dependency, true);
+    }
+    assert!(health.ready());
     std::fs::write(
         base.join("wal").join("00000000000000000001.wal"),
         b"collision",
@@ -206,6 +216,25 @@ fn append_error_stops_shard_without_reply_or_followup_acceptance() {
     };
     let reply = retry(|| shard.handle().submit_command(command.clone()));
     assert!(reply.recv_timeout(Duration::from_secs(5)).is_err());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while health.ready() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(!health.ready());
+    assert!(!health.live());
+    let diagnostics = shard.handle().take_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].kind,
+        matching_runtime::DiagnosticKind::WalCommit
+    );
+    assert_eq!(
+        (diagnostics[0].cluster_id, diagnostics[0].shard_id),
+        (ClusterId(2), ShardId(2))
+    );
+    assert_eq!(diagnostics[0].command_id, Some(CommandId(3)));
+    assert_eq!(diagnostics[0].shard_seq, Some(1));
+    assert!(diagnostics[0].io_kind.is_some());
     match shard.handle().barrier(0) {
         Err(_) => {}
         Ok(reply) => assert!(reply.recv_timeout(Duration::from_secs(5)).is_err()),
@@ -455,6 +484,15 @@ fn group_wal_failure_closes_all_waiters_and_shard() {
         (8, 100_000),
     )
     .unwrap();
+    let health = matching_runtime::Health::new(vec![shard.handle()]).unwrap();
+    for dependency in [
+        matching_runtime::HealthDependency::Recovery,
+        matching_runtime::HealthDependency::Persistence,
+        matching_runtime::HealthDependency::Control,
+    ] {
+        health.set_healthy(dependency, true);
+    }
+    assert!(health.ready());
     std::fs::write(
         temp.0.join("wal").join("00000000000000000001.wal"),
         b"collision",
@@ -479,6 +517,21 @@ fn group_wal_failure_closes_all_waiters_and_shard() {
     };
     let one = retry(|| shard.handle().submit_command(command.clone()));
     assert!(one.recv_timeout(Duration::from_secs(5)).is_err());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while health.ready() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(!health.ready());
+    assert!(!health.live());
+    let diagnostics = shard.handle().take_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].kind,
+        matching_runtime::DiagnosticKind::WalAppend
+    );
+    assert_eq!(diagnostics[0].command_id, Some(CommandId(1)));
+    assert_eq!(diagnostics[0].shard_seq, Some(1));
+    assert!(diagnostics[0].io_kind.is_some());
     match shard.handle().barrier(9) {
         Err(_) => {}
         Ok(reply) => assert!(reply.recv_timeout(Duration::from_secs(5)).is_err()),
@@ -733,6 +786,7 @@ fn snapshot_barrier_flushes_group_and_captures_fence_and_dedup() {
     );
     let directory = temp.0.join("snapshot");
     std::fs::create_dir(&directory).unwrap();
+    let health = matching_runtime::Health::new(vec![shard.handle()]).unwrap();
     let mut writer =
         matching_runtime::SnapshotWriter::start(shard.handle(), directory.clone(), 1024 * 1024)
             .unwrap();
@@ -767,6 +821,9 @@ fn snapshot_barrier_flushes_group_and_captures_fence_and_dedup() {
             .unwrap()
             .is_err()
     );
+    let metrics = health.prometheus().unwrap();
+    assert!(metrics.contains("engine_snapshot_duration_ms_count 3\n"));
+    assert!(metrics.contains("engine_snapshot_failures_total 2\n"));
     assert_eq!(
         retry(|| shard.handle().barrier(94))
             .recv_timeout(Duration::from_secs(5))

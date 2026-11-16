@@ -463,6 +463,25 @@ pub struct FeedBuilder {
 }
 
 impl FeedBuilder {
+    /// 读取构建器所属市场，不修改行情状态。
+    pub fn market_id(&self) -> MarketId {
+        self.market
+    }
+
+    /// 读取同一构建器切面的源序号及各独立行情流水位。
+    pub fn watermarks(&self) -> (u64, FeedSeqSnapshot) {
+        let (source, mbo) = self.mbo.watermarks();
+        (
+            source,
+            FeedSeqSnapshot {
+                mbo,
+                mbp: self.mbp_seq,
+                bbo: self.bbo_seq,
+                trade: self.trade_seq,
+            },
+        )
+    }
+
     /// 将检查点写入独占目录中的新文件并同步。
     /// 调用方须保证状态来自已提交源，并在写入成功后登记可信身份和水位。
     pub fn write_checkpoint_file(

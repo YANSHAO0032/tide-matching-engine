@@ -78,6 +78,7 @@ impl SnapshotWriter {
                 let _lease = lease;
                 let _lock = lock;
                 while let Ok(request) = receiver.recv() {
+                    let started = Instant::now();
                     let result = (|| {
                         if request.image.shard != handle.shard_id
                             || request
@@ -119,6 +120,9 @@ impl SnapshotWriter {
                             .recv()
                             .map_err(|_| std::io::Error::other("清单写者退出"))?
                     })();
+                    handle
+                        .metrics
+                        .observe_snapshot(started.elapsed(), result.is_err());
                     let _ = request.reply.send(result);
                 }
             })?;

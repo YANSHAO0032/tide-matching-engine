@@ -20,6 +20,10 @@ pub enum GatewayTransportError {
     ResponseUnknown,
     /// 网关共享状态锁已损坏，不能继续准入。
     SharedState,
+    /// 已提交结果的外围交接失败；命令结果必须按原身份核对。
+    Delivery(io::Error),
+    /// 健康检查与网关的分片集合不一致。
+    HealthConfiguration,
     /// 会话撤单未完成；日志保留未确认目标。
     Disconnect(crate::SessionDispatchError),
     /// 同时发生原始处理错误和断连清理错误。
@@ -71,6 +75,8 @@ pub struct GatewayTransport<'a, A, R> {
     pub session: &'a mut crate::GatewaySession,
     /// 跨连接共用的本机意图表与分层限流器。
     pub shared: &'a GatewayShared,
+    /// 所有连接共用的节点健康检查，失去就绪时禁止新的业务准入。
+    pub health: &'a crate::Health,
     /// 所有持久目标分片的消息句柄。
     pub shards: &'a [crate::ShardHandle],
     /// 包含头部和校验码的最大帧长度。
@@ -90,7 +96,23 @@ where
 {
     /// 处理完整请求帧，连接结束或出错后总是尝试排空并执行断连策略。
     pub fn serve(&mut self, stream: &mut (impl Read + Write)) -> Result<(), GatewayTransportError> {
-        let result = self.receive_loop(stream);
+        self.serve_with(stream, |_| Ok(()))
+    }
+
+    /// 在连接线程交接已提交结果后再回复；交接失败时结果未知且结束连接。
+    ///
+    /// 回调不在分片线程执行，调用方负责有界背压、跨连接排序和失败恢复。
+    /// 此回调不是持久事件日志，发生失败或进程崩溃须从权威持久前缀恢复。
+    pub fn serve_with(
+        &mut self,
+        stream: &mut (impl Read + Write),
+        mut on_committed: impl FnMut(&crate::FormalExecution) -> io::Result<()>,
+    ) -> Result<(), GatewayTransportError> {
+        let result = if self.health.covers(self.shards) {
+            self.receive_loop(stream, &mut on_committed)
+        } else {
+            Err(GatewayTransportError::HealthConfiguration)
+        };
         let cleanup = self.cleanup();
         match (result, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
@@ -136,6 +158,7 @@ where
     fn receive_loop(
         &mut self,
         stream: &mut (impl Read + Write),
+        on_committed: &mut impl FnMut(&crate::FormalExecution) -> io::Result<()>,
     ) -> Result<(), GatewayTransportError> {
         loop {
             let mut header = [0_u8; matching_protocol::HEADER_LEN];
@@ -160,6 +183,10 @@ where
                 .map_err(GatewayTransportError::Io)?;
             let frame = matching_protocol::decode_frame(&bytes, self.max_frame)
                 .map_err(GatewayTransportError::Frame)?;
+            if !self.health.ready() {
+                self.reject_not_ready(stream, frame.request_id)?;
+                continue;
+            }
             let allocation = &mut self.allocate;
             let prepared = {
                 let mut state = self
@@ -271,18 +298,24 @@ where
                     .client_seq(prepared.command_id())
                     .ok_or(GatewayTransportError::Outcome)?;
                 let now = (state.now)();
-                self.session.submit_place(
-                    &prepared,
-                    token,
-                    client_seq,
-                    &mut state.limits,
-                    now,
-                    shard,
-                )
+                self.health.admit(|| {
+                    self.session.submit_place(
+                        &prepared,
+                        token,
+                        client_seq,
+                        &mut state.limits,
+                        now,
+                        shard,
+                    )
+                })
             };
             let reply = match submitted {
-                Ok(receiver) => receiver,
-                Err(error) => {
+                Some(Ok(receiver)) => receiver,
+                None => {
+                    self.reject_not_ready(stream, request_id)?;
+                    continue;
+                }
+                Some(Err(error)) => {
                     if let Some(reason) = error.ingress_reason() {
                         let bytes = matching_protocol::encode_rejection(
                             request_id,
@@ -317,6 +350,14 @@ where
                 }
                 Err(error) => return Err(GatewayTransportError::Formal(error)),
             };
+            let delivery =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_committed(&result)))
+                    .unwrap_or_else(|_| Err(io::Error::other("事件交接异常")));
+            if let Err(error) = delivery {
+                self.health
+                    .set_healthy(crate::HealthDependency::Persistence, false);
+                return Err(GatewayTransportError::Delivery(error));
+            }
             match result.outcome {
                 crate::FormalOutcome::Placed(order_id) => {
                     let bytes = matching_protocol::encode_acceptance(
@@ -347,5 +388,22 @@ where
                 _ => return Err(GatewayTransportError::Outcome),
             }
         }
+    }
+
+    /// 对尚未进入分片的未就绪请求返回稳定过载原因。
+    ///
+    /// 初次检查发生在登记意图前；最终准入检查可能发生在登记意图后。
+    fn reject_not_ready(
+        &self,
+        stream: &mut impl Write,
+        request_id: u64,
+    ) -> Result<(), GatewayTransportError> {
+        let reply = matching_protocol::encode_rejection(
+            request_id,
+            matching_protocol::ReasonCode::new(matching_domain::RejectReason::EngineBusy as u16),
+            self.max_frame,
+        )
+        .map_err(|_| GatewayTransportError::Outcome)?;
+        stream.write_all(&reply).map_err(GatewayTransportError::Io)
     }
 }
