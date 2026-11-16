@@ -58,3 +58,25 @@ pub use market_data::{
     MarketDataState, MarketProjector, MarketSource, MboBuilder, MboChange, MboError, MboMessage,
     MboOrder, SourceEvent, SourcePayload,
 };
+
+mod session_control;
+/// 本机会话断连意图及其持久目标。
+pub use session_control::{
+    SessionControlJournal, SessionDispatchError, SessionTarget, dispatch_session_cancel,
+    dispatch_session_cancels,
+};
+
+mod gateway;
+/// 网关会话认证和限价意图准入。
+pub use gateway::{
+    GatewayAuthenticator, GatewayError, GatewayPrincipal, GatewaySession, PlaceIntent,
+    PreparedPlace,
+};
+
+mod gateway_intents;
+/// 本机持久网关意图身份表。
+pub use gateway_intents::GatewayIntentStore;
+
+mod gateway_transport;
+/// 已认证连接的同步有界帧适配器。
+pub use gateway_transport::{GatewayShared, GatewayTransport, GatewayTransportError};

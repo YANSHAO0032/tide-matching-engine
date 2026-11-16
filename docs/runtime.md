@@ -31,7 +31,7 @@
 
 `order` 在工作线程处理该消息的位置读取，因此能看到其前面已处理的变更，不能看到排在其后的变更。屏障确认此前入队的消息已处理并已尝试回复，不代表调用方已经读取响应。水位是此前已完成且已分配的最大进程内变更序号；路由等前置拒绝不占序号，进入业务执行后的拒绝占序号；`0` 表示尚未分配。水位不表示磁盘持久化。未实现的批量查询和在线摘要控制消息不返回虚假的空结果；快照镜像可计算状态摘要；LocalDurable 恢复入口可回放已提交 WAL 并续写，在线摘要控制尚未实现。
 
-登记表模式支持市场范围的正式批量撤单、预留查询及分片内用户 FenceOnly；显式配置下支持普通限价 GTC/PostOnly；持久入口另支持部分市场管理、参考价、市场熔断和开关命令。分片开关须绑定可信本机排他租约；可信配置选择 `require_managed_markets` 后，未创建市场的业务变更被持久拒绝。具体边界见 [市场生命周期](market_lifecycle.md)。正式 Market、Cancel、Amend、CancelReplace 与 Stop 命令尚未开放，FenceAndCancelAll 仍拒绝；旧低层取消不能替代真实预留归属迁移。正式模式的身份、候选提交与 PendingR2 语义见 [命令与事件身份](command_event_protocol.md)。当前不提供完整订单列表、深度或市场状态查询。
+登记表模式支持市场范围和指定来源会话的单市场正式批量撤单、预留查询及分片内用户 FenceOnly；显式配置下支持普通限价 GTC/PostOnly；持久入口另支持部分市场管理、参考价、市场熔断和开关命令。分片开关须绑定可信本机排他租约；可信配置选择 `require_managed_markets` 后，未创建市场的业务变更被持久拒绝。具体边界见 [市场生命周期](market_lifecycle.md)。正式 Market、Cancel、Amend、CancelReplace 与 Stop 命令尚未开放，FenceAndCancelAll 仍拒绝；旧低层取消不能替代真实预留归属迁移。正式模式的身份、候选提交与 PendingR2 语义见 [命令与事件身份](command_event_protocol.md)。当前不提供完整订单列表、深度或市场状态查询。
 
 ## 关闭和失败
 

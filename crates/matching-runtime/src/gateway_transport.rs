@@ -1,0 +1,351 @@
+//! 已认证会话的有界同步字节流适配器。
+use matching_domain::{CommandId, OrderId, ReservationToken};
+use std::io::{self, Read, Write};
+use std::time::Duration;
+
+/// 连接处理或断连清理失败。
+#[derive(Debug)]
+pub enum GatewayTransportError {
+    /// 输入输出或截断错误。
+    Io(io::Error),
+    /// 帧长度或完整性错误。
+    Frame(matching_protocol::FrameError),
+    /// 网关认证后准入或风险授权错误。
+    Gateway(crate::GatewayError),
+    /// 分片业务拒绝或身份冲突。
+    Formal(crate::FormalError),
+    /// 返回的业务状态不符合限价请求。
+    Outcome,
+    /// 结果未知，客户端须保留身份重试。
+    ResponseUnknown,
+    /// 网关共享状态锁已损坏，不能继续准入。
+    SharedState,
+    /// 会话撤单未完成；日志保留未确认目标。
+    Disconnect(crate::SessionDispatchError),
+    /// 同时发生原始处理错误和断连清理错误。
+    Cleanup {
+        /// 连接处理阶段的原始错误。
+        processing: Box<GatewayTransportError>,
+        /// 关闭或撤单阶段的错误。
+        cleanup: Box<GatewayTransportError>,
+    },
+}
+
+/// 所有连接共享的本机意图权威与全局限流器。
+pub struct GatewayShared {
+    /// 只保护短暂的意图登记、令牌登记和准入操作，不保护订单簿。
+    state: std::sync::Mutex<GatewaySharedState>,
+}
+/// 共用状态的内部所有权。
+struct GatewaySharedState {
+    /// 独占的持久身份与令牌日志。
+    store: crate::GatewayIntentStore,
+    /// 所有连接共用的分层限流桶。
+    limits: matching_protocol::GatewayRateLimiters,
+    /// 使用统一基准和单位的本地非阻塞单调时钟。
+    now: Box<dyn FnMut() -> u64 + Send>,
+}
+impl GatewayShared {
+    /// 接管权威意图表、限流器和所有连接共用的本地非阻塞单调时钟。
+    pub fn new(
+        store: crate::GatewayIntentStore,
+        limits: matching_protocol::GatewayRateLimiters,
+        now: impl FnMut() -> u64 + Send + 'static,
+    ) -> Self {
+        Self {
+            state: std::sync::Mutex::new(GatewaySharedState {
+                store,
+                limits,
+                now: Box::new(now),
+            }),
+        }
+    }
+}
+
+/// 已认证会话的传输适配器；认证、风险授权和身份分配由可信外围提供。
+///
+/// 流只由本调用独占，调用方须设置读取和写入超时；客户端不直接接触分片句柄。
+/// 缺失响应或超时可能表示业务已经执行，后续请求必须复用幂等键。
+pub struct GatewayTransport<'a, A, R> {
+    /// 绑定认证身份和断连日志的会话。
+    pub session: &'a mut crate::GatewaySession,
+    /// 跨连接共用的本机意图表与分层限流器。
+    pub shared: &'a GatewayShared,
+    /// 所有持久目标分片的消息句柄。
+    pub shards: &'a [crate::ShardHandle],
+    /// 包含头部和校验码的最大帧长度。
+    pub max_frame: usize,
+    /// 单次分片回复及断连清理的最大等待时间。
+    pub timeout: Duration,
+    /// 为首次意图从已保留的本地额度分配身份；不得在共享锁内访问远程服务。
+    pub allocate: A,
+    /// 按 CommandId 持久幂等签发风险授权；崩溃重试必须返回逐字段相同的令牌。
+    /// 入队前失败或结果未知的预留由风险服务按同一身份协调，网关不伪造释放。
+    pub authorize: R,
+}
+impl<A, R> GatewayTransport<'_, A, R>
+where
+    A: FnMut() -> Result<(CommandId, OrderId), crate::GatewayError>,
+    R: FnMut(&crate::PreparedPlace) -> Result<ReservationToken, crate::GatewayError>,
+{
+    /// 处理完整请求帧，连接结束或出错后总是尝试排空并执行断连策略。
+    pub fn serve(&mut self, stream: &mut (impl Read + Write)) -> Result<(), GatewayTransportError> {
+        let result = self.receive_loop(stream);
+        let cleanup = self.cleanup();
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(processing), Err(cleanup)) => Err(GatewayTransportError::Cleanup {
+                processing: Box::new(processing),
+                cleanup: Box::new(cleanup),
+            }),
+        }
+    }
+    /// 在统一期限内重试入口繁忙或结果未知；未完成目标保留在持久日志中。
+    fn cleanup(&mut self) -> Result<(), GatewayTransportError> {
+        let deadline = std::time::Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(GatewayTransportError::ResponseUnknown)?;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or(GatewayTransportError::ResponseUnknown)?;
+            match self.session.disconnect(self.shards, remaining) {
+                Ok(()) => break,
+                Err(crate::GatewayError::Ingress(crate::ShardError::Busy)) => {
+                    std::thread::yield_now()
+                }
+                Err(error) => return Err(GatewayTransportError::Gateway(error)),
+            }
+        }
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or(GatewayTransportError::ResponseUnknown)?;
+            match self.session.dispatch_all_cancels(self.shards, remaining) {
+                Ok(()) => return Ok(()),
+                Err(
+                    crate::SessionDispatchError::Ingress(crate::ShardError::Busy)
+                    | crate::SessionDispatchError::OutcomeUnknown,
+                ) => std::thread::yield_now(),
+                Err(error) => return Err(GatewayTransportError::Disconnect(error)),
+            }
+        }
+    }
+    /// 在帧头限长后读取载荷，按请求顺序向分片提交。
+    fn receive_loop(
+        &mut self,
+        stream: &mut (impl Read + Write),
+    ) -> Result<(), GatewayTransportError> {
+        loop {
+            let mut header = [0_u8; matching_protocol::HEADER_LEN];
+            match stream.read(&mut header[..1]) {
+                Ok(0) => return Ok(()),
+                Ok(_) => (),
+                Err(error) => return Err(GatewayTransportError::Io(error)),
+            }
+            stream
+                .read_exact(&mut header[1..])
+                .map_err(GatewayTransportError::Io)?;
+            let length = matching_protocol::frame_length(&header, self.max_frame)
+                .map_err(GatewayTransportError::Frame)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| GatewayTransportError::Io(io::Error::other("请求帧内存不足")))?;
+            bytes.extend_from_slice(&header);
+            bytes.resize(length, 0);
+            stream
+                .read_exact(&mut bytes[matching_protocol::HEADER_LEN..])
+                .map_err(GatewayTransportError::Io)?;
+            let frame = matching_protocol::decode_frame(&bytes, self.max_frame)
+                .map_err(GatewayTransportError::Frame)?;
+            let allocation = &mut self.allocate;
+            let prepared = {
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .map_err(|_| GatewayTransportError::SharedState)?;
+                let now = (state.now)();
+                let GatewaySharedState { store, limits, .. } = &mut *state;
+                self.session.prepare_wire_durable(
+                    &bytes,
+                    self.max_frame,
+                    store,
+                    limits,
+                    now,
+                    allocation,
+                )
+            };
+            let (request_id, prepared) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(reason) = error.ingress_reason() {
+                        let reply = matching_protocol::encode_rejection(
+                            frame.request_id,
+                            matching_protocol::ReasonCode::new(reason as u16),
+                            self.max_frame,
+                        )
+                        .map_err(|_| GatewayTransportError::Outcome)?;
+                        stream
+                            .write_all(&reply)
+                            .map_err(GatewayTransportError::Io)?;
+                        continue;
+                    }
+                    return Err(GatewayTransportError::Gateway(error));
+                }
+            };
+            let market = prepared.intent().market;
+            let shard = match self.shards.iter().find(|shard| {
+                shard
+                    .routes()
+                    .get(market)
+                    .is_some_and(|route| route.shard_id == shard.shard_id())
+            }) {
+                Some(shard) => shard,
+                None => {
+                    let bytes = matching_protocol::encode_rejection(
+                        request_id,
+                        matching_protocol::ReasonCode::new(
+                            matching_domain::RejectReason::StaleRouteEpoch as u16,
+                        ),
+                        self.max_frame,
+                    )
+                    .map_err(|_| GatewayTransportError::Outcome)?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(GatewayTransportError::Io)?;
+                    continue;
+                }
+            };
+            let existing = {
+                let state = self
+                    .shared
+                    .state
+                    .lock()
+                    .map_err(|_| GatewayTransportError::SharedState)?;
+                state.store.existing_authorization(&prepared)
+            };
+            let token_result = match existing {
+                Ok(Some(token)) => Ok(token),
+                Ok(None) => match (self.authorize)(&prepared) {
+                    Ok(token) => {
+                        let mut state = self
+                            .shared
+                            .state
+                            .lock()
+                            .map_err(|_| GatewayTransportError::SharedState)?;
+                        state.store.authorize(&prepared, || Ok(token))
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let token = match token_result {
+                Ok(token) => token,
+                Err(error) => {
+                    if let Some(reason) = error.ingress_reason() {
+                        let bytes = matching_protocol::encode_rejection(
+                            request_id,
+                            matching_protocol::ReasonCode::new(reason as u16),
+                            self.max_frame,
+                        )
+                        .map_err(|_| GatewayTransportError::Outcome)?;
+                        stream
+                            .write_all(&bytes)
+                            .map_err(GatewayTransportError::Io)?;
+                        continue;
+                    }
+                    return Err(GatewayTransportError::Gateway(error));
+                }
+            };
+            let submitted = {
+                let mut state = self
+                    .shared
+                    .state
+                    .lock()
+                    .map_err(|_| GatewayTransportError::SharedState)?;
+                let client_seq = state
+                    .store
+                    .client_seq(prepared.command_id())
+                    .ok_or(GatewayTransportError::Outcome)?;
+                let now = (state.now)();
+                self.session.submit_place(
+                    &prepared,
+                    token,
+                    client_seq,
+                    &mut state.limits,
+                    now,
+                    shard,
+                )
+            };
+            let reply = match submitted {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    if let Some(reason) = error.ingress_reason() {
+                        let bytes = matching_protocol::encode_rejection(
+                            request_id,
+                            matching_protocol::ReasonCode::new(reason as u16),
+                            self.max_frame,
+                        )
+                        .map_err(|_| GatewayTransportError::Outcome)?;
+                        stream
+                            .write_all(&bytes)
+                            .map_err(GatewayTransportError::Io)?;
+                        continue;
+                    }
+                    return Err(GatewayTransportError::Gateway(error));
+                }
+            };
+            let result = match reply
+                .recv_timeout(self.timeout)
+                .map_err(|_| GatewayTransportError::ResponseUnknown)?
+            {
+                Ok(value) => value,
+                Err(crate::FormalError::Rejected(reason)) => {
+                    let bytes = matching_protocol::encode_rejection(
+                        request_id,
+                        matching_protocol::ReasonCode::new(reason as u16),
+                        self.max_frame,
+                    )
+                    .map_err(|_| GatewayTransportError::Outcome)?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(GatewayTransportError::Io)?;
+                    continue;
+                }
+                Err(error) => return Err(GatewayTransportError::Formal(error)),
+            };
+            match result.outcome {
+                crate::FormalOutcome::Placed(order_id) => {
+                    let bytes = matching_protocol::encode_acceptance(
+                        request_id,
+                        matching_protocol::Acceptance {
+                            command_id: result.command_id.0,
+                            order_id: order_id.0,
+                            shard_seq: result.seq,
+                        },
+                        self.max_frame,
+                    )
+                    .map_err(|_| GatewayTransportError::Outcome)?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(GatewayTransportError::Io)?;
+                }
+                crate::FormalOutcome::Rejected(reason) => {
+                    let bytes = matching_protocol::encode_rejection(
+                        request_id,
+                        matching_protocol::ReasonCode::new(reason as u16),
+                        self.max_frame,
+                    )
+                    .map_err(|_| GatewayTransportError::Outcome)?;
+                    stream
+                        .write_all(&bytes)
+                        .map_err(GatewayTransportError::Io)?;
+                }
+                _ => return Err(GatewayTransportError::Outcome),
+            }
+        }
+    }
+}
