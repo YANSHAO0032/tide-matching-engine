@@ -376,6 +376,7 @@ fn signed_orders_replay(group: bool) {
         )
     }
     .unwrap();
+    let health = matching_runtime::Health::new(vec![shard.handle()]).unwrap();
     let command = |id, user, payload| CommandEnvelope {
         command_id: CommandId(id),
         session_id: 1,
@@ -520,7 +521,117 @@ fn signed_orders_replay(group: bool) {
             reason: matching_domain::RejectReason::InsufficientReservation
         }
     ));
-    let taker = submit(order(6, Side::Buy, 2, 26));
+    // 客户端帧经认证网关固定身份、登记风险令牌，再进入正式持久分片。
+    struct Auth;
+    impl matching_runtime::GatewayAuthenticator for Auth {
+        fn authenticate(
+            &self,
+            key: u64,
+            secret: &[u8],
+        ) -> Option<matching_runtime::GatewayPrincipal> {
+            (key == 6 && secret == b"test-secret").then_some(matching_runtime::GatewayPrincipal {
+                user: UserId(6),
+                stp_key: StpKey::new(0),
+            })
+        }
+    }
+    let journal = matching_runtime::SessionControlJournal::create(
+        tmp.0.join("e2e-session.log"),
+        UserId(6),
+        matching_domain::OriginSessionId(66),
+        67,
+        vec![matching_runtime::SessionTarget {
+            market,
+            route_epoch: 1,
+            command_id: CommandId(666),
+        }],
+        1,
+    )
+    .unwrap();
+    let mut gateway =
+        matching_runtime::GatewaySession::open(&Auth, 6, b"test-secret", journal, 2, 32).unwrap();
+    let mut intents =
+        matching_runtime::GatewayIntentStore::create(tmp.0.join("e2e-intents.log"), 2, 1024)
+            .unwrap();
+    let bucket = matching_protocol::BucketConfig {
+        capacity: 4,
+        refill_interval: 1,
+    };
+    let mut limiter =
+        matching_protocol::GatewayRateLimiters::new(bucket, bucket, bucket, 2).unwrap();
+    let frame = matching_protocol::encode_place_request(
+        42,
+        &matching_protocol::PlaceRequest {
+            key: 6,
+            market: market.0,
+            price: 10,
+            qty: 2,
+            stp_key: 0,
+            user_control_epoch: 0,
+            side: matching_protocol::PlaceSide::Buy,
+            stp: matching_protocol::StpPolicy::None,
+            post_only: false,
+            client_order_id: None,
+        },
+        1024,
+        32,
+    )
+    .unwrap();
+    let (request_id, prepared) = gateway
+        .prepare_wire_durable(&frame, 1024, &mut intents, &mut limiter, 0, || {
+            Ok((CommandId(6), OrderId(6)))
+        })
+        .unwrap();
+    assert_eq!(request_id, 42);
+    let Command::PlaceLimit(request) = order(6, Side::Buy, 2, 26).payload else {
+        unreachable!()
+    };
+    let token = intents
+        .authorize(&prepared, || Ok(request.reservation))
+        .unwrap();
+    let taker = gateway
+        .submit_place(
+            &prepared,
+            token,
+            intents.client_seq(CommandId(6)).unwrap(),
+            &mut limiter,
+            0,
+            &shard.handle(),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let metrics = health.prometheus().unwrap();
+    assert!(metrics.contains("engine_commands_total 6\n"));
+    assert!(metrics.contains("engine_reject_total 1\n"));
+    assert!(metrics.contains("engine_trades_total 2\n"));
+    assert!(metrics.contains("engine_match_latency_us_count 4\n"));
+    assert!(metrics.contains("engine_wal_append_latency_us_count 6\n"));
+    assert!(metrics.contains("engine_wal_fsync_latency_us_count 6\n"));
+    let token = intents
+        .authorize(&prepared, || panic!("重试不得重新授权"))
+        .unwrap();
+    let replayed = gateway
+        .submit_place(
+            &prepared,
+            token,
+            intents.client_seq(CommandId(6)).unwrap(),
+            &mut limiter,
+            0,
+            &shard.handle(),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(replayed.deduplicated);
+    let metrics = health.prometheus().unwrap();
+    assert!(metrics.contains("engine_commands_total 7\n"));
+    assert!(metrics.contains("engine_trades_total 2\n"));
+    assert!(metrics.contains("engine_match_latency_us_count 5\n"));
+    assert!(metrics.contains("engine_wal_append_latency_us_count 6\n"));
+    assert!(metrics.contains("engine_wal_fsync_latency_us_count 6\n"));
     assert_eq!(
         taker
             .events
@@ -687,6 +798,7 @@ fn signed_orders_replay(group: bool) {
     for (index, trade) in trades.iter().enumerate() {
         assert_eq!(trade.feed_seq, index as u64 + 1);
         assert_eq!(trade.engine_time, taker.events[0].engine_time);
+        assert!(taker.events.iter().any(|event| matches!(&event.payload, EngineEvent::SettlementDelta(delta) if delta.trade_id == trade.trade_id)));
     }
     let mut hash = matching_runtime::EventHasher::new();
     for event in updated

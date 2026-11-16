@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
@@ -348,6 +348,33 @@ impl SnapshotImage {
     }
 }
 
+/// 命令回复携带入队尝试起点；只对最终产生的回复采样。
+struct CommandReply<T> {
+    /// 有界的一次性回复端。
+    sender: SyncSender<T>,
+    /// 单调观测起点，不参与业务处理。
+    started: Instant,
+    /// 实际分片的延迟统计。
+    metrics: Option<Arc<ExecutionMetrics>>,
+}
+impl<T> CommandReply<T> {
+    /// 创建待投递的命令回复端。
+    fn new(sender: SyncSender<T>, metrics: Option<Arc<ExecutionMetrics>>) -> Self {
+        Self {
+            sender,
+            started: Instant::now(),
+            metrics,
+        }
+    }
+    /// 在交付回复前记录完整队列、执行及持久化耗时。
+    fn send(self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_command(self.started.elapsed());
+        }
+        self.sender.send(value)
+    }
+}
+
 /// 只在本进程队列内传递的变更、查询与控制消息。
 enum Message {
     /// 包含调用方身份、路由版本、业务载荷及一次性回复端的变更。
@@ -361,14 +388,14 @@ enum Message {
         /// 已接入的业务变更载荷。
         Mutation,
         /// 只在本进程使用的一次性执行回复端。
-        SyncSender<Result<Execution, RejectReason>>,
+        CommandReply<Result<Execution, RejectReason>>,
     ),
     /// 通过完整预留归属路径执行正式命令。
     Formal(
         /// 含路由及业务身份的命令。
         CommandEnvelope,
         /// 返回执行结果或前置拒绝的一次性回复端。
-        SyncSender<Result<FormalExecution, FormalError>>,
+        CommandReply<Result<FormalExecution, FormalError>>,
     ),
     /// 在工作线程顺序点读取预留及其待处理归属。
     Reservation(
@@ -385,6 +412,18 @@ enum Message {
         OrderId,
         /// 只在本进程使用的一次性查询回复端。
         SyncSender<Result<Option<OrderNode>, RejectReason>>,
+    ),
+    /// 按需读取本分片全部市场的订单和价档规模。
+    BookCounts(
+        /// 数量溢出时返回空值。
+        SyncSender<Option<(usize, usize)>>,
+    ),
+    /// 按需读取配置市场的两个优先级分配器。
+    PriorityCounts(
+        /// 标签数量受外部配置约束。
+        Vec<MarketId>,
+        /// 返回此分片实际持有的市场状态。
+        SyncSender<Vec<PriorityObservation>>,
     ),
     /// 确认此前已入队消息处理完毕；载荷为请求身份和返回已完成序号水位的回复端。
     Barrier(
@@ -450,6 +489,10 @@ impl Default for ShardConfig {
 pub struct Shard {
     /// 正式业务入口是否在回复前完成本地持久提交。
     durable_formal: bool,
+    /// 持久写入器的独立时延观测。
+    wal_metrics: Option<Arc<matching_persistence::DurabilityMetrics>>,
+    /// 工作线程配置中的主节点租约弱引用，不延长租约生命周期。
+    primary_lease: Option<std::sync::Weak<crate::PrimaryLease>>,
     /// 当前工作线程专属的快照来源凭据。
     snapshot_origin: Arc<()>,
     /// 限制本分片同时存在的快照后台写入器数量。
@@ -466,10 +509,18 @@ pub struct Shard {
     barrier_reached: bool,
     /// 工作线程异常退出标志。
     failed: Arc<AtomicBool>,
+    /// 工作线程尚未退出。
+    running: Arc<AtomicBool>,
+    /// 分片实际处理结果的无锁观测计数。
+    metrics: Arc<ExecutionMetrics>,
+    /// 有界的分片故障诊断队列。
+    diagnostics: Arc<DiagnosticBuffer>,
     /// 所有者丢弃时请求排空退出。
     drop_requested: Arc<AtomicBool>,
     /// 当前工作线程所属分片。
     shard_id: ShardId,
+    /// 工作线程所属集群。
+    cluster_id: ClusterId,
     /// 工作线程与入口共享的路由快照。
     routes: Arc<RouteTable>,
 }
@@ -532,10 +583,13 @@ impl Shard {
         .map_err(|_| ShardError::InvalidConfig)?
         .ok_or(ShardError::InvalidConfig)?;
         let snapshot_seq = records.snapshot().image.snapshot_seq();
+        let replay_count = records.commands().len();
+        let replay_started = Instant::now();
         let image = records
             .replay()
             .map_err(|_| ShardError::InvalidConfig)?
             .image;
+        let replay_duration = replay_started.elapsed();
         if !image.managed_markets.is_empty() && image.place.is_none() {
             return Err(ShardError::InvalidConfig);
         }
@@ -574,7 +628,7 @@ impl Shard {
             .map(|(id, book)| (*id, book.clone()))
             .collect();
         let registry = image.registry.clone();
-        Self::start_inner_with_snapshot(
+        let recovered = Self::start_inner_with_snapshot(
             (image.shard, image.cluster),
             trusted.routes.clone(),
             books,
@@ -593,7 +647,11 @@ impl Shard {
                 }),
             ),
             (Some(image), Some(ownership)),
-        )
+        )?;
+        recovered
+            .metrics
+            .observe_replay(replay_count, replay_duration);
+        Ok(recovered)
     }
 
     /// 从明确分片路由和已有单市场订单簿启动。
@@ -642,7 +700,13 @@ impl Shard {
     ) -> Result<Receiver<Result<Execution, RejectReason>>, ShardError> {
         let (tx, rx) = sync_channel(1);
         self.push(
-            Message::Mutation(command_id, market, epoch, mutation, tx),
+            Message::Mutation(
+                command_id,
+                market,
+                epoch,
+                mutation,
+                CommandReply::new(tx, Some(Arc::clone(&self.metrics))),
+            ),
             IngressClass::Mutation,
         )?;
         Ok(rx)
@@ -663,12 +727,18 @@ impl Shard {
     pub fn handle(&self) -> ShardHandle {
         ShardHandle {
             durable_formal: self.durable_formal,
+            wal_metrics: self.wal_metrics.clone(),
+            primary_lease: self.primary_lease.clone(),
             snapshot_origin: Arc::clone(&self.snapshot_origin),
             snapshot_writer_active: Arc::clone(&self.snapshot_writer_active),
             producer: self.producer.clone(),
             thread: self.thread.clone(),
             failed: Arc::clone(&self.failed),
+            running: Arc::clone(&self.running),
+            metrics: Arc::clone(&self.metrics),
+            diagnostics: Arc::clone(&self.diagnostics),
             shard_id: self.shard_id,
+            cluster_id: self.cluster_id,
             routes: Arc::clone(&self.routes),
         }
     }
@@ -1410,9 +1480,26 @@ impl Shard {
         let close = producer.clone();
         let failed = Arc::new(AtomicBool::new(false));
         let worker_failed = Arc::clone(&failed);
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let metrics = Arc::new(ExecutionMetrics::default());
+        metrics.shard_halted.store(
+            place_state
+                .as_ref()
+                .is_some_and(|state| state.shard_kill_active),
+            Ordering::Release,
+        );
+        let worker_metrics = Arc::clone(&metrics);
+        let diagnostics = Arc::new(DiagnosticBuffer::new());
+        let worker_diagnostics = Arc::clone(&diagnostics);
         let drop_requested = Arc::new(AtomicBool::new(false));
         let worker_drop = Arc::clone(&drop_requested);
         let durable_formal = durable.is_some() && place_state.is_some();
+        let wal_metrics = durable.as_ref().map(|gate| gate.batcher.metrics());
+        let primary_lease = place_state
+            .as_ref()
+            .and_then(|state| state.config.primary_lease.as_ref())
+            .map(Arc::downgrade);
         let join = thread::spawn(move || {
             // 所有权与工作线程同寿命，排空后才释放。
             let _ownership = ownership;
@@ -1453,6 +1540,7 @@ impl Shard {
                                         shard,
                                         cluster,
                                         now: clock.now(),
+                                        metrics: Some(&worker_metrics),
                                     },
                                 );
                             } else {
@@ -1466,10 +1554,16 @@ impl Shard {
                                         &mut seq,
                                     ),
                                     (shard, cluster, clock.now()),
+                                    Some(&worker_metrics),
                                 );
                             }
                         }
                         Message::Mutation(command_id, market, epoch, mutation, reply) => {
+                            let match_started = matches!(
+                                &mutation,
+                                Mutation::Place(_) | Mutation::MarketByBase(..)
+                            )
+                            .then(Instant::now);
                             let result =
                                 worker_routes.validate(market, shard, epoch).and_then(|()| {
                                     if registry.is_some() {
@@ -1501,9 +1595,15 @@ impl Shard {
                                         result,
                                     })
                                 });
+                            if let Some(started) = match_started {
+                                worker_metrics.observe_match(started.elapsed());
+                            }
+                            worker_metrics.observe_mutation(&result);
                             let _ = reply.send(result);
                         }
                         Message::Formal(command, reply) => {
+                            let match_started = matches!(&command.payload, Command::PlaceLimit(_))
+                                .then(Instant::now);
                             let result = if let Command::ApplyUserControlFenceShard(ref fence) =
                                 command.payload
                             {
@@ -1602,6 +1702,16 @@ impl Shard {
                                     .map_err(FormalError::Rejected),
                                 }
                             };
+                            if let Some(started) = match_started {
+                                worker_metrics.observe_match(started.elapsed());
+                            }
+                            worker_metrics.shard_halted.store(
+                                place_state
+                                    .as_ref()
+                                    .is_some_and(|state| state.shard_kill_active),
+                                Ordering::Release,
+                            );
+                            worker_metrics.observe_formal(&result);
                             let _ = reply.send(result);
                         }
                         Message::Reservation(id, reply) => {
@@ -1623,6 +1733,33 @@ impl Shard {
                             } else {
                                 Err(RejectReason::MarketNotFound)
                             };
+                            let _ = reply.send(result);
+                        }
+                        Message::BookCounts(reply) => {
+                            let counts = markets.values().try_fold(
+                                (0_usize, 0_usize),
+                                |(orders, levels), book| {
+                                    let (book_orders, book_levels) = book.observation_counts()?;
+                                    Some((
+                                        orders.checked_add(book_orders)?,
+                                        levels.checked_add(book_levels)?,
+                                    ))
+                                },
+                            );
+                            let _ = reply.send(counts);
+                        }
+                        Message::PriorityCounts(requested, reply) => {
+                            let result = requested
+                                .into_iter()
+                                .filter_map(|market| {
+                                    markets.get(&market).map(|book| PriorityObservation {
+                                        market,
+                                        queue: book.next_queue_priority(),
+                                        stop: book.next_stop_priority(),
+                                        ceiling: book.priority_policy().effective_ceiling(),
+                                    })
+                                })
+                                .collect();
                             let _ = reply.send(result);
                         }
                         Message::Barrier(id, reply) => {
@@ -1701,6 +1838,16 @@ impl Shard {
                                 error.kind() != std::io::ErrorKind::InvalidInput
                                     && error.kind() != std::io::ErrorKind::Unsupported
                             });
+                            if halt {
+                                worker_diagnostics.record(DiagnosticEvent {
+                                    kind: DiagnosticKind::SnapshotCommit,
+                                    cluster_id: cluster,
+                                    shard_id: shard,
+                                    command_id: None,
+                                    shard_seq: Some(snapshot_seq),
+                                    io_kind: result.as_ref().err().map(std::io::Error::kind),
+                                });
+                            }
                             let _ = reply.send(result);
                             if halt {
                                 worker_failed.store(true, Ordering::Release);
@@ -1714,10 +1861,20 @@ impl Shard {
                     }
                 }
             }));
-            if run.is_err() {
+            if let Err(payload) = &run {
+                let fault = payload.downcast_ref::<WalFault>();
+                worker_diagnostics.record(DiagnosticEvent {
+                    kind: fault.map_or(DiagnosticKind::WorkerPanic, |f| f.kind),
+                    cluster_id: cluster,
+                    shard_id: shard,
+                    command_id: fault.and_then(|f| f.command_id),
+                    shard_seq: fault.and_then(|f| f.shard_seq),
+                    io_kind: fault.map(|f| f.io_kind),
+                });
                 worker_failed.store(true, Ordering::Release);
             }
             close.close_ingress();
+            worker_running.store(false, Ordering::Release);
             // 线程异常时释放所有尚未处理消息的回复端，使接收方能够观察断连。
             if run.is_err() {
                 while consumer.pop().is_some() {}
@@ -1729,6 +1886,8 @@ impl Shard {
         let thread = join.thread().clone();
         Ok(Self {
             durable_formal,
+            wal_metrics,
+            primary_lease,
             snapshot_origin,
             snapshot_writer_active,
             producer,
@@ -1737,8 +1896,12 @@ impl Shard {
             shutdown_reply: None,
             barrier_reached: false,
             failed,
+            running,
+            metrics,
+            diagnostics,
             drop_requested,
             shard_id: shard,
+            cluster_id: cluster,
             routes: route_snapshot,
         })
     }
@@ -1874,12 +2037,13 @@ fn group_should_flush(count: usize, limit: usize, now: Instant, deadline: Instan
 fn execute_fence_group(
     first: (
         CommandEnvelope,
-        SyncSender<Result<FormalExecution, FormalError>>,
+        CommandReply<Result<FormalExecution, FormalError>>,
     ),
     consumer: &mut crate::queue::Consumer<Message>,
     gate: &mut LocalDurableCommit,
     (epochs, dedup, seq): (&mut UserControlEpochs, &mut DedupWindow, &mut Sequencer),
     (shard, cluster, now): (ShardId, ClusterId, LogicalTime),
+    metrics: Option<&ExecutionMetrics>,
 ) -> Option<Message> {
     let (limit, delay) = gate.group.expect("仅批量模式调用");
     let start = Instant::now();
@@ -1916,9 +2080,12 @@ fn execute_fence_group(
                             command_id: command_id.0,
                             payload,
                         };
-                        gate.batcher
-                            .append_at(&record, Instant::now())
-                            .expect("WAL 追加失败，分片停止");
+                        wal_or_halt(
+                            gate.batcher.append_at(&record, Instant::now()),
+                            DiagnosticKind::WalAppend,
+                            Some(command_id),
+                            Some(result.seq),
+                        );
                     }
                     planned
                 }
@@ -1945,7 +2112,12 @@ fn execute_fence_group(
             }
         }
     }
-    gate.batcher.flush().expect("WAL 批量同步失败，分片停止");
+    wal_or_halt(
+        gate.batcher.flush(),
+        DiagnosticKind::WalSync,
+        None,
+        Some(candidate.seq.last_applied()),
+    );
     assert_eq!(
         gate.batcher.committed(),
         candidate.seq.last_applied(),
@@ -1955,6 +2127,9 @@ fn execute_fence_group(
     *dedup = candidate.dedup;
     *seq = candidate.seq;
     for (reply, result) in replies {
+        if let Some(metrics) = metrics {
+            metrics.observe_formal(&result);
+        }
         let _ = reply.send(result);
     }
     deferred
@@ -1984,6 +2159,8 @@ struct FormalGroupContext<'a> {
     cluster: ClusterId,
     /// 固定业务时间。
     now: LogicalTime,
+    /// 实际提交后记录的计数；测试候选可不提供。
+    metrics: Option<&'a ExecutionMetrics>,
 }
 /// 完整分片批次的候选状态，提交前不可见。
 struct FormalBatchCandidate {
@@ -2290,7 +2467,7 @@ impl FormalBatchCandidate {
 fn execute_formal_group(
     first: (
         CommandEnvelope,
-        SyncSender<Result<FormalExecution, FormalError>>,
+        CommandReply<Result<FormalExecution, FormalError>>,
     ),
     consumer: &mut crate::queue::Consumer<Message>,
     gate: &mut LocalDurableCommit,
@@ -2315,7 +2492,12 @@ fn execute_formal_group(
                 Err(_) => candidate.reject_uncodable(&command, context.routes),
                 Ok(payload) => {
                     let command_id = command.command_id;
+                    let match_started =
+                        matches!(&command.payload, Command::PlaceLimit(_)).then(Instant::now);
                     let planned = candidate.stage(command, context.routes);
+                    if let (Some(metrics), Some(started)) = (context.metrics, match_started) {
+                        metrics.observe_match(started.elapsed());
+                    }
                     if let Ok(result) = &planned
                         && !result.deduplicated
                     {
@@ -2329,9 +2511,12 @@ fn execute_formal_group(
                             command_id: command_id.0,
                             payload,
                         };
-                        gate.batcher
-                            .append_at(&record, Instant::now())
-                            .expect("WAL 追加失败，分片停止");
+                        wal_or_halt(
+                            gate.batcher.append_at(&record, Instant::now()),
+                            DiagnosticKind::WalAppend,
+                            Some(command_id),
+                            Some(result.seq),
+                        );
                     }
                     planned
                 }
@@ -2356,7 +2541,12 @@ fn execute_formal_group(
             }
         }
     }
-    gate.batcher.flush().expect("WAL 批量同步失败，分片停止");
+    wal_or_halt(
+        gate.batcher.flush(),
+        DiagnosticKind::WalSync,
+        None,
+        Some(candidate.fence.seq.last_applied()),
+    );
     assert_eq!(
         gate.batcher.committed(),
         candidate.fence.seq.last_applied(),
@@ -2369,7 +2559,19 @@ fn execute_formal_group(
     *context.managed_markets = candidate.managed_markets;
     *context.registry = candidate.registry;
     *context.place = candidate.place;
+    if let Some(metrics) = context.metrics {
+        metrics.shard_halted.store(
+            context
+                .place
+                .as_ref()
+                .is_some_and(|state| state.shard_kill_active),
+            Ordering::Release,
+        );
+    }
     for (reply, result) in replies {
+        if let Some(metrics) = context.metrics {
+            metrics.observe_formal(&result);
+        }
         let _ = reply.send(result);
     }
     deferred
@@ -2605,15 +2807,19 @@ fn execute_place(
     };
     let n = seq.allocate().expect("分片序号耗尽，停止处理");
     if let (Some(gate), Some(bytes)) = (durable.as_mut(), bytes) {
-        gate.commit(
-            identity.cluster,
-            identity.shard,
-            clock.now().get(),
-            command.command_id,
-            n,
-            bytes,
-        )
-        .expect("WAL 持久提交失败，分片停止");
+        wal_or_halt(
+            gate.commit(
+                identity.cluster,
+                identity.shard,
+                clock.now().get(),
+                command.command_id,
+                n,
+                bytes,
+            ),
+            DiagnosticKind::WalCommit,
+            Some(command.command_id),
+            Some(n),
+        );
     }
     let cursor = TradeIdCursor::new(identity.cluster, identity.shard, n);
     let book = markets.get_mut(&market).expect("已验证市场存在");
@@ -3872,15 +4078,19 @@ fn execute_fence(
     };
     let n = seq.allocate().expect("分片序号耗尽，停止处理");
     if let (Some(gate), Some(bytes)) = (durable.as_mut(), bytes) {
-        gate.commit(
-            identity.cluster,
-            identity.shard,
-            clock.now().get(),
-            command.command_id,
-            n,
-            bytes,
-        )
-        .expect("WAL 持久提交失败，分片停止");
+        wal_or_halt(
+            gate.commit(
+                identity.cluster,
+                identity.shard,
+                clock.now().get(),
+                command.command_id,
+                n,
+                bytes,
+            ),
+            DiagnosticKind::WalCommit,
+            Some(command.command_id),
+            Some(n),
+        );
     }
     let event = EventEnvelope {
         cluster_id: identity.cluster,
@@ -4137,15 +4347,19 @@ fn execute_formal(
     };
     let n = seq.allocate().expect("分片序号耗尽，停止处理");
     if let (Some(gate), Some(bytes)) = (durable.as_mut(), bytes) {
-        gate.commit(
-            identity.cluster,
-            identity.shard,
-            clock.now().get(),
-            command.command_id,
-            n,
-            bytes,
-        )
-        .expect("WAL 持久提交失败，分片停止");
+        wal_or_halt(
+            gate.commit(
+                identity.cluster,
+                identity.shard,
+                clock.now().get(),
+                command.command_id,
+                n,
+                bytes,
+            ),
+            DiagnosticKind::WalCommit,
+            Some(command.command_id),
+            Some(n),
+        );
     }
     let mut candidate = book.clone();
     let mut candidate_registry = registry.clone();
@@ -4236,11 +4450,354 @@ fn event_count_fits(count: u64, capacity: u64) -> bool {
     count <= capacity
 }
 
+/// 分片故障的稳定类别，不包含凭据或原始命令。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticKind {
+    /// WAL 写入器追加失败。
+    WalAppend,
+    /// WAL 批次同步失败。
+    WalSync,
+    /// WAL 单条提交失败。
+    WalCommit,
+    /// 已写入快照的清单登记失败。
+    SnapshotCommit,
+    /// 未归类的线程异常或业务不变量失败。
+    WorkerPanic,
+}
+
+/// 有界错误诊断的固定字段；不包含命令载荷和任意错误文本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticEvent {
+    /// 故障类别。
+    pub kind: DiagnosticKind,
+    /// 集群身份。
+    pub cluster_id: ClusterId,
+    /// 分片身份。
+    pub shard_id: ShardId,
+    /// 已知的命令身份；批量同步时可能没有单一身份。
+    pub command_id: Option<CommandId>,
+    /// 发生故障时的相关分片序号。
+    pub shard_seq: Option<u64>,
+    /// 底层输入输出错误类别。
+    pub io_kind: Option<std::io::ErrorKind>,
+}
+
+/// 只在工作线程内携带的持久写入故障上下文。
+#[derive(Debug)]
+struct WalFault {
+    /// 稳定操作阶段。
+    kind: DiagnosticKind,
+    /// 已知命令身份。
+    command_id: Option<CommandId>,
+    /// 已知分片序号。
+    shard_seq: Option<u64>,
+    /// 输入输出错误类别。
+    io_kind: std::io::ErrorKind,
+}
+
+/// 保留持久失败上下文并停止分片，不暴露原始错误内容。
+fn wal_or_halt(
+    result: std::io::Result<()>,
+    kind: DiagnosticKind,
+    command_id: Option<CommandId>,
+    shard_seq: Option<u64>,
+) {
+    if let Err(error) = result {
+        std::panic::panic_any(WalFault {
+            kind,
+            command_id,
+            shard_seq,
+            io_kind: error.kind(),
+        });
+    }
+}
+
+/// 固定容量的非阻塞诊断通道，丢弃计数不会绕回。
+struct DiagnosticBuffer {
+    /// 等待外部消费者读取的事件。
+    events: crossbeam_queue::ArrayQueue<DiagnosticEvent>,
+    /// 因容量不足而丢弃的诊断数。
+    dropped: AtomicU64,
+    /// 丢弃计数耗尽标志。
+    exhausted: AtomicBool,
+}
+impl DiagnosticBuffer {
+    /// 创建固定容量通道。
+    fn new() -> Self {
+        Self {
+            events: crossbeam_queue::ArrayQueue::new(64),
+            dropped: AtomicU64::new(0),
+            exhausted: AtomicBool::new(false),
+        }
+    }
+    /// 在撮合线程只尝试一次，不等待消费者。
+    fn record(&self, event: DiagnosticEvent) {
+        if self.events.push(event).is_err()
+            && self
+                .dropped
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .is_err()
+        {
+            self.exhausted.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 单写者发布的非业务计数；耗尽时保留原值并显式标记。
+#[derive(Default)]
+struct ExecutionMetrics {
+    /// 已安装的分片级熔断状态。
+    shard_halted: AtomicBool,
+    /// 已有最终结果的命令。
+    commands: AtomicU64,
+    /// 被拒绝的命令。
+    rejects: AtomicU64,
+    /// 因优先级空间耗尽而实际拒绝的命令。
+    priority_exhaustions: AtomicU64,
+    /// 已提交的真实成交。
+    trades: AtomicU64,
+    /// 互斥延迟桶，边界单位为微秒，最后一个桶无上界。
+    match_buckets: [AtomicU64; 7],
+    /// 已观察的撮合候选耗时总微秒数。
+    match_sum_us: AtomicU64,
+    /// 命令入口到最终回复的时延互斥桶。
+    command_buckets: [AtomicU64; 7],
+    /// 命令时延微秒总数。
+    command_sum_us: AtomicU64,
+    /// 快照后台写入与登记的互斥时延桶，单位毫秒。
+    snapshot_buckets: [AtomicU64; 7],
+    /// 快照处理耗时总毫秒数。
+    snapshot_sum_ms: AtomicU64,
+    /// 快照后台处理失败次数。
+    snapshot_failures: AtomicU64,
+    /// 成功恢复时重放的记录数。
+    replay_records: AtomicU64,
+    /// 恢复时重放耗时的互斥桶。
+    replay_buckets: [AtomicU64; 7],
+    /// 重放总耗时，单位毫秒。
+    replay_sum_ms: AtomicU64,
+    /// 计数耗尽的可观测标志。
+    overflow: AtomicBool,
+}
+impl ExecutionMetrics {
+    /// 记录成功入队并产生最终回复的命令时延。
+    fn observe_command(&self, duration: Duration) {
+        let Ok(micros) = u64::try_from(duration.as_micros()) else {
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
+        };
+        let bucket = [10_u64, 100, 1_000, 10_000, 100_000, 1_000_000]
+            .iter()
+            .position(|limit| micros <= *limit)
+            .unwrap_or(6);
+        self.add(&self.command_buckets[bucket], 1);
+        if let Ok(value) = usize::try_from(micros) {
+            self.add(&self.command_sum_us, value);
+        } else {
+            self.overflow.store(true, Ordering::Relaxed);
+        }
+    }
+    /// 记录成功恢复所用的已提交记录及重放耗时。
+    fn observe_replay(&self, records: usize, elapsed: Duration) {
+        self.add(&self.replay_records, records);
+        let Ok(millis) = u64::try_from(elapsed.as_millis()) else {
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
+        };
+        let bucket = [1_u64, 10, 100, 1_000, 10_000, 60_000]
+            .iter()
+            .position(|limit| millis <= *limit)
+            .unwrap_or(6);
+        self.add(&self.replay_buckets[bucket], 1);
+        if let Ok(value) = usize::try_from(millis) {
+            self.add(&self.replay_sum_ms, value);
+        } else {
+            self.overflow.store(true, Ordering::Relaxed);
+        }
+    }
+    /// 记录已入队快照的文件写入和清单登记结果。
+    fn observe_snapshot(&self, elapsed: Duration, failed: bool) {
+        let Ok(millis) = u64::try_from(elapsed.as_millis()) else {
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
+        };
+        let bucket = [1_u64, 10, 100, 1_000, 10_000, 60_000]
+            .iter()
+            .position(|limit| millis <= *limit)
+            .unwrap_or(6);
+        self.add(&self.snapshot_buckets[bucket], 1);
+        let Ok(value) = usize::try_from(millis) else {
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
+        };
+        self.add(&self.snapshot_sum_ms, value);
+        if failed {
+            self.add(&self.snapshot_failures, 1);
+        }
+    }
+    /// 按单调时钟记录候选执行耗时，不用于业务时间或撮合决策。
+    fn observe_match(&self, duration: Duration) {
+        let Ok(micros) = u64::try_from(duration.as_micros()) else {
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
+        };
+        let bucket = [10_u64, 100, 1_000, 10_000, 100_000, 1_000_000]
+            .iter()
+            .position(|limit| micros <= *limit)
+            .unwrap_or(6);
+        self.add(&self.match_buckets[bucket], 1);
+        let Ok(value) = usize::try_from(micros) else {
+            self.overflow.store(true, Ordering::Relaxed);
+            return;
+        };
+        self.add(&self.match_sum_us, value);
+    }
+    /// 检查计数后更新，不让诊断溢出改变业务行为。
+    fn add(&self, counter: &AtomicU64, amount: usize) {
+        let updated = u64::try_from(amount).ok().and_then(|n| {
+            counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    old.checked_add(n)
+                })
+                .ok()
+        });
+        if updated.is_none() {
+            self.overflow.store(true, Ordering::Relaxed);
+        }
+    }
+    /// 只在正式结果已确定后记录，重试不会重复产生成交计数。
+    fn observe_formal(&self, result: &Result<FormalExecution, FormalError>) {
+        self.add(&self.commands, 1);
+        if matches!(
+            result,
+            Err(FormalError::Rejected(RejectReason::PrioritySpaceExhaustion))
+        ) || matches!(result, Ok(value) if !value.deduplicated && matches!(value.outcome, FormalOutcome::Rejected(RejectReason::PrioritySpaceExhaustion)))
+        {
+            self.add(&self.priority_exhaustions, 1);
+        }
+        match result {
+            Err(_) => self.add(&self.rejects, 1),
+            Ok(value) => {
+                if matches!(value.outcome, FormalOutcome::Rejected(_)) {
+                    self.add(&self.rejects, 1);
+                }
+                if !value.deduplicated {
+                    self.add(
+                        &self.trades,
+                        value
+                            .events
+                            .iter()
+                            .filter(|event| matches!(event.payload, EngineEvent::Trade(_)))
+                            .count(),
+                    );
+                }
+            }
+        }
+    }
+    /// 低层变更同样计入结果，但仅在真实事件中计数成交。
+    fn observe_mutation(&self, result: &Result<Execution, RejectReason>) {
+        self.add(&self.commands, 1);
+        if matches!(
+            result,
+            Err(RejectReason::PrioritySpaceExhaustion)
+                | Ok(Execution {
+                    result: Err(RejectReason::PrioritySpaceExhaustion),
+                    ..
+                })
+        ) {
+            self.add(&self.priority_exhaustions, 1);
+        }
+        match result {
+            Err(_) | Ok(Execution { result: Err(_), .. }) => self.add(&self.rejects, 1),
+            Ok(Execution {
+                result: Ok(MutationOutcome::Placed(events)),
+                ..
+            }) => self.add(
+                &self.trades,
+                events
+                    .iter()
+                    .filter(|event| matches!(event, EngineEvent::Trade(_)))
+                    .count(),
+            ),
+            Ok(Execution {
+                result: Ok(MutationOutcome::MarketByBase(value)),
+                ..
+            }) => self.add(&self.trades, value.trades().len()),
+            Ok(_) => (),
+        }
+    }
+}
+
+/// 分片入口和线程的瞬时观测，队列长度可能随并发操作变化。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardObservation {
+    /// 工作线程尚未退出。
+    pub thread_running: bool,
+    /// 外部入口尚未关闭。
+    pub ingress_open: bool,
+    /// 分片级熔断开关已激活。
+    pub shard_halted: bool,
+    /// 工作线程配置中经过启动校验的本机主节点租约仍被持有。
+    pub primary_lease_held: bool,
+    /// 工作线程遇到不可恢复错误。
+    pub failed: bool,
+    /// 有界队列当前消息数。
+    pub queue_depth: usize,
+    /// 有界队列的固定容量。
+    pub queue_capacity: usize,
+    /// 已出队消息的入队等待直方图。
+    pub queue_wait: matching_persistence::LatencySnapshot,
+    /// 已产生最终回复的命令数，包含去重命中。
+    pub commands: u64,
+    /// 最终拒绝的命令数。
+    pub rejects: u64,
+    /// 优先级耗尽拒绝次数，不重复计入正式幂等命中。
+    pub priority_exhaustions: u64,
+    /// 实际产生的成交数，不重复计算去重回复。
+    pub trades: u64,
+    /// 任一指标计数已耗尽。
+    pub metrics_overflow: bool,
+    /// 因有界诊断队列已满而丢弃的事件数。
+    pub diagnostics_dropped: u64,
+    /// 互斥的候选执行延迟桶及耗时总和。
+    pub match_latency_buckets: [u64; 7],
+    /// 撮合候选耗时总微秒数。
+    pub match_latency_sum_us: u64,
+    /// 命令总时延互斥桶。
+    pub command_latency_buckets: [u64; 7],
+    /// 命令总时延微秒数。
+    pub command_latency_sum_us: u64,
+    /// 快照处理的互斥时延桶。
+    pub snapshot_latency_buckets: [u64; 7],
+    /// 快照处理耗时总毫秒数。
+    pub snapshot_latency_sum_ms: u64,
+    /// 快照处理失败次数。
+    pub snapshot_failures: u64,
+    /// 成功恢复时重放的记录总数。
+    pub replay_records: u64,
+    /// 成功恢复的重放时延互斥桶。
+    pub replay_buckets: [u64; 7],
+    /// 成功恢复的重放时延总毫秒数。
+    pub replay_sum_ms: u64,
+    /// WAL 追加耗时，内存分片没有该观测。
+    pub wal_append: Option<matching_persistence::LatencySnapshot>,
+    /// WAL 同步耗时，内存分片没有该观测。
+    pub wal_sync: Option<matching_persistence::LatencySnapshot>,
+    /// 批量提交的记录数分布。
+    pub wal_batch_size: Option<matching_persistence::BatchSizeSnapshot>,
+    /// 批量提交的首条记录等待时延。
+    pub wal_batch_wait: Option<matching_persistence::LatencySnapshot>,
+}
+
 /// 可克隆的有界生产者，只能投递消息，不可访问撮合状态。
 #[derive(Clone)]
 pub struct ShardHandle {
     /// 该入口是否提供正式命令的本地持久回复。
     durable_formal: bool,
+    /// 持久写入器的独立时延观测。
+    wal_metrics: Option<Arc<matching_persistence::DurabilityMetrics>>,
+    /// 经过启动校验的租约弱引用。
+    primary_lease: Option<std::sync::Weak<crate::PrimaryLease>>,
     /// 用于验证镜像来自本工作线程的凭据。
     snapshot_origin: Arc<()>,
     /// 当前分片写入器持有标志。
@@ -4251,13 +4808,115 @@ pub struct ShardHandle {
     thread: Thread,
     /// 工作线程异常退出标志。
     failed: Arc<AtomicBool>,
+    /// 工作线程尚未退出。
+    running: Arc<AtomicBool>,
+    /// 分片执行计数。
+    metrics: Arc<ExecutionMetrics>,
+    /// 非阻塞、有界的错误诊断队列。
+    diagnostics: Arc<DiagnosticBuffer>,
     /// 句柄对应的分片身份。
     shard_id: ShardId,
+    /// 句柄对应的集群身份。
+    cluster_id: ClusterId,
     /// 句柄对应的不可变路由快照。
     routes: Arc<RouteTable>,
 }
 
+/// 一次顺序查询得到的市场优先级。
+pub(crate) struct PriorityObservation {
+    /// 市场身份。
+    pub(crate) market: MarketId,
+    /// 下一普通优先级。
+    pub(crate) queue: u128,
+    /// 下一止损优先级。
+    pub(crate) stop: u128,
+    /// 首个不可分配的共同上限。
+    pub(crate) ceiling: u128,
+}
+
 impl ShardHandle {
+    /// 请求配置市场的优先级状态。
+    pub(crate) fn priority_counts(
+        &self,
+        markets: Vec<MarketId>,
+    ) -> Result<Receiver<Vec<PriorityObservation>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::PriorityCounts(markets, tx), IngressClass::Query)?;
+        Ok(rx)
+    }
+    /// 在有界查询队列中请求当前订单簿规模。
+    pub(crate) fn book_counts(&self) -> Result<Receiver<Option<(usize, usize)>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::BookCounts(tx), IngressClass::Query)?;
+        Ok(rx)
+    }
+    /// 取走当前已记录的错误；诊断不能替代业务 WAL。
+    pub fn take_diagnostics(&self) -> Vec<DiagnosticEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = self.diagnostics.events.pop() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 判断两个句柄是否属于同一工作线程实例。
+    pub(crate) fn same_worker(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.running, &other.running)
+    }
+
+    /// 读取分片线程和入口状态；队列观测不阻塞撮合线程。
+    pub fn observation(&self) -> ShardObservation {
+        let (queue_depth, queue_capacity, ingress_open) = self.producer.observation();
+        ShardObservation {
+            thread_running: self.running.load(Ordering::Acquire),
+            ingress_open,
+            shard_halted: self.metrics.shard_halted.load(Ordering::Acquire),
+            primary_lease_held: self
+                .primary_lease
+                .as_ref()
+                .is_some_and(|lease| lease.strong_count() > 0),
+            failed: self.failed.load(Ordering::Acquire),
+            queue_depth,
+            queue_capacity,
+            queue_wait: self.producer.wait_observation(),
+            commands: self.metrics.commands.load(Ordering::Relaxed),
+            rejects: self.metrics.rejects.load(Ordering::Relaxed),
+            priority_exhaustions: self.metrics.priority_exhaustions.load(Ordering::Relaxed),
+            trades: self.metrics.trades.load(Ordering::Relaxed),
+            metrics_overflow: self.metrics.overflow.load(Ordering::Relaxed)
+                || self.diagnostics.exhausted.load(Ordering::Relaxed),
+            diagnostics_dropped: self.diagnostics.dropped.load(Ordering::Relaxed),
+            match_latency_buckets: std::array::from_fn(|i| {
+                self.metrics.match_buckets[i].load(Ordering::Relaxed)
+            }),
+            match_latency_sum_us: self.metrics.match_sum_us.load(Ordering::Relaxed),
+            command_latency_buckets: std::array::from_fn(|i| {
+                self.metrics.command_buckets[i].load(Ordering::Relaxed)
+            }),
+            command_latency_sum_us: self.metrics.command_sum_us.load(Ordering::Relaxed),
+            snapshot_latency_buckets: std::array::from_fn(|i| {
+                self.metrics.snapshot_buckets[i].load(Ordering::Relaxed)
+            }),
+            snapshot_latency_sum_ms: self.metrics.snapshot_sum_ms.load(Ordering::Relaxed),
+            snapshot_failures: self.metrics.snapshot_failures.load(Ordering::Relaxed),
+            replay_records: self.metrics.replay_records.load(Ordering::Relaxed),
+            replay_buckets: std::array::from_fn(|i| {
+                self.metrics.replay_buckets[i].load(Ordering::Relaxed)
+            }),
+            replay_sum_ms: self.metrics.replay_sum_ms.load(Ordering::Relaxed),
+            wal_append: self.wal_metrics.as_ref().map(|metrics| metrics.append()),
+            wal_sync: self.wal_metrics.as_ref().map(|metrics| metrics.sync()),
+            wal_batch_size: self
+                .wal_metrics
+                .as_ref()
+                .map(|metrics| metrics.batch_size()),
+            wal_batch_wait: self
+                .wal_metrics
+                .as_ref()
+                .map(|metrics| metrics.batch_wait()),
+        }
+    }
+
     /// 会话协调仅能使用带持久正式业务入口的句柄。
     pub(crate) fn has_durable_formal(&self) -> bool {
         self.durable_formal
@@ -4265,6 +4924,10 @@ impl ShardHandle {
     /// 读取句柄归属分片。
     pub(crate) fn shard_id(&self) -> ShardId {
         self.shard_id
+    }
+    /// 返回分片所属的集群身份。
+    pub(crate) fn cluster_id(&self) -> ClusterId {
+        self.cluster_id
     }
     /// 读取本句柄绑定的不可变路由快照。
     pub(crate) fn routes(&self) -> &RouteTable {
@@ -4337,7 +5000,13 @@ impl ShardHandle {
         let (tx, rx) = sync_channel(1);
         self.producer
             .try_push_classified(
-                Message::Mutation(command_id, market, epoch, mutation, tx),
+                Message::Mutation(
+                    command_id,
+                    market,
+                    epoch,
+                    mutation,
+                    CommandReply::new(tx, Some(Arc::clone(&self.metrics))),
+                ),
                 IngressClass::Mutation,
             )
             .map_err(|error| match error {
@@ -4354,7 +5023,13 @@ impl ShardHandle {
         command: CommandEnvelope,
     ) -> Result<Receiver<Result<FormalExecution, FormalError>>, ShardError> {
         let (tx, rx) = sync_channel(1);
-        self.push(Message::Formal(command, tx), IngressClass::Mutation)?;
+        self.push(
+            Message::Formal(
+                command,
+                CommandReply::new(tx, Some(Arc::clone(&self.metrics))),
+            ),
+            IngressClass::Mutation,
+        )?;
         Ok(rx)
     }
 
@@ -4376,6 +5051,61 @@ mod tests {
     use super::*;
     use crate::route_table::MarketRoute;
     use matching_orderbook::QueuePriorityPolicy;
+
+    #[test]
+    fn exhausted_observation_counter_is_reported_without_wrapping() {
+        let metrics = ExecutionMetrics::default();
+        metrics.commands.store(u64::MAX, Ordering::Relaxed);
+        metrics.add(&metrics.commands, 1);
+        assert_eq!(metrics.commands.load(Ordering::Relaxed), u64::MAX);
+        assert!(metrics.overflow.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn priority_exhaustion_metric_counts_actual_rejections() {
+        let metrics = ExecutionMetrics::default();
+        metrics.observe_mutation(&Err(RejectReason::PrioritySpaceExhaustion));
+        metrics.observe_formal(&Err(FormalError::Rejected(
+            RejectReason::PrioritySpaceExhaustion,
+        )));
+        metrics.observe_formal(&Err(FormalError::Rejected(RejectReason::MarketNotFound)));
+        assert_eq!(metrics.priority_exhaustions.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_and_count_overflow_without_blocking() {
+        let buffer = DiagnosticBuffer::new();
+        let event = DiagnosticEvent {
+            kind: DiagnosticKind::WorkerPanic,
+            cluster_id: ClusterId(1),
+            shard_id: ShardId(2),
+            command_id: None,
+            shard_seq: None,
+            io_kind: None,
+        };
+        for _ in 0..65 {
+            buffer.record(event.clone());
+        }
+        assert_eq!(buffer.events.len(), 64);
+        assert_eq!(buffer.dropped.load(Ordering::Relaxed), 1);
+        buffer.dropped.store(u64::MAX, Ordering::Relaxed);
+        buffer.record(event);
+        assert_eq!(buffer.dropped.load(Ordering::Relaxed), u64::MAX);
+        assert!(buffer.exhausted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn match_latency_buckets_include_boundaries_and_preserve_exact_sum() {
+        let metrics = ExecutionMetrics::default();
+        for micros in [0, 10, 11, 100, 101, 1_000_001] {
+            metrics.observe_match(Duration::from_micros(micros));
+        }
+        let buckets: [u64; 7] =
+            std::array::from_fn(|i| metrics.match_buckets[i].load(Ordering::Relaxed));
+        assert_eq!(buckets, [2, 2, 1, 0, 0, 0, 1]);
+        assert_eq!(metrics.match_sum_us.load(Ordering::Relaxed), 1_000_223);
+        assert!(!metrics.overflow.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn reference_update_is_a_market_managed_candidate_and_rejects_stale() {
@@ -5831,6 +6561,15 @@ mod tests {
         )
         .unwrap();
         let handle = shard.handle();
+        let health = crate::Health::new(vec![handle.clone()]).unwrap();
+        for dependency in [
+            crate::HealthDependency::Recovery,
+            crate::HealthDependency::Persistence,
+            crate::HealthDependency::Control,
+        ] {
+            health.set_healthy(dependency, true);
+        }
+        assert!(health.ready());
         let input = MarketByBase {
             order_id: OrderId(5),
             user_id: UserId(3),
@@ -5854,6 +6593,8 @@ mod tests {
         while !handle.failed.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::yield_now();
         }
+        assert!(!health.ready());
+        assert!(!health.live());
         assert!(matches!(
             handle.submit(CommandId(1), MarketId(3), 7, Mutation::Cancel(OrderId(9))),
             Err(ShardError::Failed)
@@ -6747,7 +7488,7 @@ mod group_sync_tests {
             assert!(
                 producer
                     .try_push_classified(
-                        Message::Formal(command(2), second_tx),
+                        Message::Formal(command(2), CommandReply::new(second_tx, None)),
                         IngressClass::Mutation
                     )
                     .is_ok()
@@ -6758,11 +7499,12 @@ mod group_sync_tests {
             let mut seq = Sequencer::new();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execute_fence_group(
-                    (command(1), first_tx),
+                    (command(1), CommandReply::new(first_tx, None)),
                     &mut consumer,
                     &mut gate,
                     (&mut epochs, &mut dedup, &mut seq),
                     (ShardId(1), ClusterId(1), LogicalTime::new(0)),
+                    None,
                 )
             }));
             assert_eq!(syncs.load(Ordering::SeqCst), 1);
@@ -6835,7 +7577,7 @@ mod group_sync_tests {
         assert!(
             producer
                 .try_push_classified(
-                    Message::Formal(command(2), second_tx),
+                    Message::Formal(command(2), CommandReply::new(second_tx, None)),
                     IngressClass::Mutation
                 )
                 .is_ok()
@@ -6852,7 +7594,7 @@ mod group_sync_tests {
         let routes = RouteTable::new([]).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             execute_formal_group(
-                (command(1), first_tx),
+                (command(1), CommandReply::new(first_tx, None)),
                 &mut consumer,
                 &mut gate,
                 FormalGroupContext {
@@ -6867,6 +7609,7 @@ mod group_sync_tests {
                     shard: ShardId(1),
                     cluster: ClusterId(1),
                     now: LogicalTime::new(0),
+                    metrics: None,
                 },
             )
         }));

@@ -1,7 +1,7 @@
 //! 有界队列、准入配额与关闭屏障的单消费者封装。
 
 use crossbeam_queue::ArrayQueue;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -61,11 +61,17 @@ struct Admission {
 /// 生产者和唯一消费者共同持有的队列元数据。
 struct Shared<T> {
     /// 有界消息及其准入类别。
-    queue: ArrayQueue<(IngressClass, T)>,
+    queue: ArrayQueue<(IngressClass, T, Instant)>,
     /// 入队、出队和关闭共用的元数据边界。
     admission: Mutex<Admission>,
     /// 在关闭完成后无锁识别已关闭入口。
     closed: AtomicBool,
+    /// 已出队消息的等待时延互斥桶。
+    wait_buckets: [AtomicU64; 7],
+    /// 已出队消息的等待微秒数总和。
+    wait_sum_us: AtomicU64,
+    /// 时延计数溢出标志。
+    wait_overflow: AtomicBool,
 }
 
 /// 可克隆的有界生产者入口。
@@ -81,6 +87,23 @@ impl<T> Clone for Producer<T> {
     }
 }
 impl<T> Producer<T> {
+    /// 读取队列等待的瞬时时延观测。
+    pub(crate) fn wait_observation(&self) -> matching_persistence::LatencySnapshot {
+        matching_persistence::LatencySnapshot {
+            buckets: std::array::from_fn(|i| self.shared.wait_buckets[i].load(Ordering::Relaxed)),
+            sum_us: self.shared.wait_sum_us.load(Ordering::Relaxed),
+            overflow: self.shared.wait_overflow.load(Ordering::Relaxed),
+        }
+    }
+    /// 无锁读取队列的瞬时长度、容量和入口状态；三项不构成原子快照。
+    pub(crate) fn observation(&self) -> (usize, usize, bool) {
+        (
+            self.shared.queue.len(),
+            self.shared.queue.capacity(),
+            !self.shared.closed.load(Ordering::Acquire),
+        )
+    }
+
     /// 外部消息仅尝试一次；关闭与准入在同一临界区线性化。
     pub(crate) fn try_push_classified(
         &self,
@@ -124,7 +147,7 @@ impl<T> Producer<T> {
         if quota_full {
             return Err(PushError::Full(message));
         }
-        match self.shared.queue.push((class, message)) {
+        match self.shared.queue.push((class, message, Instant::now())) {
             Ok(()) => {
                 match class {
                     IngressClass::Query => state.query += 1,
@@ -133,7 +156,7 @@ impl<T> Producer<T> {
                 }
                 Ok(())
             }
-            Err((_, message)) => Err(PushError::Full(message)),
+            Err((_, message, _)) => Err(PushError::Full(message)),
         }
     }
 
@@ -188,9 +211,13 @@ impl<T> Producer<T> {
                 if Instant::now() >= deadline {
                     return Err(message);
                 }
-                match self.shared.queue.push((IngressClass::Internal, message)) {
+                match self
+                    .shared
+                    .queue
+                    .push((IngressClass::Internal, message, Instant::now()))
+                {
                     Ok(()) => return Ok(()),
-                    Err((_, returned)) => message = returned,
+                    Err((_, returned, _)) => message = returned,
                 }
             }
             if Instant::now() >= deadline {
@@ -229,11 +256,34 @@ impl<T> Consumer<T> {
             .admission
             .lock()
             .expect("admission mutex poisoned");
-        let (class, message) = self.shared.queue.pop()?;
+        let (class, message, entered) = self.shared.queue.pop()?;
         match class {
             IngressClass::Query => state.query -= 1,
             IngressClass::Control => state.control -= 1,
             _ => {}
+        }
+        drop(state);
+        let elapsed = entered.elapsed().as_micros();
+        if let Ok(micros) = u64::try_from(elapsed) {
+            let bucket = matching_persistence::LATENCY_BOUNDS_US
+                .iter()
+                .position(|limit| micros <= *limit)
+                .unwrap_or(6);
+            for (counter, amount) in [
+                (&self.shared.wait_buckets[bucket], 1),
+                (&self.shared.wait_sum_us, micros),
+            ] {
+                if counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                        old.checked_add(amount)
+                    })
+                    .is_err()
+                {
+                    self.shared.wait_overflow.store(true, Ordering::Relaxed);
+                }
+            }
+        } else {
+            self.shared.wait_overflow.store(true, Ordering::Relaxed);
         }
         Some(message)
     }
@@ -252,6 +302,9 @@ pub(crate) fn bounded_queue_with_limits<T>(
     let shared = Arc::new(Shared {
         queue: ArrayQueue::new(limits.capacity),
         closed: AtomicBool::new(false),
+        wait_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        wait_sum_us: AtomicU64::new(0),
+        wait_overflow: AtomicBool::new(false),
         admission: Mutex::new(Admission {
             closed: false,
             query: 0,
@@ -292,6 +345,21 @@ mod tests {
         assert_eq!(consumer.pop(), Some(1));
         assert_eq!(consumer.pop(), Some(2));
         assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn wait_samples_only_messages_actually_dequeued() {
+        let (producer, mut consumer) = bounded_queue(2);
+        assert_eq!(producer.try_push(1), Ok(()));
+        assert_eq!(producer.try_push(2), Ok(()));
+        assert_eq!(producer.try_push(3), Err(3));
+        assert_eq!(producer.observation().0, 2);
+        assert_eq!(producer.wait_observation().buckets.iter().sum::<u64>(), 0);
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(producer.observation().0, 1);
+        assert_eq!(producer.wait_observation().buckets.iter().sum::<u64>(), 1);
+        assert_eq!(consumer.pop(), Some(2));
+        assert_eq!(producer.wait_observation().buckets.iter().sum::<u64>(), 2);
     }
 }
 

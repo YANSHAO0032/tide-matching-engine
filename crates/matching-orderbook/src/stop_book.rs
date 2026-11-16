@@ -139,6 +139,10 @@ pub(crate) struct StopReplacementPlan {
 }
 
 impl StopBook {
+    /// 返回尚未触发的止损订单数量。
+    pub(crate) fn len(&self) -> usize {
+        self.locations.len()
+    }
     /// 按来源、方向和价格遍历止损订单，保留同档先进先出与到期桶原序。
     pub(crate) fn write_canonical_state(
         &self,

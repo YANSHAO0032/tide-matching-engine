@@ -168,6 +168,23 @@ fn group_place_and_mass_cancel_write_before_reply() {
         .unwrap()
         .unwrap();
     assert_eq!(first.seq, 1);
+    let metrics = matching_runtime::Health::new(vec![shard.handle()])
+        .unwrap()
+        .with_priority_markets(vec![market], 1)
+        .unwrap()
+        .prometheus()
+        .unwrap();
+    assert!(metrics.contains("wal_group_commit_batch_size_count 1\n"));
+    assert!(metrics.contains("wal_group_commit_batch_size_sum 1\n"));
+    assert!(metrics.contains("wal_group_commit_wait_us_count 1\n"));
+    assert!(metrics.contains("engine_command_latency_us_count 3\n"));
+    assert!(metrics.contains("engine_book_metrics_available 1\n"));
+    assert!(metrics.contains("engine_open_orders 1\n"));
+    assert!(metrics.contains("engine_price_levels 1\n"));
+    assert!(metrics.contains("market_queue_priority_next{market_id=\"124\"} 1\n"));
+    assert!(metrics.contains("market_stop_priority_next{market_id=\"124\"} 0\n"));
+    assert!(metrics.contains("queue_priority_allocations_total{market_id=\"124\"} 1\n"));
+    assert!(metrics.contains("priority_space_exhaustion_total 0\n"));
     let snapshot_dir = base.join("snapshot");
     std::fs::create_dir(&snapshot_dir).unwrap();
     shard.shutdown(Duration::from_secs(5)).unwrap();
@@ -211,16 +228,71 @@ fn group_place_and_mass_cancel_write_before_reply() {
     let mut snapshot_writer =
         matching_runtime::SnapshotWriter::start(shard.handle(), snapshot_dir.clone(), 1024 * 1024)
             .unwrap();
+    let health = matching_runtime::Health::new(vec![shard.handle()]).unwrap();
+    let metrics = health.prometheus().unwrap();
+    assert!(metrics.contains("engine_replay_records_total 1\n"));
+    assert!(metrics.contains("engine_replay_duration_ms_count 1\n"));
     let snapshot = retry(|| shard.handle().take_snapshot(1))
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    snapshot_writer
-        .submit(1, snapshot)
-        .unwrap()
+    let audit_path = base.join("snapshot-audit.log");
+    let mut audit = matching_runtime::AuditLog::create(&audit_path, 4).unwrap();
+    audit
+        .write_snapshot(
+            77,
+            200,
+            &snapshot_writer,
+            1,
+            snapshot,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(
+        health
+            .prometheus()
+            .unwrap()
+            .contains("engine_snapshot_duration_ms_count 1\n")
+    );
+    assert_eq!(
+        audit.records()[0].action,
+        matching_runtime::AuditAction::Snapshot
+    );
+    assert_eq!(
+        audit.records()[0].outcome,
+        matching_runtime::AuditOutcome::Attempt
+    );
+    assert_eq!(
+        audit.records()[1].outcome,
+        matching_runtime::AuditOutcome::Succeeded
+    );
+    let duplicate = retry(|| shard.handle().take_snapshot(2))
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
+    assert!(matches!(
+        audit.write_snapshot(
+            77,
+            201,
+            &snapshot_writer,
+            1,
+            duplicate,
+            Duration::from_secs(5)
+        ),
+        Err(matching_runtime::AuditDispatchError::SnapshotIo(_))
+    ));
+    assert_eq!(
+        audit.records()[3].outcome,
+        matching_runtime::AuditOutcome::Unknown
+    );
+    drop(audit);
+    assert_eq!(
+        matching_runtime::AuditLog::open(&audit_path, 4)
+            .unwrap()
+            .records()
+            .len(),
+        4
+    );
     assert_eq!(
         matching_persistence::scan_segments(base.join("wal"))
             .unwrap()
@@ -350,6 +422,9 @@ fn group_place_and_mass_cancel_write_before_reply() {
         (77, 3)
     );
     assert_eq!(result.seq, 3);
+    let metrics = health.prometheus().unwrap();
+    assert!(metrics.contains("engine_open_orders 0\n"));
+    assert!(metrics.contains("engine_price_levels 0\n"));
     let digest = retry(|| shard.handle().take_snapshot(2))
         .recv_timeout(Duration::from_secs(5))
         .unwrap()

@@ -121,6 +121,8 @@ fn trade_limit_halts(group: bool) {
         received_at_unix_ns: None,
         payload,
     };
+    let audit_path = temp.0.join("admin-audit.log");
+    let mut audit = matching_runtime::AuditLog::create(&audit_path, 10).unwrap();
     for item in [
         command(1, Command::CreateMarket(Box::new(CreateMarket { config }))),
         command(
@@ -138,11 +140,69 @@ fn trade_limit_halts(group: bool) {
             }),
         ),
     ] {
-        retry(|| shard.handle().submit_command(item.clone()))
-            .recv_timeout(Duration::from_secs(5))
+        audit
+            .dispatch(17, &shard.handle(), item, Duration::from_secs(5))
             .unwrap()
             .unwrap();
     }
+    assert_eq!(audit.records().len(), 6);
+    assert_eq!(
+        audit.records()[0].action,
+        matching_runtime::AuditAction::MarketCreate
+    );
+    assert_eq!(
+        audit.records()[0].outcome,
+        matching_runtime::AuditOutcome::Attempt
+    );
+    assert_eq!(
+        audit.records()[1].outcome,
+        matching_runtime::AuditOutcome::Succeeded
+    );
+    assert_eq!(
+        audit.records()[0].command_digest,
+        audit.records()[1].command_digest
+    );
+    let mut stale = command(
+        90,
+        Command::SuspendMarket(matching_domain::SuspendMarket { market_id: market }),
+    );
+    stale.route_epoch = Some(99);
+    assert!(
+        audit
+            .dispatch(17, &shard.handle(), stale, Duration::from_secs(5))
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        audit.records()[7].outcome,
+        matching_runtime::AuditOutcome::Rejected
+    );
+    let mut full = matching_runtime::AuditLog::create(temp.0.join("full-audit.log"), 1).unwrap();
+    let before = retry(|| shard.handle().barrier(10))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .1;
+    let suspend = command(
+        91,
+        Command::SuspendMarket(matching_domain::SuspendMarket { market_id: market }),
+    );
+    assert!(matches!(
+        full.dispatch(17, &shard.handle(), suspend, Duration::from_secs(5)),
+        Err(matching_runtime::AuditDispatchError::Audit(_))
+    ));
+    let after = retry(|| shard.handle().barrier(11))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .1;
+    assert_eq!(before, after);
+    drop(audit);
+    assert_eq!(
+        matching_runtime::AuditLog::open(&audit_path, 10)
+            .unwrap()
+            .records()
+            .len(),
+        8
+    );
     let order = |id, user, side, qty| {
         let mut token = ReservationToken {
             token_id: id,

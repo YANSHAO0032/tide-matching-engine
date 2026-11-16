@@ -91,6 +91,10 @@ impl ControlCoordinator {
 }
 
 impl ControlStore {
+    /// 返回该单机租约存储绑定的集群与分片身份。
+    pub fn identity(&self) -> (ClusterId, ShardId) {
+        (self.cluster, self.shard)
+    }
     /// 绑定可信目录中的租约文件与分片身份。
     pub fn new(path: impl AsRef<Path>, cluster: ClusterId, shard: ShardId) -> Self {
         Self {

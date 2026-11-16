@@ -1,10 +1,16 @@
 //! 单写者分片执行、有界消息入口、路由、序号及有限正式命令编排。
 
+mod audit;
+/// 管理审计的固定字段和本地持久日志。
+pub use audit::{AuditAction, AuditDispatchError, AuditLog, AuditOutcome, AuditRecord};
 mod client_order_id;
 mod control_store;
 /// 可信文件目录中的单机排他主节点租约。
 pub use control_store::{ControlCoordinator, ControlStore, LeaseError, PrimaryLease};
 mod event_hash;
+mod health;
+/// 进程健康依赖和分片入口汇总。
+pub use health::{Health, HealthDependency};
 mod idempotency;
 /// 原序业务事件的确定性摘要。
 pub use event_hash::EventHasher;
@@ -35,17 +41,20 @@ pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable}
 pub use wait_strategy::WaitStrategy;
 /// 单写者工作线程及其结果。
 pub use worker::{
-    Execution, FormalError, FormalExecution, FormalOutcome, MarketDataOpenDetail, Mutation,
-    MutationEnvelope, MutationOutcome, Shard, ShardConfig, ShardError, ShardHandle, SnapshotError,
-    SnapshotImage, SnapshotRecoveryCandidate, SnapshotRestoreConfig, SnapshotWriter,
-    SnapshotWriterError,
+    DiagnosticEvent, DiagnosticKind, Execution, FormalError, FormalExecution, FormalOutcome,
+    MarketDataOpenDetail, Mutation, MutationEnvelope, MutationOutcome, Shard, ShardConfig,
+    ShardError, ShardHandle, ShardObservation, SnapshotError, SnapshotImage,
+    SnapshotRecoveryCandidate, SnapshotRestoreConfig, SnapshotWriter, SnapshotWriterError,
 };
 mod router;
 
 /// 基于显式快照的多分片路由及其错误。
 pub use router::{Router, RouterError};
 
+mod feed_monitor;
 mod feeds;
+/// 行情构建器水位和缺口的有界观测。
+pub use feed_monitor::{FeedCursorMonitor, FeedGapTelemetry, FeedKind, FeedMonitor, FeedTelemetry};
 mod market_data;
 /// 独立公开行情流及其构建器。
 pub use feeds::{

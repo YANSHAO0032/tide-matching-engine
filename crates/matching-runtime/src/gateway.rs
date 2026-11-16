@@ -273,6 +273,37 @@ impl GatewaySession {
         };
         Ok((request_id, self.prepare(request.key, candidate, intent)?))
     }
+    /// 认证失败时同步记录不含凭据的审计事件；审计失败必须显式返回。
+    ///
+    /// 认证与审计位于外围连接线程，调用方须提供不复用的审计尝试身份。
+    pub fn open_audited(
+        auth: &impl GatewayAuthenticator,
+        key: u64,
+        secret: &[u8],
+        journal: crate::SessionControlJournal,
+        limits: (usize, usize),
+        audit: &mut crate::AuditLog,
+        attempt_id: u128,
+    ) -> Result<Self, GatewayError> {
+        let result = Self::open(auth, key, secret, journal, limits.0, limits.1);
+        if matches!(result, Err(GatewayError::Unauthorized)) {
+            audit
+                .append(&crate::AuditRecord {
+                    actor_id: 0,
+                    command_id: attempt_id,
+                    action: crate::AuditAction::AuthenticationFailure,
+                    outcome: crate::AuditOutcome::Rejected,
+                    market_id: None,
+                    route_epoch: None,
+                    primary_epoch: None,
+                    scope: None,
+                    command_digest: [0; 32],
+                })
+                .map_err(GatewayError::Journal)?;
+        }
+        result
+    }
+
     /// 认证用户并接管已持久登记的开放会话。
     pub fn open(
         auth: &impl GatewayAuthenticator,

@@ -182,6 +182,8 @@ impl DurableAppender for BoxedDurableAppender {
 pub struct DurableBatcher<A> {
     /// 具有真实同步语义的顺序写入器。
     appender: A,
+    /// 底层追加与同步延迟，不影响提交。
+    metrics: std::sync::Arc<crate::DurabilityMetrics>,
     /// 本地同步策略。
     mode: DurabilityMode,
     /// 启动时固定的主节点纪元，需由可信租约上下文提供。
@@ -194,8 +196,10 @@ pub struct DurableBatcher<A> {
     pending_first: Option<u64>,
     /// 未同步记录数量。
     pending_count: usize,
-    /// 批次第一条记录入队时的单调时刻。
+    /// 调用方提供的批次首条记录追加时刻，用于判断批次期限。
     pending_since: Option<Instant>,
+    /// 首条记录追加成功后的单调时钟起点，仅用于观测。
+    pending_observed_since: Option<Instant>,
     /// 备节点是否可接收新的变更。
     standby_available: bool,
     /// I/O 或序号错误后永久停止。
@@ -209,6 +213,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
     {
         DurableBatcher {
             appender: BoxedDurableAppender(Box::new(self.appender)),
+            metrics: self.metrics,
             mode: self.mode,
             expected_epoch: self.expected_epoch,
             watermark: self.watermark,
@@ -216,6 +221,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
             pending_first: self.pending_first,
             pending_count: self.pending_count,
             pending_since: self.pending_since,
+            pending_observed_since: self.pending_observed_since,
             standby_available: self.standby_available,
             halted: self.halted,
         }
@@ -248,6 +254,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
         }
         Ok(Self {
             appender,
+            metrics: std::sync::Arc::new(crate::DurabilityMetrics::default()),
             mode,
             expected_epoch,
             watermark: CommitWatermark::new(replication, 0),
@@ -255,6 +262,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
             pending_first: None,
             pending_count: 0,
             pending_since: None,
+            pending_observed_since: None,
             standby_available: replication == ReplicationMode::LocalDurable,
             halted: false,
         })
@@ -262,6 +270,10 @@ impl<A: DurableAppender> DurableBatcher<A> {
     /// 按外部备节点健康状态开放或关闭新追加，不能自动改变持久策略。
     pub fn set_standby_available(&mut self, available: bool) {
         self.standby_available = available;
+    }
+    /// 获取共享的持久操作观测句柄。
+    pub fn metrics(&self) -> std::sync::Arc<crate::DurabilityMetrics> {
+        std::sync::Arc::clone(&self.metrics)
     }
     /// 返回实际本地同步成功的连续前缀。
     pub const fn local_durable(&self) -> u64 {
@@ -325,13 +337,17 @@ impl<A: DurableAppender> DurableBatcher<A> {
             .pending_count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("批次计数耗尽"))?;
-        if let Err(error) = self.appender.append(record) {
+        let started = Instant::now();
+        let append_result = self.appender.append(record);
+        self.metrics.observe_append(started.elapsed());
+        if let Err(error) = append_result {
             self.halted = true;
             return Err(error);
         }
         if self.pending_count == 0 {
             self.pending_first = Some(record.shard_seq);
             self.pending_since = Some(now);
+            self.pending_observed_since = Some(Instant::now());
         }
         self.pending_count = next_count;
         self.last_appended = record.shard_seq;
@@ -371,7 +387,16 @@ impl<A: DurableAppender> DurableBatcher<A> {
         let Some(first) = self.pending_first else {
             return Ok(());
         };
-        if let Err(error) = self.appender.sync() {
+        if matches!(self.mode, DurabilityMode::GroupCommit { .. })
+            && let Some(since) = self.pending_observed_since
+        {
+            self.metrics
+                .observe_batch(self.pending_count, since.elapsed());
+        }
+        let started = Instant::now();
+        let sync_result = self.appender.sync();
+        self.metrics.observe_sync(started.elapsed());
+        if let Err(error) = sync_result {
             self.halted = true;
             return Err(error);
         }
@@ -389,6 +414,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
         self.pending_first = None;
         self.pending_count = 0;
         self.pending_since = None;
+        self.pending_observed_since = None;
         Ok(())
     }
     /// 在可信复制适配器验证持久确认后推进备节点连续前缀。

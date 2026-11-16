@@ -438,10 +438,20 @@ fn durable_place_and_mass_cancel_write_before_reply() {
             scope: ShardCancelScope::Market { market_id: market },
         }),
     };
-    let result = retry(|| shard.handle().submit_command(cancel.clone().clone()))
-        .recv_timeout(Duration::from_secs(5))
+    let mut audit =
+        matching_runtime::AuditLog::create(base.join("mass-cancel-audit.log"), 2).unwrap();
+    let result = audit
+        .dispatch(77, &shard.handle(), cancel.clone(), Duration::from_secs(5))
         .unwrap()
         .unwrap();
+    assert_eq!(
+        audit.records()[0].action,
+        matching_runtime::AuditAction::MassCancel
+    );
+    assert_eq!(
+        audit.records()[1].outcome,
+        matching_runtime::AuditOutcome::Succeeded
+    );
     assert_eq!(result.seq, 5);
     let fanout_path = base.join("fanout-session.log");
     let mut fanout = matching_runtime::SessionControlJournal::create(
@@ -558,6 +568,14 @@ fn durable_place_and_mass_cancel_write_before_reply() {
             value
         });
         let shards = [shard.handle()];
+        let health = matching_runtime::Health::new(shards.to_vec()).unwrap();
+        for dependency in [
+            matching_runtime::HealthDependency::Recovery,
+            matching_runtime::HealthDependency::Persistence,
+            matching_runtime::HealthDependency::Control,
+        ] {
+            health.set_healthy(dependency, true);
+        }
         let wire = matching_protocol::encode_place_request(
             101,
             &matching_protocol::PlaceRequest {
@@ -587,6 +605,7 @@ fn durable_place_and_mass_cancel_write_before_reply() {
                 let mut transport = matching_runtime::GatewayTransport {
                     session: &mut tcp_gateway,
                     shared: &shared,
+                    health: &health,
                     shards: &shards,
                     max_frame: 1024,
                     timeout: Duration::from_secs(5),
@@ -635,6 +654,24 @@ fn durable_place_and_mass_cancel_write_before_reply() {
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            health.set_healthy(matching_runtime::HealthDependency::Persistence, false);
+            client.write_all(&wire).unwrap();
+            let mut rejected_header = [0_u8; matching_protocol::HEADER_LEN];
+            client.read_exact(&mut rejected_header).unwrap();
+            let rejected_length = matching_protocol::frame_length(&rejected_header, 1024).unwrap();
+            let mut rejected = rejected_header.to_vec();
+            rejected.resize(rejected_length, 0);
+            client
+                .read_exact(&mut rejected[matching_protocol::HEADER_LEN..])
+                .unwrap();
+            assert_eq!(
+                matching_protocol::decode_rejection(&rejected, 1024)
+                    .unwrap()
+                    .1
+                    .get(),
+                5002
+            );
+            health.set_healthy(matching_runtime::HealthDependency::Persistence, true);
             client.write_all(&wire).unwrap();
             let mut header = [0_u8; matching_protocol::HEADER_LEN];
             client.read_exact(&mut header).unwrap();
@@ -757,6 +794,7 @@ fn durable_place_and_mass_cancel_write_before_reply() {
                         .unwrap();
                 let shared_ref = &shared;
                 let shards_ref = &shards;
+                let health_ref = &health;
                 let signing_ref = &signing;
                 let (risk_started, risk_started_rx) = std::sync::mpsc::sync_channel(1);
                 let (resume_risk, resume_risk_rx) = std::sync::mpsc::sync_channel(1);
@@ -768,6 +806,7 @@ fn durable_place_and_mass_cancel_write_before_reply() {
                     let mut transport = matching_runtime::GatewayTransport {
                         session: &mut gateway,
                         shared: shared_ref,
+                        health: health_ref,
                         shards: shards_ref,
                         max_frame: 1024,
                         timeout: Duration::from_secs(5),
