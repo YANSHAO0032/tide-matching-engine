@@ -12,7 +12,7 @@ pub struct IncomingOrder {
 }
 
 impl IncomingOrder {
-    /// 从原始订单初始化全部剩余量的新到订单运行态。
+    /// 根据原始订单初始化新到订单的剩余量。
     pub fn new(original: LimitOrder) -> Self {
         let remaining = original.qty.get();
         Self {
@@ -26,7 +26,7 @@ impl IncomingOrder {
         &self.original
     }
 
-    /// 返回当前尚未成交的数量原始整数；零表示此新到订单已耗尽。
+    /// 返回尚未成交的数量原始整数；零表示订单已耗尽。
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
@@ -95,7 +95,7 @@ mod fill_tests {
         Qty::try_new(value).expect("test quantity must be positive")
     }
 
-    /// 构造可直接覆盖剩余量边界的卖出新到订单测试数据。
+    /// 构造用于测试剩余量边界的卖出新到订单。
     fn make_incoming(qty: u64) -> IncomingOrder {
         IncomingOrder {
             original: LimitOrder {

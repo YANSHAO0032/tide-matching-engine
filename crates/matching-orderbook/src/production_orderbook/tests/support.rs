@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 使用与参考模型一致的真实预留边界创建有效测试策略。
+/// 使用与参考模型一致的优先级保护边界创建测试策略。
 pub(super) fn policy() -> QueuePriorityPolicy {
     QueuePriorityPolicy::try_new(1024).unwrap()
 }
@@ -121,11 +121,11 @@ pub(super) fn assert_rest_error_preserves_state(
 pub(super) struct NodeSnapshotEntry {
     /// 发起查询时使用的标识符，用于保留查询结果与输入的对应关系。
     order_id: OrderId,
-    /// 原始订单请求及当前剩余量。
+    /// 当前保存的订单载荷。
     original: LimitOrder,
     /// 快照取得时该节点剩余的基础资产数量。
     remaining: u64,
-    /// 当前先进先出优先级及双向邻居槽位。
+    /// 当前先进先出优先级。
     priority: QueuePriority,
     /// 当前节点在同价队列中的前驱槽位。
     prev: Option<OrderIndex>,
@@ -135,7 +135,7 @@ pub(super) struct NodeSnapshotEntry {
 
 /// 按调用方给定的标识符顺序投影有效节点，不依赖 HashMap 迭代序。
 ///
-/// 仅覆盖这些标识符可达的节点，不包含 Arena 空槽和空闲链表。
+/// 仅覆盖这些标识符可达的节点，不包含 Arena 空槽和空闲栈。
 pub(super) fn node_snapshot(book: &ProductionOrderBook, ids: &[OrderId]) -> Vec<NodeSnapshotEntry> {
     ids.iter()
         .map(|id| {

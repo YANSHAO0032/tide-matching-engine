@@ -23,7 +23,7 @@ struct ReferenceStopAction {
 }
 
 impl ReferenceOrderBook {
-    /// 独立预检并提交未触发 Stop；不触碰普通挂单和 QueuePriority。
+    /// 独立预检并提交未触发 Stop；不修改普通挂单和 QueuePriority。
     ///
     /// child 模板和到期变化保留触发优先级，改触发价或来源才重新排队。
     /// 触发源和市价保护随候选原子保存。本低层簿接口要求调用方已经核对资金覆盖；
@@ -50,7 +50,7 @@ impl ReferenceOrderBook {
         Ok(plan.events)
     }
 
-    /// 基于不可变 Vec 快照完成所有业务拒绝、时效与分配器预检。
+    /// 基于不可变 Vec 完成业务校验、有效期和分配器预检。
     fn plan_stop_amend(
         &self,
         amend: &AmendOrder,
@@ -176,7 +176,7 @@ impl ReferenceOrderBook {
         })
     }
 
-    /// 独立检查限价 child 可接受的时效和当前逻辑时间边界。
+    /// 独立检查限价 child 的有效期和当前逻辑时间边界。
     fn validate_stop_child_amend_tif(
         tif: TimeInForce,
         now: LogicalTime,

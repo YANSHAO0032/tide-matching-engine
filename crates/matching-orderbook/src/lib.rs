@@ -1,7 +1,7 @@
 //! 独立参考订单簿、生产订单簿及其 Arena/先进先出/优先级基础结构。
 //!
 //! 参考簿使用 `Vec + sort`；生产簿使用 BTreeMap 价格索引、HashMap
-//! 身份定位和 Arena 内侵入式先进先出。两者独立实现市价、限价 IOC/FOK/PostOnly 与冰山可见片生命周期；
+//! 订单定位和 Arena 内侵入式先进先出。两者独立实现市价、限价 IOC/FOK/PostOnly 与冰山可见片生命周期；
 //! 两者都有带事件的 GTC 余量挂单入口，参考簿的底层限价撮合仍不自动挂单。
 //! 市价与 IOC/FOK 的新到订单不挂单、不分配优先级；冰山挂单补量会取得新优先级。
 //! PostOnly 只在成功挂单时分配；冰山每次补量移动到同价队尾。
@@ -19,7 +19,7 @@ pub use market_registry::{MarketRegistryContext, MarketRegistryOrder, MarketRegi
 pub use trigger_registry_context::TriggerRegistryContext;
 /// 参考簿与生产簿共享的只读市价计划数据；不含撮合算法。
 mod market_plan;
-/// 保存稳定槽位与后进先出空闲链表的 Arena 容器。
+/// 保存稳定槽位与后进先出空闲栈的 Arena 容器。
 pub mod order_arena;
 /// 稳定但可复用的 Arena 槽位位置。
 pub mod order_index;
@@ -68,5 +68,5 @@ pub use production_orderbook::{
     ProductionBookWithout, ProductionMassCancelPlan, ProductionOrderBook,
 };
 
-/// 命令内成交身份来源的内部适配。
+/// 命令内成交 ID 来源的内部适配。
 pub(crate) mod trade_id_source;

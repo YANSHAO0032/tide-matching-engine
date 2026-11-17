@@ -6,12 +6,12 @@ use matching_domain::{
     LimitOrder, MarketMath, OrderId, RejectReason, Side, StopOrder, StopPriority,
 };
 
-/// 完整过滤旧身份的不可变参考簿视图，是后续撤单替换计划的只读输入。
+/// 完整过滤旧订单的不可变参考簿视图，供撤单替换计划只读使用。
 ///
 /// 本类型只证明簿相关预检所见的状态，不代表身份、资金、有效期及提交可行性均已验证。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceBookWithout {
-    /// 在全部只读查询中逻辑排除的活动旧订单身份。
+    /// 在全部只读查询中逻辑排除的活动旧订单 ID。
     excluded_order_id: OrderId,
     /// 移除了旧订单但保留预留与分配器状态的参考簿副本。
     book: ReferenceOrderBook,
@@ -32,7 +32,7 @@ impl ReferenceOrderBook {
             return Err(RejectReason::InvalidOrderCombination);
         }
         // 普通和冰山共享完整运行态；过滤整张订单同时排除可见量、隐藏量及未来补量。
-        // 时效信息保存在各自载荷内，过滤载荷也排除其逻辑到期引用。
+        // 有效期保存在各自载荷内，过滤载荷也排除其逻辑到期引用。
         let book = Self {
             orders: self
                 .orders
@@ -71,12 +71,12 @@ impl ReferenceBookWithout {
         self.book.orders(side)
     }
 
-    /// 查询排除旧身份后的同侧最优普通挂单。
+    /// 查询排除旧订单后的同侧最优普通挂单。
     pub fn best(&self, side: Side) -> Option<&ReferenceOrder> {
         self.book.best(side)
     }
 
-    /// 查询排除旧身份后的未触发止损订单，绝不转换成普通流动性。
+    /// 查询排除旧订单后的未触发止损订单，绝不转换成普通流动性。
     pub fn stop_order(&self, id: OrderId) -> Option<(&StopOrder, StopPriority)> {
         self.book.stop_order(id)
     }

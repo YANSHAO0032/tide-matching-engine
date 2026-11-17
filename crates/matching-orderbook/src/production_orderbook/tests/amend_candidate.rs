@@ -43,9 +43,9 @@ fn amend(order_id: OrderId, user_id: UserId, new_qty: Qty) -> AmendOrder {
 /// 冻结订单簿内部状态以检查失败原子性。
 #[derive(Debug, PartialEq, Eq)]
 struct BookSnapshot {
-    /// 买方价格档与其队列顺序快照。
+    /// 买方价格档及队列端点快照。
     bids: Vec<LevelSnapshotEntry>,
-    /// 卖方价格档与其队列顺序快照。
+    /// 卖方价格档及队列端点快照。
     asks: Vec<LevelSnapshotEntry>,
     /// 指定订单身份对应的节点快照。
     nodes: Vec<NodeSnapshotEntry>,

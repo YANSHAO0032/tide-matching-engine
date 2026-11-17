@@ -1,4 +1,4 @@
-//! 预留状态快照的编码及校验。
+//! 验证预留状态、策略和密钥快照的编码及校验。
 use matching_domain::{
     AssetId, AssetReserve, MarketId, OrderId, OriginSessionId, ReservationId, UserId,
     snapshot_wire::{SnapshotDecoder, SnapshotEncoder},

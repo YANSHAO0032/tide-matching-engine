@@ -117,7 +117,7 @@ fn effective_protection_with_source_has_stable_attribution() {
             "side={side:?}, user={user:?}, band={band:?}"
         );
 
-        // 新辅助函数与已有纯合并函数的有效价格必须一致。
+        // 带来源与不带来源的合并结果必须使用相同的有效价格。
         assert_eq!(
             actual.map(|(price, _)| price),
             effective_protection_price(side, user, band),
@@ -224,7 +224,7 @@ fn command_start_with_source_preserves_candidate_attribution() {
 
         assert_eq!(attributed, expected);
 
-        // 旧接口严格等于新接口的价格投影。
+        // 不带来源的接口应返回相同价格。
         assert_eq!(
             effective_protection_at_command_start(protection.as_ref(), &context, side, &math,),
             Ok(expected.map(|(price, _)| price))
@@ -327,7 +327,7 @@ fn command_start_with_source_propagates_original_errors() {
             market_band_worst: Some(p(100_000)),
         };
 
-        // 以已验收的用户保护函数作为错误来源。
+        // 对照用户保护函数返回的错误。
         let expected_error = protection
             .user_protection_price(
                 context.reference_price_at_command_start,

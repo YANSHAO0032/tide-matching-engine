@@ -1,4 +1,4 @@
-//! 市场价格带的来源和复用市价保护整数数学的双侧边界。
+//! 市场价格带的参考来源和双侧边界计算，复用市价保护的整数运算。
 
 use crate::{
     Price, PriceReferenceKind, RejectReason, Side, market_order::slippage_protection_price,
@@ -14,7 +14,7 @@ pub struct PriceBandConfig {
 }
 
 impl PriceBandConfig {
-    /// 使用已有方向取整和 tick 对齐规则计算包含式下界与上界。
+    /// 使用已有方向取整和 tick 对齐规则计算含边界的价格上下限。
     ///
     /// 基点不在 `0..=9_999` 时返回 `InvalidSlippageBps`，非正价格步长返回
     /// `InvalidTick`，两者均无效时优先返回 `InvalidSlippageBps`；不可表示的

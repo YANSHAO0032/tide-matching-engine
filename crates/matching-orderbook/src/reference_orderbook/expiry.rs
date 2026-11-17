@@ -1,4 +1,4 @@
-//! 参考簿以 Vec 扫描和显式排序实现普通订单到期。
+//! 参考簿以 Vec 扫描和显式排序实现订单到期。
 
 use super::{PRIORITY_GUARD, ReferenceOrderBook};
 use crate::ReferenceOrder;
@@ -9,7 +9,7 @@ use matching_domain::{
 use matching_risk::ReservationState;
 
 impl ReferenceOrderBook {
-    /// 将时效挂单和调用方预留快照作为一次独占操作提交。
+    /// 将带有效期的挂单和调用方预留快照作为一次独占操作提交。
     pub fn rest_timed_with_reservation(
         &mut self,
         order: LimitOrder,
@@ -76,7 +76,7 @@ impl ReferenceOrderBook {
         Ok(())
     }
 
-    /// 扫描普通 GTD 订单，并按到期时间和订单标识排序后终结。
+    /// 扫描普通及未触发 GTD 订单，按到期时间和订单标识排序后终结。
     pub fn expire_gtd_through(&mut self, now: LogicalTime) -> Vec<ExpiredOrder> {
         let mut matches = self
             .orders
@@ -122,7 +122,7 @@ impl ReferenceOrderBook {
         expired.into_iter().map(|(_, entry)| entry).collect()
     }
 
-    /// 扫描并终结当前交易时段内的普通 DAY 订单。
+    /// 扫描并终结当前交易时段内的普通及未触发 DAY 订单。
     pub fn end_session(
         &mut self,
         session_id: u64,
@@ -166,7 +166,7 @@ impl ReferenceOrderBook {
         Ok(expired)
     }
 
-    /// 使用 root 冻结的价格带执行定期限价子单。
+    /// 使用根命令冻结的价格带执行定期限价子单。
     pub(super) fn place_limit_timed_frozen(
         &mut self,
         order: LimitOrder,

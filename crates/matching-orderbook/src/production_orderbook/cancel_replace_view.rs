@@ -13,12 +13,12 @@ use matching_risk::ReservationState;
 
 /// 撤单替换计划的只读前置视图，不代表完整身份、资金或命令验证已完成。
 ///
-/// 所有簿查询和预检都携带同一个排除身份；真实订单、链接、到期桶和预留保持原状。
+/// 所有簿查询和预检都排除同一旧订单；真实订单、链接、到期桶和预留保持原状。
 #[derive(Clone, Copy, Debug)]
 pub struct ProductionBookWithout<'a> {
     /// 被借用、从未实际删除订单的生产订单簿。
     book: &'a ProductionOrderBook,
-    /// 在全部只读查询中逻辑排除的活动旧订单身份。
+    /// 在全部只读查询中逻辑排除的活动旧订单 ID。
     excluded_order_id: OrderId,
 }
 
@@ -40,7 +40,7 @@ impl PartialEq for ProductionBookWithout<'_> {
 impl Eq for ProductionBookWithout<'_> {}
 
 impl ProductionOrderBook {
-    /// 确认旧身份属于支持的活动容器后，借用其逻辑删除视图。
+    /// 确认旧订单属于支持的活动容器后，借用其逻辑删除视图。
     pub fn book_without(
         &self,
         old_order_id: OrderId,
@@ -63,7 +63,7 @@ impl ProductionOrderBook {
 }
 
 impl<'a> ProductionBookWithout<'a> {
-    /// 固定排除身份并取得生产片成交计划，后续提交直接消费本计划而不重新扫描。
+    /// 固定要排除的订单并取得成交片计划，后续提交直接使用该计划而不重新扫描。
     pub(super) fn plan_limit_fills(
         &self,
         order: &LimitOrder,
@@ -186,7 +186,7 @@ impl<'a> ProductionBookWithout<'a> {
             .map(|node| node.original_order().price)
     }
 
-    /// 按价格优先返回可见深度；隐藏量及旧身份均不计入。
+    /// 按价格优先返回可见深度；隐藏量及旧订单均不计入。
     pub fn depth(&self, side: Side) -> Vec<(Price, u64)> {
         let mut result: Vec<(Price, u64)> = Vec::new();
         for node in self.orders(side) {

@@ -252,7 +252,7 @@ impl Outcome {
 /// 差分观察的普通订单运行态。
 #[derive(Debug, PartialEq, Eq)]
 struct Regular {
-    /// 订单创建时的完整普通限价载荷。
+    /// 当前保存的限价订单载荷。
     original: LimitOrder,
     /// 当前可见剩余基础数量。
     visible: u64,
@@ -271,7 +271,7 @@ struct Regular {
 /// 差分比较使用的状态投影。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct State {
-    /// 双模型共享的可观察订单簿、深度与事件状态。
+    /// 可观察的订单簿和深度。
     book: ObservedBook,
     /// 普通订单完整运行态的有序投影。
     regular: Vec<Regular>,

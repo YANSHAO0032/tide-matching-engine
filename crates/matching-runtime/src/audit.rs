@@ -65,7 +65,7 @@ pub struct AuditRecord {
     pub primary_epoch: Option<u64>,
     /// 若适用，记录集群与分片身份。
     pub scope: Option<(u16, u16)>,
-    /// 规范业务命令的 SHA-256 摘要，不包含密钥或认证凭据。
+    /// 业务命令或管理操作的摘要；认证失败等无摘要时使用全零。
     pub command_digest: [u8; 32],
 }
 
@@ -317,7 +317,7 @@ impl AuditLog {
         })
     }
 
-    /// 独占并严格检查已有日志；截断、损坏与超过上限均拒绝。
+    /// 独占并检查已有日志；拒绝已确认前缀截断、损坏或超过上限的记录。
     pub fn open(path: impl AsRef<Path>, max_records: usize) -> io::Result<Self> {
         let path = path.as_ref();
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -374,7 +374,7 @@ impl AuditLog {
         })
     }
 
-    /// 追加并同步单条记录；失败后本句柄永久停止写入。
+    /// 追加并同步单条记录；文件写入、同步或清单提交失败后停止写入。
     pub fn append(&mut self, record: &AuditRecord) -> io::Result<()> {
         if self.failed || self.records.len() >= self.max_records {
             return Err(io::Error::other("审计日志不可写或已满"));

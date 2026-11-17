@@ -61,7 +61,7 @@ fn expected_protected_quote_plan(
     }
 }
 
-// 对比全部生产簿内部状态，而不仅是活动订单。
+// 对比价格档、订单索引、Arena 和优先级分配器状态。
 fn assert_failure_atomic<F>(book: &mut ProductionOrderBook, action: F)
 where
     F: FnOnce(&mut ProductionOrderBook),
@@ -614,7 +614,7 @@ mod protected_market_by_quote {
                 );
             });
 
-            // 首档在保护范围内，余额不足 1 手，正常不足一手的预算，无触发。
+            // 首档在保护范围内，但预算不足一手，不触发保护。
             let mut book = ProductionOrderBook::new(policy());
             book.rest(order(1, maker_side, 100, 5)).unwrap();
             assert_failure_atomic(&mut book, |book| {
@@ -647,7 +647,7 @@ mod protected_market_by_quote {
                 );
             });
 
-            // 前序成交之后的不足一手的预算：下一挂单在保护范围内，无终止。
+            // 已规划一笔成交后预算不足一手；下一挂单在保护范围内，不触发保护。
             let mut book = ProductionOrderBook::new(policy());
             book.rest(order(1, maker_side, better, 1)).unwrap();
             book.rest(order(2, maker_side, 100, 5)).unwrap();
@@ -667,7 +667,7 @@ mod protected_market_by_quote {
                 );
             });
 
-            // 前序成交后仅余 5 报价资产：越界优先于不足一手的预算。
+            // 已规划一笔成交后仅余 5 报价资产：越界检查优先于预算不足检查。
             let mut book = ProductionOrderBook::new(policy());
             book.rest(order(1, maker_side, better, 1)).unwrap();
             book.rest(order(2, maker_side, outside, 5)).unwrap();
@@ -1039,7 +1039,7 @@ mod protected_market_by_quote {
             assert_eq!(book.next_queue_priority(), next_before);
             assert_eq!(validate_book(&book), Ok(()));
 
-            // 首档在保护内，但预算不足一手：不足一手的预算，无事件。
+            // 首档在保护范围内，但预算不足一手，不产生事件。
             let mut book = ProductionOrderBook::new(policy());
             book.rest(order(1, maker_side, 100, 5)).unwrap();
 

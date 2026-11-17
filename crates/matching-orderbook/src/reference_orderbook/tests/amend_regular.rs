@@ -225,10 +225,10 @@ fn amend(order: &LimitOrder) -> AmendOrder {
     }
 }
 
-/// 冻结测试关注的完整状态以比较前后变化。
+/// 保存测试关注的状态，以比较前后变化。
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
-    /// 普通订单原始载荷、可见量、隐藏量、峰值、优先级和有效期的有序快照。
+    /// 常规簿订单的原始载荷、可见量、隐藏量、峰值、优先级和有效期。
     orders: Vec<(
         LimitOrder,
         u64,

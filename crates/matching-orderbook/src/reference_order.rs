@@ -6,7 +6,7 @@ use matching_domain::{LimitOrder, Qty, QueuePriority, RejectReason, TimeInForce}
 /// 参考模型的同价先进先出由源 `Vec` 的稳定顺序表达。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceOrder {
-    /// 不随成交扣减改变的原始订单载荷。
+    /// 最近一次接受的订单载荷；成交扣减不会改变它。
     original: LimitOrder,
     /// 当前可见片的剩余量，可以在移除或补量前短暂为零。
     remaining: u64,
@@ -112,7 +112,7 @@ impl ReferenceOrder {
         }
     }
 
-    /// 借用不可变的原始订单载荷。
+    /// 借用最近一次接受的订单载荷；改单可以替换该载荷。
     pub fn original_order(&self) -> &LimitOrder {
         &self.original
     }

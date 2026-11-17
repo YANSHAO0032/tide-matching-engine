@@ -544,7 +544,7 @@ impl Health {
 
     /// 处理一个有界 HTTP 观测请求；调用方负责连接超时和访问控制。
     ///
-    /// 只支持 GET，响应后关闭连接；不会读取或执行请求体。
+    /// 只支持 GET，响应要求关闭连接；不会读取或执行请求体。
     pub fn serve_http(
         &self,
         stream: &mut (impl std::io::Read + std::io::Write),

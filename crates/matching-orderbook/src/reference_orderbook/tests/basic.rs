@@ -2,7 +2,7 @@
 use super::*;
 use matching_domain::{LimitOrder, OrderId, Price, Qty, UserId};
 
-/// 构造带指定业务字段的挂单订单测试数据。
+/// 构造指定方向、价格和数量的参考订单。
 fn order(id: u128, side: Side, price: i64, qty: u64) -> ReferenceOrder {
     ReferenceOrder::new(
         LimitOrder {
@@ -18,7 +18,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> ReferenceOrder {
     )
 }
 
-/// 直接构造非空参考簿，仅用于表达需要特定源顺序的测试前置条件。
+/// 直接构造参考簿，供需要指定原始订单顺序的测试使用。
 fn book(orders: Vec<ReferenceOrder>) -> ReferenceOrderBook {
     ReferenceOrderBook {
         orders,
@@ -481,7 +481,7 @@ fn cancel_preserves_fifo_and_remaining_on_both_sides() {
                 book.rest(candidate(id, side, 100, 10)).unwrap();
             }
 
-            // 制造不同的运行态剩余量：
+            // 构造不同的订单剩余量：
             // 标识符=30 -> 9
             // 标识符=10 -> 7
             // 标识符=20 -> 5

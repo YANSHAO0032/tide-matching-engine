@@ -41,7 +41,7 @@ fn effective_protection_at_command_start_composes_candidates() {
         );
 
         // 3. 仅有用户基点。
-        // 期望由已验收辅助函数产生，不复制基点公式。
+        // 此处验证候选组合，基点计算由辅助函数覆盖。
         let expected_user = bps_only
             .user_protection_price(
                 no_band_context.reference_price_at_command_start,
@@ -136,7 +136,7 @@ fn effective_protection_at_command_start_propagates_user_errors() {
     };
 
     for side in [Side::Buy, Side::Sell] {
-        // 1. 已验收用户辅助函数必须返回 3007。
+        // 1. 非法基点返回 3007。
         let expected_error = invalid_bps
             .user_protection_price(
                 context.reference_price_at_command_start,
@@ -185,41 +185,34 @@ fn command_start_protection_context_has_value_semantics() {
         market_band_worst: Some(band),
     };
 
-    // 字段必须原样保留。
     assert_eq!(without_band.reference_price_at_command_start, reference);
     assert_eq!(without_band.market_band_worst, None);
 
     assert_eq!(with_band.reference_price_at_command_start, reference);
     assert_eq!(with_band.market_band_worst, Some(band));
 
-    // Clone 后相等。
     assert_eq!(without_band.clone(), without_band);
     assert_eq!(with_band.clone(), with_band);
 
-    // Debug 可用。
     let debug = format!("{with_band:?}");
     assert!(debug.contains("CommandStartProtectionContext"));
     assert!(debug.contains("reference_price_at_command_start"));
     assert!(debug.contains("market_band_worst"));
 
-    // 相同字段值的独立对象相等。
     let same = CommandStartProtectionContext {
         reference_price_at_command_start: Price::try_new(100_003).unwrap(),
         market_band_worst: Some(Price::try_new(100_010).unwrap()),
     };
     assert_eq!(with_band, same);
 
-    // 相同参考值，但 None 与 Some 不相等。
     assert_ne!(without_band, with_band);
 
-    // 仅改变参考值，不相等。
     let changed_reference = CommandStartProtectionContext {
         reference_price_at_command_start: Price::try_new(100_013).unwrap(),
         market_band_worst: Some(band),
     };
     assert_ne!(with_band, changed_reference);
 
-    // 仅改变市场价格区间，不相等。
     let changed_band = CommandStartProtectionContext {
         reference_price_at_command_start: reference,
         market_band_worst: Some(Price::try_new(100_020).unwrap()),

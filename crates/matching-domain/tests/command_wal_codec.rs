@@ -250,7 +250,7 @@ fn invalid_optional_and_command_tags_are_rejected() {
 #[test]
 fn place_corrupt_values_and_lengths_are_rejected() {
     let bytes = encode_wal_command(&samples()[0]).unwrap();
-    // 前缀、完整订单、客户端身份之后依次为控制版本和只挂单标志。
+    // 分别破坏订单标记、客户端标识长度和只挂单标志。
     for (offset, value) in [(107, 255), (108, 255), (130, 255), (147, 2)] {
         let mut damaged = bytes.clone();
         damaged[offset] = value;

@@ -98,7 +98,7 @@ fn assert_book_error(book: &ProductionOrderBook, expected_category: &str) {
 
     let orders_before = book.orders.clone();
 
-    // 完整覆盖 Arena 槽位 + 空闲链表，
+    // 完整覆盖 Arena 槽位和空闲槽位列表，
     // 同时也包含所有已占用 OrderNode 状态。
     let arena_before = book.arena.test_snapshot();
 
@@ -317,7 +317,7 @@ fn validate_book_accepts_free_arena_slot_outside_active_book() {
 
     assert!(book.arena.get(temporary).is_some());
 
-    // 真实 `remove`，留下空闲链表槽位。
+    // 调用 `remove` 后，该槽位变为空闲槽位。
     let removed = book.arena.remove(temporary).unwrap();
 
     assert_eq!(removed.original_order().order_id, OrderId::new(999));

@@ -1,4 +1,4 @@
-//! 验证可信提交水位限制恢复范围。
+//! 验证按可信提交水位恢复和修复 WAL 的边界。
 use matching_persistence::{SegmentWriter, WalRecord, recover_committed};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);

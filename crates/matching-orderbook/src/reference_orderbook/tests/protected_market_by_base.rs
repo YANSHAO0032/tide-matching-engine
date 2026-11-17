@@ -237,7 +237,7 @@ fn protected_market_by_base_preflight_propagates_errors_atomically() {
     }
 
     // 3. 买入的滑点边界超过 i64 正价格值域：
-    //    既有领域层带溢出检查的算术错误必须原样传播。
+    //    领域层返回的算术溢出错误必须原样传播。
     let mut book = ReferenceOrderBook::new();
     book.rest(limit(1, Side::Sell, 100_000, 5)).unwrap();
 

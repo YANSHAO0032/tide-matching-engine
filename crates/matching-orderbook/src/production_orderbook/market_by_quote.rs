@@ -564,12 +564,12 @@ impl ProductionOrderBook {
             }
             .expect("preflighted MarketByQuote level disappeared");
 
-            // 必须仍然是当前最优对手价的先进先出头节点。
+            // 必须仍然是计划价档的先进先出头节点。
             assert_eq!(level.head(), Some(index));
 
-            // 报价预算可能不足以再成交当前最优价档的一整手，但仍足以成交更低价
-            // 的后续档位。此处只能复核预检锁定的档位与 FIFO 头，不能要求该档位
-            // 仍是整个对手侧的最优价格。
+            // 预算不足当前价档一手时，预检会终止，不跳到后续价档。
+            // 此处按预检顺序复核计划价档和 FIFO 头，
+            // 不重新执行预算计算。
 
             let maker = self
                 .arena
@@ -874,7 +874,7 @@ impl ProductionOrderBook {
         ))
     }
 
-    /// 在根命令候选状态中执行报价预算市价单，并逐笔取得真实成交身份。
+    /// 在根命令候选状态中执行报价预算市价单，并逐笔取得成交 ID。
     pub fn execute_market_by_quote_with_cursor(
         &mut self,
         incoming: MarketByQuote,

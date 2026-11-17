@@ -28,9 +28,9 @@ pub struct PlaceRequest {
     pub key: u128,
     /// 目标市场。
     pub market: u32,
-    /// 正的价格原始整数。
+    /// 原始价格整数，必须大于零。
     pub price: i64,
-    /// 正的基础数量原始整数。
+    /// 原始基础数量整数，必须大于零。
     pub qty: u64,
     /// 账户授予的自成交分组；生产部署须由可信账户策略复核。
     pub stp_key: u64,
@@ -52,7 +52,7 @@ pub enum PlaceCodecError {
     Frame(FrameError),
     /// 类型、标志、字段或字符串不符合版本化模式。
     Schema,
-    /// 字符串或整个帧超出配置。
+    /// 字符串或整个帧超出配置的长度上限。
     TooLarge,
     /// 价格不是严格正值。
     InvalidPrice,

@@ -573,7 +573,7 @@ impl ProductionOrderBook {
         );
     }
 
-    /// 生产自己的片成交计划覆盖普通及冰山 maker，并在删除旧单前冻结全部成交。
+    /// 预检普通及冰山 maker 的逐片成交，在删除旧单前冻结计划。
     fn preflight_amend_reprice(
         &self,
         plan: RegularAmendPlan,
@@ -689,7 +689,7 @@ impl ProductionOrderBook {
         Err(RejectReason::OrderNotFound)
     }
 
-    /// 核对本地 shadow state 与命令身份，不复制 reserve 容器。
+    /// 核对本地预留影子与命令身份，不复制预留资产集合。
     fn reservation_snapshot(
         &self,
         amend: &AmendOrder,

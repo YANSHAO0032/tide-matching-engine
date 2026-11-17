@@ -121,14 +121,14 @@ fn valid(book: &ProductionOrderBook) {
     assert_eq!(book.validate_stop_book(), Ok(()));
 }
 
-/// 冻结测试关注的完整状态以比较前后变化。
+/// 保存测试关注的状态，以比较前后变化。
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     /// 买方价格档与其队列顺序快照。
     bids: Vec<LevelSnapshotEntry>,
     /// 卖方价格档与其队列顺序快照。
     asks: Vec<LevelSnapshotEntry>,
-    /// Arena 槽位与空闲链的完整快照。
+    /// Arena 槽位与空闲槽位列表的完整快照。
     arena: (Vec<Option<OrderNode>>, Vec<OrderIndex>),
     /// 订单身份到 Arena 槽位的有序索引快照。
     index: Vec<(OrderId, OrderIndex)>,

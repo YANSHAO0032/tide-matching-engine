@@ -1,4 +1,4 @@
-//! ProductionOrderBook 的查询、挂单、取消、状态保持与损坏故障时停止处理验证。
+//! 验证 ProductionOrderBook 的查询、挂单、取消和异常状态处理。
 
 use super::ProductionOrderBook;
 use crate::market_plan::{ProtectedMarketByQuotePlan, ProtectionBoundaryStop, QuoteFillPlan};
@@ -48,11 +48,11 @@ mod stp;
 struct LevelSnapshotEntry {
     /// 有序价格索引中的键。
     price: Price,
-    /// 此档声明的先进先出首尾槽位。
+    /// 此档声明的先进先出首槽位。
     head: Option<OrderIndex>,
     /// 此档声明的先进先出尾槽位。
     tail: Option<OrderIndex>,
-    /// 此档声明的节点数和可见数量合计。
+    /// 此档声明的节点数。
     count: u32,
     /// 此档声明的可见基础数量聚合值。
     total_visible_qty: u64,

@@ -255,7 +255,7 @@ impl Outcome {
 struct Record {
     /// 单条命令在两个独立模型中的可观察执行结果。
     outcome: Outcome,
-    /// 单条命令后的完整订单簿与事件状态。
+    /// 单条命令后的订单簿状态投影。
     state: State,
     /// 完整金融快照与私有归属的结构相等包含所有 PendingR2 历史。
     registry: ReservationRegistry,
@@ -325,9 +325,9 @@ struct Harness {
     known_r: BTreeSet<ReservationId>,
     /// 已登记到生产侧的全部预留身份。
     known_p: BTreeSet<ReservationId>,
-    /// 每条命令显式推进的逻辑时钟。
+    /// 由时间推进命令更新的逻辑时钟。
     clock: LogicalClock,
-    /// 签发测试资金授权的确定性验签公钥集合。
+    /// 验证测试资金授权的公钥集合。
     keys: RiskKeySet,
     /// 为每条成交预先分配的单调成交身份来源。
     trades: TradeIdSource,

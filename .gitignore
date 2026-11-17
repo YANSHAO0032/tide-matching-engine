@@ -3,18 +3,18 @@
 # Rust / Cargo
 # =========================
 
-# Cargo build output
+# Cargo 构建产物
 target/
-#存放任务执行手册
+# 任务执行文档
 assignment/
-# Cargo lock file
+# Cargo 锁文件
 # 应用程序建议提交 Cargo.lock
 # 库项目通常可以不提交 Cargo.lock
 # Cargo.lock
 
 
 # =========================
-# Build / Output
+# 构建产物
 # =========================
 
 build/
@@ -22,7 +22,7 @@ dist/
 out/
 bin/
 
-# Temporary files
+# 临时文件
 tmp/
 temp/
 *.tmp
@@ -33,7 +33,7 @@ temp/
 # IDE
 # =========================
 
-# JetBrains / RustRover / IntelliJ IDEA
+# JetBrains 系列 IDE
 .idea/
 *.iml
 *.iws
@@ -44,7 +44,7 @@ temp/
 
 
 # =========================
-# OS
+# 操作系统
 # =========================
 
 # Windows
@@ -59,7 +59,7 @@ Desktop.ini
 
 
 # =========================
-# Environment / Secrets
+# 环境配置与密钥
 # =========================
 
 .env
@@ -68,7 +68,7 @@ Desktop.ini
 
 *.local
 
-# Certificates / Keys
+# 证书与密钥
 *.pem
 *.key
 *.crt
@@ -77,7 +77,7 @@ Desktop.ini
 
 
 # =========================
-# Runtime / Data
+# 运行数据
 # =========================
 
 logs/
@@ -88,20 +88,20 @@ data/
 
 
 # =========================
-# Profiling / Debug
+# 性能分析与调试
 # =========================
 
 *.prof
 *.pprof
 
-# Flamegraph / profiling outputs
+# 火焰图与性能分析产物
 flamegraph.svg
 perf.data
 perf.data.old
 
 
 # =========================
-# Coverage
+# 覆盖率
 # =========================
 
 coverage/
@@ -115,18 +115,18 @@ tarpaulin-report.html
 # Rust tooling
 # =========================
 
-# rust-analyzer / local tooling cache
+# rust-analyzer 等本地工具缓存
 .rust-analyzer/
 
-# Local benchmark / test results
+# 本地基准测试结果
 criterion/
 
-# cargo-expand / generated temporary files
+# cargo-expand 生成的临时文件
 expanded.rs
 
 
 # =========================
-# Backup files
+# 备份文件
 # =========================
 
 *.bak

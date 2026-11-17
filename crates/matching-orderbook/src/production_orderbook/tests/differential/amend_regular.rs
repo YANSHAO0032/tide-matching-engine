@@ -96,7 +96,7 @@ impl Outcome {
 /// 差分比较使用的状态投影。
 #[derive(Debug, PartialEq, Eq)]
 struct State {
-    /// 可观察订单簿、深度与事件状态。
+    /// 可观察的订单簿和深度。
     book: ObservedBook,
     /// 与业务价序及 FIFO 投影保持相同原序，包含完整预留内容和版本。
     timed_shadows: Vec<(OrderId, TimeInForce, Option<ReservationState>)>,
@@ -161,7 +161,7 @@ fn production_state(book: &ProductionOrderBook) -> State {
     }
 }
 
-/// 失败时额外比较物理槽位、空闲链、索引及完整预留映射，不能只比较语义终态。
+/// 失败时额外比较物理槽位、空闲槽位列表、索引及预留映射。
 fn production_snapshot(book: &ProductionOrderBook) -> String {
     let mut index = book.orders.iter().collect::<Vec<_>>();
     index.sort_unstable_by_key(|(id, _)| **id);
@@ -194,7 +194,7 @@ struct Harness {
     clock: LogicalClock,
     /// 单调递增的测试成交身份来源。
     ids: TradeIdSource,
-    /// 当前仍可操作的订单身份集合。
+    /// 已在命令中出现的订单身份集合，用于查询预留状态。
     known_ids: BTreeSet<OrderId>,
     /// 当前磁带中的零基命令序号。
     step: usize,

@@ -1,4 +1,4 @@
-//! Arena 生命周期、空闲链表和常数槽位访问证据。
+//! Arena 生命周期、空闲槽位栈和常数槽位访问证据。
 //!
 //! 此模块的模型与快照只用于验证实现，不参与生产状态或重放。
 
@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 impl OrderArena {
-    /// 将测试访问计数归零；不会触碰槽位或空闲链表。
+    /// 将测试访问计数归零；不会触碰槽位或空闲栈。
     pub(crate) fn reset_slot_accesses(&self) {
         self.slot_accesses.set(0);
     }

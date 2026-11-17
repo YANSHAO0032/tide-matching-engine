@@ -18,15 +18,15 @@ fn book() -> ProductionOrderBook {
     ProductionOrderBook::new(policy())
 }
 
-/// 比较完整生产簿状态。
+/// 比较生产簿的价格档、索引、Arena 和优先级分配器状态。
 ///
 /// 包括：
 /// - 双侧 BTreeMap 档位
 /// - OrderId 索引
-/// - Arena 槽位/空闲链表
+/// - Arena 槽位和空闲槽位列表
 /// - QueuePriority 分配器
 ///
-/// 只用于失败路径的原子性验证。
+/// 用于验证失败路径或只读操作不改变这些状态。
 fn assert_failure_atomic<F>(book: &mut ProductionOrderBook, action: F)
 where
     F: FnOnce(&mut ProductionOrderBook),
@@ -771,7 +771,7 @@ mod protected_market_by_base {
                 assert_eq!(validate_book(&book), Ok(()));
             }
 
-            // 挂单严格部分成交：保留槽位、优先级和先进先出后继。
+            // 挂单部分成交：保留槽位和优先级。
             let mut book = book();
             book.rest(order(1, maker_side, 100, 10)).unwrap();
             book.rest(order(2, maker_side, outside, 4)).unwrap();
@@ -963,7 +963,7 @@ mod protected_market_by_base {
                 );
             });
 
-            // 无保护：两张挂单两笔成交，单个 TradeId 必须在修改前触发不变量断言。
+            // 两张挂单均在保护范围内；TradeId 不足必须在修改前触发不变量断言。
             book.rest(order(2, maker_side, 100_000, 5)).unwrap();
             assert_failure_atomic(&mut book, |book| {
                 let result = catch_unwind(AssertUnwindSafe(|| {

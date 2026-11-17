@@ -1,4 +1,4 @@
-//! 验证快照基础编码的固定字节和有界解码。
+//! 验证快照基础编码及领域值编解码的往返和边界。
 use matching_domain::snapshot_wire::{SnapshotDecoder, SnapshotEncoder};
 #[test]
 fn round_trip_is_canonical_and_rejects_trailing_bytes() {

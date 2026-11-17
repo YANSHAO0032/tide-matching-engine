@@ -53,7 +53,7 @@ fn preflight_insert_accepts_lifo_reuse_without_consuming_free_slot() {
     assert_eq!(arena.preflight_insert(), Ok(()));
     assert_eq!(arena.test_snapshot(), before);
 
-    // 真正 `insert` 仍然复用最后进入空闲链表的第二个。
+    // 实际插入仍复用最后释放的第二个槽位。
     let reused = arena
         .insert(OrderNode::new(
             order(3, Side::Buy, 100),
@@ -77,7 +77,7 @@ fn preflight_insert_panics_on_corrupted_free_tail_without_mutation() {
             .unwrap();
 
         if occupied {
-            // 故意把仍已占用的槽位塞进空闲尾节点。
+            // 故意把已占用槽位放到空闲栈顶。
             arena.free.push(live);
         } else {
             arena.free.push(OrderIndex::try_from_usize(99).unwrap());

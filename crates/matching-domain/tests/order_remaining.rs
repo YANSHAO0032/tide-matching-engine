@@ -1,4 +1,4 @@
-//! 验证撤单事件的基础数量与报价预算余量协议。
+//! 验证撤单余量、批量撤单范围和相关原因码。
 
 use matching_domain::{
     CancelReason, EngineEvent, MarketId, OrderId, OrderRemaining, OriginSessionId, Qty,

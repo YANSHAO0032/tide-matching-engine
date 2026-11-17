@@ -76,7 +76,7 @@ impl SnapshotEncoder {
         }
         self.bytes.try_reserve(extra).map_err(|_| SnapshotWireError)
     }
-    /// 在检查容量后原样追加固定宽度字段。
+    /// 检查容量后原样追加字节。
     fn raw(&mut self, value: &[u8]) -> Result<(), SnapshotWireError> {
         self.reserve(value.len())?;
         self.bytes.extend_from_slice(value);

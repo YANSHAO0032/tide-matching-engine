@@ -1,4 +1,4 @@
-//! 费率版本不能覆盖且历史订单仍可读取其锁定配置。
+//! 验证费率版本、快照和费用取整，包括历史版本的读取。
 use matching_domain::{AssetId, RejectReason};
 use matching_risk::{FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier};
 

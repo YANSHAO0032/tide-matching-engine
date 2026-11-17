@@ -120,7 +120,6 @@ fn protected_market_by_quote_execution_preserves_event_order() {
     let second = EngineEvent::Trade(execution_trade(10, 40));
     let trigger = protected_quote_trigger();
 
-    // 只有 Trade。
     let trades_only = ProtectedMarketByQuoteExecution::new(
         vec![first.clone(), second.clone()],
         QuoteAmount::new(630),
@@ -129,7 +128,7 @@ fn protected_market_by_quote_execution_preserves_event_order() {
 
     assert_eq!(trades_only.events(), &[first.clone(), second.clone()]);
 
-    // Trade* 后紧接保护终结事件。
+    // 成交之后紧接保护终结事件。
     let with_trigger = ProtectedMarketByQuoteExecution::new(
         vec![first.clone(), second.clone(), trigger.clone()],
         QuoteAmount::new(630),
@@ -156,7 +155,6 @@ fn protected_market_by_quote_execution_has_value_semantics() {
         QuoteAmount::new(7),
     );
 
-    // 相同字段的独立实例相等。
     let same = ProtectedMarketByQuoteExecution::new(
         events.clone(),
         QuoteAmount::new(315),
@@ -168,7 +166,6 @@ fn protected_market_by_quote_execution_has_value_semantics() {
 
     assert!(format!("{original:?}").contains("ProtectedMarketByQuoteExecution"));
 
-    // 仅改变 `events`。
     let changed_events = ProtectedMarketByQuoteExecution::new(
         vec![
             EngineEvent::Trade(execution_trade(21, 30)),
@@ -192,7 +189,6 @@ fn protected_market_by_quote_execution_has_value_semantics() {
 
     assert_ne!(original, reordered);
 
-    // 仅改变 spent_quote。
     let changed_spent = ProtectedMarketByQuoteExecution::new(
         events.clone(),
         QuoteAmount::new(316),
@@ -201,7 +197,6 @@ fn protected_market_by_quote_execution_has_value_semantics() {
 
     assert_ne!(original, changed_spent);
 
-    // 仅改变 unused_quote。
     let changed_unused =
         ProtectedMarketByQuoteExecution::new(events, QuoteAmount::new(315), QuoteAmount::new(8));
 

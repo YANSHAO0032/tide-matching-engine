@@ -1,4 +1,4 @@
-//! 验证文件租约的排他性、持久纪元和损坏时失败关闭。
+//! 验证文件租约的排他性、持久纪元和损坏时的拒绝行为。
 mod t22_support;
 use matching_domain::{ClusterId, ShardId};
 use matching_runtime::{ControlCoordinator, ControlStore, LeaseError};

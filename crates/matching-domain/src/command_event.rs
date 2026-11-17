@@ -233,7 +233,7 @@ pub enum Command {
         /// 市场身份载荷。
         SuspendMarket,
     ),
-    /// 恢复暂停市场。
+    /// 恢复暂停或停止的市场。
     ResumeMarket(
         /// 市场身份载荷。
         ResumeMarket,

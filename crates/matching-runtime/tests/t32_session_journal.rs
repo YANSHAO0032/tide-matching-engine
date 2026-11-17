@@ -1,4 +1,4 @@
-//! 验证断连控制意图在本机文件中的恢复和失败关闭。
+//! 验证断连控制意图的本地恢复及损坏时的拒绝行为。
 mod t22_support;
 use matching_domain::{CommandId, MarketId, OriginSessionId, UserId};
 use matching_runtime::{SessionControlJournal, SessionTarget};

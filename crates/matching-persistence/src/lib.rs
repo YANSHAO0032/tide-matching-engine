@@ -4,7 +4,7 @@ mod durability;
 mod manifest;
 mod manifest_file;
 mod metrics;
-/// 本地持久写入操作的延迟直方图及其快照。
+/// WAL 写入和批量提交的指标与快照。
 pub use metrics::{BatchSizeSnapshot, DurabilityMetrics, LATENCY_BOUNDS_US, LatencySnapshot};
 mod record;
 mod recovery;

@@ -52,7 +52,7 @@ impl LogicalClock {
 
 #[cfg(test)]
 mod tests {
-    //! 验证逻辑时间的透明值语义，不测试时间推进协议。
+    //! 验证逻辑时间的值语义，以及时钟单调推进和拒绝回退。
     use super::*;
     use std::collections::BTreeMap;
 

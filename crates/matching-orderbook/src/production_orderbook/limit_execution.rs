@@ -11,7 +11,7 @@ impl ProductionOrderBook {
     /// 完整执行一笔限价单 GTC。
     ///
     /// 顺序：
-    /// 1. 重复标识符预检；
+    /// 1. 校验自成交模式、重复标识符和价格带；
     /// 2. 只读规划全部可成交挂单；
     /// 3. 检查 TradeId 数量；
     /// 4. 若存在 GTC 余量，预检余量挂单；
@@ -213,7 +213,7 @@ impl ProductionOrderBook {
         let order_id = order.order_id;
 
         // ------------------------------------------------------------
-        // 1. 重复标识符必须绝对最先。
+        // 1. 再次检查重复标识符。
         // ------------------------------------------------------------
 
         if self.contains_active_order(order_id) {
@@ -331,7 +331,7 @@ impl ProductionOrderBook {
              residual order qty differs from incoming remaining"
             );
 
-            // 此时所有 <= 限价的对手挂单应已经处理完成。
+            // 此时限价内可成交的对手挂单应已处理完成。
             // 若仍价格交叉 / 价格相等，属于内部规划/执行分歧。
             self.assert_rest_strictly_non_crossing(&rest_plan);
 
@@ -443,7 +443,7 @@ impl ProductionOrderBook {
         ))
     }
 
-    /// 对完整根限价命令在候选簿中逐笔生成成交身份；失败不提交状态或游标。
+    /// 对完整根限价命令在候选簿中逐笔生成成交 ID；失败不提交状态或游标。
     pub fn place_limit_gtc_with_cursor(
         &mut self,
         order: LimitOrder,
@@ -469,7 +469,7 @@ impl ProductionOrderBook {
         Ok(events)
     }
 
-    /// 在候选簿中执行 IOC 或 FOK，按实际成交推进根命令身份游标。
+    /// 在候选簿中执行 IOC 或 FOK，按实际成交推进根命令 ID 游标。
     pub fn place_limit_immediate_with_cursor(
         &mut self,
         order: LimitOrder,

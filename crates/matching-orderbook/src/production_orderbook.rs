@@ -16,7 +16,7 @@ mod cancel_replace_view;
 mod expiry;
 mod iceberg;
 mod market_binding;
-/// 可信市场绑定失败。
+/// 市场绑定错误与成交 R2 候选计划。
 pub use market_binding::{MarketBindingError, ProductionTradeR2Plan};
 mod limit_execution;
 mod market_by_base;
@@ -69,7 +69,7 @@ enum RestTargetPlan {
 
 /// `preflight_rest_common` 产生的只读挂单提交计划。
 ///
-/// 它记录身份、计划分配的优先级及目标档位的聚合快照。
+/// 它记录订单 ID、计划分配的优先级及目标档位的聚合快照。
 /// 公开 `rest` 另行施加严格不交叉；完整限价单 GTC 则在
 /// 挂单已被预检后复用本计划，保证余量的可预期拒绝发生在首笔成交前。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,7 @@ struct RestPlan {
     side: Side,
     /// 挂单所属的价格档位价格。
     price: Price,
-    /// 已预留给本次实际挂单的队列优先级。
+    /// 本次实际挂单计划使用的队列优先级。
     priority: QueuePriority,
     /// 既有或新建价格档位的预检聚合计划。
     target: RestTargetPlan,
@@ -115,7 +115,7 @@ pub struct ProductionOrderBook {
     asks: BTreeMap<Price, PriceLevel>,
     /// 当前活动 OrderId 到 Arena 槽位的定位索引，必须与节点身份一致。
     orders: HashMap<OrderId, OrderIndex>,
-    /// 活动普通与未触发止损订单的本地预留快照，仅供身份查询。
+    /// 活动普通与未触发止损订单的本地预留快照。
     reservations: HashMap<OrderId, ReservationState>,
     /// 节点的唯一存储；价格档位和标识符索引通过 OrderIndex 引用它。
     arena: OrderArena,
@@ -367,7 +367,7 @@ impl ProductionOrderBook {
         Some(node)
     }
 
-    /// 按订单身份只读查询已登记的本地预留快照。
+    /// 按订单 ID 只读查询已登记的本地预留快照。
     pub fn reservation_state(&self, order_id: OrderId) -> Option<&ReservationState> {
         self.reservations.get(&order_id)
     }
@@ -387,7 +387,7 @@ impl ProductionOrderBook {
         self.orders.contains_key(&order_id) || self.stop_book.contains(order_id)
     }
 
-    /// 在任何订单簿写入前核对候选预留身份及既有影子状态。
+    /// 在任何订单簿写入前核对候选预留归属及既有影子状态。
     fn validate_new_reservation(
         &self,
         order_id: OrderId,

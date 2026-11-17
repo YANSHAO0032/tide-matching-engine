@@ -210,5 +210,5 @@ impl TradeIdSource {
     }
 }
 
-/// 与 `OrderArena::test_snapshot` 一致的完整节点和空闲链表快照。
+/// 与 `OrderArena::test_snapshot` 一致的完整节点和空闲栈快照。
 type ArenaSnapshot = (Vec<Option<OrderNode>>, Vec<crate::OrderIndex>);

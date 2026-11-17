@@ -19,14 +19,14 @@ pub struct OrderArena {
 }
 
 impl OrderArena {
-    /// 创建没有槽位和空闲链表条目的空 Arena。
+    /// 创建没有槽位和空闲栈条目的空 Arena。
     pub fn new() -> Self {
         Self::default()
     }
 
     /// 插入订单节点，返回其槽位索引。
     ///
-    /// 优先按照后进先出顺序复用空闲链表中的空槽；
+    /// 优先按照后进先出顺序复用空闲栈中的空槽；
     /// 没有空槽时，进行带溢出检查的索引转换后追加。
     ///
     /// 复用前必须验证索引有效且槽位为空，
@@ -85,7 +85,7 @@ impl OrderArena {
         self.slots.get_mut(position)?.as_mut()
     }
 
-    /// 取走节点并将其槽位登记到空闲链表。
+    /// 取走节点并将其槽位登记到空闲栈。
     ///
     /// 仅成功删除时登记一次，不压缩槽位。
     /// 越界、空槽及尚未复用前的重复删除返回 None，
@@ -112,7 +112,7 @@ impl OrderArena {
 
     /// 只读验证下一次 `insert` 是否可执行。
     ///
-    /// 不弹出空闲链表，不扩展槽位，不修改任何 Arena 状态。
+    /// 不弹出空闲栈，不扩展槽位，不修改任何 Arena 状态。
     pub(crate) fn preflight_insert(&self) -> Result<(), RejectReason> {
         if let Some(index) = self.free.last().copied() {
             let position = usize::try_from(index.get())

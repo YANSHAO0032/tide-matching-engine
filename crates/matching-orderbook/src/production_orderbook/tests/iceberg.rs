@@ -35,7 +35,7 @@ struct BookState {
     asks: Vec<LevelState>,
     /// 活动订单标识符到 Arena 槽位的投影。
     orders: HashMap<OrderId, OrderIndex>,
-    /// Arena 槽位与空闲链表的完整投影。
+    /// Arena 槽位与空闲槽位列表的完整投影。
     arena: (Vec<Option<OrderNode>>, Vec<OrderIndex>),
     /// 快照取得时下一次将分配的队列优先级数值。
     next_priority: u128,

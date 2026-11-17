@@ -22,14 +22,14 @@ pub enum FeeAssetPolicy {
     Quote,
     /// 独立费用资产。
     Third(
-        /// 费用资产身份。
+        /// 费用资产 ID。
         AssetId,
     ),
     /// 第三资产与指定报价资产原子单位的精确、版本化换算比例。
     ThirdPriced {
-        /// 费用资产身份。
+        /// 费用资产 ID。
         asset: AssetId,
-        /// 换算基准对应的报价资产身份。
+        /// 换算基准对应的报价资产 ID。
         quote_asset: AssetId,
         /// 每组报价原子单位对应的费用资产原子数。
         numerator: u128,
@@ -49,14 +49,14 @@ pub struct FeeTier {
     pub rounding: FeeRounding,
 }
 
-/// 不可变费率版本及按层级身份排序的配置。
+/// 不可变费率版本及按层级 ID 排序的配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeeSchedule {
     /// 稳定版本号。
     version: u64,
     /// 本版本费用资产策略。
     asset_policy: FeeAssetPolicy,
-    /// 按身份排序的费率层级。
+    /// 按 ID 排序的费率层级。
     tiers: BTreeMap<u32, FeeTier>,
 }
 impl FeeSchedule {

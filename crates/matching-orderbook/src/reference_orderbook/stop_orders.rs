@@ -10,7 +10,7 @@ use matching_risk::ReservationState;
 /// 参考模型中未触发止损订单的最小运行态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ReferenceStopOrder {
-    /// 原始止损订单。
+    /// 当前未触发止损订单；改单可替换其载荷。
     pub(super) order: StopOrder,
     /// 仅用于同触发价先进先出的独立优先级。
     pub(super) priority: StopPriority,

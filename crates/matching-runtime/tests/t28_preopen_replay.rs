@@ -1,4 +1,4 @@
-//! 验证开市前参考价更新的正式持久路径。
+//! 验证开市前重校验、熔断及 KillSwitch 的持久化和重放。
 mod t22_support;
 use ed25519_dalek::{Signer, SigningKey};
 use matching_domain::*;

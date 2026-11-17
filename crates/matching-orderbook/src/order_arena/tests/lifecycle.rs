@@ -464,7 +464,7 @@ fn corrupted_free_must_panic_without_overwriting_nodes() {
 }
 #[test]
 fn identical_mixed_operations_are_deterministic() {
-    // 用相同操作带独立运行两次，比较可观察 Arena 状态而非实现细节。
+    // 独立执行两次相同操作，比较分配顺序、槽位和空闲栈。
     fn run() -> (Vec<OrderIndex>, Vec<Option<NodeState>>, Vec<OrderIndex>) {
         let mut arena = OrderArena::new();
         let mut allocated = Vec::new();

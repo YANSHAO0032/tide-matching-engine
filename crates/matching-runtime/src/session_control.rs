@@ -106,7 +106,7 @@ impl SessionControlJournal {
         )
     }
 
-    /// 同步登记会话和断连撤单配置；关闭时仍排空，禁用撤单时不生成撤单目标。
+    /// 同步登记会话和断连撤单配置；关闭时仍排空，禁用撤单时不派发撤单。
     pub fn create_with_policy(
         path: impl AsRef<Path>,
         user: UserId,

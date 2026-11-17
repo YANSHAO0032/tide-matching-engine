@@ -1,4 +1,4 @@
-//! 验证只读 `next`-成交规划的挂单、数量和状态保持性质。
+//! 验证只读成交规划选择的挂单、数量和状态保持规则。
 use super::ReferenceOrderBook;
 use crate::IncomingOrder;
 use matching_domain::{LimitOrder, OrderId, Price, Qty, QueuePriority, Side, UserId};
@@ -16,7 +16,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
     }
 }
 
-/// 将指定订单包装为尚未成交的新到订单运行态。
+/// 构造尚未成交的新到订单。
 fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
     IncomingOrder::new(order(id, side, price, qty))
 }
@@ -180,7 +180,7 @@ fn empty_opposite_side_returns_no_plan() {
 fn best_price_takes_precedence_over_earlier_worse_price() {
     let mut book = ReferenceOrderBook::new();
 
-    // 更优价格的挂单后挂入。
+    // 价格更优的订单后入簿。
     for resting in [
         order(11, Side::Sell, 110, 10),
         order(21, Side::Buy, 90, 10),
@@ -214,7 +214,7 @@ fn same_price_preserves_fifo_on_both_sides() {
     let buy = incoming(200, Side::Buy, 105, 10);
     let sell = incoming(201, Side::Sell, 95, 10);
 
-    // 最早挂入的同价挂单获得优先级。
+    // 同价订单中，先入簿的优先成交。
     assert_plan(&book, &buy, Some((0, 3)));
     assert_plan(&book, &sell, Some((1, 3)));
 

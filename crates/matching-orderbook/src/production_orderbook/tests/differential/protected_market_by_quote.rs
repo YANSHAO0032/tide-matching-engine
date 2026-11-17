@@ -77,7 +77,7 @@ fn run_case(
     assert_eq!(validate_book(&production), Ok(()));
 
     // ============================================================
-    // 3. 保存生产簿完整物理状态
+    // 3. 保存生产簿价格档、索引、槽位和分配器状态
     // ============================================================
 
     let bids_before = level_snapshot(&production.bids);
@@ -166,7 +166,7 @@ fn run_case(
             // - 买卖两侧价格索引 `bids` / `asks`（BTreeMap）
             // - PriceLevel 链表和聚合
             // - OrderId 索引
-            // - Arena 槽位 / 空闲链表
+            // - Arena 槽位 / 空闲槽位列表
             // - 下一队列优先级 `next`（QueuePriority）
             // - 分配器策略
             assert_production_failure_state_unchanged(

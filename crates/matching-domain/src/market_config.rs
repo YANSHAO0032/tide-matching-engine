@@ -37,7 +37,7 @@ pub enum ClosePolicy {
 /// 必须通过校验并与市场状态一起持久化的配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketConfig {
-    /// 市场身份。
+    /// 市场 ID。
     pub market_id: MarketId,
     /// 价格的十进制精度。
     pub price_scale: u8,
@@ -53,7 +53,7 @@ pub struct MarketConfig {
     pub order_limits: OrderLimits,
     /// 可选的市场价格带配置。
     pub price_band: Option<PriceBandConfig>,
-    /// 当前生效的费率版本身份。
+    /// 当前生效的费率版本号。
     pub active_fee_schedule_version: u64,
     /// 关市策略。
     pub close_policy: ClosePolicy,
@@ -115,7 +115,7 @@ pub struct MarketConfigUpdateChecks {
 pub enum MarketConfigUpdateError {
     /// 目标配置本身无效。
     InvalidConfig,
-    /// 更新试图更换市场身份。
+    /// 更新试图更换市场 ID。
     MarketMismatch,
     /// 数值协议的状态或历史引用约束未满足。
     Math(crate::MarketMathUpdateError),
@@ -351,7 +351,7 @@ impl ManagedMarket {
         self.lifecycle = candidate;
         Ok(events)
     }
-    /// 仅在价格带参考有效时恢复已暂停的候选市场。
+    /// 恢复已暂停的候选市场；配置价格带时须提供有效参考价。
     pub fn resume(
         &mut self,
         valid_reference: bool,

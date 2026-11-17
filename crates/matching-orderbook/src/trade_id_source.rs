@@ -1,4 +1,4 @@
-//! 成交身份来源的兼容适配。
+//! 成交 ID 来源的兼容适配。
 
 use matching_domain::{RejectReason, TradeId, TradeIdCursor};
 
@@ -6,11 +6,11 @@ use matching_domain::{RejectReason, TradeId, TradeIdCursor};
 #[derive(Clone)]
 pub(crate) enum TradeIdSource<'a> {
     /// 既有接口保持调用者保证长度的契约。
-    /// `ids` 是调用方预先提供的成交身份序列，`position` 是下一次读取的位置。
+    /// `ids` 是调用方预先提供的成交 ID 序列，`position` 是下一次读取的位置。
     Legacy { ids: &'a [TradeId], position: usize },
-    /// 仅对实际成交分配身份，记录游标耗尽。
+    /// 仅对实际成交分配 ID，并记录游标是否耗尽。
     Cursor {
-        /// 候选根命令独占的成交身份游标。
+        /// 候选根命令独占的成交 ID 游标。
         cursor: TradeIdCursor,
         /// 是否曾因游标耗尽导致根命令必须失败。
         exhausted: bool,
@@ -20,7 +20,7 @@ pub(crate) enum TradeIdSource<'a> {
 }
 
 impl<'a> TradeIdSource<'a> {
-    /// 创建使用既有身份切片的来源。
+    /// 创建使用既有 ID 切片的来源。
     pub(crate) fn legacy(ids: &'a [TradeId]) -> Self {
         Self::Legacy { ids, position: 0 }
     }
@@ -43,7 +43,7 @@ impl<'a> TradeIdSource<'a> {
         }
     }
 
-    /// 为下一笔已规划的真实成交分配身份。
+    /// 为下一笔已规划的真实成交分配 ID。
     pub(crate) fn next_id(&mut self) -> Result<TradeId, RejectReason> {
         match self {
             Self::Legacy { ids, position } => {
@@ -68,12 +68,12 @@ impl<'a> TradeIdSource<'a> {
         }
     }
 
-    /// 仅在真实成交计划已知时批量分配对应数量的身份。
+    /// 仅在真实成交计划已知时批量分配对应数量的 ID。
     pub(crate) fn reserve(&mut self, count: usize) -> Result<Vec<TradeId>, RejectReason> {
         (0..count).map(|_| self.next_id()).collect()
     }
 
-    /// 返回旧接口尚可使用的身份数量；游标没有预置长度。
+    /// 返回旧接口尚可使用的 ID 数量；游标没有预置长度。
     pub(crate) fn legacy_remaining(&self) -> Option<usize> {
         match self {
             Self::Legacy { ids, position } => Some(ids.len() - position),
@@ -81,7 +81,7 @@ impl<'a> TradeIdSource<'a> {
         }
     }
 
-    /// 判断根命令是否因成交身份空间耗尽而必须整体拒绝。
+    /// 判断根命令是否因成交 ID 空间耗尽而必须整体拒绝。
     pub(crate) fn cursor_exhausted(&self) -> bool {
         matches!(
             self,
@@ -92,7 +92,7 @@ impl<'a> TradeIdSource<'a> {
         )
     }
 
-    /// 取回游标，供候选根命令成功时提交推进后的身份状态。
+    /// 取回游标，供候选根命令成功时提交推进后的状态。
     pub(crate) fn into_cursor(self) -> Option<TradeIdCursor> {
         match self {
             Self::Cursor { cursor, .. } => Some(cursor),

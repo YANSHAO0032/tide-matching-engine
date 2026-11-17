@@ -282,8 +282,8 @@ fn protected_quote_execution_boundary_dust_and_immediate_stop() {
         assert_eq!(book.orders.len(), 1);
         assert_eq!(book.orders[0].original_order().order_id, OrderId::new(2));
 
-        // 4. 部分挂单成交：剩余量=7，
-        // 原优先级保留；剩余 50 形成不足一手的预算。
+        // 4. 挂单部分成交后剩余 7，保留原优先级；
+        // 剩余预算 50 不足以成交一手。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, maker_side, 100, 10)).unwrap();
         let priority_before = book.orders[0].priority();
@@ -316,7 +316,7 @@ fn protected_quote_execution_boundary_dust_and_immediate_stop() {
         assert_eq!(snapshot(&book), before);
 
         // 6. 成交价 100 用掉 200，还剩 5。
-        // 下一挂单越界：优先触发保护，而不是不足一手的预算。
+        // 下一挂单越界：先触发保护，而不是按预算不足一手停止。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, maker_side, 100, 2)).unwrap();
         book.rest(limit(2, maker_side, outside, 4)).unwrap();

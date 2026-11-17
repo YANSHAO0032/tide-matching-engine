@@ -181,7 +181,7 @@ fn user_protection_price_returns_aligned_explicit_worst_price_unchanged() {
 
 #[test]
 fn user_protection_price_buy_chooses_stricter_lower_candidate() {
-    // 25 个基点 辅助函数:
+    // 滑点为 25 个基点：
     // 参考值=100_003, 价格步长=10
     // => 买入基点候选 = 100_250
     //
@@ -199,7 +199,7 @@ fn user_protection_price_buy_chooses_stricter_lower_candidate() {
 
 #[test]
 fn user_protection_price_sell_chooses_stricter_higher_candidate() {
-    // 25 个基点 辅助函数:
+    // 滑点为 25 个基点：
     // 参考值=100_003, 价格步长=10
     // => 卖出基点候选 = 99_760
     //
@@ -300,7 +300,7 @@ fn maker_price_within_protection_buy_uses_inclusive_upper_boundary() {
         boundary,
     ));
 
-    // 相等：边界具有包容性。
+    // 等于边界时允许成交。
     assert!(maker_price_within_protection(
         Side::Buy,
         price(100_000),
@@ -326,7 +326,7 @@ fn maker_price_within_protection_sell_uses_inclusive_lower_boundary() {
         boundary,
     ));
 
-    // 相等：边界具有包容性。
+    // 等于边界时允许成交。
     assert!(maker_price_within_protection(
         Side::Sell,
         price(100_000),

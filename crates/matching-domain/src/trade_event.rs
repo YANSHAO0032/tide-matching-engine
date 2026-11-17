@@ -7,7 +7,7 @@ use crate::{OrderId, Price, Qty, Side, TradeId};
 pub struct TradeEvent {
     /// 此笔实际成交的唯一身份。
     pub trade_id: TradeId,
-    /// 提供挂单流动性的挂单订单身份。
+    /// 提供流动性的挂单方订单身份。
     pub maker_order_id: OrderId,
     /// 主动消耗流动性的吃单方订单身份。
     pub taker_order_id: OrderId,

@@ -29,7 +29,7 @@ impl ReferenceOrderBook {
         self.price_band
     }
 
-    /// 从指定来源冻结参考价并计算双侧包含式边界。
+    /// 从指定来源读取参考价并计算双侧价格带，包含边界值。
     pub(super) fn price_band_bounds(
         &self,
     ) -> Result<Option<(matching_domain::Price, matching_domain::Price)>, RejectReason> {
@@ -43,7 +43,7 @@ impl ReferenceOrderBook {
         config.bounds(reference.price, math.tick_size()).map(Some)
     }
 
-    /// 验证限价位于当前已冻结参考价的双侧包含区间。
+    /// 验证限价位于当前参考价对应的价格带内，包含边界值。
     pub(super) fn validate_band_price(
         &self,
         price: matching_domain::Price,

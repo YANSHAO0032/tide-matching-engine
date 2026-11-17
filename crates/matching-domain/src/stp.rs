@@ -25,7 +25,7 @@ impl StpKey {
     }
 }
 
-/// 当前进入撮合的订单决定冲突处理方式的自成交防护策略。
+/// 由吃单方决定的自成交防护策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StpMode {
     /// 当前吃单不执行自成交防护。
@@ -53,7 +53,7 @@ impl StpMode {
 /// 单个可成交 maker 与当前吃单订单之间的无副作用业务决定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StpDecision {
-    /// 不属于自成交身份，撮合器可以继续常规成交判断。
+    /// 无需执行自成交防护，撮合器可以继续判断是否成交。
     NoConflict,
     /// 终结吃单剩余量。
     CancelTaker,

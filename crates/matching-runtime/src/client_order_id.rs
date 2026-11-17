@@ -1,4 +1,4 @@
-//! 客户端订单身份的分片内活动索引及确定性终结保留。
+//! 分片内客户端订单 ID 的活动索引和有界终结历史。
 
 use matching_domain::{MarketId, OrderId, RejectReason, UserId};
 use std::collections::VecDeque;
@@ -8,11 +8,11 @@ use std::collections::VecDeque;
 struct ClientOrderKey {
     /// 身份所属用户。
     user: UserId,
-    /// 用户提供的客户端身份。
+    /// 用户提供的客户端订单 ID。
     client_id: String,
-    /// 引擎订单身份。
+    /// 引擎订单 ID。
     order_id: OrderId,
-    /// 订单所属市场，终结处理使用市场与订单身份共同定位。
+    /// 订单所属市场；终结处理按市场和订单 ID 共同定位。
     market: MarketId,
 }
 
@@ -27,7 +27,7 @@ pub(crate) struct ClientOrderIds {
     terminal: VecDeque<ClientOrderKey>,
     /// 历史保留上限。
     terminal_capacity: usize,
-    /// 单个客户端身份允许的最大 UTF-8 字节数。
+    /// 单个客户端订单 ID 允许的最大 UTF-8 字节数。
     max_id_bytes: usize,
 }
 impl ClientOrderIds {

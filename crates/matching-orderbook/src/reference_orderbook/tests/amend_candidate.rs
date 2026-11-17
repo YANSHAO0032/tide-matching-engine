@@ -44,7 +44,7 @@ fn amend(order_id: OrderId, user_id: UserId, new_qty: Qty) -> AmendOrder {
 /// 冻结订单簿内部状态以检查失败原子性。
 #[derive(Debug, PartialEq, Eq)]
 struct BookSnapshot {
-    /// 普通订单原始载荷、剩余量、峰值、优先级和有效期的有序快照。
+    /// 普通订单载荷、可见和隐藏余量、峰值、优先级及有效期的有序快照。
     regular: Vec<(
         LimitOrder,
         u64,
