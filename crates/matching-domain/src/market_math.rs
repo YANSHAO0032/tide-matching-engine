@@ -13,7 +13,7 @@ pub enum MathConfigError {
     UnsupportedScale,
     /// 最小价格步长×数量步长本金不能精确表示为报价资产最小单位。
     NonIntegralQuoteUnit,
-    /// 计算最小价格步长×数量步长本金时的带溢出检查的算术失败。
+    /// 计算最小价格步长×数量步长对应的本金时发生溢出。
     ArithmeticOverflow,
 }
 
@@ -74,7 +74,7 @@ impl MarketMath {
         self.price_scale
     }
 
-    /// 校验小数位数、价格步长与手，并在成功时构造不可变数值配置。
+    /// 校验小数位数、价格步长与数量步长，构造不可变数值配置。
     pub fn try_new(
         price_scale: u8,
         qty_scale: u8,
@@ -143,7 +143,7 @@ impl MarketMath {
         self.tick_size
     }
 
-    /// 返回已验证的基础数量最小步长，供候选订单与显示峰值核对对齐。
+    /// 返回已验证的基础数量最小步长，供候选订单与显示峰值检查对齐。
     pub const fn lot_size(&self) -> u64 {
         self.lot_size
     }
@@ -155,7 +155,7 @@ impl MarketMath {
 
     /// 计算成交本金，单位为报价资产最小单位。
     ///
-    /// 先校验价格的价格步长对齐，再校验数量的数量步长对齐；不满足时分别返回
+    /// 先校验价格是否对齐价格步长，再校验数量是否对齐数量步长；不满足时分别返回
     /// InvalidTick / InvalidLot。两项都失败时价格错误优先。
     ///
     /// 使用 N × M × K，所有乘法均执行溢出检查。
@@ -204,7 +204,7 @@ impl MarketMath {
             return Err(MathError::InvalidTick);
         }
 
-        // 2. 一个 tick_size 对应的正整数倍数 N。
+        // 2. 价格相对于 tick_size 的正整数倍数 N。
         let n = (price_raw / self.tick_size) as u128;
 
         // 3. 冻结公式：`floor(floor(quote / K) / N)`，两次除法均向下取整。
@@ -423,7 +423,7 @@ mod tests {
         let math = MarketMath::try_new(2, 8, 8, 1, 1000).unwrap();
         let price = Price::try_new(100).unwrap();
 
-        // N=100，K=10，因此一个手本金为 1000 报价资产最小单位。
+        // N=100，K=10，因此一手本金为 1000 报价资产最小单位。
         assert_eq!(math.max_qty_for_quote(QuoteAmount::new(0), price), Ok(None));
 
         assert_eq!(
@@ -441,8 +441,8 @@ mod tests {
         let math = MarketMath::try_new(2, 8, 8, 1, 1000).unwrap();
         let price = Price::try_new(123).unwrap();
 
-        // 一个手本金：123 × 10 = 1230。
-        // 预算 3000 只能购买两个完整手。
+        // 一手本金：123 × 10 = 1230。
+        // 预算 3000 只能购买两手。
         assert_eq!(
             math.max_qty_for_quote(QuoteAmount::new(3000), price),
             Ok(Some(Qty::try_new(2000).unwrap()))
@@ -497,7 +497,7 @@ mod tests {
 
             match result {
                 None => {
-                    // 连一个合法手都买不起。
+                    // 连一手都买不起。
                     let first_lot = Qty::try_new(1000).unwrap();
                     let cost = math.trade_notional(price, first_lot).unwrap();
 

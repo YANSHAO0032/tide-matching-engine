@@ -29,7 +29,7 @@ mod worker;
 pub use idempotency::IdempotencyConfig;
 /// 正式限价下单使用的可信市场策略与资源上限。
 pub use place_config::{PlaceConfigError, PlaceLimits, PlaceSupportConfig};
-/// 本地持久前缀中的正式命令。
+/// 本地持久命令、快照和行情恢复入口。
 pub use recovery::{
     CommittedMarketDataReplay, RecoveredCommand, SnapshotRecoveryRecords, SnapshotReplayResult,
     recover_local_commands, recover_market_data_from_genesis, recover_snapshot_records,

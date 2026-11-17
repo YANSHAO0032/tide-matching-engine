@@ -1,10 +1,10 @@
-//! 将持久化前缀转换为已验证身份的正式命令。
+//! 从持久化前缀恢复命令、快照及行情重放状态。
 use matching_domain::{CommandEnvelope, decode_wal_command};
 use std::{io, path::Path};
 
 /// 持有快照候选与其后的连续正式命令；尚未执行重放。
 pub struct SnapshotRecoveryRecords {
-    /// 已校验的最新或回退快照及权威提交水位。
+    /// 已校验的快照或可信初始候选及权威提交水位。
     snapshot: crate::SnapshotRecoveryCandidate,
     /// 严格按分片序号排列的后续正式命令。
     commands: Vec<RecoveredCommand>,
@@ -45,7 +45,7 @@ impl CommittedMarketDataReplay {
 }
 
 impl SnapshotRecoveryRecords {
-    /// 借用已验证的快照候选。
+    /// 借用已验证的快照或初始候选。
     pub fn snapshot(&self) -> &crate::SnapshotRecoveryCandidate {
         &self.snapshot
     }

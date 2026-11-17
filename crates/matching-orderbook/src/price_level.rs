@@ -133,7 +133,7 @@ impl PriceLevel {
     /// 保持同价先进先出，优先级必须严格递增。
     /// 可复用 Arena 的空槽，但不能改变队列顺序。
     ///
-    /// 校验失败不修改价档、Arena 或空闲链表。
+    /// 校验失败不修改价档、Arena 或空闲栈。
     /// 内部链接不变量违反时直接触发不变量断言。
     ///
     /// 此低层原语不建立 OrderId 查找，也不分配 QueuePriority；调用方必须
@@ -415,8 +415,8 @@ impl PriceLevel {
 
     /// 在不解除链接的前提下提交同价普通改单的数量变化。
     ///
-    /// 该路径只允许减量或不变；调用方负责订单载荷和到期索引的其余提交，
-    /// 本方法只维护节点余量及本价档可见聚合。
+    /// 该路径只允许减量或不变；本方法更新节点载荷、余量和价档可见聚合，
+    /// 调用方负责到期索引等其余提交。
     pub(crate) fn amend_regular_in_place(
         &mut self,
         arena: &mut OrderArena,
@@ -455,7 +455,7 @@ impl PriceLevel {
         self.total_visible_qty = total;
     }
 
-    /// 不解链的冰山减量只扣减公开深度；候选已确保不会增加公开暴露。
+    /// 不解链的冰山改单只扣减公开深度；候选已确保不会增加可见量。
     pub(crate) fn amend_iceberg_in_place(
         &mut self,
         arena: &mut OrderArena,

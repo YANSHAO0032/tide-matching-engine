@@ -17,7 +17,7 @@ pub(crate) mod test_support;
 /// 参考模型的受保护基础数量市价成交计划。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProtectedMarketByBasePlan {
-    /// 保留此前已验收的挂单标识符与 `Qty` 成交计划。
+    /// 按顺序记录挂单 ID 和计划成交量。
     fills: Vec<(OrderId, Qty)>,
 
     /// 至多一个终止点，即价格优先顺序中的首个越界挂单。
@@ -31,7 +31,7 @@ impl ReferenceOrderBook {
     /// - TradeId 不足在任何状态变更前触发不变量断言（测试/参考簿故障时停止处理）。
     /// - 挂单按价格优先、同价先进先出选择。
     /// - 市价吃单方剩余量不挂簿。
-    /// - 不分配 QueuePriority。
+    /// - 吃单方不分配 QueuePriority；冰山挂单补量会取得新优先级。
     pub fn execute_market_by_base(
         &mut self,
         incoming: MarketByBase,
@@ -460,7 +460,7 @@ impl ReferenceOrderBook {
         Ok(events)
     }
 
-    /// 在候选参考簿中按真实成交生成命令内标识。
+    /// 在候选参考簿中按真实成交生成命令内成交 ID。
     pub fn execute_market_by_base_with_cursor(
         &mut self,
         incoming: MarketByBase,

@@ -138,7 +138,7 @@ impl ProductionOrderBook {
             None => Err(MarketBindingError),
         }
     }
-    /// 输出按订单身份排序的预留快照，供分片核验全部市场归属。
+    /// 输出按订单 ID 排序的预留快照，供分片核验全部市场归属。
     pub fn reservation_snapshots(
         &self,
     ) -> Vec<(matching_domain::OrderId, &matching_risk::ReservationState)> {

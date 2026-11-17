@@ -1,4 +1,4 @@
-//! 验证正式限价入口的可信启动与客户端身份生命周期。
+//! 验证批量持久提交、恢复与会话撤单的顺序。
 mod t22_support;
 use matching_domain::{AssetId, ClusterId, LogicalTime, MarketId, MarketMath, ShardId};
 use matching_orderbook::QueuePriorityPolicy;

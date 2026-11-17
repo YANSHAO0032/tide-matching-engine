@@ -571,7 +571,7 @@ impl ReferenceOrderBook {
         self.orders = slice.orders;
         self.next_priority = slice.next_priority;
         self.retain_active_reservations();
-        // 余量仍在簿中才保留同一 shadow state；订单终结沿用既有终结清理规则。
+        // 余量仍在簿中才保留同一预留影子；订单终结时按既有规则清理。
         if self
             .orders
             .iter()
@@ -626,7 +626,7 @@ impl ReferenceOrderBook {
         Err(RejectReason::OrderNotFound)
     }
 
-    /// 核对本地 shadow state 与命令身份，不复制 reserve 容器。
+    /// 核对本地预留影子与命令身份，不复制预留资产集合。
     fn reservation_snapshot(
         &self,
         amend: &AmendOrder,

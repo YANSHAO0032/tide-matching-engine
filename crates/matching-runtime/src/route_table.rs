@@ -20,7 +20,7 @@ pub enum RouteState {
 /// 单个市场的进程内路由快照。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarketRoute {
-    /// 市场身份。
+    /// 市场 ID。
     pub market_id: MarketId,
     /// 生效的所属分片。
     pub shard_id: ShardId,
@@ -30,14 +30,14 @@ pub struct MarketRoute {
     pub state: RouteState,
 }
 
-/// 路由配置存在重复市场身份。
+/// 路由配置存在重复市场 ID。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DuplicateMarketRoute;
 
 /// 唯一市场映射的不可变内存快照，不代表持久化控制存储。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteTable {
-    /// 以市场身份确定唯一配置，不依赖哈希或取模路由。
+    /// 按市场 ID 确定唯一配置，不依赖哈希或取模路由。
     routes: BTreeMap<MarketId, MarketRoute>,
 }
 
@@ -60,7 +60,7 @@ impl RouteTable {
         self.routes.get(&market_id)
     }
 
-    /// 依市场身份顺序读取所有路由。
+    /// 按市场 ID 顺序读取所有路由。
     pub fn routes(&self) -> impl Iterator<Item = &MarketRoute> {
         self.routes.values()
     }

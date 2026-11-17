@@ -501,7 +501,7 @@ impl GatewaySession {
     ) -> Result<matching_domain::ShardMassCancelResult, crate::SessionDispatchError> {
         crate::dispatch_session_cancel(&mut self.journal, market, shard, timeout)
     }
-    /// 依次完成所有已关闭会话的待处理目标，失败时保留尚未确认的目标。
+    /// 依次处理本会话的全部待撤单目标，失败时保留尚未确认的目标。
     pub fn dispatch_all_cancels(
         &mut self,
         shards: &[crate::ShardHandle],

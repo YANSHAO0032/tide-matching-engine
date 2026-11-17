@@ -99,7 +99,7 @@ impl ProductionOrderBook {
         self.place_limit_timed_frozen(order, tif, now, current_session_id, trade_ids, None)
     }
 
-    /// 使普通 GTD 挂单在到达给定逻辑时间后确定性到期。
+    /// 使不晚于给定逻辑时间的普通及未触发 GTD 订单确定性到期。
     pub fn expire_gtd_through(&mut self, now: LogicalTime) -> Vec<ExpiredOrder> {
         let mut expired = self
             .regular_expiry
@@ -136,7 +136,7 @@ impl ProductionOrderBook {
         expired.into_iter().map(|(_, entry)| entry).collect()
     }
 
-    /// 终结当前交易时段中的普通 DAY 挂单。
+    /// 终结当前交易时段中的普通及未触发 DAY 订单。
     pub fn end_session(
         &mut self,
         session_id: u64,
@@ -171,7 +171,7 @@ impl ProductionOrderBook {
         Ok(expired)
     }
 
-    /// 使用 root 冻结的价格带执行定期限价子单。
+    /// 使用根命令冻结的价格带执行定期限价子单。
     pub(super) fn place_limit_timed_frozen(
         &mut self,
         order: LimitOrder,

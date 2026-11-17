@@ -61,11 +61,9 @@ fn market_by_base_has_value_semantics() {
     changed.qty = Qty::try_new(200).unwrap();
     assert_ne!(original, changed);
 
-    // 原始测试数据明确没有保护。
     assert_eq!(original.market_protection, None);
     assert_eq!(original, same);
 
-    // None 与 Some 不相等。
     let mut changed = original.clone();
     changed.market_protection = Some(MarketProtection {
         max_slippage_bps: Some(100),
@@ -104,11 +102,9 @@ fn market_by_quote_has_value_semantics() {
     changed.quote_budget = QuoteBudget::try_new(2000).unwrap();
     assert_ne!(original, changed);
 
-    // 原始测试数据明确没有保护。
     assert_eq!(original.market_protection, None);
     assert_eq!(original, same);
 
-    // None 与 Some 不相等。
     let mut changed = original.clone();
     changed.market_protection = Some(MarketProtection {
         max_slippage_bps: Some(100),
@@ -177,28 +173,22 @@ fn market_protection_has_value_semantics_clone_and_debug() {
         worst_price: Some(Price::try_new(105).unwrap()),
     };
 
-    // Clone 后相等。
     assert_eq!(original.clone(), original);
 
-    // Debug 可用。
     assert!(format!("{original:?}").contains("MarketProtection"));
 
-    // 修改基点后不相等。
     let mut changed = original.clone();
     changed.max_slippage_bps = Some(200);
     assert_ne!(original, changed);
 
-    // 修改 worst_price 后不相等。
     let mut changed = original.clone();
     changed.worst_price = Some(Price::try_new(110).unwrap());
     assert_ne!(original, changed);
 
-    // 基点: Some -> None 后不相等。
     let mut changed = original.clone();
     changed.max_slippage_bps = None;
     assert_ne!(original, changed);
 
-    // worst_price: Some -> None 后不相等。
     let mut changed = original.clone();
     changed.worst_price = None;
     assert_ne!(original, changed);

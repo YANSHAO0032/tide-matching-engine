@@ -19,11 +19,11 @@ pub enum MarketRegistryOrder {
     Quote(MarketByQuote),
 }
 
-/// 市价计划所使用的确定性数值、保护和成交身份输入。
+/// 市价计划使用的数值、保护和成交 ID 输入。
 pub struct MarketRegistryContext<'a> {
     /// 市场数值配置。
     pub math: &'a MarketMath,
-    /// 旧切片入口由调用方提供的成交身份；游标入口不读取此字段。
+    /// 切片入口由调用方提供的成交 ID；游标入口不读取此字段。
     pub trade_ids: &'a [TradeId],
     /// 命令开始冻结的可选保护上下文。
     pub protection: Option<&'a CommandStartProtectionContext>,

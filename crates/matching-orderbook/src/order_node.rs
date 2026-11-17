@@ -26,7 +26,7 @@ pub struct OrderNode {
 }
 
 impl OrderNode {
-    /// 从原始限价单 GTC 订单创建尚未链接的运行态节点。
+    /// 根据限价订单创建尚未链接的 GTC 节点。
     ///
     /// `remaining` 精确复制原始 `Qty`，两个链接均为空；只有 `PriceLevel`
     /// 在完成局部不变量预检后才可连接该节点。
@@ -200,7 +200,7 @@ impl OrderNode {
         self.tif = tif;
     }
 
-    /// 冰山同价非增暴露改单只写入已校验的显示片与隐藏片，保留链接及优先级。
+    /// 冰山同价改单未增加可见量和总余量时，写入已校验的数量，保留链接及优先级。
     pub(crate) fn amend_iceberg_in_place(
         &mut self,
         order: LimitOrder,

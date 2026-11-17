@@ -311,13 +311,13 @@ struct Coverage {
     old_iceberg: usize,
     /// 成功替换的旧止损限价订单次数。
     old_stop: usize,
-    /// 全部命令累计产生的成交数量。
+    /// 全部命令累计产生的成交事件数。
     trades: usize,
     /// 成功 Amend 命令次数。
     amended: usize,
     /// 成功 Cancel 命令次数。
     canceled: usize,
-    /// 成功 expiry 命令次数。
+    /// 到期处理返回的订单数。
     expired: usize,
     /// 成功参考价更新命令次数。
     references: usize,

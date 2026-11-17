@@ -32,11 +32,11 @@ pub struct StopLimitOrder {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
-    /// 触发 child 继承的自成交防护分组身份。
+    /// 触发 child 继承的自成交防护分组键。
     pub stp_key: crate::StpKey,
     /// 触发 child 继承的吃单方自成交防护策略。
     pub stp_mode: crate::StpMode,
-    /// 接收阶段锁定、触发拒绝时必须释放的预留身份。
+    /// 接收阶段锁定、触发拒绝时必须释放的预留 ID。
     pub reservation_id: ReservationId,
     /// 接收阶段固定的费率版本。
     pub fee_schedule_version: u64,
@@ -65,11 +65,11 @@ pub struct StopMarketOrder {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
-    /// 触发 child 继承的自成交防护分组身份。
+    /// 触发 child 继承的自成交防护分组键。
     pub stp_key: crate::StpKey,
     /// 触发 child 继承的吃单方自成交防护策略。
     pub stp_mode: crate::StpMode,
-    /// 接收阶段锁定、触发拒绝时必须释放的预留身份。
+    /// 接收阶段锁定、触发拒绝时必须释放的预留 ID。
     pub reservation_id: ReservationId,
     /// 接收阶段固定的费率版本。
     pub fee_schedule_version: u64,
@@ -127,7 +127,7 @@ impl StopOrder {
         }
     }
 
-    /// 返回触发 child 必须继承的自成交防护分组身份。
+    /// 返回触发 child 必须继承的自成交防护分组键。
     pub fn stp_key(&self) -> crate::StpKey {
         match self {
             Self::Limit(order) => order.stp_key,
@@ -170,7 +170,7 @@ impl StopOrder {
         }
     }
 
-    /// 返回接收阶段锁定的预留身份。
+    /// 返回接收阶段锁定的预留 ID。
     pub fn reservation_id(&self) -> ReservationId {
         match self {
             Self::Limit(order) => order.reservation_id,

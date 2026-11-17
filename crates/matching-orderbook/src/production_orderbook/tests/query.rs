@@ -145,7 +145,7 @@ fn same_price_orders_are_individually_addressable() {
         );
     }
 
-    // 三次测试数据分配。
+    // 三次挂单各分配一次优先级。
     assert_eq!(book.next_queue_priority(), 3);
 }
 
@@ -204,7 +204,7 @@ fn repeated_queries_preserve_state() {
 
     assert_eq!(node_snapshot(&book, &ids), nodes_before);
 
-    // Arena 的槽位 + 空闲链表必须完整不变。
+    // Arena 的槽位和空闲栈必须保持不变。
     assert_eq!(book.arena.test_snapshot(), arena_before);
 
     // 查询不得消耗 QueuePriority。

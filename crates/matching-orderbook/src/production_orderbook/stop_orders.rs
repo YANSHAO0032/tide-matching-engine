@@ -30,7 +30,7 @@ impl ProductionOrderBook {
     /// 登记一个未触发止损订单。
     ///
     /// 该入口只维护 StopBook 和触发前到期索引，不执行触发、child 下单或撮合。
-    /// 订单标识在常规簿与 StopBook 间全局唯一；任一校验失败均不分配 StopPriority。
+    /// 订单标识不能与本簿的普通订单或 Stop 重复；校验失败不分配 StopPriority。
     pub fn place_stop(
         &mut self,
         order: StopOrder,

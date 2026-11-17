@@ -22,7 +22,7 @@ impl ProductionOrderBook {
         Ok(())
     }
 
-    /// 完成时效预检后，原子挂单并保存调用方预留状态。
+    /// 完成有效期预检后，原子挂单并保存调用方预留状态。
     pub fn rest_timed_with_reservation(
         &mut self,
         order: LimitOrder,
@@ -68,7 +68,7 @@ impl ProductionOrderBook {
 
     /// 将不可成交的普通 DAY/GTD/GTC 订单挂入订单簿并登记必要的到期索引。
     ///
-    /// 时效和会话校验发生在优先级、Arena 或价格档位发生任何写入之前。
+    /// 有效期和会话校验发生在优先级、Arena 或价格档位发生任何写入之前。
     pub fn rest_timed(
         &mut self,
         order: LimitOrder,
@@ -88,7 +88,7 @@ impl ProductionOrderBook {
         Ok(())
     }
 
-    /// 校验普通可挂单订单的时效参数。
+    /// 校验普通可挂单订单的有效期参数。
     pub(super) fn validate_resting_tif(
         tif: TimeInForce,
         now: LogicalTime,
@@ -148,7 +148,7 @@ impl ProductionOrderBook {
         self.commit_rest_timed(order, TimeInForce::Gtc, plan);
     }
 
-    /// 提交已通过所有时效、索引和挂单预检的普通订单。
+    /// 提交已通过有效期、索引和挂单预检的普通订单。
     pub(super) fn commit_rest_timed(
         &mut self,
         order: LimitOrder,
@@ -250,7 +250,7 @@ impl ProductionOrderBook {
     ///
     /// # 错误
     ///
-    /// - `OrderNotFound`：当前活动订单簿中不存在该 OrderId。
+    /// - `OrderNotFound`：当前普通挂单中不存在该 OrderId。
     ///
     /// # 不变量断言
     ///
@@ -529,8 +529,8 @@ impl ProductionOrderBook {
 
 /// 将已预检 `node` 接入目标价格档，并返回它的稳定 Arena 槽位。
 ///
-/// 调用方随后才写入 OrderId 索引并推进分配器。这里的所有断言都在
-/// `push_back` 或插入新档位前比较预检快照；任何差异是内部状态漂移，
+/// 调用方随后才写入 OrderId 索引并推进分配器。写入目标价档前比较预检快照，
+/// 写入后校验聚合结果；任何差异是内部状态漂移，
 /// 不能退化为业务 `RejectReason`。
 pub(super) fn commit_rest_target(
     levels: &mut BTreeMap<Price, PriceLevel>,

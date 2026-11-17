@@ -1,4 +1,4 @@
-//! 验证 `next`-成交执行、连续成交、TradeEvent 与固定命令带确定性。
+//! 验证单笔和连续成交、TradeEvent 及固定命令序列的确定性。
 use super::*;
 use matching_domain::{OrderId, Price, Qty, UserId};
 
@@ -15,7 +15,7 @@ fn order(id: u128, side: Side, price: i64, qty: u64) -> LimitOrder {
     }
 }
 
-/// 将指定订单包装为尚未成交的新到订单运行态。
+/// 构造尚未成交的新到订单。
 fn incoming(id: u128, side: Side, price: i64, qty: u64) -> IncomingOrder {
     IncomingOrder::new(order(id, side, price, qty))
 }

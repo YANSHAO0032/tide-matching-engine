@@ -1,6 +1,6 @@
 use crate::reject_reason::RejectReason;
 
-/// 以价格小数位数定义的原始整数表示的严格正价格。
+/// 按价格精度缩放的严格正整数价格。
 ///
 /// 原始值不是价格步长个数；构造只检查正值，市场价格步长对齐由 MarketMath 校验。
 ///
@@ -37,15 +37,15 @@ impl Price {
         }
     }
 
-    /// 读取价格原始整数；不乘除价格步长或小数位数。
+    /// 读取价格原始整数；不进行价格步长或精度换算。
     pub const fn get(self) -> i64 {
         self.0
     }
 }
 
-/// 以数量小数位数定义的原始整数表示的严格正数量。
+/// 按数量精度缩放的严格正整数数量。
 ///
-/// 原始值不是数量步长的倍数；构造只检查正值，市场数量步长对齐由 MarketMath 校验。
+/// 原始值不是以数量步长为单位的计数；构造只检查正值，步长对齐由 MarketMath 校验。
 ///
 /// 自然排序仅表示底层整数的数值顺序。
 #[repr(transparent)]
@@ -62,7 +62,7 @@ impl Qty {
         }
     }
 
-    /// 读取数量原始整数；不乘除手或小数位数。
+    /// 读取数量原始整数；不进行数量步长或精度换算。
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -140,7 +140,7 @@ impl SignedAmount {
     pub const fn get(self) -> i128 {
         self.0
     }
-    /// 正向或负向溢出均返回 ArithmeticOverflow
+    /// 正向或负向溢出均返回 ArithmeticOverflow。
     pub const fn checked_add(self, rhs: Self) -> Result<Self, RejectReason> {
         match self.0.checked_add(rhs.0) {
             Some(value) => Ok(Self(value)),

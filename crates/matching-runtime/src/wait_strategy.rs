@@ -7,7 +7,7 @@ pub enum WaitStrategy {
     BusySpin,
     /// 让出当前线程的执行机会。
     Yield,
-    /// 休眠直到其他线程发出唤醒令牌。
+    /// 停放线程等待唤醒；也可能无令牌提前返回。
     Park,
     /// 先短暂自旋，再让出线程，最后等待唤醒。
     #[default]

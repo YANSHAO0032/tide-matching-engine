@@ -260,7 +260,7 @@ fn protected_quote_preflight_empty_dust_and_unbounded() {
         assert_eq!(plan.stop, None);
         assert_eq!(snapshot(&book), before);
 
-        // 4. 已经成交一张挂单，下一档在保护边界内，但发生不足一手的预算。
+        // 4. 已规划一笔成交，下一档在保护范围内，但剩余预算不足一手。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, maker_side, better, 1)).unwrap();
         book.rest(limit(2, maker_side, 100, 5)).unwrap();
@@ -280,8 +280,8 @@ fn protected_quote_preflight_empty_dust_and_unbounded() {
         assert_eq!(plan.stop, None);
         assert_eq!(snapshot(&book), before);
 
-        // 5. 已成交一张挂单、预算只剩 5，
-        // 但下一张挂单越界，应当先记录保护终止，而非不足一手的预算。
+        // 5. 已规划一笔成交、预算只剩 5；下一张挂单越界，
+        // 应先记录保护终止，而不是预算不足一手。
         let mut book = ReferenceOrderBook::new();
         book.rest(limit(1, maker_side, better, 1)).unwrap();
         book.rest(limit(2, maker_side, outside, 5)).unwrap();
@@ -442,7 +442,7 @@ fn protected_quote_preflight_rejections_are_atomic() {
     );
     assert_eq!(snapshot(&book), before);
 
-    // 更重要的原子性：即使已只读规划一笔成交，
+    // 即使已只读规划一笔成交，
     // 后续挂单的数学校验失败，也绝不能改簿。
     for (side, maker_side, better, invalid_price) in [
         (Side::Buy, Side::Sell, 90, 101),

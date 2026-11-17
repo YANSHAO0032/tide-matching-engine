@@ -27,12 +27,12 @@ pub struct BatchSizeSnapshot {
     pub overflow: bool,
 }
 
-/// 非业务时延统计，数值耗尽时保留原值并显式标记。
+/// 非业务直方图；数值耗尽时保留原值并标记溢出。
 #[derive(Default)]
 struct Histogram {
     /// 互斥桶。
     buckets: [AtomicU64; 7],
-    /// 观察耗时总和。
+    /// 所有样本值之和。
     sum: AtomicU64,
     /// 溢出标志。
     overflow: AtomicBool,
@@ -70,7 +70,7 @@ impl Histogram {
     }
 }
 
-/// WAL 底层追加和同步操作的耗时。
+/// WAL 追加、同步和批量提交的观测指标。
 #[derive(Default)]
 pub struct DurabilityMetrics {
     /// 写入器追加耗时。
@@ -79,7 +79,7 @@ pub struct DurabilityMetrics {
     sync: Histogram,
     /// 批量提交的记录数。
     batch_size: Histogram,
-    /// 第一条记录等待批次同步的实际时间。
+    /// 首条记录追加后到开始批次同步的时间。
     batch_wait: Histogram,
 }
 impl DurabilityMetrics {

@@ -130,7 +130,7 @@ proptest! {
             );
         }
 
-        // 同时验证先进先出前缀、每笔数量及挂单-价格。
+        // 同时验证 FIFO 前缀、每笔数量和挂单价格。
         prop_assert_eq!(fills, expected_fills);
 
         // 完全成交的挂单被移除；

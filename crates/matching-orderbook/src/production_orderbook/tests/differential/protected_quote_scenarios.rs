@@ -107,7 +107,7 @@ fn build(makers: &[Maker]) -> (ReferenceOrderBook, ProductionOrderBook) {
 
 /// 两套引擎分别调用自己的公开受保护报价资产执行入口。
 ///
-/// 预期由测试手写固定预期构成，而不是从任意一侧结果推导。
+/// 预期结果由测试手写，不从任一模型的结果推导。
 ///
 /// stable_maker 用于验证部分成交挂单的 Arena 槽位
 /// 和 QueuePriority 在成交前后不变。
@@ -330,7 +330,7 @@ fn t0638_empty_equal_budget_initial_and_after_dust() {
         );
 
         // 2. 边界相等、预算恰好耗尽。
-        // 不允许继续读取下一越界挂单。
+        // 后续挂单虽已越界，也不能再产生保护触发事件。
         let after = assert_case(
             &[(1, maker_side, 100, 2), (2, maker_side, outside, 4)],
             &quote(100, side, 200, None),
@@ -370,7 +370,7 @@ fn t0638_empty_equal_budget_initial_and_after_dust() {
         // 4. 成交后不足一手的预算。
         // 更优价格档成交 1 手后只剩 5 报价资产。
         // 后续档位价格 100 在保护范围内，
-        // 不能因为不足一手的预算产生触发。
+        // 预算不足一手不会产生保护触发事件。
         let budget = better as u128 + 5;
 
         let after = assert_case(
@@ -573,7 +573,7 @@ fn t0638_invalid_tick_overflow_and_invalid_lot_are_atomic() {
         );
 
         // ----------------------------------------------------
-        // InvalidLot：Qty=11 合法，但 lot_size=10
+        // InvalidLot：Qty=11 为正，但未按 lot_size=10 对齐。
         // ----------------------------------------------------
 
         assert_case(

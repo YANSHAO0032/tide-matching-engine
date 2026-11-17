@@ -1,4 +1,4 @@
-//! 验证有可信租约时的历史纪元回放与损坏日志失败关闭。
+//! 验证可信租约下拒绝未来纪元及回退的日志纪元。
 mod t22_support;
 use matching_domain::*;
 use matching_orderbook::QueuePriorityPolicy;

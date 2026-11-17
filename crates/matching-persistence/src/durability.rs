@@ -62,7 +62,7 @@ pub struct DurabilityConfig {
     pub allow_data_loss_on_failover: bool,
 }
 impl DurabilityConfig {
-    /// 拒绝内存模式与持久恢复、高可用或生产环境组合。
+    /// 校验内存模式、复制策略和批次参数的组合。
     pub fn validate(&self) -> Result<(), DurabilityError> {
         if self.mode == DurabilityMode::MemoryOnly
             && (self.profile == Profile::Production
@@ -144,7 +144,7 @@ impl CommitWatermark {
     }
 }
 
-/// 有序追加及真实同步接口；实现者不得在未同步时返回成功。
+/// 有序追加与同步接口；`sync` 返回成功前必须完成实际同步。
 pub trait DurableAppender {
     /// 判断下一条记录是否需要关闭当前 segment。
     fn would_rotate(&self, record: &WalRecord) -> io::Result<bool>;
@@ -182,7 +182,7 @@ impl DurableAppender for BoxedDurableAppender {
 pub struct DurableBatcher<A> {
     /// 具有真实同步语义的顺序写入器。
     appender: A,
-    /// 底层追加与同步延迟，不影响提交。
+    /// WAL 追加、同步和批量提交指标，不参与提交决策。
     metrics: std::sync::Arc<crate::DurabilityMetrics>,
     /// 本地同步策略。
     mode: DurabilityMode,
@@ -283,7 +283,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
     pub const fn committed(&self) -> u64 {
         self.watermark.committed()
     }
-    /// 在提交前缀内登记已同步快照；清单写入失败后停止持久写入。
+    /// 在提交前缀内登记已同步快照；非 `InvalidInput` 的清单错误会停止持久写入。
     pub fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
         if self.halted || self.pending_count != 0 || snapshot_seq > self.committed() {
             return Err(io::Error::new(
@@ -304,7 +304,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
     pub fn appender(&self) -> &A {
         &self.appender
     }
-    /// 顺序追加记录，达到批次上限时同步；`now` 只决定批次时限。
+    /// 顺序追加记录并按配置同步；`now` 只用于判断批次时限。
     pub fn append_at(&mut self, record: &WalRecord, now: Instant) -> io::Result<()> {
         if self.halted {
             return Err(io::Error::other("持久写入器已停止"));

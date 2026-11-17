@@ -1,4 +1,4 @@
-//! 生产簿价格带配置与缺失参考价的只读边界。
+//! 价格带配置、参考价更新和撮合保护边界测试。
 use super::*;
 use matching_domain::{PriceBandConfig, PriceReferenceKind};
 use proptest::prelude::*;

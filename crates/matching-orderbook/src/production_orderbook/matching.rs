@@ -10,7 +10,7 @@ impl ProductionOrderBook {
     /// - 仅选择当前对手盘最优价格的先进先出头节点挂单；
     /// - 成交价始终取挂单价格；
     /// - 挂单严格部分成交时保留原槽位/先进先出/优先级；
-    /// - 挂单完全成交时通过 `pop_front` 移除；
+    /// - 普通挂单完全成交时通过 `pop_front` 移除；冰山可见片耗尽时可能补量；
     /// - 不循环到下一挂单；
     /// - 不将新到订单剩余量重新挂簿；
     /// - TradeId 由调用方提供，本方法不分配。
@@ -212,7 +212,7 @@ impl ProductionOrderBook {
 
             level.apply_head_partial_fill(&mut self.arena, fill_qty);
         } else {
-            // 全部成交/恰好全部成交挂单：必须物理移除头节点，
+            // 挂单全部成交时必须移除头节点，
             // 绝不能先把剩余量改成零再留下来。
             let (level_became_empty, maker_tif) = match maker_side {
                 Side::Buy => {
@@ -344,8 +344,8 @@ impl ProductionOrderBook {
 
         // ---------- 第二阶段：提交 ----------
         //
-        // 不复制挂单状态变更。
-        // 每一笔全部委托已经验收的单步入口。
+        // 每笔成交都交给单步入口处理。
+        // 预检结果与实际执行不一致时立即停止。
 
         let mut trades = Vec::with_capacity(expected_fills);
 
@@ -387,7 +387,7 @@ impl ProductionOrderBook {
 
     /// 在一个价格档内模拟先进先出成交，并验证单步提交依赖的局部结构。
     ///
-    /// 该扫描只读地推进 `incoming_remaining`，返回实际需要的 TradeId 数量。
+    /// 该扫描只修改模拟余量 `incoming_remaining`，返回实际需要的 TradeId 数量。
     /// 它检查的链表、身份、聚合与优先级关系必须足以让后续
     /// `execute_next_fill_trade` 不会因可预期数据错误在部分批量后返回 Err。
     pub(super) fn preflight_level_fill_count(

@@ -16,10 +16,10 @@ impl ReasonCode {
         self.0
     }
 }
-/// 拒绝回复的帧或载荷无效。
+/// 回复帧或载荷的编码、解码失败。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RejectionCodecError {
-    /// 帧完整性或版本错误。
+    /// 帧编码或解码失败。
     Frame(FrameError),
     /// 类型、标志或载荷长度不符合回复模式。
     Schema,

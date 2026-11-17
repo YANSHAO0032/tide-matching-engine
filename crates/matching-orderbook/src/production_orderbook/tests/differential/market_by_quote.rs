@@ -32,7 +32,7 @@ fn fixed_market_by_quote_tape(taker_side: Side) -> Vec<Command> {
         quote_market_command(90, taker_side, 1000, &[]),
         // 1. 建立第一张挂单。
         Command::Place(order(30, maker_side, better, 7)),
-        // 2. 小于当前最优价格，直接不足一手的预算。
+        // 2. 预算低于最优价，不足以成交一手。
         quote_market_command(91, taker_side, (better - 1) as u128, &[]),
         // 3. 单挂单部分成交：成交 3，挂单方30 剩余 4。
         //    未用预算=1。
@@ -47,7 +47,7 @@ fn fixed_market_by_quote_tape(taker_side: Side) -> Vec<Command> {
         // 挂单方20: 2
         // 挂单方20 留下 2。
         quote_market_command(93, taker_side, multi_budget, &[9102, 9103, 9104]),
-        // 7. 耗尽最后 2 手，报价预算余量终结。
+        // 7. 成交最后 2 手后流动性耗尽，仍有未用预算。
         quote_market_command(94, taker_side, 1000, &[9105]),
         // 8. 再次空簿。
         quote_market_command(95, taker_side, 100, &[]),
@@ -75,8 +75,7 @@ fn fixed_market_by_quote_buy_and_sell_tapes_are_differential_and_reproducible() 
 
         assert_eq!(first.len(), 11);
 
-        // 所有成功的报价资产命令均不得挂单吃单方，
-        // 也不得消耗优先级。
+        // 成功的报价预算市价单不能入簿，也不能消耗优先级。
         for &index in &[0usize, 2, 3, 6, 7, 8] {
             let CommandOutcome::MarketByQuote(Ok(_)) = &first[index].outcome else {
                 panic!(
@@ -205,7 +204,7 @@ fn fixed_market_by_quote_buy_and_sell_tapes_are_differential_and_reproducible() 
         assert_eq!(remaining_side.orders[0].original.order_id, OrderId::new(20),);
         assert_eq!(remaining_side.orders[0].remaining, 2);
 
-        // 最后两个手全部成交，额外预算终结。
+        // 最后两手全部成交，剩余预算未使用。
         let CommandOutcome::MarketByQuote(Ok(exhaust)) = &first[7].outcome else {
             panic!("MarketByQuote liquidity exhaustion expected");
         };
@@ -444,7 +443,7 @@ proptest! {
             prop_assert!(trade.qty.get() > 0);
         }
 
-        // 10. 无成交时预算全部返还。
+        // 10. 无成交时预算全部未使用。
         if production_execution.trades().is_empty() {
             prop_assert_eq!(spent, 0);
             prop_assert_eq!(unused, budget);

@@ -40,9 +40,9 @@ pub enum RejectReason {
     InvalidPrice = 2002,
     /// 数量或初始报价资产预算不是该字段要求的严格正值。
     InvalidQty = 2003,
-    /// 价格不符合市场 tick_size 的对齐要求。
+    /// 价格步长无效，或价格未按市场 tick_size 对齐。
     InvalidTick = 2004,
-    /// 数量不符合市场 lot_size 的对齐要求。
+    /// 数量步长无效，或数量未按市场 lot_size 对齐。
     InvalidLot = 2005,
     /// 订单本金低于市场最小值。
     MinNotional = 2006,
@@ -90,7 +90,7 @@ pub enum RejectReason {
     StaleUserControlEpoch = 4005,
     /// 所需带溢出检查的算术无法以目标整数类型精确表示。
     ArithmeticOverflow = 5001,
-    /// 有界入口容量已满，当前请求未进入业务执行。
+    /// 入口繁忙（容量、配额或准入锁竞争），请求未进入业务执行。
     EngineBusy = 5002,
     /// 主节点纪元与控制命令不一致。
     StalePrimaryEpoch = 5005,

@@ -92,7 +92,7 @@ pub enum CircuitBreakerReason {
 pub struct MarketLifecycle {
     /// 当前市场状态。
     state: MarketState,
-    /// 最近启动的交易时段身份。
+    /// 最近启动的交易时段 ID。
     session_id: Option<u64>,
     /// 当前时段是否尚未结束。
     session_active: bool,
@@ -114,7 +114,7 @@ impl MarketLifecycle {
     pub const fn state(&self) -> MarketState {
         self.state
     }
-    /// 返回最近启动的交易时段身份。
+    /// 返回最近启动的交易时段 ID。
     pub const fn session_id(&self) -> Option<u64> {
         self.session_id
     }

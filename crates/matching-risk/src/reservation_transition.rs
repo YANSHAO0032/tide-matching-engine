@@ -1,4 +1,4 @@
-//! 撤单替换资金状态的只读计划与显式提交边界。
+//! 预留接管、调整、归属转移和结算的预检与提交。
 
 use crate::{
     ExpectedAmendReservation, ReservationState, ReservationStatus, RiskKeySet,
@@ -87,7 +87,7 @@ pub struct PlannedReservationTransition {
 /// 金融上仍为活动的预留必须恰好归属于活动订单或等待后置资金处理。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReservationBinding {
-    /// 金融预留仍绑定到可见活动订单。
+    /// 金融预留仍绑定到活动订单。
     ActiveOrder(OrderId),
     /// 订单已终结，金融预留等待后续 R2 结算。
     PendingR2,
@@ -308,7 +308,7 @@ impl ReservationRegistry {
         writer.bytes(&w.finish())
     }
 
-    /// 恢复登记表并通过原始构造入口重建及验证归属。
+    /// 恢复登记表，并通过构造入口重建和校验归属。
     pub fn read_snapshot(
         reader: &mut matching_domain::snapshot_wire::SnapshotDecoder<'_>,
     ) -> Result<Self, matching_domain::snapshot_wire::SnapshotWireError> {
@@ -648,7 +648,7 @@ impl ReservationRegistry {
         }
         Ok(())
     }
-    /// 只读验证资金过渡；任何拒绝都保留新预留的未接管清理身份。
+    /// 只读验证资金过渡；拒绝独立新预留时返回未接管的清理身份。
     pub fn plan_transition(
         &self,
         keys: &RiskKeySet,
@@ -669,7 +669,7 @@ impl ReservationRegistry {
             })
     }
 
-    /// 仅消费已证明计划，不产生事件；新预留版本从零开始。
+    /// 应用已验证的计划，不产生事件；新预留版本从零开始。
     ///
     /// 延续旧预留时推进一次金融版本；改用新预留时旧金融状态完整保留，仅归属等待后置资金处理。
     ///

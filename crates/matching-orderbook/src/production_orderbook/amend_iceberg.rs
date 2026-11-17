@@ -9,7 +9,7 @@ use matching_domain::{
 };
 
 impl ProductionOrderBook {
-    /// 所有数量、成交、目标档和优先级失败均在删除原单之前完成。
+    /// 删除原单前完成数量、成交、目标价档和优先级的预检。
     pub(super) fn commit_iceberg_amend_with_source(
         &mut self,
         plan: IcebergAmendPlan,

@@ -87,7 +87,7 @@ fn cancel_single_order_removes_level_on_both_sides() {
             }
         }
 
-        // 取消不消费分配器。
+        // 取消不分配新的优先级。
         assert_eq!(book.next_queue_priority(), next_before);
 
         assert_eq!(book.queue_priority_allocator.policy(), &policy_before);
@@ -253,7 +253,7 @@ fn canceled_slot_can_be_reused_without_reviving_old_order_id() {
 
     assert_eq!(book.next_queue_priority(), 1);
 
-    // Arena 空闲链表应复用刚释放的槽位。
+    // Arena 应复用刚释放的空闲槽位。
     book.rest(order(20, Side::Buy, 95, 7)).unwrap();
 
     let new_slot = *book.orders.get(&OrderId::new(20)).unwrap();
@@ -341,7 +341,7 @@ fn cancel_same_price_sell_head_middle_and_tail_preserves_fifo() {
         let head_node = book.arena.get(head).unwrap();
         let tail_node = book.arena.get(tail).unwrap();
 
-        // 先进先出剩余节点顺序。
+        // 剩余节点保持先进先出顺序。
         assert_eq!(
             head_node.original_order().order_id,
             OrderId::new(expected_ids[0])
@@ -351,7 +351,7 @@ fn cancel_same_price_sell_head_middle_and_tail_preserves_fifo() {
             OrderId::new(expected_ids[1])
         );
 
-        // 两节点链必须完整互反。
+        // 两个节点的前后链接必须一致。
         assert_eq!(head_node.prev(), None);
         assert_eq!(head_node.next(), Some(tail));
 
@@ -379,7 +379,7 @@ fn assert_cancel_panics_without_mutation(book: &mut ProductionOrderBook, order_i
     let asks_before = level_snapshot(&book.asks);
     let orders_before = book.orders.clone();
 
-    // 完整包含已占用槽位 + 空闲链表。
+    // 快照包含已占用槽位和空闲槽位列表。
     let arena_before = book.arena.test_snapshot();
 
     let next_before = book.queue_priority_allocator.next();
@@ -486,7 +486,7 @@ fn cancel_panics_without_mutation_when_node_side_points_to_missing_level() {
     let priority = removed.priority();
 
     // 原节点真实位于 `bids`[100]，
-    // 但替换后的节点自述为卖出，因此取消会寻找 `asks`[100]。
+    // 但替换后的节点是卖单，因此取消会寻找 `asks`[100]。
     let replacement = OrderNode::new(order(1, Side::Sell, 100, 5), priority);
 
     assert_eq!(book.arena.insert(replacement).unwrap(), slot);
@@ -511,7 +511,7 @@ fn cancel_panics_without_mutation_when_node_price_points_to_missing_level() {
     let priority = removed.priority();
 
     // PriceLevel 仍然是真实的 `bids`[100]，
-    // 但节点现在自述价格=101。
+    // 但节点的价格已变为 101。
     let replacement = OrderNode::new(order(1, Side::Buy, 101, 5), priority);
 
     assert_eq!(book.arena.insert(replacement).unwrap(), slot);
@@ -541,7 +541,7 @@ fn cancel_panics_without_mutation_when_exact_price_level_is_missing() {
         .unwrap();
 
         // Arena 与标识符映射都仍然存在；
-        // 只删除节点应该所属的准确价格档。
+        // 只删除节点所属的价格档。
         let removed_level = match side {
             Side::Buy => book.bids.remove(&price),
             Side::Sell => book.asks.remove(&price),

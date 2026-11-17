@@ -16,7 +16,7 @@ pub struct Frame {
     pub flags: u16,
     /// 调用方用于关联响应的身份。
     pub request_id: u64,
-    /// 已通过帧长度检查的原始载荷。
+    /// 帧的原始载荷；解码时会检查帧长度。
     pub payload: Vec<u8>,
 }
 

@@ -29,7 +29,7 @@ fn fixed_market_by_base_tape(taker_side: Side) -> Vec<Command> {
         // 单档部分成交：挂单方30 剩余 4。
         Command::Place(order(30, maker_side, better, 7)),
         market_command(91, taker_side, 3, &[9001]),
-        // 第二笔买/卖入场：原有挂单方30 优先，随后同价挂单方10，再到更差价格挂单方20。
+        // 第二笔市价单依次成交挂单 30、同价挂单 10 和较差价位的挂单 20。
         Command::Place(order(20, maker_side, worse, 4)),
         Command::Place(order(10, maker_side, better, 5)),
         market_command(92, taker_side, 11, &[9002, 9003, 9004]),
@@ -119,7 +119,7 @@ fn fixed_market_by_base_buy_and_sell_tapes_are_differential_and_reproducible() {
             )
         );
 
-        // 说明: 挂单方20 原本 4，多个吃掉 2，余 2；下一笔全部吃掉。
+        // 挂单 20 原有 4 手，上一步成交 2 手，下一笔成交剩余 2 手。
         let CommandOutcome::MarketByBase(Ok(exhaust)) = &first[6].outcome else {
             panic!("remainder")
         };

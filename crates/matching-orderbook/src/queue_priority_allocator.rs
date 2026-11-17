@@ -416,7 +416,7 @@ mod tests {
 
         assert_eq!(policy.synthetic_ceiling(), Some(3));
 
-        // 测试用=3 明显比真实上限更早。
+        // 测试上限 3 先于真实上限到达。
         assert_eq!(policy.effective_ceiling(), 3);
 
         let mut allocator = QueuePriorityAllocator::new(policy);
@@ -491,7 +491,7 @@ mod tests {
             Err(QueuePriorityInitError::EmptyPrioritySpace)
         );
 
-        // 测试用=0 同样不存在可分配空间。
+        // 测试上限为 0 时也没有可分配空间。
         assert_eq!(
             QueuePriorityPolicy::try_with_synthetic_ceiling(DEFAULT_GUARD, Some(0),),
             Err(QueuePriorityInitError::EmptyPrioritySpace)
@@ -584,7 +584,7 @@ mod tests {
             QueuePriorityPolicy::try_with_synthetic_ceiling(DEFAULT_GUARD, Some(real_ceiling + 10))
                 .unwrap();
 
-        // 测试用虽然允许继续增长，
+        // 测试上限虽然允许继续增长，
         // 但真实预留边界更早。
         assert_eq!(
             QueuePriorityAllocator::try_restore(policy, real_ceiling + 1,),

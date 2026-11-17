@@ -242,11 +242,8 @@ pub(super) fn observe_production(book: &ProductionOrderBook) -> ObservedBook {
 
 /// 当前普通订单簿的只读不变量检查。
 ///
-/// 适用范围（以当前普通订单限价单 GTC / 取消测试域为准）：
-/// §54: 1–5、7–11、26、49；16 仅成交正量与单命令序列内 TradeId 唯一；
-/// 28–30 仅普通订单 QueuePriority 的单调分配、同价先进先出和不复用部分。
-/// 止损订单、到期索引、跨分片唯一性、WAL、摘要、崩溃均不适用，
-/// 不将本测试解释为覆盖这些尚未接入的系统性质。
+/// 检查价格顺序、深度聚合、活动订单与优先级唯一性，以及同价 FIFO。
+/// 成交事件、止损、到期索引、跨分片唯一性和持久化不在此函数的检查范围内。
 pub(super) fn assert_regular_book_invariants(
     book: &ObservedBook,
     next_priority: u128,
@@ -342,13 +339,13 @@ pub(super) fn assert_regular_book_invariants(
     }
 }
 
-/// 在受控业务错误后验证生产簿的完整内部状态不变。
+/// 在受控业务错误后比较生产簿的指定结构状态。
 ///
 /// 这里比语义观察更严格，同时覆盖：
 ///
 /// - 买价 / 卖价价档元数据
 /// - OrderId 索引
-/// - Arena 已占用槽位 / 空闲链表
+/// - Arena 已占用槽位 / 空闲栈
 /// - 下一队列优先级 `next`（QueuePriority）
 /// - 分配器策略
 pub(super) fn assert_production_failure_state_unchanged(

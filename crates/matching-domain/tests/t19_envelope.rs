@@ -1,4 +1,4 @@
-//! 验证命令与事件封装携带的业务身份。
+//! 验证命令与事件的业务身份，以及已有原因码的稳定性。
 use matching_domain::{
     ClusterId, Command, CommandEnvelope, CommandId, EngineEvent, EventEnvelope, MarketId,
     MassCancelShard, RejectReason, ShardCancelScope, ShardId, UserId,

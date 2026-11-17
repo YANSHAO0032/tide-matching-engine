@@ -77,7 +77,7 @@ impl ProductionOrderBook {
         self.price_band
     }
 
-    /// 从指定来源当前参考价冻结包含式价格带。
+    /// 按指定来源的当前参考价计算价格带，包含边界值。
     pub fn price_band_bounds(&self) -> Result<Option<(Price, Price)>, RejectReason> {
         self.price_band
             .map(|(band, math)| {
@@ -90,7 +90,7 @@ impl ProductionOrderBook {
             .transpose()
     }
 
-    /// 验证限价位于命令开始时的包含式市场价格带内。
+    /// 验证限价位于当前市场价格带内，包含边界值。
     pub(super) fn validate_band_price(&self, price: Price) -> Result<(), RejectReason> {
         if let Some((lower, upper)) = self.price_band_bounds()?
             && (price < lower || price > upper)

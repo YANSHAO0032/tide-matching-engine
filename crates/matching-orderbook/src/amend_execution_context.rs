@@ -13,7 +13,7 @@ use matching_risk::{
 pub struct AmendExecutionContext<'a> {
     /// 本命令开始固定的实际市场数值规则，不使用默认价格或数量步长。
     pub market_math: matching_domain::MarketMath,
-    /// 与调整令牌绑定、在提交命令前已确定的身份。
+    /// 提交命令前确定并与调整令牌绑定的命令 ID。
     pub command_id: CommandId,
     /// 本次候选校验固定使用的费率版本；未触发止损必须匹配接收时固定的版本。
     pub fee_schedule_version: u64,
@@ -31,7 +31,7 @@ pub struct AmendRegistryContext<'a> {
     pub now: matching_domain::LogicalTime,
     /// 当前交易时段。
     pub current_session_id: u64,
-    /// 旧切片入口所需的调用方成交身份；游标入口不读取此字段。
+    /// 切片入口所需的调用方成交 ID；游标入口不读取此字段。
     pub trade_ids: &'a [matching_domain::TradeId],
     /// 固定的数值、签名和资金校验上下文。
     pub execution: &'a AmendExecutionContext<'a>,

@@ -212,7 +212,7 @@ impl ReferenceOrderBook {
                         .expect("resting reference child");
                     let mut original = entry.original_order().clone();
                     original.qty = stop.qty;
-                    // 接续绝对目标，而不把已成交量混入新剩余量。
+                    // 保留 child 接受时的总量，供后续改单计算已成交量。
                     entry.amend_regular_in_place(
                         original,
                         matching_domain::Qty::try_new(entry.total_remaining())
@@ -556,7 +556,7 @@ impl ReferenceOrderBook {
                         .expect("resting reference child");
                     let mut original = entry.original_order().clone();
                     original.qty = stop.qty;
-                    // 接续绝对目标，而不把已成交量混入新剩余量。
+                    // 保留 child 接受时的总量，供后续改单计算已成交量。
                     entry.amend_regular_in_place(
                         original,
                         matching_domain::Qty::try_new(entry.total_remaining())

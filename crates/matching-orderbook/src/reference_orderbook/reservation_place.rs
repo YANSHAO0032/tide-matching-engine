@@ -450,7 +450,7 @@ impl ReferenceOrderBook {
             .find(|order| order.original_order().order_id == accepted.order_id)
             && resting.peak_size().is_none()
         {
-            // 保留接收绝对总量，避免把入簿前的成交量丢给后续改单。
+            // 保留接收时的总量，让后续改单能计入入簿前的成交。
             resting.amend_regular_in_place(
                 accepted.clone(),
                 Qty::try_new(resting.total_remaining())?,

@@ -328,7 +328,7 @@ fn manifest_failure_after_wal_sync_cannot_advance_commit() {
         ManifestManager, ManifestState, ManifestStorage, RegisteredAppender, SegmentWriter,
     };
     struct Failing {
-        /// 已尝试写入的清单代数。
+        /// 尝试写入清单的次数。
         writes: usize,
     }
     impl ManifestStorage for Failing {
@@ -447,7 +447,7 @@ fn startup_fails_before_wal_write_if_second_manifest_slot_fails() {
         ManifestManager, ManifestState, ManifestStorage, RegisteredAppender, SegmentWriter,
     };
     struct FailSecond {
-        /// 已尝试写入的清单代数。
+        /// 尝试写入清单的次数。
         writes: usize,
     }
     impl ManifestStorage for FailSecond {

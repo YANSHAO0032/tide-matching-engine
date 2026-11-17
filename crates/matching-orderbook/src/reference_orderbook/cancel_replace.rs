@@ -36,7 +36,7 @@ impl ReferenceOrderBook {
     /// `expected` 的命令身份、市场、费率及完整资金上界必须来自调用方真实执行配置，
     /// 不得从令牌填入或猜测。它与实际旧影子及独立新单身份再次交叉核对。
     /// `context` 延续正常参考下单的显式时间、数值及成交身份契约。
-    /// 不读取网络、墙上时钟或生产簿，不产生任何资金释放事件。
+    /// 不访问网络、系统时钟或生产簿，不产生资金释放事件。
     pub fn plan_cancel_replace(
         &self,
         request: &CancelReplaceOrder,
@@ -51,7 +51,7 @@ impl ReferenceOrderBook {
 
     /// 完整核对簿及登记表前态后，一次安装已验证的组合后态和有序事件。
     ///
-    /// 首次真实写入后无撮合、资金校验、正常拒绝或回滚；漂移必须按不变量错误停止。
+    /// 首次真实写入后不再撮合、校验资金或回滚；前态发生变化时返回 StateChanged。
     pub fn apply_cancel_replace(
         &mut self,
         registry: &mut ReservationRegistry,

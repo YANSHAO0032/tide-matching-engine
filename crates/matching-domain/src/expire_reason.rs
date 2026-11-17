@@ -8,9 +8,9 @@ pub enum ExpireReason {
     GtdReached = 1201,
     /// 常规 DAY 订单因交易时段结束而到期。
     SessionEnded = 1202,
-    /// 未触发 Stop 的 GTD 生命周期达到逻辑到期时间。
+    /// 未触发的 Stop 达到 GTD 逻辑到期时间。
     StopTriggerGtdReached = 1203,
-    /// 未触发 Stop 的 DAY 生命周期因交易时段结束而到期。
+    /// 未触发的 Stop 因 DAY 会话结束而到期。
     StopTriggerSessionEnded = 1204,
     /// 市场关闭时的到期终结。
     MarketClosed = 1205,

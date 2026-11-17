@@ -1,4 +1,4 @@
-//! 审计记录必须可恢复、可核对并拒绝损坏。
+//! 验证审计记录恢复、已确认前缀的损坏检测和未确认尾部清理。
 mod t22_support;
 use matching_runtime::{AuditAction, AuditLog, AuditOutcome, AuditRecord};
 

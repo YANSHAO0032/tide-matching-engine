@@ -829,7 +829,7 @@ fn streamed_fixed_seed_100k_tape_processes_every_step() {
 }
 
 /// 两个具名固定种子；每个独立生成两次并完整比较输入。
-/// 所有 §54 声明的覆盖范围见 assert_regular_book_invariants 注释。
+/// 订单簿不变量检查的范围见 assert_regular_book_invariants 注释。
 /// 这不是止损订单 / 到期索引 / WAL / 摘要 / 崩溃 / 跨分片断言。
 fn assert_reproducible_streamed_10k(name: &str, seed: [u8; 32]) {
     const LENGTH: usize = 10_000;

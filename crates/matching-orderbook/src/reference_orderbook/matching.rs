@@ -51,10 +51,10 @@ impl ReferenceOrderBook {
         Ok(Some((&self.orders[maker_index], fill_qty)))
     }
 
-    /// 执行至多一笔 `next`-成交，不生成事件，也不将新到订单剩余量挂簿。
+    /// 最多执行一笔成交，不生成事件，也不将新到订单剩余量挂簿。
     ///
     /// 先规划并预检双方扣减，再修改运行态。
-    /// 返回挂单身份、挂单价格和成交量。
+    /// 返回挂单 ID、挂单价格和成交量。
     pub fn execute_next_fill(
         &mut self,
         incoming: &mut IncomingOrder,
@@ -100,7 +100,7 @@ impl ReferenceOrderBook {
     ///
     /// 结果按实际成交顺序排列，价格取各挂单的价格。
     /// 冰山挂单存在时，先对整条命令模拟补量/优先级再提交。
-    /// 此既有接口仅投影成交；不挂单新到订单，富事件接口保留生命周期事件。
+    /// 此接口只返回成交；不挂单新到订单，带事件的接口保留生命周期事件。
     pub fn execute_fills(
         &mut self,
         incoming: &mut IncomingOrder,

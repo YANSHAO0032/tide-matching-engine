@@ -1,4 +1,4 @@
-//! 验证市场配置的数值约束及变更边界。
+//! 验证市场配置、状态管理及命令编码的约束和边界。
 use matching_domain::{
     ClosePolicy, ExecutionLimits, MarketConfig, MarketId, OrderLimits, Qty, QuoteAmount,
 };

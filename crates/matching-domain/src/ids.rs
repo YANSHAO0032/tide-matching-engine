@@ -116,12 +116,12 @@ mod tests {
                 assert_ne!(zero, one);
                 assert_ne!(one, max);
 
-                //自然数值排序
+                // 按数值升序排列；不代表业务优先级。
                 let mut values = [max, one, zero];
                 values.sort();
                 assert_eq!(values, [zero, one, max]);
 
-                //相等的标识符在HashSet中视为同一个值
+                // 相同标识符在 HashSet 中只保留一份。
                 let mut set = HashSet::new();
                 assert!(set.insert(one));
                 assert!(!set.insert($id::new(1)));

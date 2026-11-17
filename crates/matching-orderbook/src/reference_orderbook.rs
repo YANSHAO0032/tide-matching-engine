@@ -36,7 +36,7 @@ pub use stop_trigger::ReferenceTriggerRegistryPlan;
 
 /// 为优先级计数器保留不可分配的高位保护空间。
 ///
-/// 到达该边界前必须拒绝新挂单订单，避免计数器回绕后破坏先进先出语义。
+/// 计数器到达该边界时拒绝新挂单，避免回绕后破坏先进先出语义。
 const PRIORITY_GUARD: u128 = 1_024;
 
 /// 单市场参考订单簿
@@ -69,7 +69,7 @@ impl ReferenceOrderBook {
         Self::default()
     }
 
-    /// 按订单身份只读查询已登记的本地预留快照。
+    /// 按订单 ID 只读查询已登记的本地预留快照。
     pub fn reservation_state(&self, order_id: OrderId) -> Option<&ReservationState> {
         self.reservations.get(&order_id)
     }
@@ -109,7 +109,7 @@ impl ReferenceOrderBook {
         self.orders(side).into_iter().next()
     }
 
-    /// 在参考 Vec 变更前核对候选预留身份及既有影子状态。
+    /// 在参考 Vec 变更前核对候选预留归属及既有影子状态。
     fn validate_new_reservation(
         &self,
         order_id: OrderId,
@@ -129,7 +129,7 @@ impl ReferenceOrderBook {
         Ok(())
     }
 
-    /// 批量成交只清除已终结身份，未触发止损仍拥有同一预留。
+    /// 只清除已终结订单的预留；未触发止损仍保留预留。
     fn retain_active_reservations(&mut self) {
         let orders = &self.orders;
         let stops = &self.stop_orders;

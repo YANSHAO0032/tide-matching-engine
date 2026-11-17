@@ -1,4 +1,4 @@
-//! 固定市场状态拒绝原因编号及其快照解码。
+//! 验证市场状态、配置和名义价值拒绝码的编码与解码。
 use matching_domain::{
     RejectReason,
     snapshot_wire::{SnapshotDecoder, SnapshotEncoder, decode_reject_reason, encode_reject_reason},

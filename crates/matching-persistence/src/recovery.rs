@@ -2,7 +2,7 @@
 use crate::{WalRecord, scan_segments};
 use std::{io, path::Path};
 
-/// 校验调用方已验证快照的序号属于清单记录且未落在已回收前缀内。
+/// 检查快照序号为零基线或与清单登记一致，且未落在已回收前缀内。
 fn valid_snapshot_boundary(state: &crate::ManifestState, seq: u64) -> bool {
     seq >= state.wal_gc_safe_seq
         && (seq == 0

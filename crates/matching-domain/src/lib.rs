@@ -22,7 +22,7 @@ pub mod command_wal_codec;
 mod event_digest;
 /// 导出事件摘要编码入口。
 pub use event_digest::encode_event_for_hash;
-/// 当前订单簿使用的最小生命周期与成交事件载荷。
+/// 订单、成交、资金和市场状态等业务事件载荷。
 pub mod engine_event;
 /// 订单到期的稳定业务原因。
 pub mod expire_reason;
@@ -125,7 +125,7 @@ pub use command_event::{
 };
 /// 正式命令的版本化持久编码与解码。
 pub use command_wal_codec::{CommandCodecError, decode_wal_command, encode_wal_command};
-/// 最小订单生命周期事件及终结余量的计价模式。
+/// 业务事件及订单终结余量的计价模式。
 pub use engine_event::{EngineEvent, OrderRemaining};
 /// 订单到期的稳定业务原因。
 pub use expire_reason::ExpireReason;

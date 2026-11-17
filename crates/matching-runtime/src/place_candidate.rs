@@ -325,7 +325,7 @@ pub(crate) fn release_terminal_reservations(
     Ok(output)
 }
 
-/// 将成交逐笔转换为隔离的结算候选；调用方仍须执行版本费率 R1 和持久提交。
+/// 按指定费率版本预检预留，并逐笔生成结算候选；持久提交由调用方负责。
 pub(crate) fn place_candidate_with_fees(
     input: (
         PlacePlanningContext<'_>,

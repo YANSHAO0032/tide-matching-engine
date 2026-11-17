@@ -132,7 +132,7 @@ pub(crate) struct StopReplacementPlan {
     order: StopOrder,
     /// 原位置的优先级，用于检测计划与提交之间的状态漂移。
     old_priority: StopPriority,
-    /// 新优先级，仅触发价改变时分配。
+    /// 新优先级，触发价或触发来源改变时分配。
     priority: StopPriority,
     /// 是否迁移到另一触发来源或触发价档位。
     requeue: bool,

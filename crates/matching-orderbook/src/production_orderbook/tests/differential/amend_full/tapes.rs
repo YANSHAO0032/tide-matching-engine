@@ -274,7 +274,7 @@ struct Coverage {
     stop_amend: usize,
     /// 成功修改冰山订单的次数。
     iceberg_amend: usize,
-    /// 全部命令累计产生的成交数量。
+    /// 全部命令累计产生的成交笔数。
     trades: usize,
     /// 全部命令累计触发的止损子订单数量。
     triggered: usize,

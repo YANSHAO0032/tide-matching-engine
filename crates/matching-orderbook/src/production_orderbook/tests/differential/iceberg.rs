@@ -63,7 +63,7 @@ impl IceOutcome {
     }
 }
 
-/// 差分观察到的冰山订单状态。
+/// 差分观察到的普通或冰山订单状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IceOrder {
     /// 不随成交扣减改变的原始限价订单载荷。
@@ -85,9 +85,9 @@ struct IceOrder {
 struct IceState {
     /// 只含可见数量的整簿业务观察。
     visible_book: ObservedBook,
-    /// 按业务顺序排列的买侧冰山订单投影。
+    /// 按业务顺序排列的买侧订单投影。
     bids: Vec<IceOrder>,
-    /// 按业务顺序排列的卖侧冰山订单投影。
+    /// 按业务顺序排列的卖侧订单投影。
     asks: Vec<IceOrder>,
     /// 下一次将分配的队列优先级数值。
     next_priority: u128,

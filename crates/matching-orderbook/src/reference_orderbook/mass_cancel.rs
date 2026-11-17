@@ -18,7 +18,7 @@ pub struct ReferenceMassCancelPlan {
     after_book: ReferenceOrderBook,
     /// 已把本批活动绑定迁移到 PendingR2 的登记表后态。
     after_registry: ReservationRegistry,
-    /// 按 OrderId 升序冻结、等待与后态一起发布的撤单事件。
+    /// 按各计划规定的顺序生成、等待与后态一起提交的订单事件。
     events: Vec<EngineEvent>,
 }
 

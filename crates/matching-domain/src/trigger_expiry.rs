@@ -2,7 +2,7 @@ use crate::LogicalTime;
 
 /// 未触发 Stop 在触发前的独立存活期。
 ///
-/// 它不能由触发后 child 的 `TimeInForce` 推导；只有逻辑时间或会话结束命令能终结它。
+/// 不能由触发后 child 的 `TimeInForce` 推导；到期由逻辑时间或会话结束命令驱动。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TriggerExpiry {
     /// 未触发 Stop 持续有效，直到被取消或触发。

@@ -114,7 +114,7 @@ pub(super) struct ModelEntry {
     pub(super) slot: OrderIndex,
 }
 
-/// 生成有界混合操作；权重保证有足够的非空先进先出状态可验证。
+/// 生成有界混合操作；提高尾插权重以增加非空状态的覆盖机会。
 pub(super) fn level_op_strategy() -> impl Strategy<Value = LevelOp> {
     prop_oneof![
         // 尾插略微提高权重，否则大量空档移除头节点/解除链接的覆盖价值较低。
@@ -396,7 +396,7 @@ pub(super) fn validate_level(level: &PriceLevel, arena: &OrderArena) -> Result<(
 
     Ok(())
 }
-/// 校验器测试注入的单一损坏维度，每种样本只应违反其目标不变量。
+/// 校验器测试注入的损坏类型；一次注入也可能影响其他不变量。
 #[derive(Debug, Clone, Copy)]
 enum LevelDamage {
     /// 元数据节点数与实际链长不一致。

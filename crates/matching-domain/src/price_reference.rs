@@ -1,7 +1,7 @@
 use crate::{Price, RejectReason};
 use std::collections::BTreeMap;
 
-/// 可驱动止损触发的确定性价格参考来源。
+/// 确定性价格参考来源；只有部分来源可驱动止损触发。
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PriceReferenceKind {

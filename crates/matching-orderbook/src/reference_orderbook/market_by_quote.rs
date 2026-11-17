@@ -74,7 +74,7 @@ impl ReferenceOrderBook {
     ///
     /// - 重复活动 OrderId 优先拒绝；
     /// - 挂单按价格优先、同价先进先出；
-    /// - 不足一手时立即不足一手的预算停止；
+    /// - 预算不足一手时立即停止；
     /// - 不修改订单簿、不消耗 QueuePriority；
     /// - 不生成 TradeEvent 或 MarketByQuoteExecution。
     pub(super) fn preflight_market_by_quote(
@@ -252,7 +252,7 @@ impl ReferenceOrderBook {
                 .max_qty_for_quote(remaining_quote, maker_price)
                 .map_err(Self::reject_quote_math_error)?;
 
-            // 预算不足一手：不足一个合法手，整单停止；不生成保护终止。
+            // 预算不足一手时整单停止，不生成保护终止事件。
             let Some(max_qty) = affordable else {
                 break;
             };
@@ -678,7 +678,7 @@ impl ReferenceOrderBook {
         ))
     }
 
-    /// 在候选参考簿中按实际成交分配根命令身份。
+    /// 在候选参考簿中按实际成交分配根命令内的成交 ID。
     pub fn execute_market_by_quote_with_cursor(
         &mut self,
         incoming: MarketByQuote,

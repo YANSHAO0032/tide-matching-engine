@@ -13,7 +13,7 @@ pub struct MarketByBase {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
-    /// 账户层固定的自成交防护分组身份。
+    /// 账户层固定的自成交防护分组键。
     pub stp_key: crate::StpKey,
     /// 本市价订单作为吃单时决定冲突处理的策略。
     pub stp_mode: crate::StpMode,
@@ -96,7 +96,7 @@ pub struct MarketByQuote {
     pub order_id: OrderId,
     /// 订单所属用户标识符。
     pub user_id: UserId,
-    /// 账户层固定的自成交防护分组身份。
+    /// 账户层固定的自成交防护分组键。
     pub stp_key: crate::StpKey,
     /// 本市价订单作为吃单时决定冲突处理的策略。
     pub stp_mode: crate::StpMode,
@@ -195,7 +195,7 @@ impl MarketProtection {
             Side::Sell => false,
         };
 
-        // 1. 基点候选必须优先计算。
+        // 1. 先计算基点候选，保持校验错误的优先顺序。
         //
         // 因此：
         // - 基点 >= 10_000 仍稳定优先返回 InvalidSlippageBps(3007)；
@@ -355,7 +355,7 @@ pub fn effective_protection_with_source(
     user_worst: Option<Price>,
     market_band_worst: Option<Price>,
 ) -> Option<(Price, ProtectionSource)> {
-    // 完全复用已验收的买入/卖出取严逻辑。
+    // 买入取较低边界，卖出取较高边界。
     let effective_worst = effective_protection_price(side, user_worst, market_band_worst)?;
 
     // 只根据哪项候选等于有效边界决定来源。
@@ -375,7 +375,7 @@ pub fn effective_protection_with_source(
 /// 在命令开始时组合用户保护候选与已计算的市场价格区间候选。
 ///
 /// reference_price_at_command_start 由调用方提前捕获。
-/// 算术提供已验证的 tick_size。
+/// MarketMath 提供已验证的 tick_size。
 /// market_band_worst 由外部配置/市场参考价计算层提供并完成价格步长校验；
 /// 本函数不会再次验证市场价格区间对齐。
 ///
@@ -421,7 +421,7 @@ pub fn effective_protection_at_command_start_with_source(
 
 const BPS_DENOMINATOR: u128 = 10_000;
 
-/// 根据命令开始时捕获的参考值价格计算用户滑点保护边界。
+/// 根据命令开始时捕获的参考价格计算用户滑点保护边界。
 ///
 /// 这是纯整数计算：
 /// - 买入: 先按基点向下取整，再向下对齐价格步长；

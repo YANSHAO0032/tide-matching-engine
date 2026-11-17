@@ -1,6 +1,6 @@
 /// 订单类型标签。
 ///
-/// 该枚举只承载声明的类型；各类型的下单、触发和撮合行为在对应阶段实现。
+/// 该枚举只表示订单类型；下单、触发和撮合行为由对应组件处理。
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrderType {
     /// 带价格约束的限价订单。
@@ -17,7 +17,7 @@ pub enum OrderType {
 
 #[cfg(test)]
 mod tests {
-    //! 验证订单类型标签的值语义，不覆盖未来订单行为。
+    //! 验证订单类型标签的值语义，不测试下单或撮合行为。
     use super::OrderType;
 
     #[test]

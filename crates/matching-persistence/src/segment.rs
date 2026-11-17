@@ -128,7 +128,7 @@ impl SegmentWriter {
         })
     }
 
-    /// 按序号追加；文件达到上限时创建新 segment。
+    /// 按序号追加；当前文件容不下新记录时创建新 segment。
     pub fn append(&mut self, record: &WalRecord) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::other("写入器已失败"));
@@ -208,7 +208,7 @@ impl SegmentWriter {
                 .checked_add(len)
                 .is_none_or(|sum| sum > self.max_size))
     }
-    /// 同步当前文件和目录；任一失败均停止后续写入。
+    /// 同步当前文件和目录；同步失败后停止后续写入。
     pub(crate) fn durable_sync(&mut self) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::other("写入器已失败"));

@@ -1,4 +1,4 @@
-//! 止损限价 child 必须重新核验已锁定的本地预留和费率。
+//! 验证止损 child 的预留、费率和报价预算覆盖。
 use matching_domain::{
     AssetId, AssetReserve, FeeAssetPolicy, FeeRounding, FeeSchedule, FeeScheduleBook, FeeTier,
     MarketId, MarketMath, OrderId, OriginSessionId, Price, PriceReferenceKind, Qty, RejectReason,

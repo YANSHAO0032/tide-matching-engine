@@ -17,18 +17,18 @@ use matching_risk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// 调用方固定的真实市场数值、逻辑时间、时段和成交身份。
+/// 调用方固定的市场数值、逻辑时间、时段和成交 ID。
 ///
 /// 资金需求与费率由独立的 `ExpectedReplacementReservation` 提供，不能从令牌猜测。
-/// 旧切片入口由调用方提供足量成交身份；游标入口在候选状态按真实成交生成。
+/// 切片入口由调用方提供足量成交 ID；游标入口在候选状态按真实成交生成。
 pub struct ProductionCancelReplaceContext<'a> {
     /// 实际市场价格、数量和本金规则。
     pub math: &'a MarketMath,
-    /// 持久化的逻辑时间输入，不读取墙上时钟。
+    /// 持久化的逻辑时间输入，不读取系统时钟。
     pub now: LogicalTime,
     /// 当前实际交易时段身份。
     pub current_session_id: u64,
-    /// 旧切片入口由调用方提供的原序成交身份；游标入口不读取此字段。
+    /// 切片入口由调用方提供的原序成交 ID；游标入口不读取此字段。
     pub trade_ids: &'a [TradeId],
 }
 
@@ -45,7 +45,7 @@ struct ProductionSnapshot {
     orders: HashMap<OrderId, OrderIndex>,
     /// 活动订单身份到金融预留影子的映射快照。
     reservations: HashMap<OrderId, ReservationState>,
-    /// Arena 槽位和空闲槽位链的完整快照。
+    /// Arena 槽位和空闲槽位栈的完整快照。
     arena: (Vec<Option<OrderNode>>, Vec<OrderIndex>),
     /// 普通挂单优先级分配器快照。
     queue_priority_allocator: QueuePriorityAllocator,
@@ -136,11 +136,11 @@ struct ProductionStandardReplace {
     tif: TimeInForce,
     /// 真实生产索引与 FIFO 扫描冻结的冰山成交片计划。
     fills: IcebergPlan,
-    /// 与冻结成交片一一对应的成交身份，来自旧切片或命令游标。
+    /// 与冻结成交片一一对应的成交 ID，来自切片或命令游标。
     trade_ids: Vec<TradeId>,
     /// 新单尚有余量时冻结的实际挂单计划。
     residual: Option<RestPlan>,
-    /// 新单余量挂单预先保留的 Arena 槽位。
+    /// 新单余量挂单预计使用的 Arena 槽位。
     residual_slot: Option<OrderIndex>,
     /// 提交后仍有活动新订单时绑定给它的金融预留快照。
     active_reservation: ReservationState,

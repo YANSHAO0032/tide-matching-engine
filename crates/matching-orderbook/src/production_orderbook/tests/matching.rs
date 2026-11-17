@@ -138,7 +138,7 @@ fn next_fill_trade_removes_full_maker_but_keeps_taker_remainder_unrested() {
 
     assert_eq!(book.order(OrderId::new(1)), None);
 
-    // 吃单方没有被偷偷挂进生产簿。
+    // 吃单方余量不会自动入簿。
     assert_eq!(book.order(OrderId::new(2)), None);
 
     assert_eq!(book.next_queue_priority(), next_before);

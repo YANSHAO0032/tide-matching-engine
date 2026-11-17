@@ -518,7 +518,7 @@ fn place_limit_gtc_remainder_reuses_fully_filled_maker_slot() {
 
     assert!(!book.orders.contains_key(&maker_id));
 
-    // Arena 空闲链表是后进先出。
+    // Arena 空闲槽位按后进先出顺序复用。
     // 挂单 pop_front 释放的槽位应立即被余量挂单复用。
     assert_eq!(book.orders.get(&taker_id), Some(&maker_slot));
 

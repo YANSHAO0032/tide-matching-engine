@@ -252,7 +252,7 @@ impl ProductionOrderBook {
         })
     }
 
-    /// 生产簿独立只读规划；不触碰 Arena、价档、标识符索引或分配器。
+    /// 生产簿独立只读规划；不修改 Arena、价档、标识符索引或分配器。
     /// 业务拒绝优先级：重复标识符 -> 命令开始时保护 -> 扫描。
     /// 返回成交前缀及首个越界价，终结保护本身不消耗 TradeId。
     fn preflight_protected_market_by_base_plan(
@@ -691,7 +691,7 @@ impl ProductionOrderBook {
         Ok(events)
     }
 
-    /// 在根命令候选状态中执行基础数量市价单，并逐笔取得真实成交身份。
+    /// 在根命令候选状态中执行基础数量市价单，并逐笔取得成交 ID。
     pub fn execute_market_by_base_with_cursor(
         &mut self,
         incoming: MarketByBase,
