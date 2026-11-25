@@ -2,6 +2,22 @@
 use matching_persistence::{SegmentWriter, WalRecord, recover_committed};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[test]
+fn extend_crash_child_syncs_unregistered_wal() {
+    use std::io::Write;
+    let Some(root) = std::env::var_os("TIDE_EXTEND_CRASH_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("wal").join("00000000000000000001.wal"))
+        .unwrap();
+    file.write_all(&record(2).encode().unwrap()).unwrap();
+    file.sync_all().unwrap();
+    std::fs::write(root.join("ready"), b"ready").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(15));
+}
 fn record(seq: u64) -> WalRecord {
     WalRecord {
         cluster_id: 1,
@@ -609,6 +625,271 @@ fn recovered_appender_repairs_tail_and_continues_from_committed_watermark() {
         .unwrap();
     assert_eq!(batcher.committed(), 2);
     drop(batcher);
+    assert_eq!(
+        matching_persistence::recover_local(&wal, &manifest, 0, 1, 2).unwrap(),
+        vec![record(1), record(2)]
+    );
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    std::fs::create_dir(manifest.join("manifest.tmp")).unwrap();
+    assert!(
+        matching_persistence::extend_local_prefix(
+            &wal,
+            &mut manager,
+            4096,
+            1,
+            2,
+            &[record(3)],
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
+    assert_eq!(manager.state().local_durable_seq, 2);
+    assert_eq!(
+        matching_persistence::scan_segments(&wal)
+            .unwrap()
+            .records
+            .len(),
+        3
+    );
+    drop(manager);
+    std::fs::remove_dir(manifest.join("manifest.tmp")).unwrap();
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 2);
+    matching_persistence::extend_local_prefix(
+        &wal,
+        &mut manager,
+        4096,
+        1,
+        2,
+        &[record(3)],
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    drop(manager);
+    assert_eq!(
+        matching_persistence::recover_local(&wal, &manifest, 0, 1, 2).unwrap(),
+        vec![record(1), record(2), record(3)]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_local_ahead_requires_authority_and_repairs_after_manifest() {
+    use matching_persistence::{
+        DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
+        Profile, RegisteredAppender, ReplicationMode,
+    };
+    let root = std::env::temp_dir().join(format!(
+        "t34-reconcile-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir_all(&wal).unwrap();
+    std::fs::create_dir_all(&manifest).unwrap();
+    let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    let appender =
+        RegisteredAppender::new(SegmentWriter::new(&wal, 4096).unwrap(), manager).unwrap();
+    let config = DurabilityConfig {
+        profile: Profile::Development,
+        mode: DurabilityMode::FsyncEach,
+        replication: ReplicationMode::LocalDurable,
+        crash_recovery_required: true,
+        ha_enabled: false,
+        allow_data_loss_on_failover: false,
+    };
+    let mut batcher = DurableBatcher::new_with_config(appender, config, 3).unwrap();
+    batcher
+        .append_at(&record(1), std::time::Instant::now())
+        .unwrap();
+    batcher
+        .append_at(&record(2), std::time::Instant::now())
+        .unwrap();
+    drop(batcher);
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    assert!(
+        matching_persistence::reconcile_local_prefix(&wal, &mut manager, 1, 1, 2, |_, _| Err(
+            std::io::Error::other("写权失效")
+        ))
+        .is_err()
+    );
+    assert_eq!(manager.state().local_durable_seq, 2);
+    matching_persistence::reconcile_local_prefix(&wal, &mut manager, 1, 1, 2, |prefix, through| {
+        assert_eq!(through, 1);
+        assert_eq!(prefix, &[record(1)]);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(manager.state().local_durable_seq, 1);
+    drop(manager);
+    assert_eq!(
+        matching_persistence::recover_local(&wal, &manifest, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    let manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    let appender = RegisteredAppender::recover_local(&wal, 4096, manager, 0, 1, 2).unwrap();
+    let mut resumed = DurableBatcher::resume_local(appender, config, 3).unwrap();
+    resumed
+        .append_at(&record(2), std::time::Instant::now())
+        .unwrap();
+    drop(resumed);
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    manager
+        .submit(matching_persistence::ManifestIntent::ReconcileLocalPrefix {
+            through_seq: 1,
+            active_segment: Some(1),
+        })
+        .unwrap();
+    drop(manager);
+    let manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 1);
+    assert_eq!(
+        matching_persistence::recover_local_with_manifest(&wal, &manager, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    assert_eq!(
+        matching_persistence::repair_local_wal_with_manifest(&wal, &manager, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    drop(manager);
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    matching_persistence::reconcile_local_prefix(&wal, &mut manager, 0, 1, 2, |prefix, through| {
+        assert!(prefix.is_empty());
+        assert_eq!(through, 0);
+        Ok(())
+    })
+    .unwrap();
+    let appender = RegisteredAppender::recover_local(&wal, 4096, manager, 0, 1, 2).unwrap();
+    let mut resumed = DurableBatcher::resume_local(appender, config, 3).unwrap();
+    resumed
+        .append_at(&record(1), std::time::Instant::now())
+        .unwrap();
+    drop(resumed);
+    assert_eq!(
+        matching_persistence::recover_local(&wal, &manifest, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn extend_local_prefix_requires_verified_contiguous_records() {
+    use matching_persistence::{
+        DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
+        Profile, RegisteredAppender, ReplicationMode,
+    };
+    let root = std::env::temp_dir().join(format!(
+        "t34-extend-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let wal = root.join("wal");
+    let manifest = root.join("manifest");
+    std::fs::create_dir_all(&wal).unwrap();
+    std::fs::create_dir_all(&manifest).unwrap();
+    let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+    let appender =
+        RegisteredAppender::new(SegmentWriter::new(&wal, 4096).unwrap(), manager).unwrap();
+    let config = DurabilityConfig {
+        profile: Profile::Development,
+        mode: DurabilityMode::FsyncEach,
+        replication: ReplicationMode::LocalDurable,
+        crash_recovery_required: true,
+        ha_enabled: false,
+        allow_data_loss_on_failover: false,
+    };
+    let mut batcher = DurableBatcher::new_with_config(appender, config, 3).unwrap();
+    batcher
+        .append_at(&record(1), std::time::Instant::now())
+        .unwrap();
+    drop(batcher);
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    let original = std::fs::read(wal.join("00000000000000000001.wal")).unwrap();
+    assert!(
+        matching_persistence::extend_local_prefix(
+            &wal,
+            &mut manager,
+            4096,
+            1,
+            2,
+            &[record(2)],
+            |_, _| Err(std::io::Error::other("权威失效"))
+        )
+        .is_err()
+    );
+    assert!(
+        matching_persistence::extend_local_prefix(
+            &wal,
+            &mut manager,
+            63,
+            1,
+            2,
+            &[record(2)],
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
+    assert!(
+        matching_persistence::extend_local_prefix(
+            &wal,
+            &mut manager,
+            4096,
+            1,
+            2,
+            &[record(3)],
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
+    assert_eq!(manager.state().local_durable_seq, 1);
+    assert_eq!(
+        std::fs::read(wal.join("00000000000000000001.wal")).unwrap(),
+        original
+    );
+    drop(manager);
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "extend_crash_child_syncs_unregistered_wal"])
+        .env("TIDE_EXTEND_CRASH_DIR", &root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !root.join("ready").exists() && std::time::Instant::now() < deadline {
+        assert!(child.try_wait().unwrap().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let ready = root.join("ready").exists();
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert!(ready);
+    let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+    assert_eq!(manager.state().local_durable_seq, 1);
+    assert_eq!(
+        matching_persistence::recover_local_with_manifest(&wal, &manager, 0, 1, 2).unwrap(),
+        vec![record(1)]
+    );
+    matching_persistence::extend_local_prefix(
+        &wal,
+        &mut manager,
+        4096,
+        1,
+        2,
+        &[record(2)],
+        |prefix, suffix| {
+            assert_eq!(prefix, &[record(1)]);
+            assert_eq!(suffix, &[record(2)]);
+            Ok(())
+        },
+    )
+    .unwrap();
+    drop(manager);
     assert_eq!(
         matching_persistence::recover_local(&wal, &manifest, 0, 1, 2).unwrap(),
         vec![record(1), record(2)]

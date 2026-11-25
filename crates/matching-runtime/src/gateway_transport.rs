@@ -3,6 +3,10 @@ use matching_domain::{CommandId, OrderId, ReservationToken};
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "gateway_transport_tests.rs"]
+mod tests;
+
 /// 连接处理或断连清理失败。
 #[derive(Debug)]
 pub enum GatewayTransportError {
@@ -148,7 +152,10 @@ where
                 Ok(()) => return Ok(()),
                 Err(
                     crate::SessionDispatchError::Ingress(crate::ShardError::Busy)
-                    | crate::SessionDispatchError::OutcomeUnknown,
+                    | crate::SessionDispatchError::OutcomeUnknown
+                    | crate::SessionDispatchError::Formal(crate::FormalError::Rejected(
+                        matching_domain::RejectReason::StaleRouteEpoch,
+                    )),
                 ) => std::thread::yield_now(),
                 Err(error) => return Err(GatewayTransportError::Disconnect(error)),
             }
@@ -160,7 +167,7 @@ where
         stream: &mut (impl Read + Write),
         on_committed: &mut impl FnMut(&crate::FormalExecution) -> io::Result<()>,
     ) -> Result<(), GatewayTransportError> {
-        loop {
+        'requests: loop {
             let mut header = [0_u8; matching_protocol::HEADER_LEN];
             match stream.read(&mut header[..1]) {
                 Ok(0) => return Ok(()),
@@ -224,12 +231,20 @@ where
                 }
             };
             let market = prepared.intent().market;
-            let shard = match self.shards.iter().find(|shard| {
-                shard
+            let mut selected = None;
+            for shard in self.shards {
+                let routes = shard
                     .routes()
+                    .map_err(|e| GatewayTransportError::Gateway(crate::GatewayError::Ingress(e)))?;
+                if routes
                     .get(market)
                     .is_some_and(|route| route.shard_id == shard.shard_id())
-            }) {
+                {
+                    selected = Some(shard);
+                    break;
+                }
+            }
+            let shard = match selected {
                 Some(shard) => shard,
                 None => {
                     let bytes = matching_protocol::encode_rejection(
@@ -287,36 +302,64 @@ where
                     return Err(GatewayTransportError::Gateway(error));
                 }
             };
-            let submitted = {
-                let mut state = self
-                    .shared
-                    .state
-                    .lock()
-                    .map_err(|_| GatewayTransportError::SharedState)?;
-                let client_seq = state
-                    .store
-                    .client_seq(prepared.command_id())
-                    .ok_or(GatewayTransportError::Outcome)?;
-                let now = (state.now)();
-                self.health.admit(|| {
-                    self.session.submit_place(
-                        &prepared,
-                        token,
-                        client_seq,
-                        &mut state.limits,
-                        now,
-                        shard,
-                    )
-                })
-            };
-            let reply = match submitted {
-                Some(Ok(receiver)) => receiver,
-                None => {
-                    self.reject_not_ready(stream, request_id)?;
-                    continue;
-                }
-                Some(Err(error)) => {
-                    if let Some(reason) = error.ingress_reason() {
+            let mut stale_retries = 0_u8;
+            let result = loop {
+                let submitted = {
+                    let mut state = self
+                        .shared
+                        .state
+                        .lock()
+                        .map_err(|_| GatewayTransportError::SharedState)?;
+                    let client_seq = state
+                        .store
+                        .client_seq(prepared.command_id())
+                        .ok_or(GatewayTransportError::Outcome)?;
+                    let now = (state.now)();
+                    self.health.admit(|| {
+                        self.session.submit_place(
+                            &prepared,
+                            token.clone(),
+                            client_seq,
+                            &mut state.limits,
+                            now,
+                            shard,
+                        )
+                    })
+                };
+                let reply = match submitted {
+                    Some(Ok(receiver)) => receiver,
+                    None => {
+                        self.reject_not_ready(stream, request_id)?;
+                        continue 'requests;
+                    }
+                    Some(Err(error)) => {
+                        if let Some(reason) = error.ingress_reason() {
+                            let bytes = matching_protocol::encode_rejection(
+                                request_id,
+                                matching_protocol::ReasonCode::new(reason as u16),
+                                self.max_frame,
+                            )
+                            .map_err(|_| GatewayTransportError::Outcome)?;
+                            stream
+                                .write_all(&bytes)
+                                .map_err(GatewayTransportError::Io)?;
+                            continue 'requests;
+                        }
+                        return Err(GatewayTransportError::Gateway(error));
+                    }
+                };
+                match reply
+                    .recv_timeout(self.timeout)
+                    .map_err(|_| GatewayTransportError::ResponseUnknown)?
+                {
+                    Ok(value) => break value,
+                    Err(crate::FormalError::Rejected(
+                        matching_domain::RejectReason::StaleRouteEpoch,
+                    )) if stale_retries < 2 => {
+                        stale_retries = stale_retries.checked_add(1).expect("有界路由重试计数");
+                        continue;
+                    }
+                    Err(crate::FormalError::Rejected(reason)) => {
                         let bytes = matching_protocol::encode_rejection(
                             request_id,
                             matching_protocol::ReasonCode::new(reason as u16),
@@ -326,29 +369,10 @@ where
                         stream
                             .write_all(&bytes)
                             .map_err(GatewayTransportError::Io)?;
-                        continue;
+                        continue 'requests;
                     }
-                    return Err(GatewayTransportError::Gateway(error));
+                    Err(error) => return Err(GatewayTransportError::Formal(error)),
                 }
-            };
-            let result = match reply
-                .recv_timeout(self.timeout)
-                .map_err(|_| GatewayTransportError::ResponseUnknown)?
-            {
-                Ok(value) => value,
-                Err(crate::FormalError::Rejected(reason)) => {
-                    let bytes = matching_protocol::encode_rejection(
-                        request_id,
-                        matching_protocol::ReasonCode::new(reason as u16),
-                        self.max_frame,
-                    )
-                    .map_err(|_| GatewayTransportError::Outcome)?;
-                    stream
-                        .write_all(&bytes)
-                        .map_err(GatewayTransportError::Io)?;
-                    continue;
-                }
-                Err(error) => return Err(GatewayTransportError::Formal(error)),
             };
             let delivery =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_committed(&result)))

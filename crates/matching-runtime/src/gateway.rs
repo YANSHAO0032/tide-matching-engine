@@ -137,6 +137,9 @@ pub struct GatewaySession {
     max_client_id: usize,
     /// 一旦开始关闭即阻止新的会话准入。
     closing: bool,
+    /// 在测试中控制读取路由与入队之间的交错。
+    #[cfg(test)]
+    pub(crate) route_snapshot_hook: Option<Box<dyn FnOnce(u64) + Send>>,
 }
 impl GatewaySession {
     /// 在授权前同步登记意图身份；跨会话重试复用已持久化的身份。
@@ -334,6 +337,8 @@ impl GatewaySession {
             max_entries,
             max_client_id,
             closing: false,
+            #[cfg(test)]
+            route_snapshot_hook: None,
         })
     }
     /// 在获取风险授权之前绑定幂等键、已分配命令身份及完整订单意图。
@@ -418,19 +423,26 @@ impl GatewaySession {
         {
             return Err(GatewayError::Reservation);
         }
-        let target = self
+        let journal_target = self
             .journal
             .targets()
             .iter()
             .find(|t| t.market == intent.market)
             .ok_or(GatewayError::Route)?;
+        let routes = shard.routes().map_err(GatewayError::Ingress)?;
+        let target = routes.get(intent.market).ok_or(GatewayError::Route)?;
         if !shard.has_durable_formal()
-            || shard
-                .routes()
-                .validate(intent.market, shard.shard_id(), target.route_epoch)
-                .is_err()
+            || target.shard_id != shard.shard_id()
+            || target.route_epoch < journal_target.route_epoch
         {
             return Err(GatewayError::Route);
+        }
+        routes
+            .validate(intent.market, shard.shard_id(), target.route_epoch)
+            .map_err(GatewayError::Rejected)?;
+        #[cfg(test)]
+        if let Some(hook) = self.route_snapshot_hook.take() {
+            hook(target.route_epoch);
         }
         limiter
             .check_submit(self.key, self.user.0, now)
@@ -467,16 +479,24 @@ impl GatewaySession {
             .checked_add(timeout)
             .ok_or(GatewayError::Drain)?;
         for target in self.journal.targets() {
-            let shard = shards
-                .iter()
-                .find(|shard| {
-                    shard.has_durable_formal()
-                        && shard
-                            .routes()
-                            .validate(target.market, shard.shard_id(), target.route_epoch)
-                            .is_ok()
-                })
-                .ok_or(GatewayError::Route)?;
+            let mut selected = None;
+            for shard in shards {
+                if shard.has_durable_formal()
+                    && shard
+                        .routes()
+                        .map_err(GatewayError::Ingress)?
+                        .get(target.market)
+                        .is_some_and(|route| {
+                            route.shard_id == shard.shard_id()
+                                && route.state == crate::RouteState::Active
+                                && route.route_epoch >= target.route_epoch
+                        })
+                {
+                    selected = Some(shard);
+                    break;
+                }
+            }
+            let shard = selected.ok_or(GatewayError::Route)?;
             let reply = shard
                 .barrier(u128::from(target.market.0))
                 .map_err(GatewayError::Ingress)?;

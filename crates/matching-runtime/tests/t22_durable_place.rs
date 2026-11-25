@@ -1049,17 +1049,216 @@ fn durable_place_and_mass_cancel_write_before_reply() {
         matching_domain::decode_wal_command(&records[4].payload).unwrap(),
         cancel
     );
+    let updated_routes = RouteTable::new([MarketRoute {
+        market_id: market,
+        shard_id,
+        route_epoch: 2,
+        state: RouteState::Active,
+    }])
+    .unwrap();
+    let route_dir = base.join("route-control");
+    std::fs::create_dir(&route_dir).unwrap();
+    let route_store = matching_runtime::RouteControlStore::create_for_cluster(
+        &route_dir,
+        ClusterId(1),
+        routes.clone(),
+        8,
+        8,
+    )
+    .unwrap();
+    let mut route_coordinator =
+        matching_runtime::RouteCoordinator::new(route_store, vec![shard.handle()]).unwrap();
+    route_coordinator
+        .update(1, updated_routes.clone(), Duration::from_secs(5))
+        .unwrap();
+    let mut after_refresh = cancel.clone();
+    after_refresh.command_id = CommandId(200);
+    after_refresh.session_id = 200;
+    after_refresh.client_seq = 1;
+    assert_eq!(
+        retry(|| shard.handle().submit_command(after_refresh.clone()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err(),
+        matching_domain::RejectReason::StaleRouteEpoch
+    );
+    after_refresh.route_epoch = Some(2);
+    let refreshed_result = retry(|| shard.handle().submit_command(after_refresh.clone()))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed_result.seq, 13);
+    let refreshed_journal = matching_runtime::SessionControlJournal::create(
+        base.join("gateway-stale-session.log"),
+        UserId(7),
+        matching_domain::OriginSessionId(201),
+        202,
+        vec![matching_runtime::SessionTarget {
+            market,
+            route_epoch: 1,
+            command_id: CommandId(202),
+        }],
+        1,
+    )
+    .unwrap();
+    let mut refreshed_gateway =
+        matching_runtime::GatewaySession::open(&Auth, 7, b"secret", refreshed_journal, 8, 32)
+            .unwrap();
+    let mut refreshed_command = make(201, 201, 1);
+    let Command::PlaceLimit(ref mut refreshed_place) = refreshed_command.payload else {
+        unreachable!()
+    };
+    refreshed_place.client_order_id = Some("client-refresh".into());
+    refreshed_place.user_control_epoch = 1;
+    let refreshed_wire = matching_protocol::encode_place_request(
+        201,
+        &matching_protocol::PlaceRequest {
+            key: 201,
+            market: market.0,
+            price: 10,
+            qty: 2,
+            stp_key: 0,
+            user_control_epoch: 1,
+            side: matching_protocol::PlaceSide::Buy,
+            stp: matching_protocol::StpPolicy::None,
+            post_only: false,
+            client_order_id: Some("client-refresh".into()),
+        },
+        1024,
+        32,
+    )
+    .unwrap();
+    let mut refreshed_limits =
+        matching_protocol::GatewayRateLimiters::new(rate, rate, rate, 8).unwrap();
+    let mut refreshed_intents =
+        matching_runtime::GatewayIntentStore::create(base.join("refreshed-intents.log"), 8, 1024)
+            .unwrap();
+    let (_, refreshed_prepared) = refreshed_gateway
+        .prepare_wire_durable(
+            &refreshed_wire,
+            1024,
+            &mut refreshed_intents,
+            &mut refreshed_limits,
+            0,
+            || Ok((CommandId(201), OrderId(201))),
+        )
+        .unwrap();
+    let refreshed_token = refreshed_place.reservation.clone();
+    let result = refreshed_gateway
+        .submit_place(
+            &refreshed_prepared,
+            refreshed_token,
+            1,
+            &mut refreshed_limits,
+            0,
+            &shard.handle(),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!((result.command_id, result.seq), (CommandId(201), 14));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match refreshed_gateway.disconnect(&[shard.handle()], Duration::from_secs(5)) {
+            Err(matching_runtime::GatewayError::Ingress(matching_runtime::ShardError::Busy))
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now()
+            }
+            result => {
+                result.unwrap();
+                break;
+            }
+        }
+    }
+    let refreshed_cancel = loop {
+        match refreshed_gateway.dispatch_cancel(market, &shard.handle(), Duration::from_secs(5)) {
+            Err(matching_runtime::SessionDispatchError::Ingress(
+                matching_runtime::ShardError::Busy,
+            )) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+            result => break result.unwrap(),
+        }
+    };
+    assert_eq!(refreshed_cancel.canceled_orders, 1);
+    let mut future_journal = matching_runtime::SessionControlJournal::create(
+        base.join("future-route-session.log"),
+        UserId(7),
+        matching_domain::OriginSessionId(203),
+        204,
+        vec![matching_runtime::SessionTarget {
+            market,
+            route_epoch: 3,
+            command_id: CommandId(203),
+        }],
+        1,
+    )
+    .unwrap();
+    future_journal.disconnect().unwrap();
+    assert!(matches!(
+        matching_runtime::dispatch_session_cancel(
+            &mut future_journal,
+            market,
+            &shard.handle(),
+            Duration::from_secs(5)
+        ),
+        Err(matching_runtime::SessionDispatchError::Route)
+    ));
+    assert_eq!(future_journal.pending().unwrap().len(), 1);
+    let future_open = matching_runtime::SessionControlJournal::create(
+        base.join("future-open-session.log"),
+        UserId(7),
+        matching_domain::OriginSessionId(205),
+        206,
+        vec![matching_runtime::SessionTarget {
+            market,
+            route_epoch: 3,
+            command_id: CommandId(205),
+        }],
+        1,
+    )
+    .unwrap();
+    let mut future_gateway =
+        matching_runtime::GatewaySession::open(&Auth, 7, b"secret", future_open, 8, 32).unwrap();
+    let mut future_limits =
+        matching_protocol::GatewayRateLimiters::new(rate, rate, rate, 8).unwrap();
+    let (_, future_prepared) = future_gateway
+        .prepare_wire_durable(
+            &refreshed_wire,
+            1024,
+            &mut refreshed_intents,
+            &mut future_limits,
+            0,
+            || panic!("已有身份不得重新分配"),
+        )
+        .unwrap();
+    assert!(matches!(
+        future_gateway.submit_place(
+            &future_prepared,
+            refreshed_place.reservation.clone(),
+            1,
+            &mut future_limits,
+            0,
+            &shard.handle()
+        ),
+        Err(matching_runtime::GatewayError::Route)
+    ));
+    assert!(matches!(
+        future_gateway.disconnect(&[shard.handle()], Duration::from_secs(5)),
+        Err(matching_runtime::GatewayError::Route)
+    ));
     let image = retry(|| shard.handle().take_snapshot(1))
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
     let digest = image.state_digest(1024 * 1024).unwrap();
     shard.shutdown(Duration::from_secs(5)).unwrap();
+    drop(route_coordinator);
     let trusted = matching_runtime::SnapshotRestoreConfig {
         cluster: ClusterId(1),
         shard: shard_id,
         primary_epoch: 1,
-        routes,
+        routes: updated_routes,
         user_capacity: 8,
         idempotency: IdempotencyConfig::default(),
         place: Some(config),
@@ -1080,5 +1279,6 @@ fn durable_place_and_mass_cancel_write_before_reply() {
     .replay()
     .unwrap();
     assert_eq!(replay.executions[3].events, canceled.events);
+    assert_eq!(replay.executions[12].events, refreshed_result.events);
     assert_eq!(replay.image.state_digest(1024 * 1024).unwrap(), digest);
 }

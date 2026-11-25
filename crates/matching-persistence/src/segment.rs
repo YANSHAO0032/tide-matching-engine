@@ -59,6 +59,10 @@ pub struct SegmentWriter {
     failed: bool,
 }
 impl SegmentWriter {
+    /// 返回由该写入器独占使用的 WAL 目录。
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
     /// 在调用方独占目录且完成修复后重开严格验证的活动段。
     pub(crate) fn open_repaired(
         directory: impl AsRef<Path>,

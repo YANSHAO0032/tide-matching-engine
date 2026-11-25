@@ -400,16 +400,24 @@ pub fn dispatch_session_cancels(
         .checked_add(timeout)
         .ok_or(SessionDispatchError::OutcomeUnknown)?;
     for target in journal.pending().map_err(SessionDispatchError::Journal)? {
-        let shard = shards
-            .iter()
-            .find(|shard| {
-                shard.has_durable_formal()
-                    && shard
-                        .routes()
-                        .validate(target.market, shard.shard_id(), target.route_epoch)
-                        .is_ok()
-            })
-            .ok_or(SessionDispatchError::Route)?;
+        let mut selected = None;
+        for shard in shards {
+            if shard.has_durable_formal()
+                && shard
+                    .routes()
+                    .map_err(SessionDispatchError::Ingress)?
+                    .get(target.market)
+                    .is_some_and(|route| {
+                        route.shard_id == shard.shard_id()
+                            && route.state == crate::RouteState::Active
+                            && route.route_epoch >= target.route_epoch
+                    })
+            {
+                selected = Some(shard);
+                break;
+            }
+        }
+        let shard = selected.ok_or(SessionDispatchError::Route)?;
         let remaining = end
             .checked_duration_since(std::time::Instant::now())
             .ok_or(SessionDispatchError::OutcomeUnknown)?;
@@ -430,9 +438,20 @@ pub fn dispatch_session_cancel(
     if !shard.has_durable_formal() {
         return Err(SessionDispatchError::NonDurable);
     }
-    let command = journal
+    let mut command = journal
         .command(market)
         .map_err(SessionDispatchError::Journal)?;
+    let routes = shard.routes().map_err(SessionDispatchError::Ingress)?;
+    let route = routes.get(market).ok_or(SessionDispatchError::Route)?;
+    if route.shard_id != shard.shard_id()
+        || route.state != crate::RouteState::Active
+        || command
+            .route_epoch
+            .is_none_or(|epoch| route.route_epoch < epoch)
+    {
+        return Err(SessionDispatchError::Route);
+    }
+    command.route_epoch = Some(route.route_epoch);
     let id = command.command_id;
     // 恢复后旧会话的已准入消息也必须先于撤单执行。
     let deadline = std::time::Instant::now()

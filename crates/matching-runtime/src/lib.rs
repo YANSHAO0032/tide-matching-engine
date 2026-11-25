@@ -19,6 +19,7 @@ mod place_candidate;
 mod place_config;
 mod queue;
 mod recovery;
+mod route_store;
 mod route_table;
 mod sequencer;
 mod user_control;
@@ -31,9 +32,16 @@ pub use idempotency::IdempotencyConfig;
 pub use place_config::{PlaceConfigError, PlaceLimits, PlaceSupportConfig};
 /// 本地持久命令、快照和行情恢复入口。
 pub use recovery::{
-    CommittedMarketDataReplay, RecoveredCommand, SnapshotRecoveryRecords, SnapshotReplayResult,
-    recover_local_commands, recover_market_data_from_genesis, recover_snapshot_records,
-    recover_snapshot_records_with_genesis,
+    CommittedMarketDataReplay, RecoveredCommand, ReplayCheckpoint, ReplicatedRecoveryCoordinator,
+    SnapshotRecoveryRecords, SnapshotReplayResult, recover_local_commands,
+    recover_market_data_from_genesis, recover_snapshot_records,
+    recover_snapshot_records_with_genesis, recover_verified_genesis_records,
+    recover_verified_snapshot_records_with_genesis,
+};
+/// 单机可信目录中的持久路由控制存储。
+pub use route_store::{
+    LocalRouteAuthority, RouteAuthority, RouteControlStore, RouteCoordinator, RouteMonitor,
+    decode_route_snapshot, encode_route_snapshot,
 };
 /// 显式路由与配置错误。
 pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable};

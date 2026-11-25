@@ -45,6 +45,13 @@ pub enum ManifestIntent {
     },
     /// 首次持久确认前将首代状态复制到另一槽。
     RecoveryAnchor,
+    /// 按外围已核验的权威前缀降低本地水位；调用方必须独占目录并持有有效写权。
+    ReconcileLocalPrefix {
+        /// 已核验的连续权威水位。
+        through_seq: u64,
+        /// 覆盖该水位的活动段；空前缀时为空。
+        active_segment: Option<u64>,
+    },
     /// 登记已持久化的快照。
     SnapshotCommitted {
         /// 快照身份。
@@ -186,6 +193,40 @@ impl<S: ManifestStorage> ManifestManager<S> {
                         io::ErrorKind::InvalidInput,
                         "恢复锚点状态无效",
                     ));
+                }
+            }
+            ManifestIntent::ReconcileLocalPrefix {
+                through_seq,
+                active_segment,
+            } => {
+                if through_seq >= next.local_durable_seq
+                    || through_seq < next.wal_gc_safe_seq
+                    || through_seq < next.replication_safe_seq
+                    || !next.gc_plan.is_empty()
+                    || (through_seq == 0) != active_segment.is_none()
+                    || active_segment.is_some_and(|first| first == 0 || first > through_seq)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "本地前缀协调边界无效",
+                    ));
+                }
+                next.local_durable_seq = through_seq;
+                next.active_segment = active_segment;
+                if next
+                    .latest_snapshot
+                    .is_some_and(|(_, seq)| seq > through_seq)
+                {
+                    next.latest_snapshot = next
+                        .previous_snapshot
+                        .take()
+                        .filter(|(_, seq)| *seq <= through_seq);
+                }
+                if next
+                    .previous_snapshot
+                    .is_some_and(|(_, seq)| seq > through_seq)
+                {
+                    next.previous_snapshot = None;
                 }
             }
             ManifestIntent::SnapshotCommitted {

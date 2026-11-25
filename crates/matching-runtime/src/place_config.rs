@@ -31,6 +31,8 @@ pub struct PlaceSupportConfig {
     pub(crate) managed_only: bool,
     /// 启动时持有的单机主节点排他租约；不进入业务快照。
     pub(crate) primary_lease: Option<std::sync::Arc<crate::PrimaryLease>>,
+    /// 工作线程启动时暂停变更，直到路由协调器确认权威。
+    pub(crate) require_route_authority: bool,
 }
 
 /// 正式下单配置不满足市场唯一性或容量约束。
@@ -63,6 +65,7 @@ impl PlaceSupportConfig {
             limits,
             managed_only: false,
             primary_lease: None,
+            require_route_authority: false,
         })
     }
     /// 要求正式业务变更仅作用于已创建的受管理市场。
@@ -73,6 +76,11 @@ impl PlaceSupportConfig {
     /// 将可信主节点租约绑定到分片生命周期；租约身份在启动时校验。
     pub fn with_primary_lease(mut self, lease: std::sync::Arc<crate::PrimaryLease>) -> Self {
         self.primary_lease = Some(lease);
+        self
+    }
+    /// 要求分片从暂停状态启动，等待路由协调器确认后才处理变更。
+    pub fn require_route_authority(mut self) -> Self {
+        self.require_route_authority = true;
         self
     }
 }

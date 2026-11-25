@@ -8,21 +8,24 @@ mod metrics;
 pub use metrics::{BatchSizeSnapshot, DurabilityMetrics, LATENCY_BOUNDS_US, LatencySnapshot};
 mod record;
 mod recovery;
+mod replica_epoch;
 mod scan;
 mod segment;
 mod snapshot;
 mod wal_gc;
 pub use durability::{
     BoxedDurableAppender, CommitWatermark, DurabilityConfig, DurabilityError, DurabilityMode,
-    DurableAppender, DurableBatcher, Profile, RegisteredAppender, ReplicationMode,
+    DurableAppender, DurableBatcher, FencedStandbyReplica, Profile, RegisteredAppender,
+    ReplicaDurableAck, ReplicationMode, StandbyReplica,
 };
 pub use manifest::{ManifestIntent, ManifestManager, ManifestState, ManifestStorage};
 pub use manifest_file::{FileManifestStorage, sync_directory};
 pub use record::{WalError, WalRecord};
 pub use recovery::{
-    recover_committed, recover_local, recover_local_with_manifest, repair_local_wal,
-    repair_local_wal_with_manifest,
+    extend_local_prefix, reconcile_local_prefix, recover_committed, recover_local,
+    recover_local_with_manifest, repair_local_wal, repair_local_wal_with_manifest,
 };
+pub use replica_epoch::{ReplicaEpochState, ReplicaEpochStore};
 pub use scan::{ScanError, ScanResult, scan_segment};
 pub use segment::{SegmentMeta, SegmentScan, SegmentWriter, scan_segments, truncate_torn_tail};
 pub use snapshot::{

@@ -79,7 +79,17 @@ pub fn recover_local_with_manifest(
             "清单未通过严格恢复检查",
         ));
     }
-    let state = manager.state();
+    recover_local_state(wal, manager.state(), snapshot_seq, cluster_id, shard_id)
+}
+
+/// 在独占的实时清单状态下读取持久前缀；调用方负责保证状态来源可信。
+pub(crate) fn recover_local_state(
+    wal: impl AsRef<Path>,
+    state: &crate::ManifestState,
+    snapshot_seq: u64,
+    cluster_id: u16,
+    shard_id: u16,
+) -> io::Result<Vec<WalRecord>> {
     if state.generation == 0
         && std::fs::read_dir(wal.as_ref())?
             .next()
@@ -241,6 +251,131 @@ pub fn repair_local_wal_with_manifest(
         file.sync_all()?;
     }
     Ok(records)
+}
+
+/// 在独占目录与严格清单锁下，将本地超前的完整尾部协调到外围权威前缀。
+///
+/// 调用方的 `verify` 必须验证有效写权、目标水位及全部前缀记录，包括空前缀；
+/// 它必须持续保证接任协调安全。本入口先持久更新清单，再按清单修复尾部；
+/// 任一步结果未知均须停止启动并重新验证权威。已回收创世 WAL 时拒绝。
+pub fn reconcile_local_prefix(
+    wal: impl AsRef<Path>,
+    manager: &mut crate::ManifestManager<crate::FileManifestStorage>,
+    target: u64,
+    cluster_id: u16,
+    shard_id: u16,
+    verify: impl FnOnce(&[WalRecord], u64) -> io::Result<()>,
+) -> io::Result<()> {
+    let wal = wal.as_ref();
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "本地权威前缀不完整");
+    let records = recover_local_with_manifest(wal, manager, 0, cluster_id, shard_id)?;
+    if target >= manager.state().local_durable_seq {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "目标不是本地超前前缀",
+        ));
+    }
+    let count = usize::try_from(target).map_err(|_| invalid())?;
+    let prefix = records.get(..count).ok_or_else(invalid)?;
+    verify(prefix, target)?;
+    let scan = scan_segments(wal)?;
+    let active_segment = if target == 0 {
+        None
+    } else {
+        Some(
+            scan.segments
+                .iter()
+                .find(|segment| {
+                    segment.first_seq <= target
+                        && segment.last_seq.is_some_and(|last| last >= target)
+                })
+                .ok_or_else(invalid)?
+                .first_seq,
+        )
+    };
+    manager.submit(crate::ManifestIntent::ReconcileLocalPrefix {
+        through_seq: target,
+        active_segment,
+    })?;
+    repair_local_wal_with_manifest(wal, manager, 0, cluster_id, shard_id)?;
+    Ok(())
+}
+
+/// 在独占目录及严格清单锁下，按外围核验的连续记录补齐落后的本地 WAL。
+///
+/// 调用方须核验完整本地前缀、后缀、权威水位和有效写权；任何失败或结果未知后
+/// 必须停止启动并重新协调。每条记录同步后才推进清单，允许从已持久前缀重试。
+pub fn extend_local_prefix(
+    wal: impl AsRef<Path>,
+    manager: &mut crate::ManifestManager<crate::FileManifestStorage>,
+    max_segment_size: u64,
+    cluster_id: u16,
+    shard_id: u16,
+    suffix: &[WalRecord],
+    verify: impl FnOnce(&[WalRecord], &[WalRecord]) -> io::Result<()>,
+) -> io::Result<()> {
+    let wal = wal.as_ref();
+    let prefix = recover_local_with_manifest(wal, manager, 0, cluster_id, shard_id)?;
+    if manager.state().generation < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "补齐需要已初始化的双槽清单",
+        ));
+    }
+    if !(64..=64 * 1024 * 1024).contains(&max_segment_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "补齐 segment 容量无效",
+        ));
+    }
+    if suffix.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "补齐后缀为空"));
+    }
+    let mut previous_seq = manager.state().local_durable_seq;
+    let mut previous_epoch = prefix.last().map_or(0, |record| record.epoch);
+    for record in suffix {
+        if record.cluster_id != cluster_id
+            || record.shard_id != shard_id
+            || previous_seq.checked_add(1) != Some(record.shard_seq)
+            || record.epoch == 0
+            || record.epoch < previous_epoch
+            || record
+                .encode()
+                .ok()
+                .and_then(|bytes| u64::try_from(bytes.len()).ok())
+                .is_none_or(|size| size > max_segment_size)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "补齐记录不连续或身份无效",
+            ));
+        }
+        previous_seq = record.shard_seq;
+        previous_epoch = record.epoch;
+    }
+    verify(&prefix, suffix)?;
+    repair_local_wal_with_manifest(wal, manager, 0, cluster_id, shard_id)?;
+    let state = manager.state();
+    let mut writer = crate::SegmentWriter::open_repaired(
+        wal,
+        max_segment_size,
+        state.active_segment,
+        cluster_id,
+        shard_id,
+        state.local_durable_seq,
+    )?;
+    for record in suffix {
+        writer.append(record)?;
+        writer.durable_sync()?;
+        let first_seq = writer
+            .active_first()
+            .ok_or_else(|| io::Error::other("补齐活动段缺失"))?;
+        manager.submit(crate::ManifestIntent::LocalDurableAdvanced {
+            through_seq: record.shard_seq,
+            first_seq,
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

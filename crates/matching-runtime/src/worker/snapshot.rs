@@ -58,6 +58,75 @@ fn route_bytes(routes: &RouteTable, limit: usize) -> Result<Vec<u8>, SnapshotWir
     Ok(w.finish())
 }
 
+/// 解码历史路由以验证旧快照摘要；当前所有权仍由外部路由决定。
+fn read_routes(bytes: &[u8], limit: usize) -> Result<RouteTable, SnapshotWireError> {
+    let mut r = SnapshotDecoder::new(bytes, limit)?;
+    let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+    if count > r.remaining() / 15 {
+        return Err(SnapshotWireError);
+    }
+    let mut routes = Vec::new();
+    routes
+        .try_reserve_exact(count)
+        .map_err(|_| SnapshotWireError)?;
+    let mut previous = None;
+    for _ in 0..count {
+        let market_id = MarketId::new(r.u32()?);
+        if previous.is_some_and(|id| id >= market_id) {
+            return Err(SnapshotWireError);
+        }
+        previous = Some(market_id);
+        let shard_id = ShardId::new(r.u16()?);
+        let route_epoch = r.u64()?;
+        let state = match r.u8()? {
+            0 => RouteState::Active,
+            1 => RouteState::Migrating {
+                source: ShardId::new(r.u16()?),
+                target: ShardId::new(r.u16()?),
+            },
+            _ => return Err(SnapshotWireError),
+        };
+        routes.push(crate::MarketRoute {
+            market_id,
+            shard_id,
+            route_epoch,
+            state,
+        });
+    }
+    r.finish()?;
+    RouteTable::new(routes).map_err(|_| SnapshotWireError)
+}
+
+/// 判断路由是否涉及本分片，包括迁移中的源和目标。
+fn involves_shard(route: &crate::MarketRoute, shard: ShardId) -> bool {
+    route.shard_id == shard
+        || matches!(route.state, RouteState::Migrating { source, target } if source == shard || target == shard)
+}
+
+/// 恢复时允许同一所有者的活动路由版本前进，不允许变更市场归属。
+fn compatible_routes(old: &RouteTable, current: &RouteTable, shard: ShardId) -> bool {
+    old.routes()
+        .filter(|route| involves_shard(route, shard))
+        .all(|route| {
+            current.get(route.market_id).is_some_and(|new| {
+                route == new
+                    || (route.shard_id == shard
+                        && new.shard_id == shard
+                        && route.state == RouteState::Active
+                        && new.state == RouteState::Active
+                        && route.route_epoch <= new.route_epoch)
+            })
+        })
+        && current
+            .routes()
+            .filter(|route| involves_shard(route, shard))
+            .all(|route| {
+                old.get(route.market_id).is_some_and(|old| {
+                    old == route || (old.shard_id == shard && route.shard_id == shard)
+                })
+            })
+}
+
 /// 将完整可信下单配置编码，以便恢复时逐字节核验。
 fn place_bytes(config: &PlaceSupportConfig, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
     let mut w = SnapshotEncoder::new(limit);
@@ -259,6 +328,22 @@ impl SnapshotImage {
         manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,
         config: &SnapshotRestoreConfig,
     ) -> std::io::Result<Option<SnapshotRecoveryCandidate>> {
+        Self::read_recovery_candidate_inner(directory, manager, config, false)
+    }
+    /// 供已委托外围验证快照和写权的复制恢复路径读取历史纪元。
+    pub(crate) fn read_replicated_recovery_candidate(
+        directory: impl AsRef<std::path::Path>,
+        manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,
+        config: &SnapshotRestoreConfig,
+    ) -> std::io::Result<Option<SnapshotRecoveryCandidate>> {
+        Self::read_recovery_candidate_inner(directory, manager, config, true)
+    }
+    fn read_recovery_candidate_inner(
+        directory: impl AsRef<std::path::Path>,
+        manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,
+        config: &SnapshotRestoreConfig,
+        replicated: bool,
+    ) -> std::io::Result<Option<SnapshotRecoveryCandidate>> {
         let directory = directory.as_ref();
         if !manager.recovery_checked() {
             return Err(std::io::Error::new(
@@ -287,7 +372,7 @@ impl SnapshotImage {
             }
             Ok(image)
         };
-        match Self::read_committed_snapshot(directory, manager, config) {
+        match Self::read_committed_snapshot_inner(directory, manager, config, replicated) {
             Ok(Some(image)) => {
                 let seq = image.snapshot_seq;
                 Ok(Some(SnapshotRecoveryCandidate {
@@ -308,9 +393,10 @@ impl SnapshotImage {
                 else {
                     return Err(error);
                 };
-                let image = Self::decode_snapshot(&bytes, config).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "上一快照镜像无效")
-                })?;
+                let image =
+                    Self::decode_snapshot_inner(&bytes, config, replicated).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "上一快照镜像无效")
+                    })?;
                 Ok(Some(SnapshotRecoveryCandidate {
                     image: check(image, seq)?,
                     committed_through: committed,
@@ -326,6 +412,14 @@ impl SnapshotImage {
         manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,
         config: &SnapshotRestoreConfig,
     ) -> std::io::Result<Option<Self>> {
+        Self::read_committed_snapshot_inner(directory, manager, config, false)
+    }
+    fn read_committed_snapshot_inner(
+        directory: impl AsRef<std::path::Path>,
+        manager: &matching_persistence::ManifestManager<matching_persistence::FileManifestStorage>,
+        config: &SnapshotRestoreConfig,
+        replicated: bool,
+    ) -> std::io::Result<Option<Self>> {
         if !manager.recovery_checked() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -337,7 +431,7 @@ impl SnapshotImage {
         else {
             return Ok(None);
         };
-        let mut image = Self::decode_snapshot(&bytes, config)
+        let mut image = Self::decode_snapshot_inner(&bytes, config, replicated)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "快照镜像无效"))?;
         if image.snapshot_seq != seq
             || seq > manager.state().local_durable_seq
@@ -443,6 +537,13 @@ impl SnapshotImage {
         bytes: &[u8],
         config: &SnapshotRestoreConfig,
     ) -> Result<Self, SnapshotWireError> {
+        Self::decode_snapshot_inner(bytes, config, false)
+    }
+    fn decode_snapshot_inner(
+        bytes: &[u8],
+        config: &SnapshotRestoreConfig,
+        replicated: bool,
+    ) -> Result<Self, SnapshotWireError> {
         let mut r = SnapshotDecoder::new(bytes, config.max_bytes)?;
         let version = r.u16()?;
         if !(2..=10).contains(&version) {
@@ -457,19 +558,22 @@ impl SnapshotImage {
         let shard = ShardId::new(r.u16()?);
         let now = LogicalTime::new(r.u64()?);
         let primary_epoch = r.u64()?;
-        let historical_epoch_allowed = config
-            .place
-            .as_ref()
-            .and_then(|place| place.primary_lease.as_ref())
-            .is_some_and(|lease| {
-                primary_epoch > 0
-                    && primary_epoch <= config.primary_epoch
-                    && lease.verify(cluster, shard, config.primary_epoch).is_ok()
-            });
+        let historical_epoch_allowed =
+            (replicated && primary_epoch > 0 && primary_epoch <= config.primary_epoch)
+                || config
+                    .place
+                    .as_ref()
+                    .and_then(|place| place.primary_lease.as_ref())
+                    .is_some_and(|lease| {
+                        primary_epoch > 0
+                            && primary_epoch <= config.primary_epoch
+                            && lease.verify(cluster, shard, config.primary_epoch).is_ok()
+                    });
+        let historical_routes = read_routes(r.bytes()?, config.max_bytes)?;
         if cluster != config.cluster
             || shard != config.shard
             || (primary_epoch != config.primary_epoch && !historical_epoch_allowed)
-            || r.bytes()? != route_bytes(&config.routes, config.max_bytes)?
+            || !compatible_routes(&historical_routes, &config.routes, shard)
         {
             return Err(SnapshotWireError);
         }
@@ -692,7 +796,8 @@ impl SnapshotImage {
         }
         let digest: [u8; 32] = r.bytes()?.try_into().map_err(|_| SnapshotWireError)?;
         r.finish()?;
-        let image = Self {
+        let mut image = Self {
+            replay_route_floor: Some(Arc::new(historical_routes.clone())),
             genesis_baseline: false,
             origin: None,
             start_allowed: false,
@@ -702,7 +807,7 @@ impl SnapshotImage {
             shard,
             now,
             primary_epoch,
-            routes: Arc::new(config.routes.clone()),
+            routes: Arc::new(historical_routes),
             markets,
             managed_markets,
             registry,
@@ -713,6 +818,7 @@ impl SnapshotImage {
         if image.state_digest(config.max_bytes)? != digest {
             return Err(SnapshotWireError);
         }
+        image.routes = Arc::new(config.routes.clone());
         Ok(image)
     }
 }
@@ -720,6 +826,153 @@ impl SnapshotImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_respects_snapshot_route_floor_and_current_ceiling() {
+        use matching_domain::{
+            AssetId, Command, CommandEnvelope, CommandId, MarketMath, MassCancelShard,
+            ShardCancelScope,
+        };
+        use matching_risk::{LimitReservePolicy, RiskKeySet};
+        let market = MarketId(5);
+        let routes = |epoch| {
+            RouteTable::new([crate::MarketRoute {
+                market_id: market,
+                shard_id: ShardId(3),
+                route_epoch: epoch,
+                state: RouteState::Active,
+            }])
+            .unwrap()
+        };
+        let policy = LimitReservePolicy::new(
+            (AssetId(1), 0),
+            (AssetId(2), 0),
+            MarketMath::try_new(0, 0, 0, 1, 1).unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let place = crate::PlaceSupportConfig::new(
+            RiskKeySet::new(1, []).unwrap(),
+            [(market, policy)],
+            crate::PlaceLimits {
+                active_orders: 8,
+                terminal_history: 8,
+                client_id_bytes: 32,
+            },
+        )
+        .unwrap();
+        let mut trusted = SnapshotRestoreConfig {
+            cluster: ClusterId(2),
+            shard: ShardId(3),
+            primary_epoch: 1,
+            routes: routes(1),
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: Some(place),
+            expect_registry: true,
+            max_markets: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let image = super::super::empty_recovery_candidate(
+            &trusted,
+            &[(
+                market,
+                matching_orderbook::QueuePriorityPolicy::try_new(1).unwrap(),
+            )],
+            0,
+        )
+        .unwrap()
+        .image;
+        let encoded = image.encode_snapshot(trusted.max_bytes).unwrap();
+        trusted.routes = routes(2);
+        for (epoch, accepted) in [(0, false), (1, true), (2, true), (3, false)] {
+            let image = SnapshotImage::decode_snapshot(&encoded, &trusted).unwrap();
+            let candidate = SnapshotRecoveryCandidate {
+                image,
+                committed_through: 1,
+                used_previous: false,
+            };
+            let command = CommandEnvelope {
+                command_id: CommandId(1),
+                session_id: 1,
+                client_seq: 1,
+                market_id: Some(market),
+                user_id: None,
+                route_epoch: Some(epoch),
+                client_timestamp: None,
+                received_at_unix_ns: None,
+                payload: Command::MassCancelShard(MassCancelShard {
+                    scope: ShardCancelScope::Market { market_id: market },
+                }),
+            };
+            let record = crate::RecoveredCommand {
+                shard_seq: 1,
+                epoch: 1,
+                engine_time: 0,
+                command,
+            };
+            assert_eq!(
+                super::super::replay_snapshot_records(candidate, vec![record]).is_ok(),
+                accepted,
+                "路由版本 {epoch}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_recovery_accepts_unrelated_shard_route_change() {
+        let mut config = SnapshotRestoreConfig {
+            cluster: ClusterId(2),
+            shard: ShardId(3),
+            primary_epoch: 7,
+            routes: RouteTable::new([]).unwrap(),
+            user_capacity: 8,
+            idempotency: IdempotencyConfig::default(),
+            place: None,
+            expect_registry: true,
+            max_markets: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let image = super::super::empty_recovery_candidate(&config, &[], 0)
+            .unwrap()
+            .image;
+        let bytes = image.encode_snapshot(config.max_bytes).unwrap();
+        config.routes = RouteTable::new([crate::MarketRoute {
+            market_id: MarketId(9),
+            shard_id: ShardId(4),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let recovered = SnapshotImage::decode_snapshot(&bytes, &config).unwrap();
+        assert_eq!(recovered.routes.as_ref(), &config.routes);
+        config.routes = RouteTable::new([crate::MarketRoute {
+            market_id: MarketId(9),
+            shard_id: ShardId(3),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        assert!(SnapshotImage::decode_snapshot(&bytes, &config).is_err());
+    }
+
+    #[test]
+    fn historical_routes_reject_truncation_and_noncanonical_order() {
+        let route = |id| crate::MarketRoute {
+            market_id: MarketId(id),
+            shard_id: ShardId(4),
+            route_epoch: 1,
+            state: RouteState::Active,
+        };
+        let table = RouteTable::new([route(1), route(2)]).unwrap();
+        let mut bytes = route_bytes(&table, 1024).unwrap();
+        assert_eq!(read_routes(&bytes, 1024).unwrap(), table);
+        assert!(read_routes(&bytes[..bytes.len() - 1], 1024).is_err());
+        bytes[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        assert!(read_routes(&bytes, 1024).is_err());
+    }
 
     #[test]
     fn zero_sequence_snapshot_rejects_older_wal_epoch() {
@@ -886,6 +1139,20 @@ mod tests {
             }
             let inactive_digest = image.state_digest(trusted.max_bytes).unwrap();
             let inactive = image.encode_snapshot(trusted.max_bytes).unwrap();
+            let mut newer = trusted.clone();
+            newer.routes = RouteTable::new([crate::MarketRoute {
+                market_id: market,
+                shard_id: ShardId(3),
+                route_epoch: 2,
+                state: RouteState::Active,
+            }])
+            .unwrap();
+            let restored_with_newer = SnapshotImage::decode_snapshot(&inactive, &newer).unwrap();
+            assert_eq!(restored_with_newer.routes.as_ref(), &newer.routes);
+            let newer_bytes = restored_with_newer
+                .encode_snapshot(newer.max_bytes)
+                .unwrap();
+            assert!(SnapshotImage::decode_snapshot(&newer_bytes, &trusted).is_err());
             assert_eq!(
                 u16::from_be_bytes([inactive[0], inactive[1]]),
                 if fee { 4 } else { 3 }

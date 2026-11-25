@@ -136,6 +136,7 @@ impl Health {
                 || !state.primary_lease_held
                 || !state.thread_running
                 || !state.ingress_open
+                || !state.route_ready
                 || state.failed
         }) {
             return Err("主节点要求运行中的持久分片及有效本机租约");
@@ -205,6 +206,7 @@ impl Health {
                 state.thread_running
                     && !state.failed
                     && state.ingress_open
+                    && state.route_ready
                     && !state.shard_halted
                     && (!self.require_primary || state.primary_lease_held)
             })
