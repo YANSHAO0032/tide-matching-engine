@@ -390,7 +390,7 @@ for each command, in original tape order
 100k path: stream records only; no final-state-only shortcut
 ```
 
-Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。命令游标已按 cluster、shard、shard_seq 和 trade_index 编码；序号尚无法通过恢复跨重启接续，不宣称跨重启唯一性。开发环境正式入口已接入本地 WAL 同步，持久 digest 和崩溃回放仍无实现证据。
+Reference 的 `Vec + sort` 模型与 Production 的 BTreeMap/HashMap/Arena/PriceLevel 路径保持独立，避免用生产实现生成期望结果。固定 seed、生成器版本和命令索引用于重建失败输入；长 tape 逐条校验与比较，不要求保留所有历史快照。图中概括多个测试套件：基础 GTC/Cancel、Market 数量/预算/保护，以及包含冰山、GTC/Cancel/IOC/FOK/PostOnly 和受保护市价单的混合命令；不声称单条 tape 同时包含所有类型。重复 tape 比较逐命令原序结果和状态，不只比较终态。命令游标按 cluster、shard、shard_seq 和 trade_index 编码；本地持久入口可以通过可信快照及已提交 WAL 恢复序号和状态摘要，具体恢复边界见[快照说明](snapshot.md)。认证复制接任及其验证范围见[控制存储说明](control_store.md)。
 
 ## 未触发止损订单与触发前到期
 

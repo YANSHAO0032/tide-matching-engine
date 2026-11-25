@@ -6,6 +6,7 @@ use matching_domain::{
 use sha2::{Digest, Sha256};
 
 /// 使用版本化有界事件编码计算连续 SHA-256 摘要。
+#[derive(Clone)]
 pub struct EventHasher {
     /// 已消费的原序事件摘要状态。
     hash: Sha256,

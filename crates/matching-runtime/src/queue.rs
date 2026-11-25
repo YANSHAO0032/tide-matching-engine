@@ -66,6 +66,8 @@ struct Shared<T> {
     admission: Mutex<Admission>,
     /// 在关闭完成后无锁识别已关闭入口。
     closed: AtomicBool,
+    /// 控制权失效后永久禁止执行尚未处理的变更。
+    route_fenced: AtomicBool,
     /// 已出队消息的等待时延互斥桶。
     wait_buckets: [AtomicU64; 7],
     /// 已出队消息的等待微秒数总和。
@@ -87,6 +89,14 @@ impl<T> Clone for Producer<T> {
     }
 }
 impl<T> Producer<T> {
+    #[cfg(test)]
+    pub(crate) fn routes_are_fenced(&self) -> bool {
+        self.shared.route_fenced.load(Ordering::Acquire)
+    }
+    /// 标记控制权已失效；与正常关闭排空分开。
+    pub(crate) fn fence_routes(&self) {
+        self.shared.route_fenced.store(true, Ordering::Release);
+    }
     /// 读取队列等待的瞬时时延观测。
     pub(crate) fn wait_observation(&self) -> matching_persistence::LatencySnapshot {
         matching_persistence::LatencySnapshot {
@@ -243,6 +253,10 @@ pub(crate) struct Consumer<T> {
     shared: Arc<Shared<T>>,
 }
 impl<T> Consumer<T> {
+    /// 检查控制权是否已被标记失效。
+    pub(crate) fn routes_fenced(&self) -> bool {
+        self.shared.route_fenced.load(Ordering::Acquire)
+    }
     /// 在准入锁下共同观察关闭状态和队列空状态。
     pub(crate) fn is_closed_and_empty(&self) -> bool {
         let state = self.shared.admission.lock().expect("准入状态锁已损坏");
@@ -302,6 +316,7 @@ pub(crate) fn bounded_queue_with_limits<T>(
     let shared = Arc::new(Shared {
         queue: ArrayQueue::new(limits.capacity),
         closed: AtomicBool::new(false),
+        route_fenced: AtomicBool::new(false),
         wait_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         wait_sum_us: AtomicU64::new(0),
         wait_overflow: AtomicBool::new(false),

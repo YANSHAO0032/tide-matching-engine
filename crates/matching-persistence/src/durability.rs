@@ -152,6 +152,30 @@ pub trait DurableAppender {
     fn append(&mut self, record: &WalRecord) -> io::Result<()>;
     /// 同步当前文件以及新目录项。
     fn sync(&mut self) -> io::Result<()>;
+    /// 取走已核验的备节点持久确认；普通本地写入器不提供确认。
+    fn take_replica_ack(&mut self) -> Option<ReplicaDurableAck> {
+        None
+    }
+    /// 返回已知复制链健康状态；本地写入器不提供此观测。
+    fn replication_ready(&self) -> Option<bool> {
+        None
+    }
+    /// 返回是否要求工作线程在对外回复前登记业务摘要。
+    fn digest_checkpoint_required(&self) -> bool {
+        false
+    }
+    /// 在可信外围登记已提交前缀的状态与有序事件摘要。
+    fn checkpoint_digest(
+        &mut self,
+        _seq: u64,
+        _state: [u8; 32],
+        _events: [u8; 32],
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "写入器不支持摘要检查点",
+        ))
+    }
     /// 通过同一个清单写者登记已同步的快照文件。
     fn commit_snapshot(&mut self, _snapshot_id: u64, _snapshot_seq: u64) -> io::Result<()> {
         Err(io::Error::new(
@@ -172,6 +196,18 @@ impl DurableAppender for BoxedDurableAppender {
     }
     fn sync(&mut self) -> io::Result<()> {
         self.0.sync()
+    }
+    fn take_replica_ack(&mut self) -> Option<ReplicaDurableAck> {
+        self.0.take_replica_ack()
+    }
+    fn replication_ready(&self) -> Option<bool> {
+        self.0.replication_ready()
+    }
+    fn digest_checkpoint_required(&self) -> bool {
+        self.0.digest_checkpoint_required()
+    }
+    fn checkpoint_digest(&mut self, seq: u64, state: [u8; 32], events: [u8; 32]) -> io::Result<()> {
+        self.0.checkpoint_digest(seq, state, events)
     }
     fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
         self.0.commit_snapshot(snapshot_id, snapshot_seq)
@@ -194,6 +230,8 @@ pub struct DurableBatcher<A> {
     last_appended: u64,
     /// 未同步批次首序号。
     pending_first: Option<u64>,
+    /// 未同步批次固定的集群与分片身份。
+    pending_identity: Option<(u16, u16)>,
     /// 未同步记录数量。
     pending_count: usize,
     /// 调用方提供的批次首条记录追加时刻，用于判断批次期限。
@@ -219,6 +257,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
             watermark: self.watermark,
             last_appended: self.last_appended,
             pending_first: self.pending_first,
+            pending_identity: self.pending_identity,
             pending_count: self.pending_count,
             pending_since: self.pending_since,
             pending_observed_since: self.pending_observed_since,
@@ -260,6 +299,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
             watermark: CommitWatermark::new(replication, 0),
             last_appended: 0,
             pending_first: None,
+            pending_identity: None,
             pending_count: 0,
             pending_since: None,
             pending_observed_since: None,
@@ -282,6 +322,34 @@ impl<A: DurableAppender> DurableBatcher<A> {
     /// 返回当前策略允许对外提交的前缀。
     pub const fn committed(&self) -> u64 {
         self.watermark.committed()
+    }
+    /// 返回写入器是否要求每批提交后登记摘要。
+    pub fn digest_checkpoint_required(&self) -> bool {
+        self.appender.digest_checkpoint_required()
+    }
+    /// 只在备节点持久策略的完整提交顺序点登记摘要；失败后停止后续写入。
+    pub fn checkpoint_digest(
+        &mut self,
+        seq: u64,
+        state: [u8; 32],
+        events: [u8; 32],
+    ) -> io::Result<()> {
+        if self.halted
+            || self.watermark.mode != ReplicationMode::StandbyDurable
+            || self.pending_count != 0
+            || seq == 0
+            || seq != self.committed()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "摘要不属于当前完整提交前缀",
+            ));
+        }
+        let result = self.appender.checkpoint_digest(seq, state, events);
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
     }
     /// 在提交前缀内登记已同步快照；非 `InvalidInput` 的清单错误会停止持久写入。
     pub fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
@@ -309,7 +377,9 @@ impl<A: DurableAppender> DurableBatcher<A> {
         if self.halted {
             return Err(io::Error::other("持久写入器已停止"));
         }
-        if self.watermark.mode == ReplicationMode::StandbyDurable && !self.standby_available {
+        if self.watermark.mode == ReplicationMode::StandbyDurable
+            && (!self.standby_available || self.appender.replication_ready() == Some(false))
+        {
             return Err(io::Error::other("备节点不可用"));
         }
         if record.epoch != self.expected_epoch {
@@ -333,6 +403,16 @@ impl<A: DurableAppender> DurableBatcher<A> {
         if rotate && self.pending_count != 0 {
             self.flush()?;
         }
+        if self
+            .pending_identity
+            .is_some_and(|identity| identity != (record.cluster_id, record.shard_id))
+        {
+            self.halted = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "批次分片身份不一致",
+            ));
+        }
         let next_count = self
             .pending_count
             .checked_add(1)
@@ -346,6 +426,7 @@ impl<A: DurableAppender> DurableBatcher<A> {
         }
         if self.pending_count == 0 {
             self.pending_first = Some(record.shard_seq);
+            self.pending_identity = Some((record.cluster_id, record.shard_id));
             self.pending_since = Some(now);
             self.pending_observed_since = Some(Instant::now());
         }
@@ -411,7 +492,25 @@ impl<A: DurableAppender> DurableBatcher<A> {
                 "本地持久前缀不连续",
             ));
         }
+        if let Some(ack) = self.appender.take_replica_ack()
+            && (self.watermark.mode != ReplicationMode::StandbyDurable
+                || self.pending_identity != Some((ack.cluster_id, ack.shard_id))
+                || ack.epoch != self.expected_epoch
+                || ack.first_seq != first
+                || ack.through_seq != self.last_appended
+                || self
+                    .watermark
+                    .advance_standby(ack.first_seq, ack.through_seq)
+                    .is_err())
+        {
+            self.halted = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "备节点确认身份或连续前缀无效",
+            ));
+        }
         self.pending_first = None;
+        self.pending_identity = None;
         self.pending_count = 0;
         self.pending_since = None;
         self.pending_observed_since = None;
@@ -428,6 +527,237 @@ impl<A: DurableAppender> DurableBatcher<A> {
             return Err(DurabilityError);
         }
         self.watermark.advance_standby(first, last)
+    }
+}
+
+/// 备节点完成实际同步后返回的连续持久前缀确认。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaDurableAck {
+    /// 确认所属的集群身份。
+    pub cluster_id: u16,
+    /// 确认所属的分片身份。
+    pub shard_id: u16,
+    /// 当前复制会话绑定的主节点纪元。
+    pub epoch: u64,
+    /// 本次确认的第一个连续序号。
+    pub first_seq: u64,
+    /// 本次确认的最后一个连续序号。
+    pub through_seq: u64,
+}
+
+/// 备节点本地 WAL 写入与连续持久确认；不执行或发布业务事件。
+pub struct StandbyReplica<A> {
+    /// 备节点独占的本地持久批处理器。
+    batcher: DurableBatcher<A>,
+    /// 复制记录必须匹配的集群身份。
+    cluster: u16,
+    /// 复制记录必须匹配的分片身份。
+    shard: u16,
+    /// 复制会话固定的主节点纪元。
+    epoch: u64,
+    /// 单次允许的最大记录数量。
+    max_batch: usize,
+    /// 发生持久错误后永久停止确认。
+    halted: bool,
+}
+
+impl<A: DurableAppender> StandbyReplica<A> {
+    /// 使用已验证本地持久边界建立备节点写入器。
+    pub fn new(
+        batcher: DurableBatcher<A>,
+        cluster: u16,
+        shard: u16,
+        epoch: u64,
+        max_batch: usize,
+    ) -> io::Result<Self> {
+        if epoch == 0
+            || max_batch == 0
+            || batcher.expected_epoch != epoch
+            || batcher.halted
+            || batcher.pending_count != 0
+            || batcher.watermark.mode != ReplicationMode::LocalDurable
+            || batcher.last_appended != batcher.watermark.local
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "备节点持久边界或配置无效",
+            ));
+        }
+        Ok(Self {
+            batcher,
+            cluster,
+            shard,
+            epoch,
+            max_batch,
+            halted: false,
+        })
+    }
+
+    /// 验证完整连续批次，实际同步后返回该前缀的确认。
+    pub fn append_batch(
+        &mut self,
+        records: &[WalRecord],
+        now: Instant,
+    ) -> io::Result<ReplicaDurableAck> {
+        if self.halted {
+            return Err(io::Error::other("备节点持久写入已停止"));
+        }
+        if records.is_empty() || records.len() > self.max_batch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "复制批次大小无效",
+            ));
+        }
+        let first = self
+            .batcher
+            .committed()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("备节点序号耗尽"))?;
+        let mut expected = first;
+        for (index, record) in records.iter().enumerate() {
+            if record.cluster_id != self.cluster
+                || record.shard_id != self.shard
+                || record.epoch != self.epoch
+                || record.shard_seq != expected
+                || record.encode().is_err()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "复制记录身份、格式或序号无效",
+                ));
+            }
+            if index + 1 < records.len() {
+                expected = expected
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("备节点序号耗尽"))?;
+            }
+        }
+        let result = (|| {
+            for record in records {
+                self.batcher.append_at(record, now)?;
+            }
+            self.batcher.flush()?;
+            if self.batcher.committed() != expected {
+                return Err(io::Error::other("备节点持久前缀不连续"));
+            }
+            Ok(ReplicaDurableAck {
+                cluster_id: self.cluster,
+                shard_id: self.shard,
+                epoch: self.epoch,
+                first_seq: first,
+                through_seq: expected,
+            })
+        })();
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
+    }
+}
+
+/// 串行化备节点写入与持久纪元栅栏；远端写权和复制意图仍须由调用方核验。
+pub struct FencedStandbyReplica<A> {
+    /// 与栅栏共享独占顺序的本地备节点。
+    replica: StandbyReplica<A>,
+    /// 可恢复的已安装纪元。
+    epochs: crate::ReplicaEpochStore,
+    /// 当前进程是否已重新核验权威。
+    active: bool,
+    /// 当前进程是否已经安装并验证接任栅栏。
+    fenced: bool,
+    /// 栅栏写入失败后的不确定状态只能通过重新恢复处理。
+    halted: bool,
+}
+
+impl<A: DurableAppender> FencedStandbyReplica<A> {
+    /// 暂停复制并保留已安装栅栏，供调用方重新核验恢复。
+    pub fn suspend(&mut self) {
+        self.active = false;
+    }
+    /// 核对栅栏身份和已恢复的真实本地前缀；每次创建均从未激活状态开始。
+    pub fn new(replica: StandbyReplica<A>, epochs: crate::ReplicaEpochStore) -> io::Result<Self> {
+        let state = epochs.state();
+        if replica.cluster != state.cluster_id
+            || replica.shard != state.shard_id
+            || replica.epoch != state.epoch
+            || replica.batcher.committed() < state.durable_seq
+            || replica.halted
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "备节点与持久栅栏不一致",
+            ));
+        }
+        Ok(Self {
+            replica,
+            epochs,
+            active: false,
+            fenced: false,
+            halted: false,
+        })
+    }
+
+    /// 验证当前权威并串行安装纪元，返回栅栏时真实本地持久水位；验证失败时暂停复制。
+    pub fn activate(
+        &mut self,
+        epoch: u64,
+        verify: impl FnOnce(u16, u16, u64) -> io::Result<()>,
+    ) -> io::Result<u64> {
+        self.active = false;
+        self.fenced = false;
+        let state = self.epochs.state();
+        if epoch < state.epoch || self.replica.halted || self.halted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "备节点纪元回退或已停止",
+            ));
+        }
+        verify(state.cluster_id, state.shard_id, epoch)?;
+        if epoch > state.epoch {
+            if let Err(error) =
+                self.epochs
+                    .advance(state.epoch, epoch, self.replica.batcher.committed())
+            {
+                self.halted = true;
+                return Err(error);
+            }
+            self.replica.epoch = epoch;
+            self.replica.batcher.expected_epoch = epoch;
+        }
+        self.fenced = true;
+        Ok(self.replica.batcher.committed())
+    }
+
+    /// 在调用方完成权威前缀核对后开放复制；检查时须重新验证远端写权。
+    pub fn confirm_reconciled(
+        &mut self,
+        durable_seq: u64,
+        verify: impl FnOnce(u16, u16, u64) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.active = false;
+        if !self.fenced
+            || self.halted
+            || self.replica.halted
+            || self.replica.batcher.committed() != durable_seq
+        {
+            return Err(io::Error::other("备节点栅栏或协调水位无效"));
+        }
+        let state = self.epochs.state();
+        verify(state.cluster_id, state.shard_id, state.epoch)?;
+        self.active = true;
+        Ok(())
+    }
+
+    /// 在调用方验证复制意图后写入；栅栏和批次均通过独占借用排序。
+    pub fn append_batch(
+        &mut self,
+        records: &[WalRecord],
+        now: Instant,
+    ) -> io::Result<ReplicaDurableAck> {
+        if !self.active {
+            return Err(io::Error::other("备节点尚未通过权威校验"));
+        }
+        self.replica.append_batch(records, now)
     }
 }
 
@@ -468,7 +798,72 @@ impl RegisteredAppender<crate::FileManifestStorage> {
     }
 }
 
+impl FencedStandbyReplica<RegisteredAppender<crate::FileManifestStorage>> {
+    /// 在栅栏顺序点读取清单确认的备节点前缀；调用方须独占目录并验证快照。
+    pub fn fenced_records(&self, snapshot_seq: u64) -> io::Result<Vec<WalRecord>> {
+        let batcher = &self.replica.batcher;
+        let appender = &batcher.appender;
+        if !self.fenced
+            || self.active
+            || self.halted
+            || self.replica.halted
+            || batcher.halted
+            || batcher.pending_count != 0
+            || batcher.committed() != appender.manifest.state().local_durable_seq
+            || batcher.last_appended != batcher.committed()
+        {
+            return Err(io::Error::other("备节点尚未处于可核对的持久栅栏"));
+        }
+        crate::recovery::recover_local_state(
+            appender.writer.directory(),
+            appender.manifest.state(),
+            snapshot_seq,
+            self.replica.cluster,
+            self.replica.shard,
+        )
+    }
+}
+
 impl DurableBatcher<RegisteredAppender<crate::FileManifestStorage>> {
+    /// 以严格清单确认的本地前缀初始化备节点持久续写。
+    ///
+    /// 可信工厂必须保留传入的本地写入器，并独立完成同一基线的权威日志、
+    /// 备节点、租约和业务重放协调；健康标志本身不构成这些事实的证明。
+    /// 该低层入口不负责快照校验、路由准入或修复超出权威前缀的本地尾部。
+    pub fn resume_replicated_with<A, F>(
+        appender: RegisteredAppender<crate::FileManifestStorage>,
+        config: DurabilityConfig,
+        expected_epoch: u64,
+        factory: F,
+    ) -> io::Result<DurableBatcher<A>>
+    where
+        A: DurableAppender,
+        F: FnOnce(RegisteredAppender<crate::FileManifestStorage>, u64) -> io::Result<A>,
+    {
+        if !appender.manifest.recovery_checked()
+            || config.replication != ReplicationMode::StandbyDurable
+            || expected_epoch == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "复制续写需要严格清单和备节点持久策略",
+            ));
+        }
+        config
+            .validate()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "无效持久性配置"))?;
+        let baseline = appender.manifest.state().local_durable_seq;
+        let appender = factory(appender, baseline)?;
+        if appender.replication_ready() != Some(true) {
+            return Err(io::Error::other("复制链尚未就绪"));
+        }
+        let mut batcher = DurableBatcher::new_with_config(appender, config, expected_epoch)?;
+        batcher.watermark = CommitWatermark::new(ReplicationMode::StandbyDurable, baseline);
+        batcher.last_appended = baseline;
+        batcher.standby_available = true;
+        Ok(batcher)
+    }
+
     /// 仅以严格验证和修复后的本地持久水位初始化续写批处理器。
     pub fn resume_local(
         appender: RegisteredAppender<crate::FileManifestStorage>,
@@ -547,5 +942,68 @@ impl<S: ManifestStorage> DurableAppender for RegisteredAppender<S> {
             first_seq,
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fenced_standby_tests {
+    use super::*;
+
+    struct EmptyAppender;
+    impl DurableAppender for EmptyAppender {
+        fn would_rotate(&self, _: &WalRecord) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn append(&mut self, _: &WalRecord) -> io::Result<()> {
+            Ok(())
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unknown_fence_sync_forbids_reactivation_of_old_epoch() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("tide-epoch-sync-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let mut epochs = crate::ReplicaEpochStore::create(root.join("epoch"), 1, 2, 3, 0).unwrap();
+        epochs.fail_next_sync();
+        let config = DurabilityConfig {
+            profile: Profile::Development,
+            mode: DurabilityMode::FsyncEach,
+            replication: ReplicationMode::LocalDurable,
+            crash_recovery_required: true,
+            ha_enabled: false,
+            allow_data_loss_on_failover: false,
+        };
+        let batcher = DurableBatcher::new_with_config(EmptyAppender, config, 3).unwrap();
+        let replica = StandbyReplica::new(batcher, 1, 2, 3, 8).unwrap();
+        let mut fenced = FencedStandbyReplica::new(replica, epochs).unwrap();
+        fenced.activate(3, |_, _, _| Ok(())).unwrap();
+        assert!(fenced.activate(4, |_, _, _| Ok(())).is_err());
+        assert!(fenced.activate(3, |_, _, _| Ok(())).is_err());
+        assert!(fenced.activate(4, |_, _, _| Ok(())).is_err());
+        drop(fenced);
+        let store = crate::ReplicaEpochStore::open(root.join("epoch"), 1, 2).unwrap();
+        assert_eq!(store.state().epoch, 4);
+        drop(store);
+        let target = root.canonicalize().unwrap();
+        assert_eq!(
+            target.parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        assert!(
+            target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("tide-epoch-sync-")
+        );
+        std::fs::remove_dir_all(target).unwrap();
     }
 }

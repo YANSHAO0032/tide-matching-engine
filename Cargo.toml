@@ -6,6 +6,7 @@ members = [
     "crates/matching-persistence",
     "crates/matching-risk",
     "crates/matching-protocol",
+    "crates/matching-control",
 ]
 resolver = "3"
 

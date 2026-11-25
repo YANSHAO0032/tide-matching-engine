@@ -168,12 +168,21 @@ fn group_place_and_mass_cancel_write_before_reply() {
         .unwrap()
         .unwrap();
     assert_eq!(first.seq, 1);
-    let metrics = matching_runtime::Health::new(vec![shard.handle()])
+    let health = matching_runtime::Health::new(vec![shard.handle()])
         .unwrap()
         .with_priority_markets(vec![market], 1)
-        .unwrap()
-        .prometheus()
         .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let metrics = loop {
+        let metrics = health.prometheus().unwrap();
+        if (metrics.contains("market_queue_priority_next{market_id=\"124\"} 1\n")
+            && metrics.contains("engine_book_metrics_available 1\n"))
+            || std::time::Instant::now() >= deadline
+        {
+            break metrics;
+        }
+        std::thread::yield_now();
+    };
     assert!(metrics.contains("wal_group_commit_batch_size_count 1\n"));
     assert!(metrics.contains("wal_group_commit_batch_size_sum 1\n"));
     assert!(metrics.contains("wal_group_commit_wait_us_count 1\n"));
@@ -422,8 +431,21 @@ fn group_place_and_mass_cancel_write_before_reply() {
         (77, 3)
     );
     assert_eq!(result.seq, 3);
-    let metrics = health.prometheus().unwrap();
-    assert!(metrics.contains("engine_open_orders 0\n"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let metrics = loop {
+        let metrics = health.prometheus().unwrap();
+        if metrics.contains("engine_book_metrics_available 1\n")
+            || std::time::Instant::now() >= deadline
+        {
+            break metrics;
+        }
+        std::thread::yield_now();
+    };
+    assert!(metrics.contains("engine_book_metrics_available 1\n"));
+    assert!(
+        metrics.contains("engine_open_orders 0\n"),
+        "指标内容：{metrics}"
+    );
     assert!(metrics.contains("engine_price_levels 0\n"));
     let digest = retry(|| shard.handle().take_snapshot(2))
         .recv_timeout(Duration::from_secs(5))
@@ -445,7 +467,7 @@ fn group_place_and_mass_cancel_write_before_reply() {
     );
     snapshot_writer.shutdown().unwrap();
     shard.shutdown(Duration::from_secs(5)).unwrap();
-    let restore = matching_runtime::SnapshotRestoreConfig {
+    let mut restore = matching_runtime::SnapshotRestoreConfig {
         cluster: ClusterId(1),
         shard: shard_id,
         primary_epoch: 1,
@@ -458,6 +480,161 @@ fn group_place_and_mass_cancel_write_before_reply() {
         max_bytes: 1024 * 1024,
     };
     let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(base.join("manifest")).unwrap();
+    let verified = matching_runtime::recover_verified_snapshot_records_with_genesis(
+        base.join("wal"),
+        &snapshot_dir,
+        &manager,
+        &restore,
+        &[],
+        2,
+        |record| {
+            if record == &records[1] {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("权威记录不一致"))
+            }
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        verified
+            .commands()
+            .iter()
+            .map(|record| record.shard_seq)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(verified.replay().unwrap().executions.len(), 1);
+    let mut newer_epoch = restore.clone();
+    newer_epoch.primary_epoch = 2;
+    assert!(
+        matching_runtime::recover_snapshot_records_with_genesis(
+            base.join("wal"),
+            &snapshot_dir,
+            &manager,
+            &newer_epoch,
+            &[]
+        )
+        .is_err()
+    );
+    let historical = matching_runtime::recover_verified_snapshot_records_with_genesis(
+        base.join("wal"),
+        &snapshot_dir,
+        &manager,
+        &newer_epoch,
+        &[],
+        2,
+        |record| {
+            if record == &records[1] {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("权威记录不一致"))
+            }
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(historical.snapshot().image.snapshot_seq(), 1);
+    assert_eq!(historical.commands().len(), 1);
+    let genesis = matching_runtime::recover_verified_genesis_records(
+        base.join("wal"),
+        &manager,
+        &restore,
+        &[(market, QueuePriorityPolicy::try_new(100).unwrap())],
+        2,
+        |record| {
+            if record == &records[usize::try_from(record.shard_seq - 1).unwrap()] {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("权威记录不一致"))
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(genesis.snapshot().image.snapshot_seq(), 0);
+    assert_eq!(genesis.commands().len(), 2);
+    let prefix = matching_runtime::recover_verified_genesis_records(
+        base.join("wal"),
+        &manager,
+        &restore,
+        &[(market, QueuePriorityPolicy::try_new(100).unwrap())],
+        1,
+        |_| Ok(()),
+    )
+    .unwrap()
+    .replay()
+    .unwrap();
+    let checkpoint = matching_runtime::ReplayCheckpoint {
+        shard_seq: 1,
+        state_digest: prefix.image.state_digest(1024 * 1024).unwrap(),
+        event_hash: prefix.event_hash,
+        max_state_bytes: 1024 * 1024,
+    };
+    let recovered = genesis.replay_with_checkpoint(1, checkpoint).unwrap();
+    assert_eq!(recovered.executions.len(), 2);
+    assert_eq!(recovered.executions[1].seq, 2);
+    for bad in [
+        matching_runtime::ReplayCheckpoint {
+            state_digest: [0; 32],
+            ..checkpoint
+        },
+        matching_runtime::ReplayCheckpoint {
+            event_hash: [0; 32],
+            ..checkpoint
+        },
+        matching_runtime::ReplayCheckpoint {
+            shard_seq: 3,
+            ..checkpoint
+        },
+    ] {
+        let records = matching_runtime::recover_verified_genesis_records(
+            base.join("wal"),
+            &manager,
+            &restore,
+            &[(market, QueuePriorityPolicy::try_new(100).unwrap())],
+            2,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(records.replay_with_checkpoint(1, bad).is_err());
+    }
+    assert!(
+        matching_runtime::recover_verified_snapshot_records_with_genesis(
+            base.join("wal"),
+            &snapshot_dir,
+            &manager,
+            &restore,
+            &[],
+            0,
+            |_| Ok(())
+        )
+        .is_err()
+    );
+    assert!(
+        matching_runtime::recover_verified_snapshot_records_with_genesis(
+            base.join("wal"),
+            &snapshot_dir,
+            &manager,
+            &restore,
+            &[],
+            4,
+            |_| Ok(())
+        )
+        .is_err()
+    );
+    assert!(
+        matching_runtime::recover_verified_snapshot_records_with_genesis(
+            base.join("wal"),
+            &snapshot_dir,
+            &manager,
+            &restore,
+            &[],
+            2,
+            |_| Err(std::io::Error::other("权威失效"))
+        )
+        .is_err()
+    );
     let batch = matching_runtime::recover_snapshot_records(
         base.join("wal"),
         &snapshot_dir,
@@ -492,6 +669,28 @@ fn group_place_and_mass_cancel_write_before_reply() {
     }
     // 断连恢复可能遇到已经入队但尚未读取回复的旧会话命令。
     let next_reply = retry(|| restarted.handle().submit_command(next.clone()));
+    let route_dir = base.join("route-control");
+    std::fs::create_dir(&route_dir).unwrap();
+    let authority = matching_runtime::RouteControlStore::create_for_cluster(
+        &route_dir,
+        ClusterId(1),
+        restore.routes.clone(),
+        8,
+        8,
+    )
+    .unwrap();
+    let mut coordinator =
+        matching_runtime::RouteCoordinator::new(authority, vec![restarted.handle()]).unwrap();
+    let updated_routes = RouteTable::new([MarketRoute {
+        market_id: market,
+        shard_id,
+        route_epoch: 2,
+        state: RouteState::Active,
+    }])
+    .unwrap();
+    coordinator
+        .update(1, updated_routes.clone(), Duration::from_secs(5))
+        .unwrap();
     let session_path = base.join("group-session.log");
     let mut session = matching_runtime::SessionControlJournal::create(
         &session_path,
@@ -507,13 +706,20 @@ fn group_place_and_mass_cancel_write_before_reply() {
     )
     .unwrap();
     session.disconnect().unwrap();
-    let result = matching_runtime::dispatch_session_cancel(
-        &mut session,
-        market,
-        &restarted.handle(),
-        Duration::from_secs(5),
-    )
-    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let result = loop {
+        match matching_runtime::dispatch_session_cancel(
+            &mut session,
+            market,
+            &restarted.handle(),
+            Duration::from_secs(5),
+        ) {
+            Err(matching_runtime::SessionDispatchError::Ingress(
+                matching_runtime::ShardError::Busy,
+            )) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+            result => break result.unwrap(),
+        }
+    };
     assert_eq!(
         next_reply
             .recv_timeout(Duration::from_secs(5))
@@ -529,6 +735,8 @@ fn group_place_and_mass_cancel_write_before_reply() {
         .unwrap();
     let after_digest = after.state_digest(1024 * 1024).unwrap();
     restarted.shutdown(Duration::from_secs(5)).unwrap();
+    drop(coordinator);
+    restore.routes = updated_routes;
     let manager = matching_persistence::ManifestManager::<matching_persistence::FileManifestStorage>::open_recovery(base.join("manifest")).unwrap();
     let replay = matching_runtime::recover_snapshot_records(
         base.join("wal"),

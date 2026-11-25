@@ -23,7 +23,7 @@ pub use snapshot_writer::{SnapshotWriter, SnapshotWriterError};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle, Thread};
@@ -222,6 +222,8 @@ pub enum SnapshotError {
 ///
 /// 镜像可编码并由后台写入器提交；仅内存捕获不代表快照已持久提交。
 pub struct SnapshotImage {
+    /// 快照时各市场路由版本，仅用于约束快照后的 WAL 回放。
+    replay_route_floor: Option<Arc<RouteTable>>,
     /// 无快照恢复时构造的空基线；不参与编码和业务摘要。
     genesis_baseline: bool,
     /// 本进程屏障来源凭据；从磁盘恢复的镜像没有提交权限。
@@ -377,6 +379,23 @@ impl<T> CommandReply<T> {
 
 /// 只在本进程队列内传递的变更、查询与控制消息。
 enum Message {
+    /// 测试中在顺序点阻塞分片，建立确定的排空边界。
+    #[cfg(test)]
+    TestBlock(SyncSender<()>, Receiver<()>),
+    /// 在队列顺序点暂停或恢复市场变更。
+    RouteAdmission(
+        /// 是否暂停市场变更。
+        bool,
+        /// 返回控制操作结果。
+        SyncSender<Result<(), ShardError>>,
+    ),
+    /// 在队列顺序点安装可信路由，不分配业务序号。
+    InstallRoutes(
+        /// 已从控制权威读取的完整路由。
+        RouteTable,
+        /// 返回安装结果。
+        SyncSender<Result<(), ShardError>>,
+    ),
     /// 包含调用方身份、路由版本、业务载荷及一次性回复端的变更。
     Mutation(
         /// 调用方提供的命令身份。
@@ -472,6 +491,8 @@ pub struct ShardConfig {
     pub max_control_inflight: usize,
     /// 工作线程空闲策略。
     pub wait_strategy: WaitStrategy,
+    /// 启动时暂停变更，等待路由权威确认。
+    pub require_route_authority: bool,
 }
 impl Default for ShardConfig {
     fn default() -> Self {
@@ -481,12 +502,17 @@ impl Default for ShardConfig {
             max_query_inflight: 512,
             max_control_inflight: 128,
             wait_strategy: WaitStrategy::Hybrid,
+            require_route_authority: false,
         }
     }
 }
 
 /// 分片入口与线程所有权；订单簿仅存在于工作线程中。
 pub struct Shard {
+    /// 工作线程是否从路由暂停状态启动。
+    route_gated_at_start: bool,
+    /// 工作线程最近确认的路由准入状态。
+    route_ready: Arc<AtomicBool>,
     /// 正式业务入口是否在回复前完成本地持久提交。
     durable_formal: bool,
     /// 持久写入器的独立时延观测。
@@ -522,10 +548,257 @@ pub struct Shard {
     /// 工作线程所属集群。
     cluster_id: ClusterId,
     /// 工作线程与入口共享的路由快照。
-    routes: Arc<RouteTable>,
+    routes: Arc<RwLock<Arc<RouteTable>>>,
 }
 
 impl Shard {
+    /// 在可信外围协调下重放分片并恢复备节点持久续写。
+    ///
+    /// 恢复期间独占 WAL 和清单；协调器须验证快照、权威前缀、写权与备节点，
+    /// 并在重放完成后确认复制。启动时路由保持暂停，不能仅凭本入口证明 HA。
+    pub fn recover_replicated_group_with_genesis<C: crate::ReplicatedRecoveryCoordinator>(
+        wal: impl AsRef<std::path::Path>,
+        manifest: impl AsRef<std::path::Path>,
+        snapshot_dir: impl AsRef<std::path::Path>,
+        trusted: &SnapshotRestoreConfig,
+        policies: &[(MarketId, matching_orderbook::QueuePriorityPolicy)],
+        (max_batch, max_delay_micros): (usize, u64),
+        mut coordinator: C,
+    ) -> Result<Self, ShardError> {
+        use matching_persistence::{
+            DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
+            Profile, RegisteredAppender, ReplicationMode,
+        };
+        if trusted.primary_epoch == 0
+            || trusted
+                .place
+                .as_ref()
+                .is_none_or(|place| !place.require_route_authority)
+            || max_batch == 0
+            || max_batch > ShardConfig::default().capacity
+            || max_delay_micros == 0
+            || Instant::now()
+                .checked_add(Duration::from_micros(max_delay_micros))
+                .is_none()
+        {
+            return Err(ShardError::InvalidConfig);
+        }
+        validate_durable_directories(wal.as_ref(), manifest.as_ref())?;
+        validate_durable_directories(wal.as_ref(), snapshot_dir.as_ref())?;
+        validate_durable_directories(manifest.as_ref(), snapshot_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal.as_ref())?;
+        let mut manager = ManifestManager::<FileManifestStorage>::open_recovery(manifest)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        let records = coordinator
+            .recover(
+                wal.as_ref(),
+                snapshot_dir.as_ref(),
+                &mut manager,
+                trusted,
+                policies,
+            )
+            .map_err(|_| ShardError::InvalidConfig)?;
+        let snapshot_seq = records.snapshot().image.snapshot_seq();
+        let baseline = records.snapshot().committed_through;
+        if baseline > manager.state().local_durable_seq {
+            return Err(ShardError::InvalidConfig);
+        }
+        let replay_count = records.commands().len();
+        let replay_started = Instant::now();
+        let replay = if let Some(checkpoint) = coordinator.replay_checkpoint() {
+            records.replay_with_checkpoint(trusted.primary_epoch, checkpoint)
+        } else {
+            records.replay_replicated(trusted.primary_epoch)
+        }
+        .map_err(|_| ShardError::InvalidConfig)?;
+        let replay_duration = replay_started.elapsed();
+        coordinator
+            .verify_replay(&replay)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        coordinator
+            .reconcile_local(wal.as_ref(), &mut manager, trusted, baseline)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        if !replay.image.managed_markets.is_empty() && replay.image.place.is_none() {
+            return Err(ShardError::InvalidConfig);
+        }
+        let ownership = crate::ownership::MarketOwnership::acquire(
+            replay.image.cluster,
+            replay.image.shard,
+            replay.image.markets.keys().copied(),
+        )
+        .ok_or(ShardError::InvalidConfig)?;
+        let appender = RegisteredAppender::recover_local(
+            &wal,
+            64 * 1024 * 1024,
+            manager,
+            snapshot_seq,
+            trusted.cluster.get(),
+            trusted.shard.get(),
+        )
+        .map_err(|_| ShardError::InvalidConfig)?;
+        let config = DurabilityConfig {
+            profile: Profile::Production,
+            mode: DurabilityMode::GroupCommit {
+                max_batch,
+                max_delay_micros,
+            },
+            replication: ReplicationMode::StandbyDurable,
+            crash_recovery_required: true,
+            ha_enabled: true,
+            allow_data_loss_on_failover: false,
+        };
+        let batcher = DurableBatcher::resume_replicated_with(
+            appender,
+            config,
+            trusted.primary_epoch,
+            |local, baseline| coordinator.finish(local, baseline, &replay),
+        )
+        .map_err(|_| ShardError::InvalidConfig)?
+        .into_boxed();
+        let event_hasher = if batcher.digest_checkpoint_required() {
+            if snapshot_seq != 0 {
+                return Err(ShardError::InvalidConfig);
+            }
+            Some(replay.event_hasher.clone())
+        } else {
+            None
+        };
+        let mut image = replay.image;
+        image.primary_epoch = trusted.primary_epoch;
+        let books = image
+            .markets
+            .iter()
+            .map(|(id, book)| (*id, book.clone()))
+            .collect();
+        let registry = image.registry.clone();
+        let recovered = Self::start_inner_with_snapshot(
+            (image.shard, image.cluster),
+            trusted.routes.clone(),
+            books,
+            ShardConfig::default(),
+            registry,
+            (
+                image.now,
+                trusted.idempotency,
+                image.primary_epoch,
+                trusted.user_capacity,
+                None,
+                Some(LocalDurableCommit {
+                    event_hasher,
+                    _wal_lease: Some(wal_lease),
+                    batcher,
+                    epoch: trusted.primary_epoch,
+                    group: Some((max_batch, max_delay_micros)),
+                }),
+            ),
+            (Some(image), Some(ownership)),
+        )?;
+        recovered
+            .metrics
+            .observe_replay(replay_count, replay_duration);
+        Ok(recovered)
+    }
+
+    /// 从空状态启动要求备节点持久确认的正式命令分片。
+    ///
+    /// 工厂由可信外围提供，必须保留传入的本地 WAL 写入器，并实现认证复制与写权事务。
+    /// 此入口仅处理空状态启动，不提供接任恢复；分片在路由协调前保持暂停。
+    pub fn start_replicated_group_place_support<P, A, F>(
+        (shard, cluster): (ShardId, ClusterId),
+        routes: RouteTable,
+        policies: Vec<(MarketId, matching_orderbook::QueuePriorityPolicy)>,
+        (registry, now): (ReservationRegistry, LogicalTime),
+        (idempotency, epoch, user_capacity, place): (
+            IdempotencyConfig,
+            u64,
+            usize,
+            PlaceSupportConfig,
+        ),
+        ((wal_dir, manifest_dir), (max_batch, max_delay_micros)): ((P, P), (usize, u64)),
+        factory: F,
+    ) -> Result<Self, ShardError>
+    where
+        P: AsRef<std::path::Path>,
+        A: matching_persistence::DurableAppender + Send + 'static,
+        F: FnOnce(
+            matching_persistence::RegisteredAppender<matching_persistence::FileManifestStorage>,
+        ) -> std::io::Result<A>,
+    {
+        use matching_persistence::{
+            DurabilityConfig, DurabilityMode, DurableBatcher, FileManifestStorage, ManifestManager,
+            Profile, RegisteredAppender, ReplicationMode, SegmentWriter,
+        };
+        if now.get() != 0
+            || epoch == 0
+            || !place.require_route_authority
+            || registry != ReservationRegistry::new([]).map_err(|_| ShardError::InvalidConfig)?
+            || max_batch > ShardConfig::default().capacity
+            || Instant::now()
+                .checked_add(Duration::from_micros(max_delay_micros))
+                .is_none()
+        {
+            return Err(ShardError::InvalidConfig);
+        }
+        let config = DurabilityConfig {
+            profile: Profile::Production,
+            mode: DurabilityMode::GroupCommit {
+                max_batch,
+                max_delay_micros,
+            },
+            replication: ReplicationMode::StandbyDurable,
+            crash_recovery_required: true,
+            ha_enabled: true,
+            allow_data_loss_on_failover: false,
+        };
+        config.validate().map_err(|_| ShardError::InvalidConfig)?;
+        let mut books = Vec::with_capacity(policies.len());
+        for (market, policy) in policies {
+            let mut book = ProductionOrderBook::new(policy);
+            book.bind_market(market)
+                .map_err(|_| ShardError::InvalidConfig)?;
+            books.push((market, book));
+        }
+        validate_durable_directories(wal_dir.as_ref(), manifest_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal_dir.as_ref())?;
+        let writer =
+            SegmentWriter::new(wal_dir, 64 * 1024 * 1024).map_err(|_| ShardError::InvalidConfig)?;
+        let manifest = ManifestManager::<FileManifestStorage>::open(manifest_dir)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        let registered =
+            RegisteredAppender::new(writer, manifest).map_err(|_| ShardError::InvalidConfig)?;
+        let appender = factory(registered).map_err(|_| ShardError::InvalidConfig)?;
+        if appender.replication_ready() != Some(true) {
+            return Err(ShardError::InvalidConfig);
+        }
+        let mut batcher = DurableBatcher::new_with_config(appender, config, epoch)
+            .map_err(|_| ShardError::InvalidConfig)?;
+        batcher.set_standby_available(true);
+        let event_hasher = batcher
+            .digest_checkpoint_required()
+            .then(crate::EventHasher::new);
+        Self::start_inner(
+            shard,
+            cluster,
+            routes,
+            books,
+            ShardConfig::default(),
+            Some(registry),
+            (
+                now,
+                idempotency,
+                epoch,
+                user_capacity,
+                Some(place),
+                Some(LocalDurableCommit {
+                    event_hasher,
+                    _wal_lease: Some(wal_lease),
+                    batcher: batcher.into_boxed(),
+                    epoch,
+                    group: Some((max_batch, max_delay_micros)),
+                }),
+            ),
+        )
+    }
     /// 从严格清单及快照恢复本地批量持久分片；调用方须独占 WAL 和快照目录。
     ///
     /// 先在隔离镜像完成提交前缀重放，成功后才修复尾部和恢复持久追加；不支持备节点持久策略。
@@ -571,6 +844,7 @@ impl Shard {
         validate_durable_directories(wal.as_ref(), manifest.as_ref())?;
         validate_durable_directories(wal.as_ref(), snapshot_dir.as_ref())?;
         validate_durable_directories(manifest.as_ref(), snapshot_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal.as_ref())?;
         let manager = ManifestManager::<FileManifestStorage>::open_recovery(manifest)
             .map_err(|_| ShardError::InvalidConfig)?;
         let records = crate::recovery::recover_snapshot_records_with_genesis(
@@ -641,6 +915,8 @@ impl Shard {
                 trusted.user_capacity,
                 None,
                 Some(LocalDurableCommit {
+                    event_hasher: None,
+                    _wal_lease: Some(wal_lease),
                     batcher,
                     epoch: trusted.primary_epoch,
                     group: Some((max_batch, max_delay_micros)),
@@ -726,6 +1002,8 @@ impl Shard {
     /// 创建可并发克隆的外部生产者句柄。
     pub fn handle(&self) -> ShardHandle {
         ShardHandle {
+            route_gated_at_start: self.route_gated_at_start,
+            route_ready: Arc::clone(&self.route_ready),
             durable_formal: self.durable_formal,
             wal_metrics: self.wal_metrics.clone(),
             primary_lease: self.primary_lease.clone(),
@@ -838,16 +1116,40 @@ fn validate_durable_directories(
     Ok(())
 }
 
+/// 在 WAL 目录的规范父目录中持有独占锁；锁文件必须保持原位。
+fn acquire_wal_directory(wal: &std::path::Path) -> Result<std::fs::File, ShardError> {
+    let wal = std::fs::canonicalize(wal).map_err(|_| ShardError::InvalidConfig)?;
+    let parent = wal.parent().ok_or(ShardError::InvalidConfig)?;
+    let mut name = wal
+        .file_name()
+        .ok_or(ShardError::InvalidConfig)?
+        .to_os_string();
+    name.push(".tide-wal.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(parent.join(name))
+        .map_err(|_| ShardError::InvalidConfig)?;
+    file.try_lock().map_err(|_| ShardError::InvalidConfig)?;
+    Ok(file)
+}
+
 /// 由分片独占的持久写入原语。
 type OwnedAppender = matching_persistence::BoxedDurableAppender;
 /// 支持本地逐条或批量同步提交的 WAL 写入器。
 struct LocalDurableCommit {
+    /// 从创世以来的可续写事件摘要；仅认证复制需要。
+    event_hasher: Option<crate::EventHasher>,
     /// 单写者批处理器。
     batcher: matching_persistence::DurableBatcher<OwnedAppender>,
     /// 启动时固定的主节点纪元。
     epoch: u64,
     /// 可选批量大小和最长等待微秒数；适用于批量持久提交模式。
     group: Option<(usize, u64)>,
+    /// 批处理器关闭后才释放 WAL 排他锁；内存模拟器不使用文件锁。
+    _wal_lease: Option<std::fs::File>,
 }
 impl LocalDurableCommit {
     /// 写入并同步后核对连续提交水位。
@@ -914,6 +1216,7 @@ impl Shard {
         };
         config.validate().map_err(|_| ShardError::InvalidConfig)?;
         validate_durable_directories(wal_dir.as_ref(), manifest_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal_dir.as_ref())?;
         let writer =
             SegmentWriter::new(wal_dir, 64 * 1024 * 1024).map_err(|_| ShardError::InvalidConfig)?;
         let manifest =
@@ -937,6 +1240,8 @@ impl Shard {
                 user_capacity,
                 None,
                 Some(LocalDurableCommit {
+                    event_hasher: None,
+                    _wal_lease: Some(wal_lease),
                     batcher,
                     epoch,
                     group: Some((max_batch, max_delay_micros)),
@@ -992,6 +1297,7 @@ impl Shard {
             books.push((market, book));
         }
         validate_durable_directories(wal_dir.as_ref(), manifest_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal_dir.as_ref())?;
         let writer =
             SegmentWriter::new(wal_dir, 64 * 1024 * 1024).map_err(|_| ShardError::InvalidConfig)?;
         let manifest =
@@ -1015,6 +1321,8 @@ impl Shard {
                 user_capacity,
                 Some(place),
                 Some(LocalDurableCommit {
+                    event_hasher: None,
+                    _wal_lease: Some(wal_lease),
                     batcher,
                     epoch,
                     group: Some((max_batch, max_delay_micros)),
@@ -1062,6 +1370,7 @@ impl Shard {
             allow_data_loss_on_failover: false,
         };
         validate_durable_directories(wal_dir.as_ref(), manifest_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal_dir.as_ref())?;
         let writer =
             SegmentWriter::new(wal_dir, 64 * 1024 * 1024).map_err(|_| ShardError::InvalidConfig)?;
         let manifest =
@@ -1085,6 +1394,8 @@ impl Shard {
                 user_capacity,
                 Some(place),
                 Some(LocalDurableCommit {
+                    event_hasher: None,
+                    _wal_lease: Some(wal_lease),
                     batcher,
                     epoch,
                     group: None,
@@ -1121,6 +1432,7 @@ impl Shard {
         };
         config.validate().map_err(|_| ShardError::InvalidConfig)?;
         validate_durable_directories(wal_dir.as_ref(), manifest_dir.as_ref())?;
+        let wal_lease = acquire_wal_directory(wal_dir.as_ref())?;
         let writer =
             SegmentWriter::new(wal_dir, 64 * 1024 * 1024).map_err(|_| ShardError::InvalidConfig)?;
         let manifest =
@@ -1144,6 +1456,8 @@ impl Shard {
                 user_capacity,
                 None,
                 Some(LocalDurableCommit {
+                    event_hasher: None,
+                    _wal_lease: Some(wal_lease),
                     batcher,
                     epoch,
                     group: None,
@@ -1472,8 +1786,9 @@ impl Shard {
             max_control_inflight: config.max_control_inflight,
         })
         .map_err(|_| ShardError::InvalidConfig)?;
-        let route_snapshot = Arc::new(routes);
-        let worker_routes = Arc::clone(&route_snapshot);
+        let mut worker_routes = Arc::new(routes);
+        let route_snapshot = Arc::new(RwLock::new(Arc::clone(&worker_routes)));
+        let shared_routes = Arc::clone(&route_snapshot);
         let snapshot_origin = Arc::new(());
         let worker_snapshot_origin = Arc::clone(&snapshot_origin);
         let snapshot_writer_active = Arc::new(AtomicBool::new(false));
@@ -1495,6 +1810,12 @@ impl Shard {
         let drop_requested = Arc::new(AtomicBool::new(false));
         let worker_drop = Arc::clone(&drop_requested);
         let durable_formal = durable.is_some() && place_state.is_some();
+        let start_route_paused = config.require_route_authority
+            || place_state
+                .as_ref()
+                .is_some_and(|state| state.config.require_route_authority);
+        let route_ready = Arc::new(AtomicBool::new(!start_route_paused));
+        let worker_route_ready = Arc::clone(&route_ready);
         let wal_metrics = durable.as_ref().map(|gate| gate.batcher.metrics());
         let primary_lease = place_state
             .as_ref()
@@ -1508,6 +1829,7 @@ impl Shard {
                 let clock = LogicalClock::new(now);
                 let mut waiter = Waiter::new(config.wait_strategy);
                 let mut deferred = None;
+                let mut route_paused = start_route_paused;
                 loop {
                     let Some(msg) = deferred.take().or_else(|| consumer.pop()) else {
                         if worker_drop.load(Ordering::Acquire) && consumer.is_closed_and_empty() {
@@ -1518,6 +1840,45 @@ impl Shard {
                     };
                     waiter.reset();
                     match msg {
+                        #[cfg(test)]
+                        Message::TestBlock(entered, release) => {
+                            let _ = entered.send(());
+                            let _ = release.recv();
+                        }
+                        Message::RouteAdmission(paused, reply) => {
+                            route_paused = paused;
+                            worker_route_ready.store(!paused, Ordering::Release);
+                            let _ = reply.send(Ok(()));
+                        }
+                        Message::Mutation(_, _, _, _, reply)
+                            if route_paused || consumer.routes_fenced() =>
+                        {
+                            let _ = reply.send(Err(RejectReason::EngineBusy));
+                        }
+                        Message::Formal(_, reply) if route_paused || consumer.routes_fenced() => {
+                            let _ =
+                                reply.send(Err(FormalError::Rejected(RejectReason::EngineBusy)));
+                        }
+                        Message::InstallRoutes(next, reply) => {
+                            let valid = !next.routes().any(|route| matches!(route.state, RouteState::Migrating { source, target } if source == shard || target == shard))
+                                && worker_routes.routes().filter(|r| r.shard_id == shard)
+                                .all(|old| next.get(old.market_id).is_some_and(|new| {
+                                    new.shard_id == shard && old.state == RouteState::Active
+                                        && new.state == RouteState::Active && new.route_epoch >= old.route_epoch
+                                }))
+                                && next.routes().filter(|r| r.shard_id == shard)
+                                    .all(|new| worker_routes.get(new.market_id).is_some_and(|old| old.shard_id == shard));
+                            let result = if !valid {
+                                Err(ShardError::InvalidConfig)
+                            } else if let Ok(mut visible) = shared_routes.write() {
+                                worker_routes = Arc::new(next);
+                                *visible = Arc::clone(&worker_routes);
+                                Ok(())
+                            } else {
+                                Err(ShardError::Failed)
+                            };
+                            let _ = reply.send(result);
+                        }
                         Message::Formal(command, reply)
                             if durable.as_ref().is_some_and(|gate| gate.group.is_some())
                                 || (durable.is_some() && place_state.is_some()) =>
@@ -1791,6 +2152,7 @@ impl Shard {
                                     })
                                     .transpose()?;
                                 Ok(SnapshotImage {
+                                    replay_route_floor: None,
                                     genesis_baseline: false,
                                     origin: Some(Arc::clone(&worker_snapshot_origin)),
                                     start_allowed: durable.is_none(),
@@ -1885,6 +2247,8 @@ impl Shard {
         });
         let thread = join.thread().clone();
         Ok(Self {
+            route_gated_at_start: start_route_paused,
+            route_ready,
             durable_formal,
             wal_metrics,
             primary_lease,
@@ -2029,8 +2393,14 @@ impl FenceBatchCandidate {
 }
 
 /// 满批或达到等待期限时停止接收当前批次。
-fn group_should_flush(count: usize, limit: usize, now: Instant, deadline: Instant) -> bool {
-    count >= limit || now >= deadline
+fn group_should_flush(
+    count: usize,
+    limit: usize,
+    now: Instant,
+    deadline: Instant,
+    fenced: bool,
+) -> bool {
+    fenced || count >= limit || now >= deadline
 }
 
 /// 顺序规划并提交一批围栏；非正式消息留给工作线程在提交后处理。
@@ -2061,6 +2431,10 @@ fn execute_fence_group(
     let mut deferred = None;
     loop {
         if let Some((command, reply)) = pending.take() {
+            if consumer.routes_fenced() {
+                replies.push((reply, Err(FormalError::Rejected(RejectReason::EngineBusy))));
+                break;
+            }
             let payload = matching_domain::encode_wal_command(&command);
             let result = match payload {
                 Err(_) => Err(FormalError::Rejected(RejectReason::InvalidOrderCombination)),
@@ -2092,7 +2466,7 @@ fn execute_fence_group(
             };
             replies.push((reply, result));
         }
-        if group_should_flush(replies.len(), limit, Instant::now(), deadline) {
+        if group_should_flush(replies.len(), limit, Instant::now(), deadline, false) {
             break;
         }
         match consumer.pop() {
@@ -2105,7 +2479,13 @@ fn execute_fence_group(
             }
             None => {
                 let now = Instant::now();
-                if now >= deadline {
+                if group_should_flush(
+                    replies.len(),
+                    limit,
+                    now,
+                    deadline,
+                    consumer.routes_fenced(),
+                ) {
                     break;
                 }
                 std::thread::park_timeout(deadline.duration_since(now));
@@ -2176,6 +2556,41 @@ struct FormalBatchCandidate {
     place: Option<PlaceRuntimeState>,
 }
 impl FormalBatchCandidate {
+    /// 将批次候选复制为摘要镜像；此镜像不具备快照提交权限。
+    fn digest_image(&self, context: &FormalGroupContext<'_>) -> Result<SnapshotImage, ()> {
+        let place = self
+            .place
+            .as_ref()
+            .map(|state| {
+                Ok::<_, ()>(PlaceRuntimeState {
+                    market_data: state.market_data.clone(),
+                    config: state.config.clone(),
+                    ids: state.ids.try_clone_preallocated()?,
+                    fee_book: state.fee_book.clone(),
+                    shard_kill_active: state.shard_kill_active,
+                })
+            })
+            .transpose()?;
+        Ok(SnapshotImage {
+            replay_route_floor: None,
+            genesis_baseline: false,
+            origin: None,
+            start_allowed: false,
+            request_id: 0,
+            snapshot_seq: self.fence.seq.last_applied(),
+            cluster: context.cluster,
+            shard: context.shard,
+            now: context.now,
+            primary_epoch: self.fence.expected_epoch,
+            routes: Arc::new(context.routes.clone()),
+            markets: self.markets.clone(),
+            managed_markets: self.managed_markets.clone(),
+            registry: self.registry.clone(),
+            user_epochs: self.fence.epochs.try_clone_preallocated()?,
+            dedup: Some(self.fence.dedup.try_clone_preallocated()?),
+            place,
+        })
+    }
     /// 从真实状态构造独立候选；容量预留失败则停止当前批次。
     fn new(context: &FormalGroupContext<'_>, epoch: u64) -> Result<Self, ()> {
         let place = context
@@ -2487,6 +2902,10 @@ fn execute_formal_group(
     let mut deferred = None;
     loop {
         if let Some((command, reply)) = pending.take() {
+            if consumer.routes_fenced() {
+                replies.push((reply, Err(FormalError::Rejected(RejectReason::EngineBusy))));
+                break;
+            }
             let payload = matching_domain::encode_wal_command(&command);
             let result = match payload {
                 Err(_) => candidate.reject_uncodable(&command, context.routes),
@@ -2523,7 +2942,7 @@ fn execute_formal_group(
             };
             replies.push((reply, result));
         }
-        if group_should_flush(replies.len(), limit, Instant::now(), deadline) {
+        if group_should_flush(replies.len(), limit, Instant::now(), deadline, false) {
             break;
         }
         match consumer.pop() {
@@ -2534,7 +2953,13 @@ fn execute_formal_group(
             }
             None => {
                 let now = Instant::now();
-                if now >= deadline {
+                if group_should_flush(
+                    replies.len(),
+                    limit,
+                    now,
+                    deadline,
+                    consumer.routes_fenced(),
+                ) {
                     break;
                 }
                 std::thread::park_timeout(deadline.duration_since(now));
@@ -2552,6 +2977,40 @@ fn execute_formal_group(
         candidate.fence.seq.last_applied(),
         "批量提交水位不连续"
     );
+    if candidate.fence.seq.last_applied() > context.seq.last_applied()
+        && let Some(event_hasher) = gate.event_hasher.as_mut()
+    {
+        for (_, result) in &replies {
+            if let Ok(execution) = result
+                && !execution.deduplicated
+            {
+                for event in &execution.events {
+                    wal_or_halt(
+                        event_hasher
+                            .update(event)
+                            .map_err(|_| std::io::Error::other("事件摘要编码失败")),
+                        DiagnosticKind::WalSync,
+                        Some(execution.command_id),
+                        Some(execution.seq),
+                    );
+                }
+            }
+        }
+        let image = candidate
+            .digest_image(&context)
+            .expect("摘要候选状态分配失败");
+        let state = image
+            .state_digest(256 * 1024 * 1024)
+            .expect("状态摘要编码失败");
+        let events = event_hasher.clone().finish();
+        wal_or_halt(
+            gate.batcher
+                .checkpoint_digest(candidate.fence.seq.last_applied(), state, events),
+            DiagnosticKind::WalSync,
+            None,
+            Some(candidate.fence.seq.last_applied()),
+        );
+    }
     *context.epochs = candidate.fence.epochs;
     *context.dedup = candidate.fence.dedup;
     *context.seq = candidate.fence.seq;
@@ -4735,6 +5194,8 @@ pub struct ShardObservation {
     pub thread_running: bool,
     /// 外部入口尚未关闭。
     pub ingress_open: bool,
+    /// 工作线程已确认路由变更准入开放。
+    pub route_ready: bool,
     /// 分片级熔断开关已激活。
     pub shard_halted: bool,
     /// 工作线程配置中经过启动校验的本机主节点租约仍被持有。
@@ -4792,6 +5253,10 @@ pub struct ShardObservation {
 /// 可克隆的有界生产者，只能投递消息，不可访问撮合状态。
 #[derive(Clone)]
 pub struct ShardHandle {
+    /// 工作线程是否从路由暂停状态启动。
+    route_gated_at_start: bool,
+    /// 工作线程最近确认的路由准入状态。
+    route_ready: Arc<AtomicBool>,
     /// 该入口是否提供正式命令的本地持久回复。
     durable_formal: bool,
     /// 持久写入器的独立时延观测。
@@ -4819,7 +5284,7 @@ pub struct ShardHandle {
     /// 句柄对应的集群身份。
     cluster_id: ClusterId,
     /// 句柄对应的不可变路由快照。
-    routes: Arc<RouteTable>,
+    routes: Arc<RwLock<Arc<RouteTable>>>,
 }
 
 /// 一次顺序查询得到的市场优先级。
@@ -4835,6 +5300,22 @@ pub(crate) struct PriorityObservation {
 }
 
 impl ShardHandle {
+    /// 返回工作线程创建时是否已启用路由暂停。
+    pub(crate) fn route_gated_at_start(&self) -> bool {
+        self.route_gated_at_start
+    }
+    #[cfg(test)]
+    pub(crate) fn block_for_test(
+        &self,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    ) -> Result<(), ShardError> {
+        self.push(Message::TestBlock(entered, release), IngressClass::Control)
+    }
+    #[cfg(test)]
+    pub(crate) fn routes_are_fenced(&self) -> bool {
+        self.producer.routes_are_fenced()
+    }
     /// 请求配置市场的优先级状态。
     pub(crate) fn priority_counts(
         &self,
@@ -4870,6 +5351,7 @@ impl ShardHandle {
         ShardObservation {
             thread_running: self.running.load(Ordering::Acquire),
             ingress_open,
+            route_ready: self.route_ready.load(Ordering::Acquire),
             shard_halted: self.metrics.shard_halted.load(Ordering::Acquire),
             primary_lease_held: self
                 .primary_lease
@@ -4929,9 +5411,82 @@ impl ShardHandle {
     pub(crate) fn cluster_id(&self) -> ClusterId {
         self.cluster_id
     }
+    /// 控制权威退出时关闭此分片的外部入口。
+    pub(crate) fn close_route_ingress(&self) {
+        self.producer.close_ingress();
+        self.thread.unpark();
+    }
+    /// 失权时同时阻止尚未开始处理的队列变更。
+    pub(crate) fn fence_route_ingress(&self) {
+        self.producer.fence_routes();
+        self.close_route_ingress();
+    }
+    /// 入口关闭后等待此前已接受的消息完成；工作线程退出也代表不再执行。
+    pub(crate) fn drain_closed_route_ingress(&self) {
+        loop {
+            if !self.running.load(Ordering::Acquire) {
+                return;
+            }
+            let (tx, rx) = sync_channel(1);
+            let Some(deadline) = Instant::now().checked_add(Duration::from_secs(1)) else {
+                continue;
+            };
+            if self
+                .producer
+                .push_internal_until(Message::Barrier(0, tx), deadline)
+                .is_err()
+            {
+                continue;
+            }
+            self.thread.unpark();
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(_) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if !self.running.load(Ordering::Acquire) =>
+                    {
+                        return;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                }
+            }
+        }
+    }
     /// 读取本句柄绑定的不可变路由快照。
-    pub(crate) fn routes(&self) -> &RouteTable {
-        &self.routes
+    pub(crate) fn routes(&self) -> Result<Arc<RouteTable>, ShardError> {
+        self.routes
+            .read()
+            .map(|routes| Arc::clone(&routes))
+            .map_err(|_| ShardError::Failed)
+    }
+
+    /// 在队列顺序点安装可信路由；本接口不执行市场迁移。
+    pub(crate) fn install_routes(
+        &self,
+        routes: RouteTable,
+    ) -> Result<Receiver<Result<(), ShardError>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::InstallRoutes(routes, tx), IngressClass::Control)?;
+        Ok(rx)
+    }
+
+    /// 暂停此分片的市场变更，队列中更早的操作先完成。
+    pub(crate) fn pause_route_mutations(
+        &self,
+    ) -> Result<Receiver<Result<(), ShardError>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::RouteAdmission(true, tx), IngressClass::Control)?;
+        Ok(rx)
+    }
+
+    /// 在可信路由安装后恢复市场变更。
+    pub(crate) fn resume_route_mutations(
+        &self,
+    ) -> Result<Receiver<Result<(), ShardError>>, ShardError> {
+        let (tx, rx) = sync_channel(1);
+        self.push(Message::RouteAdmission(false, tx), IngressClass::Control)?;
+        Ok(rx)
     }
 
     /// 在线程队列中查询当前订单节点及业务余量。
@@ -6628,6 +7183,7 @@ mod tests {
                 max_query_inflight: 3,
                 max_control_inflight: 3,
                 wait_strategy: WaitStrategy::Park,
+                require_route_authority: false,
             },
         )
         .unwrap();
@@ -7286,6 +7842,8 @@ mod durability_atomicity_tests {
             allow_data_loss_on_failover: false,
         };
         let mut durable = Some(LocalDurableCommit {
+            event_hasher: None,
+            _wal_lease: None,
             batcher: DurableBatcher::new_with_config(appender, config, 7)
                 .unwrap()
                 .into_boxed(),
@@ -7443,13 +8001,14 @@ mod group_sync_tests {
     fn deadline_stops_batch_even_when_more_messages_are_available() {
         let start = Instant::now();
         let deadline = start + Duration::from_micros(10);
-        assert!(!group_should_flush(1, 8, start, deadline));
-        assert!(group_should_flush(1, 8, deadline, deadline));
-        assert!(group_should_flush(8, 8, start, deadline));
+        assert!(!group_should_flush(1, 8, start, deadline, false));
+        assert!(group_should_flush(1, 8, deadline, deadline, false));
+        assert!(group_should_flush(8, 8, start, deadline, false));
+        assert!(group_should_flush(1, 8, start, deadline, true));
     }
     #[test]
     fn single_sync_covers_batch_and_failure_keeps_real_state() {
-        for fail in [false, true] {
+        for (fail, fenced) in [(false, false), (true, false), (false, true)] {
             let syncs = Arc::new(AtomicUsize::new(0));
             let config = DurabilityConfig {
                 profile: Profile::Development,
@@ -7463,6 +8022,8 @@ mod group_sync_tests {
                 allow_data_loss_on_failover: false,
             };
             let mut gate = LocalDurableCommit {
+                event_hasher: None,
+                _wal_lease: None,
                 batcher: DurableBatcher::new_with_config(
                     Probe {
                         syncs: syncs.clone(),
@@ -7497,6 +8058,9 @@ mod group_sync_tests {
             let before = epochs.clone();
             let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
             let mut seq = Sequencer::new();
+            if fenced {
+                producer.fence_routes();
+            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execute_fence_group(
                     (command(1), CommandReply::new(first_tx, None)),
@@ -7507,8 +8071,16 @@ mod group_sync_tests {
                     None,
                 )
             }));
-            assert_eq!(syncs.load(Ordering::SeqCst), 1);
-            if fail {
+            if fenced {
+                assert!(result.is_ok());
+                assert_eq!(seq.last_applied(), 0);
+                assert!(matches!(
+                    first_rx.recv().unwrap(),
+                    Err(FormalError::Rejected(RejectReason::EngineBusy))
+                ));
+                assert!(second_rx.try_recv().is_err());
+            } else if fail {
+                assert_eq!(syncs.load(Ordering::SeqCst), 1);
                 assert!(result.is_err());
                 assert_eq!(epochs, before);
                 assert_eq!(seq.last_applied(), 0);
@@ -7516,6 +8088,7 @@ mod group_sync_tests {
                 assert!(first_rx.recv().is_err());
                 assert!(second_rx.recv().is_err());
             } else {
+                assert_eq!(syncs.load(Ordering::SeqCst), 1);
                 assert!(result.is_ok());
                 assert_eq!(seq.last_applied(), 2);
                 assert_eq!(
@@ -7544,6 +8117,277 @@ mod group_sync_tests {
             }
         }
     }
+    struct FenceAfterAppend(
+        /** 用于在追加后触发栅栏的队列入口。 */ crate::queue::Producer<Message>,
+    );
+    impl DurableAppender for FenceAfterAppend {
+        fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn append(&mut self, _: &WalRecord) -> std::io::Result<()> {
+            self.0.fence_routes();
+            Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fencing_during_batch_stops_next_candidate_without_consuming_sequence() {
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: 4,
+            mutation_reserved_slots: 1,
+            max_query_inflight: 1,
+            max_control_inflight: 1,
+        })
+        .unwrap();
+        let config = DurabilityConfig {
+            profile: Profile::Development,
+            mode: DurabilityMode::GroupCommit {
+                max_batch: 2,
+                max_delay_micros: 100_000,
+            },
+            replication: ReplicationMode::LocalDurable,
+            crash_recovery_required: false,
+            ha_enabled: false,
+            allow_data_loss_on_failover: false,
+        };
+        let mut gate = LocalDurableCommit {
+            event_hasher: None,
+            _wal_lease: None,
+            batcher: DurableBatcher::new_with_config(FenceAfterAppend(producer.clone()), config, 7)
+                .unwrap()
+                .into_boxed(),
+            epoch: 7,
+            group: Some((2, 100_000)),
+        };
+        let (tx1, rx1) = sync_channel(1);
+        let (tx2, rx2) = sync_channel(1);
+        assert!(
+            producer
+                .try_push_classified(
+                    Message::Formal(command(2), CommandReply::new(tx2, None)),
+                    IngressClass::Mutation
+                )
+                .is_ok()
+        );
+        let mut epochs = UserControlEpochs::new(4).unwrap();
+        let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        execute_fence_group(
+            (command(1), CommandReply::new(tx1, None)),
+            &mut consumer,
+            &mut gate,
+            (&mut epochs, &mut dedup, &mut seq),
+            (ShardId(1), ClusterId(1), LogicalTime::new(0)),
+            None,
+        );
+        assert_eq!(rx1.recv().unwrap().unwrap().seq, 1);
+        assert!(matches!(
+            rx2.recv().unwrap(),
+            Err(FormalError::Rejected(RejectReason::EngineBusy))
+        ));
+        assert_eq!(seq.last_applied(), 1);
+        assert_eq!(gate.batcher.committed(), 1);
+        assert!(dedup.lookup(&command(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn fencing_empty_batch_queue_does_not_wait_for_batch_deadline() {
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: 4,
+            mutation_reserved_slots: 1,
+            max_query_inflight: 1,
+            max_control_inflight: 1,
+        })
+        .unwrap();
+        let config = DurabilityConfig {
+            profile: Profile::Development,
+            mode: DurabilityMode::GroupCommit {
+                max_batch: 2,
+                max_delay_micros: 2_000_000,
+            },
+            replication: ReplicationMode::LocalDurable,
+            crash_recovery_required: false,
+            ha_enabled: false,
+            allow_data_loss_on_failover: false,
+        };
+        let mut gate = LocalDurableCommit {
+            event_hasher: None,
+            _wal_lease: None,
+            batcher: DurableBatcher::new_with_config(FenceAfterAppend(producer), config, 7)
+                .unwrap()
+                .into_boxed(),
+            epoch: 7,
+            group: Some((2, 2_000_000)),
+        };
+        let (tx, rx) = sync_channel(1);
+        let mut epochs = UserControlEpochs::new(4).unwrap();
+        let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        let start = Instant::now();
+        execute_fence_group(
+            (command(1), CommandReply::new(tx, None)),
+            &mut consumer,
+            &mut gate,
+            (&mut epochs, &mut dedup, &mut seq),
+            (ShardId(1), ClusterId(1), LogicalTime::new(0)),
+            None,
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "失权后仍等待批次截止时间"
+        );
+        assert_eq!(rx.recv().unwrap().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn fencing_empty_formal_batch_queue_does_not_wait_for_batch_deadline() {
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: 4,
+            mutation_reserved_slots: 1,
+            max_query_inflight: 1,
+            max_control_inflight: 1,
+        })
+        .unwrap();
+        let config = DurabilityConfig {
+            profile: Profile::Development,
+            mode: DurabilityMode::GroupCommit {
+                max_batch: 2,
+                max_delay_micros: 2_000_000,
+            },
+            replication: ReplicationMode::LocalDurable,
+            crash_recovery_required: false,
+            ha_enabled: false,
+            allow_data_loss_on_failover: false,
+        };
+        let mut gate = LocalDurableCommit {
+            event_hasher: None,
+            _wal_lease: None,
+            batcher: DurableBatcher::new_with_config(FenceAfterAppend(producer), config, 7)
+                .unwrap()
+                .into_boxed(),
+            epoch: 7,
+            group: Some((2, 2_000_000)),
+        };
+        let (tx, rx) = sync_channel(1);
+        let mut epochs = UserControlEpochs::new(4).unwrap();
+        let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        let mut markets = BTreeMap::new();
+        let mut managed_markets = BTreeMap::new();
+        let mut registry = Some(ReservationRegistry::new([]).unwrap());
+        let mut place = None;
+        let routes = RouteTable::new([]).unwrap();
+        let start = Instant::now();
+        execute_formal_group(
+            (command(1), CommandReply::new(tx, None)),
+            &mut consumer,
+            &mut gate,
+            FormalGroupContext {
+                epochs: &mut epochs,
+                dedup: &mut dedup,
+                seq: &mut seq,
+                markets: &mut markets,
+                managed_markets: &mut managed_markets,
+                registry: &mut registry,
+                place: &mut place,
+                routes: &routes,
+                shard: ShardId(1),
+                cluster: ClusterId(1),
+                now: LogicalTime::new(0),
+                metrics: None,
+            },
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "失权后仍等待批次截止时间"
+        );
+        assert_eq!(rx.recv().unwrap().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn fenced_formal_batch_rejects_before_sequence_and_wal() {
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let config = DurabilityConfig {
+            profile: Profile::Development,
+            mode: DurabilityMode::GroupCommit {
+                max_batch: 2,
+                max_delay_micros: 100_000,
+            },
+            replication: ReplicationMode::LocalDurable,
+            crash_recovery_required: false,
+            ha_enabled: false,
+            allow_data_loss_on_failover: false,
+        };
+        let mut gate = LocalDurableCommit {
+            event_hasher: None,
+            _wal_lease: None,
+            batcher: DurableBatcher::new_with_config(
+                Probe {
+                    syncs: syncs.clone(),
+                    fail: false,
+                },
+                config,
+                7,
+            )
+            .unwrap()
+            .into_boxed(),
+            epoch: 7,
+            group: Some((2, 100_000)),
+        };
+        let (producer, mut consumer) = bounded_queue_with_limits(IngressLimits {
+            capacity: 4,
+            mutation_reserved_slots: 1,
+            max_query_inflight: 1,
+            max_control_inflight: 1,
+        })
+        .unwrap();
+        let (tx, rx) = sync_channel(1);
+        let mut epochs = UserControlEpochs::new(4).unwrap();
+        let before = epochs.clone();
+        let mut dedup = DedupWindow::new(IdempotencyConfig::default()).unwrap();
+        let mut seq = Sequencer::new();
+        let mut markets = BTreeMap::new();
+        let mut managed_markets = BTreeMap::new();
+        let mut registry = Some(ReservationRegistry::new([]).unwrap());
+        let registry_before = registry.clone();
+        let mut place = None;
+        let routes = RouteTable::new([]).unwrap();
+        producer.fence_routes();
+        let deferred = execute_formal_group(
+            (command(1), CommandReply::new(tx, None)),
+            &mut consumer,
+            &mut gate,
+            FormalGroupContext {
+                epochs: &mut epochs,
+                dedup: &mut dedup,
+                seq: &mut seq,
+                markets: &mut markets,
+                managed_markets: &mut managed_markets,
+                registry: &mut registry,
+                place: &mut place,
+                routes: &routes,
+                shard: ShardId(1),
+                cluster: ClusterId(1),
+                now: LogicalTime::new(0),
+                metrics: None,
+            },
+        );
+        assert!(deferred.is_none());
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Err(FormalError::Rejected(RejectReason::EngineBusy))
+        ));
+        assert_eq!(seq.last_applied(), 0);
+        assert_eq!(gate.batcher.committed(), 0);
+        assert_eq!(syncs.load(Ordering::SeqCst), 0);
+        assert_eq!(epochs, before);
+        assert_eq!(registry, registry_before);
+        assert!(dedup.lookup(&command(1)).unwrap().is_none());
+    }
+
     #[test]
     fn synced_prefix_then_failure_installs_no_candidate_state() {
         let syncs = Arc::new(AtomicUsize::new(0));
@@ -7559,6 +8403,8 @@ mod group_sync_tests {
             allow_data_loss_on_failover: false,
         };
         let mut gate = LocalDurableCommit {
+            event_hasher: None,
+            _wal_lease: None,
             batcher: DurableBatcher::new_with_config(PrefixProbe(syncs.clone()), config, 7)
                 .unwrap()
                 .into_boxed(),
@@ -7697,6 +8543,7 @@ pub(crate) fn empty_recovery_candidate(
     let registry =
         ReservationRegistry::new([]).map_err(|_| std::io::Error::other("预留基线无效"))?;
     let image = SnapshotImage {
+        replay_route_floor: None,
         genesis_baseline: true,
         origin: None,
         start_allowed: false,
@@ -7729,6 +8576,31 @@ pub(crate) fn replay_snapshot_records(
     candidate: SnapshotRecoveryCandidate,
     records: Vec<crate::RecoveredCommand>,
 ) -> std::io::Result<crate::SnapshotReplayResult> {
+    replay_snapshot_records_inner(candidate, records, None, None)
+}
+
+/// 以外围核验过的写者纪元为上界重放旧纪元的连续前缀。
+pub(crate) fn replay_replicated_snapshot_records(
+    candidate: SnapshotRecoveryCandidate,
+    records: Vec<crate::RecoveredCommand>,
+    epoch: u64,
+    checkpoint: Option<crate::ReplayCheckpoint>,
+) -> std::io::Result<crate::SnapshotReplayResult> {
+    if epoch == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "写者纪元为零",
+        ));
+    }
+    replay_snapshot_records_inner(candidate, records, Some(epoch), checkpoint)
+}
+
+fn replay_snapshot_records_inner(
+    candidate: SnapshotRecoveryCandidate,
+    records: Vec<crate::RecoveredCommand>,
+    replicated_epoch: Option<u64>,
+    checkpoint: Option<crate::ReplayCheckpoint>,
+) -> std::io::Result<crate::SnapshotReplayResult> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut image = candidate.image;
         let mut seq = Sequencer::from_last_applied(image.snapshot_seq)
@@ -7740,6 +8612,7 @@ pub(crate) fn replay_snapshot_records(
             .try_reserve(records.len())
             .map_err(|_| std::io::Error::other("重放结果容量不足"))?;
         let mut event_hasher = crate::EventHasher::new();
+        let mut checkpoint_seen = checkpoint.is_none();
         let lease_epoch = image
             .place
             .as_ref()
@@ -7750,11 +8623,35 @@ pub(crate) fn replay_snapshot_records(
                     .ok()
                     .map(|()| lease.epoch())
             });
+        if replicated_epoch.is_some() && lease_epoch.is_some() && replicated_epoch != lease_epoch {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "恢复纪元与本地租约不一致",
+            ));
+        }
+        let lease_epoch = replicated_epoch.or(lease_epoch);
+        if !image.genesis_baseline && lease_epoch.is_some_and(|epoch| image.primary_epoch > epoch) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "快照纪元超过恢复写权",
+            ));
+        }
         let mut previous_epoch = if image.genesis_baseline && lease_epoch.is_some() {
             None
         } else {
             Some(image.primary_epoch)
         };
+        let mut previous_routes: BTreeMap<MarketId, u64> = image
+            .replay_route_floor
+            .as_ref()
+            .map(|routes| {
+                routes
+                    .routes()
+                    .filter(|route| route.shard_id == image.shard)
+                    .map(|route| (route.market_id, route.route_epoch))
+                    .collect()
+            })
+            .unwrap_or_default();
         for record in records {
             let epoch_valid = if let Some(limit) = lease_epoch {
                 record.epoch > 0
@@ -7798,6 +8695,43 @@ pub(crate) fn replay_snapshot_records(
                 event_capacity: u64::from(u32::MAX) + 1,
             };
             let command = record.command;
+            // 路由校验发生在写入 WAL 之前；重放使用记录中的历史版本，仍约束当前可信所有权与版本上限。
+            let replay_routes = if let Some(market) = command.market_id {
+                let epoch = command.route_epoch.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "已提交命令重放时被前置拒绝：缺少路由版本",
+                    )
+                })?;
+                let current = image.routes.get(market).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "已提交命令重放时被前置拒绝：市场路由不存在",
+                    )
+                })?;
+                if current.shard_id != image.shard
+                    || current.state != RouteState::Active
+                    || epoch > current.route_epoch
+                    || previous_routes
+                        .get(&market)
+                        .is_some_and(|previous| epoch < *previous)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "已提交命令重放时被前置拒绝：路由所有权或版本无效",
+                    ));
+                }
+                previous_routes.insert(market, epoch);
+                RouteTable::new(image.routes.routes().copied().map(|mut route| {
+                    if route.market_id == market {
+                        route.route_epoch = epoch;
+                    }
+                    route
+                }))
+                .map_err(|_| std::io::Error::other("重放路由重复"))?
+            } else {
+                (*image.routes).clone()
+            };
             let mut result = match &command.payload {
                 Command::ShardKillSwitch(_) => {
                     let window = image.dedup.as_mut().ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
@@ -7805,7 +8739,7 @@ pub(crate) fn replay_snapshot_records(
                 }
                 Command::UpdateFeeSchedule(_) => {
                     let window = image.dedup.as_mut().ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
-                    execute_fee_schedule_update(identity, &image.routes, &mut seq, &clock, window,
+                    execute_fee_schedule_update(identity, &replay_routes, &mut seq, &clock, window,
                         FeeUpdateState { place: &mut image.place, managed_markets: &image.managed_markets,
                             markets: &image.markets, registry: &image.registry }, command)
                 }
@@ -7827,7 +8761,7 @@ pub(crate) fn replay_snapshot_records(
                     execute_market_management(
                         MarketManagementContext {
                             identity,
-                            routes: &image.routes,
+                            routes: &replay_routes,
                             seq: &mut seq,
                             clock: &clock,
                             markets: &mut image.markets,
@@ -7867,8 +8801,7 @@ pub(crate) fn replay_snapshot_records(
                     let epoch = command
                         .route_epoch
                         .ok_or_else(|| std::io::Error::other("重放下单缺少路由版本"))?;
-                    image
-                        .routes
+                    replay_routes
                         .validate(market, image.shard, epoch)
                         .map_err(|_| std::io::Error::other("重放下单路由无效"))?;
                     image
@@ -7917,7 +8850,7 @@ pub(crate) fn replay_snapshot_records(
                         .as_mut()
                         .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
                     execute_formal_guarded(
-                        &image.routes,
+                        &replay_routes,
                         identity,
                         &mut seq,
                         &clock,
@@ -7966,7 +8899,34 @@ pub(crate) fn replay_snapshot_records(
                     .map_err(|_| std::io::Error::other("重放事件摘要编码失败"))?;
             }
             image.snapshot_seq = result.seq;
+            if let Some(checkpoint) = checkpoint
+                && result.seq == checkpoint.shard_seq
+            {
+                let digest = image
+                    .state_digest(checkpoint.max_state_bytes)
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "检查点状态摘要编码失败",
+                        )
+                    })?;
+                if digest != checkpoint.state_digest
+                    || event_hasher.clone().finish() != checkpoint.event_hash
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "重放检查点摘要不一致",
+                    ));
+                }
+                checkpoint_seen = true;
+            }
             executions.push(result);
+        }
+        if !checkpoint_seen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "重放未到达检查点",
+            ));
         }
         if seq.last_applied() != candidate.committed_through {
             return Err(std::io::Error::new(
@@ -7974,15 +8934,19 @@ pub(crate) fn replay_snapshot_records(
                 "重放未覆盖持久前缀",
             ));
         }
-        if let Some(epoch) = lease_epoch {
+        if replicated_epoch.is_none()
+            && let Some(epoch) = lease_epoch
+        {
             image.primary_epoch = epoch;
         }
         image.start_allowed = true;
         image.genesis_baseline = false;
+        image.replay_route_floor = None;
         Ok(crate::SnapshotReplayResult {
             image,
             executions,
-            event_hash: event_hasher.finish(),
+            event_hash: event_hasher.clone().finish(),
+            event_hasher,
         })
     }));
     result.map_err(|_| std::io::Error::other("重放触发内部不变量失败"))?

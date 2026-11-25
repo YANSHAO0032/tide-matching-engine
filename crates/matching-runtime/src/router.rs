@@ -39,7 +39,7 @@ impl Router {
         let mut shards = BTreeMap::new();
         for (id, handle) in handles {
             if handle.shard_id() != id
-                || handle.routes() != &routes
+                || handle.routes().map_err(RouterError::Shard)?.as_ref() != &routes
                 || shards.insert(id, handle).is_some()
             {
                 return Err(RouterError::InvalidConfig);
@@ -58,7 +58,7 @@ impl Router {
         Ok(Self { routes, shards })
     }
 
-    /// 使用显式路由投递变更；调用方版本原样传给目标分片复核。
+    /// 使用固定所有权定位分片，再按当前快照检查版本；目标分片继续复核。
     pub fn submit(
         &self,
         command_id: CommandId,
@@ -70,12 +70,15 @@ impl Router {
             .routes
             .get(market)
             .ok_or(RouterError::Rejected(RejectReason::StaleRouteEpoch))?;
-        self.routes
+        let shard = self
+            .shards
+            .get(&route.shard_id)
+            .ok_or(RouterError::InvalidConfig)?;
+        let current = shard.routes().map_err(RouterError::Shard)?;
+        current
             .validate(market, route.shard_id, epoch)
             .map_err(RouterError::Rejected)?;
-        self.shards
-            .get(&route.shard_id)
-            .ok_or(RouterError::InvalidConfig)?
+        shard
             .submit(command_id, market, epoch, mutation)
             .map_err(RouterError::Shard)
     }
@@ -101,6 +104,218 @@ mod tests {
             price: Price::try_new(100).unwrap(),
             qty: Qty::try_new(1).unwrap(),
         }
+    }
+
+    fn retry<T>(mut operation: impl FnMut() -> Result<T, ShardError>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match operation() {
+                Ok(value) => return value,
+                Err(ShardError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                Err(error) => panic!("分片入口失败: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn route_barrier_rejects_mutations_until_resumed() {
+        let routes = RouteTable::new([MarketRoute {
+            market_id: MarketId(10),
+            shard_id: ShardId(2),
+            route_epoch: 1,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        let mut shard = Shard::start(
+            ShardId(2),
+            ClusterId(2004),
+            routes,
+            vec![(
+                MarketId(10),
+                ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap()),
+            )],
+        )
+        .unwrap();
+        let handle = shard.handle();
+        retry(|| handle.pause_route_mutations())
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let rejected =
+            retry(|| handle.submit(CommandId(1), MarketId(10), 1, Mutation::Place(order(1))))
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        assert!(matches!(rejected, Err(RejectReason::EngineBusy)));
+        let fence = matching_domain::CommandEnvelope {
+            command_id: CommandId(2),
+            session_id: 1,
+            client_seq: 1,
+            market_id: None,
+            user_id: Some(UserId(1)),
+            route_epoch: None,
+            client_timestamp: None,
+            received_at_unix_ns: None,
+            payload: matching_domain::Command::ApplyUserControlFenceShard(
+                matching_domain::ApplyUserControlFenceShard {
+                    parent_command_id: CommandId(2),
+                    user_id: UserId(1),
+                    new_epoch: 1,
+                    action: matching_domain::UserFenceAction::FenceOnly,
+                    expected_primary_epoch: 1,
+                },
+            ),
+        };
+        let formal = retry(|| handle.submit_command(fence.clone()))
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(
+            formal,
+            Err(crate::FormalError::Rejected(RejectReason::EngineBusy))
+        ));
+        retry(|| handle.resume_route_mutations())
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let result =
+            retry(|| handle.submit(CommandId(1), MarketId(10), 1, Mutation::Place(order(1))))
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+        assert_eq!(result.seq, 1);
+        shard.shutdown(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn router_accepts_current_epoch_after_route_refresh() {
+        let make_routes = |epoch| {
+            RouteTable::new([MarketRoute {
+                market_id: MarketId(10),
+                shard_id: ShardId(2),
+                route_epoch: epoch,
+                state: RouteState::Active,
+            }])
+            .unwrap()
+        };
+        let mut shard = Shard::start(
+            ShardId(2),
+            ClusterId(2010),
+            make_routes(1),
+            vec![(
+                MarketId(10),
+                ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap()),
+            )],
+        )
+        .unwrap();
+        let handle = shard.handle();
+        let router = Router::new(make_routes(1), [(ShardId(2), handle.clone())]).unwrap();
+        retry(|| handle.install_routes(make_routes(2)))
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            router.submit(CommandId(1), MarketId(10), 1, Mutation::Place(order(1))),
+            Err(RouterError::Rejected(RejectReason::StaleRouteEpoch))
+        ));
+        let result = router
+            .submit(CommandId(1), MarketId(10), 2, Mutation::Place(order(1)))
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.seq, 1);
+        shard.shutdown(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn route_refresh_is_ordered_with_mutations_without_consuming_sequence() {
+        let make_routes = |epoch| {
+            RouteTable::new([MarketRoute {
+                market_id: MarketId(10),
+                shard_id: ShardId(2),
+                route_epoch: epoch,
+                state: RouteState::Active,
+            }])
+            .unwrap()
+        };
+        let mut shard = Shard::start(
+            ShardId(2),
+            ClusterId(2003),
+            make_routes(7),
+            vec![(
+                MarketId(10),
+                ProductionOrderBook::new(QueuePriorityPolicy::try_new(1024).unwrap()),
+            )],
+        )
+        .unwrap();
+        let handle = shard.handle();
+        let first =
+            retry(|| handle.submit(CommandId(1), MarketId(10), 7, Mutation::Place(order(1))));
+        let refresh = retry(|| handle.install_routes(make_routes(8)));
+        let stale =
+            retry(|| handle.submit(CommandId(2), MarketId(10), 7, Mutation::Place(order(2))));
+        assert_eq!(
+            first
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .seq,
+            1
+        );
+        refresh
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stale.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(RejectReason::StaleRouteEpoch)
+        ));
+        let second =
+            retry(|| handle.submit(CommandId(2), MarketId(10), 8, Mutation::Place(order(2))))
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+        assert_eq!(second.seq, 2);
+        assert!(matches!(
+            retry(|| handle.install_routes(make_routes(7)))
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Err(ShardError::InvalidConfig)
+        ));
+        let reassigned = RouteTable::new([MarketRoute {
+            market_id: MarketId(10),
+            shard_id: ShardId(3),
+            route_epoch: 9,
+            state: RouteState::Active,
+        }])
+        .unwrap();
+        assert!(matches!(
+            retry(|| handle.install_routes(reassigned.clone()))
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Err(ShardError::InvalidConfig)
+        ));
+        let migrating = RouteTable::new([
+            *make_routes(8).get(MarketId(10)).unwrap(),
+            MarketRoute {
+                market_id: MarketId(11),
+                shard_id: ShardId(3),
+                route_epoch: 1,
+                state: RouteState::Migrating {
+                    source: ShardId(3),
+                    target: ShardId(2),
+                },
+            },
+        ])
+        .unwrap();
+        assert!(matches!(
+            retry(|| handle.install_routes(migrating.clone()))
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Err(ShardError::InvalidConfig)
+        ));
+        shard.shutdown(Duration::from_secs(2)).unwrap();
     }
 
     #[test]
