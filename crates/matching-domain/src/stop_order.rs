@@ -36,7 +36,7 @@ pub struct StopLimitOrder {
     pub stp_key: crate::StpKey,
     /// 触发 child 继承的吃单方自成交防护策略。
     pub stp_mode: crate::StpMode,
-    /// 接收阶段锁定、触发拒绝时必须释放的预留 ID。
+    /// 接收时锁定的预留 ID，触发被拒后用于定位待释放的资金。
     pub reservation_id: ReservationId,
     /// 接收阶段固定的费率版本。
     pub fee_schedule_version: u64,
@@ -59,7 +59,7 @@ pub struct StopLimitOrder {
 pub struct StopMarketOrder {
     /// 决定本单触发集合的持久价格来源。
     pub trigger_reference: crate::PriceReferenceKind,
-    /// 触发时以该来源价格冻结并执行的市价保护。
+    /// 子订单的用户价格保护参数。整条触发级联沿用根命令开始时冻结的参考价。
     pub market_protection: Option<crate::MarketProtection>,
     /// 订单唯一标识符。
     pub order_id: OrderId,
@@ -69,7 +69,7 @@ pub struct StopMarketOrder {
     pub stp_key: crate::StpKey,
     /// 触发 child 继承的吃单方自成交防护策略。
     pub stp_mode: crate::StpMode,
-    /// 接收阶段锁定、触发拒绝时必须释放的预留 ID。
+    /// 接收时锁定的预留 ID，触发被拒后用于定位待释放的资金。
     pub reservation_id: ReservationId,
     /// 接收阶段固定的费率版本。
     pub fee_schedule_version: u64,

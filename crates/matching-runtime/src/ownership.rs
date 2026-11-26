@@ -45,6 +45,25 @@ impl MarketOwnership {
         }
         Some(Self { shard, markets })
     }
+    /// 在工作线程停写时一次更新市场认领；冲突保留原有登记。
+    pub(crate) fn replace(&mut self, markets: impl Iterator<Item = MarketId>) -> bool {
+        let next: Vec<_> = markets.map(|id| (self.shard.0, id)).collect();
+        let mut active = active().lock().expect("市场所有权锁损坏");
+        if next
+            .iter()
+            .any(|key| active.markets.contains(key) && !self.markets.contains(key))
+        {
+            return false;
+        }
+        for key in self.markets.drain(..) {
+            assert!(active.markets.remove(&key));
+        }
+        for key in &next {
+            assert!(active.markets.insert(*key));
+        }
+        self.markets = next;
+        true
+    }
 }
 
 impl Drop for MarketOwnership {

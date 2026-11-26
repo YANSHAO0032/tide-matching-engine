@@ -463,6 +463,11 @@ pub struct FeedBuilder {
 }
 
 impl FeedBuilder {
+    /// 借用完整逐订单状态以核对同一迁移屏障的两个投影。
+    pub(crate) fn mbo_view(&self) -> &MboBuilder {
+        &self.mbo
+    }
+
     /// 读取构建器所属市场，不修改行情状态。
     pub fn market_id(&self) -> MarketId {
         self.market

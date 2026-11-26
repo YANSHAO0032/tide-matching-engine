@@ -65,6 +65,26 @@ impl RouteTable {
         self.routes.values()
     }
 
+    /// 通用途径仅能推进既有活动路由的纪元；所有权和迁移阶段须由迁移流程提交。
+    pub fn allows_epoch_update(&self, next: &Self) -> bool {
+        self.routes.len() == next.routes.len()
+            && self.routes().all(|old| {
+                next.get(old.market_id).is_some_and(|new| {
+                    old.state == RouteState::Active
+                        && new.state == RouteState::Active
+                        && new.shard_id == old.shard_id
+                        && new.route_epoch >= old.route_epoch
+                })
+            })
+    }
+
+    /// 判断分片是否为当前任一迁移的源或目标。参与分片据此暂停全部业务变更。
+    pub(crate) fn migration_participant(&self, shard: ShardId) -> bool {
+        self.routes().any(|route| {
+            matches!(route.state, RouteState::Migrating { source, target } if shard == source || shard == target)
+        })
+    }
+
     /// 分配序号前检查状态、所有权及调用方携带的版本。
     pub fn validate(
         &self,
@@ -73,10 +93,14 @@ impl RouteTable {
         route_epoch: u64,
     ) -> Result<(), RejectReason> {
         let route = self.get(market_id).ok_or(RejectReason::StaleRouteEpoch)?;
-        if matches!(route.state, RouteState::Migrating { .. }) {
+        if route.route_epoch != route_epoch {
+            return Err(RejectReason::StaleRouteEpoch);
+        }
+        if matches!(route.state, RouteState::Migrating { source, target } if shard_id == source || shard_id == target)
+        {
             return Err(RejectReason::MigrationInProgress);
         }
-        if route.shard_id != shard_id || route.route_epoch != route_epoch {
+        if route.shard_id != shard_id || route.state != RouteState::Active {
             return Err(RejectReason::StaleRouteEpoch);
         }
         Ok(())
@@ -122,6 +146,10 @@ mod tests {
             target: ShardId(4),
         };
         let table = RouteTable::new([route]).unwrap();
+        assert_eq!(
+            table.validate(MarketId(7), ShardId(3), 7),
+            Err(RejectReason::StaleRouteEpoch)
+        );
         assert_eq!(
             table.validate(MarketId(7), ShardId(3), 8),
             Err(RejectReason::MigrationInProgress)

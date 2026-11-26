@@ -1,4 +1,4 @@
-//! 单机可信目录中的持久路由日志；不提供跨主机复制。
+//! 单机持久路由日志、路由权威接口，以及向分片安装权威路由的协调器。
 use crate::{MarketRoute, RouteState, RouteTable};
 use matching_domain::{
     ClusterId, MarketId, ShardId,
@@ -12,6 +12,33 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
+
+mod migration;
+use migration::MigrationAction;
+pub(crate) use migration::MigrationRoutes;
+
+/// 绑定权威版本、集群和已核验新表的迁移写入许可，只能由本进程的协调器创建。
+pub struct MigrationRouteChange<'a> {
+    /// 已核对的集群。
+    cluster: ClusterId,
+    /// 先前线性一致读取的权威版本。
+    expected: u64,
+    /// 只能写入此份完整路由表。
+    routes: &'a RouteTable,
+}
+
+impl MigrationRouteChange<'_> {
+    /// 校验适配器绑定的集群后，取得一次比较写入的版本与快照。
+    pub fn for_cluster(&self, cluster: ClusterId) -> io::Result<(u64, &RouteTable)> {
+        if self.cluster != cluster {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "迁移路由集群不匹配",
+            ));
+        }
+        Ok((self.expected, self.routes))
+    }
+}
 
 /// 单进程持有的持久路由权威；仅适用于可信单机文件系统。
 pub struct RouteControlStore {
@@ -307,6 +334,14 @@ pub trait RouteAuthority: Send + 'static {
     }
     /// 比较版本并原子持久化新路由；失败必须显式返回。
     fn compare_and_swap(&mut self, expected: u64, routes: RouteTable) -> io::Result<u64>;
+
+    /// 持久化协调器核验的迁移阶段；未支持迁移的适配器拒绝该操作。
+    fn commit_migration(&mut self, _change: MigrationRouteChange<'_>) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "路由权威未支持迁移",
+        ))
+    }
 }
 
 /// 单机权威的封装；只能由协调器构建。
@@ -335,7 +370,18 @@ impl RouteAuthority for LocalRouteAuthority {
     }
 
     fn compare_and_swap(&mut self, expected: u64, routes: RouteTable) -> io::Result<u64> {
+        if !self.0.read()?.1.allows_epoch_update(&routes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "所有权变更须由迁移流程提交",
+            ));
+        }
         self.0.compare_and_swap(expected, routes)
+    }
+
+    fn commit_migration(&mut self, change: MigrationRouteChange<'_>) -> io::Result<u64> {
+        let (expected, routes) = change.for_cluster(self.cluster_id())?;
+        self.0.compare_and_swap(expected, routes.clone())
     }
 }
 
@@ -357,6 +403,8 @@ pub struct RouteCoordinator<A: RouteAuthority = LocalRouteAuthority> {
 
 /// 在外围周期核验路由权威的线程句柄。
 pub struct RouteMonitor {
+    /// 监视线程实际管理的分片，供迁移定位同一工作线程。
+    shards: Vec<crate::ShardHandle>,
     /// 通知线程结束的有界通道。
     stop: std::sync::mpsc::SyncSender<MonitorCommand>,
     /// 核验线程；退出后协调器负责关闭并排空入口。
@@ -366,6 +414,17 @@ pub struct RouteMonitor {
 enum MonitorCommand {
     /// 停止权威监视线程。
     Stop,
+    /// 在续约线程中核验身份并执行单次迁移路由操作。
+    Migration {
+        /// 绑定集群、市场、源和目标的迁移身份。
+        id: crate::MigrationId,
+        /// 当前请求的路由阶段。
+        action: MigrationAction,
+        /// 控制消息可等待的时间。
+        timeout: Duration,
+        /// 返回权威路由或失败原因。
+        reply: std::sync::mpsc::SyncSender<io::Result<MarketRoute>>,
+    },
     /// 在监视线程持有权威期间更新路由。
     Update(
         /// 预期的当前路由版本。
@@ -385,9 +444,20 @@ impl RouteMonitor {
         if timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "更新时间为零"));
         }
+        self.request(timeout, |reply| {
+            MonitorCommand::Update(expected, routes, timeout, reply)
+        })
+    }
+
+    /// 投递一次权威操作并等待确认，超时后只允许核对持久结果。
+    fn request<T>(
+        &self,
+        timeout: Duration,
+        command: impl FnOnce(std::sync::mpsc::SyncSender<io::Result<T>>) -> MonitorCommand,
+    ) -> io::Result<T> {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         self.stop
-            .try_send(MonitorCommand::Update(expected, routes, timeout, reply))
+            .try_send(command(reply))
             .map_err(|error| match error {
                 std::sync::mpsc::TrySendError::Full(_) => {
                     io::Error::new(io::ErrorKind::WouldBlock, "路由监视入口繁忙")
@@ -500,32 +570,34 @@ impl<A: RouteAuthority> RouteCoordinator<A> {
                             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                             Ok(MonitorCommand::Update(expected, routes, timeout, reply)) => {
                                 let result = self.update_inner(expected, routes, timeout);
-                                let failed = self.failed;
                                 let _ = reply.send(result);
-                                if failed {
-                                    break;
-                                }
-                                let renewed =
-                                    self.store.as_mut().expect("协调器持有路由权威").renew();
-                                if renewed.is_err() {
-                                    self.fence_ingress();
-                                    break;
-                                }
-                                if self.verify_authority().is_err() {
-                                    break;
-                                }
                             }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                let renewed =
-                                    self.store.as_mut().expect("协调器持有路由权威").renew();
-                                if renewed.is_err() {
-                                    self.fence_ingress();
-                                    break;
-                                }
-                                if self.verify_authority().is_err() {
-                                    break;
-                                }
+                            Ok(MonitorCommand::Migration {
+                                id,
+                                action,
+                                timeout,
+                                reply,
+                            }) => {
+                                let result = self.apply_migration(id, action, timeout);
+                                let _ = reply.send(result);
                             }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        if self.failed {
+                            break;
+                        }
+                        if self
+                            .store
+                            .as_mut()
+                            .expect("协调器持有路由权威")
+                            .renew()
+                            .is_err()
+                        {
+                            self.fence_ingress();
+                            break;
+                        }
+                        if self.verify_authority().is_err() {
+                            break;
                         }
                     }
                 }));
@@ -546,6 +618,7 @@ impl<A: RouteAuthority> RouteCoordinator<A> {
         }
         Ok(RouteMonitor {
             stop,
+            shards: monitor_shards,
             join: Some(join),
         })
     }
@@ -617,12 +690,12 @@ impl<A: RouteAuthority> RouteCoordinator<A> {
                 return Err(invalid());
             }
         }
-        if routes.routes().any(|route| {
-            !shards
-                .iter()
-                .any(|shard| shard.shard_id() == route.shard_id)
-                || route.state != RouteState::Active
-        }) {
+        let contains = |id| shards.iter().any(|shard| shard.shard_id() == id);
+        if routes.routes().filter(|r| r.state != RouteState::Active).count() > 1
+            || routes.routes().any(|r| !contains(r.shard_id)
+                || matches!(r.state, RouteState::Migrating { source, target }
+                    if r.shard_id != source || source == target || !contains(target) || r.route_epoch == 0))
+        {
             return Err(invalid());
         }
         let authority = claim.authority.as_mut().expect("启动守卫持有权威");
@@ -729,48 +802,78 @@ impl<A: RouteAuthority> RouteCoordinator<A> {
                 "路由版本不匹配",
             ));
         }
-        if current.routes().count() != routes.routes().count()
-            || current.routes().any(|old| {
-                routes.get(old.market_id).is_none_or(|new| {
-                    new.shard_id != old.shard_id
-                        || new.state != RouteState::Active
-                        || old.state != RouteState::Active
-                        || new.route_epoch < old.route_epoch
-                })
-            })
-        {
+        if !current.allows_epoch_update(&routes) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "本入口不支持所有权变更",
             ));
         }
+        self.publish_routes(expected, &current, routes, timeout, None, None)
+    }
+
+    /// 暂停受影响的分片，确认持久转换后让所有分片看到同一份完整路由。
+    fn publish_routes(
+        &mut self,
+        expected: u64,
+        previous: &RouteTable,
+        routes: RouteTable,
+        timeout: Duration,
+        participants: Option<(ShardId, ShardId)>,
+        prefixes: Option<(u64, u64)>,
+    ) -> io::Result<u64> {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(invalid)?;
+        let participating = |shard: &&crate::ShardHandle| {
+            participants.is_none_or(|(source, target)| {
+                shard.shard_id() == source || shard.shard_id() == target
+            })
+        };
         self.failed = true;
         let result = (|| {
-            for shard in &self.shards {
+            for shard in self.shards.iter().filter(participating) {
                 await_control(deadline, || shard.pause_route_mutations())?;
             }
-            let revision = self
-                .store
-                .as_mut()
-                .expect("协调器持有路由权威")
-                .compare_and_swap(expected, routes.clone())?;
-            let (confirmed_revision, confirmed_routes) =
-                self.store.as_ref().expect("协调器持有路由权威").load()?;
-            if revision <= expected || confirmed_revision != revision || confirmed_routes != routes
+            // 停写前可能有在途命令。任一水位变化就恢复原路由，调用方重新预检。
+            let mut checked = true;
+            if let (Some((source, target)), Some((source_seq, target_seq))) =
+                (participants, prefixes)
             {
-                return Err(io::Error::other("路由权威未确认预期版本"));
+                for (id, seq) in [(source, source_seq), (target, target_seq)] {
+                    let handle = self.migration_shard(id)?;
+                    let (_, applied) = await_reply(deadline, || handle.barrier(0))?;
+                    checked &= applied == seq;
+                }
             }
-            for shard in &self.shards {
-                await_control(deadline, || shard.install_routes(routes.clone()))?;
-            }
-            let authority = self.store.as_mut().expect("协调器持有路由权威");
-            authority.renew()?;
-            let (current_revision, current_routes) = authority.load()?;
-            if current_revision != revision || current_routes != routes {
+            let store = self.store.as_mut().expect("协调器持有路由权威");
+            let (revision, confirmed) = if checked {
+                let revision = if participants.is_some() {
+                    store.commit_migration(MigrationRouteChange {
+                        cluster: self.cluster,
+                        expected,
+                        routes: &routes,
+                    })?
+                } else {
+                    store.compare_and_swap(expected, routes.clone())?
+                };
+                let (confirmed_revision, confirmed_routes) = store.load()?;
+                if revision <= expected
+                    || confirmed_revision != revision
+                    || confirmed_routes != routes
+                {
+                    return Err(io::Error::other("路由权威未确认预期版本"));
+                }
+                for shard in &self.shards {
+                    await_control(deadline, || shard.install_routes(routes.clone()))?;
+                }
+                (revision, &routes)
+            } else {
+                (expected, previous)
+            };
+            store.renew()?;
+            let (current_revision, current_routes) = store.load()?;
+            if current_revision != revision || &current_routes != confirmed {
                 return Err(io::Error::other("恢复前路由权威发生变化"));
             }
-            for shard in &self.shards {
+            for shard in self.shards.iter().filter(participating) {
                 await_control(deadline, || shard.resume_route_mutations())?;
             }
             Ok(revision)
@@ -780,6 +883,12 @@ impl<A: RouteAuthority> RouteCoordinator<A> {
             self.failed = false;
         } else {
             self.fence_ingress();
+        }
+        if result.as_ref().is_ok_and(|version| *version == expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "迁移预检后分片水位已变化",
+            ));
         }
         result
     }
@@ -854,11 +963,20 @@ fn release_after_drain<A: RouteAuthority>(
 /// 重试未入队的控制消息；超时后的已入队消息可能仍会执行。
 fn await_control(
     deadline: Instant,
-    mut submit: impl FnMut() -> Result<
+    submit: impl FnMut() -> Result<
         std::sync::mpsc::Receiver<Result<(), crate::ShardError>>,
         crate::ShardError,
     >,
 ) -> io::Result<()> {
+    await_reply(deadline, submit)?
+        .map_err(|error| io::Error::other(format!("路由控制失败: {error:?}")))
+}
+
+/// 在总期限内取得有界控制消息的回复，只重试尚未入队的请求。
+fn await_reply<T>(
+    deadline: Instant,
+    mut submit: impl FnMut() -> Result<std::sync::mpsc::Receiver<T>, crate::ShardError>,
+) -> io::Result<T> {
     let receiver = loop {
         if Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "路由控制超时"));
@@ -874,8 +992,7 @@ fn await_control(
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "路由控制超时"))?;
     receiver
         .recv_timeout(remaining)
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "路由控制回复未知"))?
-        .map_err(|error| io::Error::other(format!("路由控制失败: {error:?}")))
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "路由控制回复未知"))
 }
 
 #[cfg(test)]
@@ -885,7 +1002,8 @@ mod tests {
     fn monitor_start_timeout_fences_before_late_resume() {
         use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
         use std::sync::mpsc::sync_channel;
-        struct Authority(/** 模拟权威的路由快照。 */ RouteTable);
+        /// 模拟权威的路由快照。
+        struct Authority(RouteTable);
         impl RouteAuthority for Authority {
             fn cluster_id(&self) -> ClusterId {
                 ClusterId(967)
@@ -1085,7 +1203,8 @@ mod tests {
     #[test]
     fn direct_update_panic_fences_even_if_caller_catches_it() {
         use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
-        struct Authority(/** 模拟权威的路由快照。 */ RouteTable);
+        /// 模拟权威的路由快照。
+        struct Authority(RouteTable);
         impl RouteAuthority for Authority {
             fn requires_monitor(&self) -> bool {
                 false
@@ -1136,10 +1255,8 @@ mod tests {
     #[test]
     fn startup_renewal_panic_fences_instead_of_graceful_drain() {
         use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
-        struct Authority(
-            /** 模拟权威的路由快照。 */ RouteTable,
-            /** 控制续约时是否触发异常。 */ bool,
-        );
+        /// 模拟路由权威，依次保存路由表与续约时是否触发异常的标志。
+        struct Authority(RouteTable, bool);
         impl RouteAuthority for Authority {
             fn requires_monitor(&self) -> bool {
                 false

@@ -554,7 +554,8 @@ fn standby_verifies_exact_live_writer_identity_before_epoch_barrier() {
     std::thread::scope(|scope| {
         let server = scope.spawn(|| {
             use std::io::{Read, Write};
-            struct FailReply(/** 用于模拟回复失败的实际连接。 */ std::net::TcpStream);
+            /// 用于模拟回复失败的实际连接。
+            struct FailReply(std::net::TcpStream);
             impl Read for FailReply {
                 fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
                     self.0.read(bytes)

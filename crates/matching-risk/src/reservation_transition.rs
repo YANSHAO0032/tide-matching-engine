@@ -205,6 +205,42 @@ impl PlannedR2 {
 }
 
 impl ReservationRegistry {
+    /// 提取本登记表中属于该市场的所有预留及其绑定，保留已释放记录和待结算记录。
+    pub fn market_partition(&self, market: MarketId) -> Result<Self, RejectReason> {
+        let states = self.states.values().filter(|s| s.market_id == market);
+        Self::new_with_pending_r2(
+            states.clone().cloned(),
+            states
+                .filter(|s| self.is_pending_r2(s.reservation_id))
+                .map(|s| s.reservation_id),
+        )
+    }
+
+    /// 把市场预留移入目标登记表。目标已有该市场记录、预留标识重复或活动订单绑定冲突时，两侧保持原状。
+    pub fn transfer_market_to(
+        &mut self,
+        target: &mut Self,
+        market: MarketId,
+    ) -> Result<(), RejectReason> {
+        let incoming = self.market_partition(market)?;
+        if target.states.values().any(|s| s.market_id == market)
+            || incoming
+                .states
+                .keys()
+                .any(|id| target.states.contains_key(id))
+        {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let mut combined = target.clone();
+        combined.states.extend(incoming.states);
+        combined.bindings.extend(incoming.bindings);
+        combined.validate_bindings(&combined.bindings)?;
+        self.states.retain(|_, s| s.market_id != market);
+        self.bindings.retain(|id, _| self.states.contains_key(id));
+        *target = combined;
+        Ok(())
+    }
+
     /// 在隔离副本中预检扣减及终结；调用方还须原子同步订单簿和事件。
     pub fn plan_r2(
         &self,

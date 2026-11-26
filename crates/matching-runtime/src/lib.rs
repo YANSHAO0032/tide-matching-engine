@@ -14,6 +14,9 @@ pub use health::{Health, HealthDependency};
 mod idempotency;
 /// 原序业务事件的确定性摘要。
 pub use event_hash::EventHasher;
+mod migration;
+/// 停市迁移的持久交接与切换结果。
+pub use migration::{MigrationId, MigrationResult, MigrationStorage};
 mod ownership;
 mod place_candidate;
 mod place_config;
@@ -40,8 +43,8 @@ pub use recovery::{
 };
 /// 单机可信目录中的持久路由控制存储。
 pub use route_store::{
-    LocalRouteAuthority, RouteAuthority, RouteControlStore, RouteCoordinator, RouteMonitor,
-    decode_route_snapshot, encode_route_snapshot,
+    LocalRouteAuthority, MigrationRouteChange, RouteAuthority, RouteControlStore, RouteCoordinator,
+    RouteMonitor, decode_route_snapshot, encode_route_snapshot,
 };
 /// 显式路由与配置错误。
 pub use route_table::{DuplicateMarketRoute, MarketRoute, RouteState, RouteTable};

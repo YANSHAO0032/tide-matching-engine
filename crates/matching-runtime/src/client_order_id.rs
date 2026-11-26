@@ -31,6 +31,66 @@ pub(crate) struct ClientOrderIds {
     max_id_bytes: usize,
 }
 impl ClientOrderIds {
+    /// 按市场筛选活动与终结身份，保留终结淘汰顺序。
+    fn market_keys(&self, market: MarketId) -> Self {
+        let mut selected = self.clone();
+        selected.active.retain(|k| k.market == market);
+        selected.terminal.retain(|k| k.market == market);
+        selected
+    }
+
+    /// 市场摘要只记录客户端身份；分片容量不随市场迁移。
+    pub(crate) fn write_market_state(
+        &self,
+        market: MarketId,
+        w: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        let mut selected = self.market_keys(market);
+        selected.active_capacity = selected.active.len().max(1);
+        selected.terminal_capacity = selected.terminal.len();
+        selected.max_id_bytes = selected
+            .active
+            .iter()
+            .chain(&selected.terminal)
+            .map(|k| k.client_id.len())
+            .max()
+            .unwrap_or(1);
+        selected.write_canonical_state(w)
+    }
+
+    /// 转移该市场的活动和终结身份，拒绝容量不足或与目标已保留的身份冲突。
+    pub(crate) fn transfer_market_to(
+        &mut self,
+        target: &mut Self,
+        market: MarketId,
+    ) -> Result<(), ()> {
+        let incoming = self.market_keys(market);
+        if incoming
+            .active
+            .len()
+            .checked_add(target.active.len())
+            .ok_or(())?
+            > target.active_capacity
+            || incoming
+                .terminal
+                .len()
+                .checked_add(target.terminal.len())
+                .ok_or(())?
+                > target.terminal_capacity
+            || incoming.active.iter().chain(&incoming.terminal).any(|k| {
+                k.client_id.len() > target.max_id_bytes
+                    || target.lookup(k.user, &k.client_id).is_some()
+            })
+        {
+            return Err(());
+        }
+        target.active.extend(incoming.active);
+        target.terminal.extend(incoming.terminal);
+        self.active.retain(|k| k.market != market);
+        self.terminal.retain(|k| k.market != market);
+        Ok(())
+    }
+
     /// 活动身份按用户及客户端身份排序，终结历史保持淘汰顺序。
     pub(crate) fn write_canonical_state(
         &self,

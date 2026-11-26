@@ -12,7 +12,7 @@ pub struct ManifestState {
     pub replication_safe_seq: u64,
     /// 最近持久化快照身份及其分片序号。
     pub latest_snapshot: Option<(u64, u64)>,
-    /// 最近一份之前已提交的快照身份和序号。
+    /// 可回退的上一份快照身份和序号。登记迁移基线时清空。
     pub previous_snapshot: Option<(u64, u64)>,
     /// 当前活动 segment 的首序号。
     pub active_segment: Option<u64>,
@@ -57,6 +57,13 @@ pub enum ManifestIntent {
         /// 快照身份。
         snapshot_id: u64,
         /// 快照覆盖的分片序号。
+        snapshot_seq: u64,
+    },
+    /// 在当前持久水位登记市场迁移后的基线，丢弃无法靠业务日志重建的迁移前回退点。
+    MigrationSnapshotCommitted {
+        /// 已持久化的迁移快照身份。
+        snapshot_id: u64,
+        /// 已暂停分片的完整持久前缀。
         snapshot_seq: u64,
     },
     /// 提升备节点安全前缀。
@@ -253,6 +260,37 @@ impl<S: ManifestStorage> ManifestManager<S> {
                 }
                 next.previous_snapshot = next.latest_snapshot;
                 next.latest_snapshot = Some((snapshot_id, snapshot_seq));
+            }
+            ManifestIntent::MigrationSnapshotCommitted {
+                snapshot_id,
+                snapshot_seq,
+            } => {
+                if next.generation < 2
+                    || snapshot_seq != next.local_durable_seq
+                    || !next.gc_plan.is_empty()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "迁移快照要求完整且稳定的持久前缀",
+                    ));
+                }
+                if next.latest_snapshot == Some((snapshot_id, snapshot_seq))
+                    && next.previous_snapshot.is_none()
+                {
+                    return Ok(());
+                }
+                if [next.latest_snapshot, next.previous_snapshot]
+                    .into_iter()
+                    .flatten()
+                    .any(|(id, _)| id == snapshot_id)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "迁移快照身份冲突",
+                    ));
+                }
+                next.latest_snapshot = Some((snapshot_id, snapshot_seq));
+                next.previous_snapshot = None;
             }
             ManifestIntent::ReplicationSafeSeqAdvanced { seq } => {
                 if seq < next.replication_safe_seq {

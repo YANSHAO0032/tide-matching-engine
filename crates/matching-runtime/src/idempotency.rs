@@ -70,6 +70,8 @@ struct Entry {
     command_id: CommandId,
     /// 原始业务意图。
     intent: Intent,
+    /// 跨分片迁入时记录首次执行所在分片，以保留原始去重回复序号。
+    original_shard: Option<matching_domain::ShardId>,
     /// 首次执行序号。
     seq: u64,
     /// 首次业务结果。
@@ -130,6 +132,119 @@ pub(crate) struct DedupWindow {
     session_order: VecDeque<usize>,
 }
 impl DedupWindow {
+    /// 按窗口保留顺序复制指定市场的命令条目，为尚无来源标记的条目补记原执行分片。
+    fn market_entries(
+        &self,
+        market: MarketId,
+        shard: matching_domain::ShardId,
+    ) -> impl Iterator<Item = Entry> + '_ {
+        self.entries
+            .iter()
+            .filter(move |e| e.intent.market == Some(market))
+            .cloned()
+            .map(move |mut e| {
+                e.original_shard.get_or_insert(shard);
+                e
+            })
+    }
+
+    /// 单市场摘要使用原执行分片与序号，并排除同一会话在其他市场的活动。
+    pub(crate) fn write_market_state(
+        &self,
+        market: MarketId,
+        shard: matching_domain::ShardId,
+        w: &mut matching_domain::snapshot_wire::SnapshotEncoder,
+    ) -> Result<(), matching_domain::snapshot_wire::SnapshotWireError> {
+        use matching_domain::snapshot_wire::SnapshotWireError;
+        let entries: VecDeque<_> = self.market_entries(market, shard).collect();
+        let ids: std::collections::BTreeSet<_> = entries.iter().map(|e| e.command_id).collect();
+        let mut sessions = std::collections::BTreeMap::new();
+        for session in self.sessions.iter().filter(|s| s.id.is_some()) {
+            let aliases: VecDeque<_> = session
+                .aliases
+                .iter()
+                .copied()
+                .filter(|(_, id)| ids.contains(id))
+                .collect();
+            if !aliases.is_empty() {
+                sessions.insert(session.id.ok_or(SnapshotWireError)?, aliases);
+            }
+        }
+        let mut scoped = Self::new(IdempotencyConfig {
+            command_capacity: entries.len().max(1),
+            session_capacity: sessions.len().max(1),
+            aliases_per_session: sessions.values().map(VecDeque::len).max().unwrap_or(1),
+        })
+        .map_err(|_| SnapshotWireError)?;
+        scoped.entries = entries;
+        for (index, (id, aliases)) in sessions.into_iter().enumerate() {
+            scoped.sessions[index] = Session {
+                id: Some(id),
+                highest: aliases.iter().map(|a| a.0).max().ok_or(SnapshotWireError)?,
+                aliases,
+            };
+            scoped.session_order.push_back(index);
+        }
+        scoped.write_snapshot(w)
+    }
+
+    /// 在隔离分片候选中迁移市场窗口；容量或身份冲突时调用方丢弃候选。
+    pub(crate) fn transfer_market_to(
+        &mut self,
+        target: &mut Self,
+        market: MarketId,
+        shard: matching_domain::ShardId,
+    ) -> Result<(), ()> {
+        let moved: std::collections::BTreeSet<_> = self
+            .market_entries(market, shard)
+            .map(|e| e.command_id)
+            .collect();
+        if target.entries.len().checked_add(moved.len()).ok_or(())? > target.config.command_capacity
+            || target.entries.iter().any(|e| moved.contains(&e.command_id))
+        {
+            return Err(());
+        }
+        for index in &self.session_order {
+            let session = &self.sessions[*index];
+            let mut incoming = session
+                .aliases
+                .iter()
+                .copied()
+                .filter(|(_, id)| moved.contains(id))
+                .peekable();
+            if incoming.peek().is_none() {
+                continue;
+            }
+            let slot = if let Some(slot) = target.sessions.iter().position(|s| s.id == session.id) {
+                slot
+            } else {
+                let slot = target
+                    .sessions
+                    .iter()
+                    .position(|s| s.id.is_none())
+                    .ok_or(())?;
+                target.session_order.push_back(slot);
+                slot
+            };
+            let dest = &mut target.sessions[slot];
+            dest.id = session.id;
+            dest.highest = dest.highest.max(session.highest);
+            for alias in incoming {
+                if dest.aliases.len() == target.config.aliases_per_session
+                    || dest.aliases.iter().any(|(seq, _)| *seq == alias.0)
+                {
+                    return Err(());
+                }
+                dest.aliases.push_back(alias);
+            }
+        }
+        target.entries.extend(self.market_entries(market, shard));
+        self.entries.retain(|e| !moved.contains(&e.command_id));
+        for session in &mut self.sessions {
+            session.aliases.retain(|(_, id)| !moved.contains(id));
+        }
+        Ok(())
+    }
     /// 按会话淘汰次序重排内部槽位，保留命令和别名先后次序。
     pub(crate) fn write_canonical_state(
         &self,
@@ -173,6 +288,11 @@ impl DedupWindow {
             SnapshotEncoder, SnapshotWireError, encode_reject_reason,
         };
         let mut w = SnapshotEncoder::new(256 * 1024 * 1024);
+        // 合法容量严格为正；零前缀标记逐条携带原分片身份的新版窗口。
+        let has_migrated = self.entries.iter().any(|e| e.original_shard.is_some());
+        if has_migrated {
+            w.u64(0)?;
+        }
         for value in [
             self.config.command_capacity,
             self.config.session_capacity,
@@ -199,6 +319,15 @@ impl DedupWindow {
             let command = matching_domain::command_wal_codec::encode_wal_command(&envelope)
                 .map_err(|_| SnapshotWireError)?;
             w.bytes(&command)?;
+            if has_migrated {
+                match entry.original_shard {
+                    Some(shard) => {
+                        w.u8(1)?;
+                        w.u16(shard.get())?;
+                    }
+                    None => w.u8(0)?,
+                }
+            }
             w.u64(entry.seq)?;
             match entry.outcome {
                 FormalOutcome::FeeScheduleUpdated(version) => {
@@ -281,11 +410,13 @@ impl DedupWindow {
         };
         let bytes = reader.bytes()?;
         let mut r = SnapshotDecoder::new(bytes, 256 * 1024 * 1024)?;
-        for expected in [
-            config.command_capacity,
-            config.session_capacity,
-            config.aliases_per_session,
-        ] {
+        let first = r.u64()?;
+        let has_migrated = first == 0;
+        let capacity = if has_migrated { r.u64()? } else { first };
+        if usize::try_from(capacity).ok() != Some(config.command_capacity) {
+            return Err(SnapshotWireError);
+        }
+        for expected in [config.session_capacity, config.aliases_per_session] {
             if usize::try_from(r.u64()?).ok() != Some(expected) {
                 return Err(SnapshotWireError);
             }
@@ -311,11 +442,27 @@ impl DedupWindow {
             {
                 return Err(SnapshotWireError);
             }
+            let original_shard = if has_migrated {
+                match r.u8()? {
+                    0 => None,
+                    1 if command.market_id.is_some() => {
+                        Some(matching_domain::ShardId::new(r.u16()?))
+                    }
+                    _ => return Err(SnapshotWireError),
+                }
+            } else {
+                None
+            };
             let seq = r.u64()?;
-            if seq <= previous_seq || seq > snapshot_seq {
+            if seq == 0 {
                 return Err(SnapshotWireError);
             }
-            previous_seq = seq;
+            if original_shard.is_none() {
+                if seq <= previous_seq || seq > snapshot_seq {
+                    return Err(SnapshotWireError);
+                }
+                previous_seq = seq;
+            }
             let outcome = match r.u8()? {
                 0 => FormalOutcome::Placed(matching_domain::OrderId::new(r.u128()?)),
                 1 => FormalOutcome::UserFence(r.u64()?),
@@ -357,6 +504,7 @@ impl DedupWindow {
             window.entries.push_back(Entry {
                 command_id: command.command_id,
                 intent: Intent::from(&command),
+                original_shard,
                 seq,
                 outcome,
                 summary,
@@ -536,6 +684,7 @@ impl DedupWindow {
             command_id: c.command_id,
             intent: prepared.intent,
             seq: result.seq,
+            original_shard: None,
             outcome: result.outcome.clone(),
             summary: result.summary.clone(),
             event_range: result.event_range,
@@ -613,6 +762,35 @@ mod tests {
         }
         assert_ne!(first, Intent::from(&command));
     }
+    #[test]
+    fn migration_retains_original_seq_and_alias_without_advancing_target() {
+        use matching_domain::{
+            ShardId,
+            snapshot_wire::{SnapshotDecoder, SnapshotEncoder},
+        };
+        let cfg = IdempotencyConfig {
+            command_capacity: 3,
+            session_capacity: 3,
+            aliases_per_session: 3,
+        };
+        let mut source = DedupWindow::new(cfg).unwrap();
+        let mut target = DedupWindow::new(cfg).unwrap();
+        let old = cmd(1, 10, 3, 5);
+        source.insert(&old, &result(1, 100000));
+        target.insert(&cmd(2, 11, 4, 6), &result(2, 1));
+        source
+            .transfer_market_to(&mut target, MarketId(5), ShardId(1))
+            .unwrap();
+        assert!(source.lookup(&old).unwrap().is_none());
+        let mut w = SnapshotEncoder::new(65536);
+        target.write_snapshot(&mut w).unwrap();
+        let bytes = w.finish();
+        let mut r = SnapshotDecoder::new(&bytes, 65536).unwrap();
+        let restored = DedupWindow::read_snapshot(&mut r, cfg, 1).unwrap();
+        assert_eq!(restored.lookup(&old).unwrap().unwrap().seq, 100000);
+        assert!(restored.lookup(&cmd(9, 10, 3, 5)).is_err());
+    }
+
     /// 构造带指定身份与市场的测试命令。
     fn cmd(id: u128, session: u64, seq: u64, market: u32) -> CommandEnvelope {
         CommandEnvelope {

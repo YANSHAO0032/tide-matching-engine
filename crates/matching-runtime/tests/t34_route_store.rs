@@ -142,7 +142,8 @@ fn authority_watch_detects_out_of_band_revision_and_closes_ingress() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{RouteAuthority, RouteCoordinator, Shard, ShardError};
     use std::sync::{Arc, Mutex};
-    struct Authority(/** 共享的路由版本和快照。 */ Arc<Mutex<(u64, RouteTable)>>);
+    /// 共享的路由版本和快照。
+    struct Authority(Arc<Mutex<(u64, RouteTable)>>);
     impl RouteAuthority for Authority {
         fn requires_monitor(&self) -> bool {
             false
@@ -191,7 +192,8 @@ fn authority_watch_detects_out_of_band_revision_and_closes_ingress() {
 fn coordinator_startup_fences_if_authority_cannot_renew() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{RouteAuthority, RouteCoordinator, Shard, ShardError};
-    struct Authority(/** 模拟权威返回的路由快照。 */ RouteTable);
+    /// 模拟权威返回的路由快照。
+    struct Authority(RouteTable);
     impl RouteAuthority for Authority {
         fn requires_monitor(&self) -> bool {
             false
@@ -300,7 +302,8 @@ fn coordinator_startup_fences_if_authority_changes_during_validation() {
 fn leased_authority_rejects_shard_started_without_route_gate() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{RouteAuthority, RouteCoordinator, Shard};
-    struct Authority(/** 模拟权威返回的路由快照。 */ RouteTable);
+    /// 模拟权威返回的路由快照。
+    struct Authority(RouteTable);
     impl RouteAuthority for Authority {
         fn cluster_id(&self) -> ClusterId {
             ClusterId(964)
@@ -345,7 +348,8 @@ fn leased_authority_waits_for_monitor_before_admitting_mutations() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{Mutation, RouteAuthority, RouteCoordinator, Shard, ShardError};
     use std::time::{Duration, Instant};
-    struct Authority(/** 模拟权威返回的路由快照。 */ RouteTable);
+    /// 模拟权威返回的路由快照。
+    struct Authority(RouteTable);
     impl RouteAuthority for Authority {
         fn cluster_id(&self) -> ClusterId {
             ClusterId(968)
@@ -555,7 +559,8 @@ fn failed_startup_retains_authority_until_accepted_work_finishes() {
         IdempotencyConfig, RouteAuthority, RouteCoordinator, Shard, ShardError,
     };
     use std::time::{Duration, Instant};
-    struct Failing(/** 用于模拟错误的路由存储。 */ RouteControlStore);
+    /// 用于模拟错误的路由存储。
+    struct Failing(RouteControlStore);
     impl RouteAuthority for Failing {
         fn requires_monitor(&self) -> bool {
             false
@@ -784,10 +789,8 @@ fn timed_out_monitored_update_can_commit_and_must_fail_closed() {
 fn direct_update_does_not_resume_after_renewal_failure() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{RouteAuthority, RouteCoordinator, Shard};
-    struct Authority(
-        /** 共享路由版本及快照。 */ std::sync::Mutex<(u64, RouteTable)>,
-        /** 续约调用次数。 */ usize,
-    );
+    /// 模拟路由权威，依次保存路由状态与续约次数。
+    struct Authority(std::sync::Mutex<(u64, RouteTable)>, usize);
     impl RouteAuthority for Authority {
         fn requires_monitor(&self) -> bool {
             false
@@ -974,10 +977,8 @@ fn monitored_coordinator_can_update_routes_without_stopping_monitor() {
 fn monitor_start_fails_closed_if_initial_renewal_fails() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{RouteAuthority, RouteCoordinator, Shard};
-    struct Authority(
-        /** 模拟权威的路由快照。 */ RouteTable,
-        /** 续约调用次数。 */ usize,
-    );
+    /// 模拟路由权威，依次保存路由状态与续约次数。
+    struct Authority(RouteTable, usize);
     impl RouteAuthority for Authority {
         fn requires_monitor(&self) -> bool {
             false
@@ -1207,7 +1208,8 @@ fn coordinator_closes_when_authority_reports_unpersisted_success() {
     use matching_orderbook::{ProductionOrderBook, QueuePriorityPolicy};
     use matching_runtime::{RouteAuthority, RouteCoordinator, Shard, ShardError};
     use std::time::Duration;
-    struct Faulty(/** 测试使用的路由快照。 */ RouteTable);
+    /// 测试使用的路由快照。
+    struct Faulty(RouteTable);
     impl RouteAuthority for Faulty {
         fn requires_monitor(&self) -> bool {
             false

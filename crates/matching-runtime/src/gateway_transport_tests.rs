@@ -21,6 +21,16 @@ impl crate::GatewayAuthenticator for Auth {
 
 #[test]
 fn tcp_stale_route_retries_same_identity_without_wal_gap() {
+    stale_request_crosses_route_change(false);
+}
+
+#[test]
+fn tcp_inflight_place_reselects_migrated_owner_and_reuses_authorization() {
+    stale_request_crosses_route_change(true);
+}
+
+/// 在网关取得旧路由后切换纪元或所有者，验证单次授权、命令身份和实际落盘位置。
+fn stale_request_crosses_route_change(move_market: bool) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -30,7 +40,8 @@ fn tcp_stale_route_retries_same_identity_without_wal_gap() {
     std::fs::create_dir(&dir).unwrap();
     std::fs::create_dir(dir.join("wal")).unwrap();
     std::fs::create_dir(dir.join("manifest")).unwrap();
-    struct Cleanup(/** 测试结束时清理的临时目录。 */ std::path::PathBuf);
+    /// 测试结束时清理的临时目录。
+    struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let target = self.0.canonicalize();
@@ -53,7 +64,11 @@ fn tcp_stale_route_retries_same_identity_without_wal_gap() {
         }
     }
     let _cleanup = Cleanup(dir.clone());
-    let (market, shard_id, cluster) = (MarketId(81), ShardId(82), ClusterId(963));
+    let (market, shard_id, cluster) = (
+        MarketId(81),
+        ShardId(82),
+        ClusterId(if move_market { 1038 } else { 963 }),
+    );
     let routes = |epoch| {
         crate::RouteTable::new([crate::MarketRoute {
             market_id: market,
@@ -93,12 +108,49 @@ fn tcp_stale_route_retries_same_identity_without_wal_gap() {
         (dir.join("wal"), dir.join("manifest")),
     )
     .unwrap();
+    let target_id = ShardId(83);
+    let mut target = if move_market {
+        for name in [
+            "target-wal",
+            "target-manifest",
+            "source-snapshots",
+            "target-snapshots",
+            "archive",
+        ] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        let target_config = crate::PlaceSupportConfig::empty_for_migration(
+            RiskKeySet::new(1, [(1, signing.verifying_key())]).unwrap(),
+            crate::PlaceLimits {
+                active_orders: 8,
+                terminal_history: 8,
+                client_id_bytes: 32,
+            },
+        )
+        .unwrap();
+        Some(
+            crate::Shard::start_with_durable_place_support(
+                target_id,
+                cluster,
+                routes(1),
+                vec![],
+                (ReservationRegistry::new([]).unwrap(), LogicalTime::new(0)),
+                (crate::IdempotencyConfig::default(), 1, 8, target_config),
+                (dir.join("target-wal"), dir.join("target-manifest")),
+            )
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    let mut shards = vec![shard.handle()];
+    shards.extend(target.iter().map(crate::Shard::handle));
     let control_dir = dir.join("control");
     std::fs::create_dir(&control_dir).unwrap();
     let store =
         crate::RouteControlStore::create_for_cluster(&control_dir, cluster, routes(1), 8, 8)
             .unwrap();
-    let mut coordinator = crate::RouteCoordinator::new(store, vec![shard.handle()]).unwrap();
+    let mut coordinator = crate::RouteCoordinator::new(store, shards.clone()).unwrap();
     let journal = crate::SessionControlJournal::create_with_policy(
         dir.join("session.log"),
         UserId(7),
@@ -130,7 +182,6 @@ fn tcp_stale_route_retries_same_identity_without_wal_gap() {
         matching_protocol::GatewayRateLimiters::new(bucket, bucket, bucket, 2).unwrap(),
         || 0,
     );
-    let shards = [shard.handle()];
     let health = crate::Health::new(shards.to_vec()).unwrap();
     for dependency in [
         crate::HealthDependency::Recovery,
@@ -211,9 +262,32 @@ fn tcp_stale_route_retries_same_identity_without_wal_gap() {
             .unwrap();
         client.write_all(&wire).unwrap();
         assert_eq!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
-        coordinator
-            .update(1, routes(2), Duration::from_secs(5))
-            .unwrap();
+        if move_market {
+            let migration = crate::MigrationStorage {
+                archive: dir.join("archive"),
+                source_snapshot: (dir.join("source-snapshots"), 1),
+                target_snapshot: (dir.join("target-snapshots"), 1),
+                max_bytes: 1024 * 1024,
+                timeout: Duration::from_secs(5),
+            };
+            migration
+                .migrate(
+                    &mut coordinator,
+                    crate::MigrationId {
+                        cluster,
+                        market,
+                        source: shard_id,
+                        target: target_id,
+                        old_epoch: 1,
+                    },
+                    Some(&crate::FeedBuilder::new(market)),
+                )
+                .unwrap();
+        } else {
+            coordinator
+                .update(1, routes(2), Duration::from_secs(5))
+                .unwrap();
+        }
         release.send(()).unwrap();
         let mut header = [0; matching_protocol::HEADER_LEN];
         client.read_exact(&mut header).unwrap();
@@ -239,12 +313,28 @@ fn tcp_stale_route_retries_same_identity_without_wal_gap() {
     assert_eq!(allocations.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(authorizations.load(std::sync::atomic::Ordering::SeqCst), 1);
     let observed = shard.handle().observation();
-    assert_eq!((observed.commands, observed.rejects), (2, 1));
+    if let Some(target) = target.as_mut() {
+        assert_eq!((observed.commands, observed.rejects), (1, 1));
+        let accepted = target.handle().observation();
+        assert_eq!((accepted.commands, accepted.rejects), (1, 0));
+        target.shutdown(Duration::from_secs(5)).unwrap();
+    } else {
+        assert_eq!((observed.commands, observed.rejects), (2, 1));
+    }
     shard.shutdown(Duration::from_secs(5)).unwrap();
     drop(coordinator);
-    let records = matching_persistence::scan_segments(dir.join("wal"))
-        .unwrap()
-        .records;
+    let wal = if move_market {
+        assert!(
+            matching_persistence::scan_segments(dir.join("wal"))
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        dir.join("target-wal")
+    } else {
+        dir.join("wal")
+    };
+    let records = matching_persistence::scan_segments(wal).unwrap().records;
     assert_eq!(records.len(), 1);
     let command = matching_domain::decode_wal_command(&records[0].payload).unwrap();
     assert_eq!(

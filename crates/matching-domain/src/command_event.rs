@@ -37,7 +37,7 @@ pub struct CommandResultSummary {
     pub first_event_index: Option<u32>,
     /// 最后一个事件的索引；无事件时为空。
     pub last_event_index: Option<u32>,
-    /// 已分配的分片序号；是否持久化取决于运行时入口及其提交策略。
+    /// 首次执行命令的分片序号。市场迁移后重试仍返回原序号，持久性取决于执行入口及其提交策略。
     pub durable_seq: Option<u64>,
     /// 被业务拒绝时的稳定原因。
     pub reject_reason: Option<RejectReason>,
@@ -268,9 +268,9 @@ pub enum Command {
 /// 外部业务命令及其路由、会话与审计信息。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandEnvelope {
-    /// 外部业务意图身份；正式入口的分片内窗口用于有限期去重。
+    /// 外部业务意图标识。重试沿用此值，市场迁移携带窗口内该市场的去重记录。
     pub command_id: CommandId,
-    /// 接入会话身份；与客户端序号共同用于分片内的有限别名检查。
+    /// 接入会话标识。与客户端序号共同标识去重窗口中的一次请求。
     pub session_id: u64,
     /// 调用方提供的会话内客户端序号；窗口外的旧序号不单独拒绝。
     pub client_seq: u64,
@@ -288,9 +288,9 @@ pub struct CommandEnvelope {
     pub payload: Command,
 }
 
-/// 根命令产生的一条业务事件及其进程内确定性身份。
+/// 根命令产生的一条业务事件。集群、分片、分片序号及事件索引共同标识该事件。
 ///
-/// 身份只在当前分片运行生命周期内保证唯一；未恢复序号时重启可能复用。
+/// 从持久前缀重放时可重建相同身份。市场迁移后，新事件使用新所属分片的序号空间。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventEnvelope {
     /// 集群身份。

@@ -435,7 +435,8 @@ fn malformed_or_truncated_frames_never_reach_standby_wal() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    struct Probe(/** 记录持久化探针调用次数的共享计数器。 */ Arc<AtomicUsize>);
+    /// 记录持久化探针调用次数的共享计数器。
+    struct Probe(Arc<AtomicUsize>);
     impl DurableAppender for Probe {
         fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
             Ok(false)
@@ -494,7 +495,8 @@ fn missing_replication_intent_is_rejected_before_standby_wal() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    struct Capture(/** 记录发送端输出的帧字节。 */ Vec<u8>);
+    /// 记录发送端输出的帧字节。
+    struct Capture(Vec<u8>);
     impl Read for Capture {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             Ok(0)
@@ -509,7 +511,8 @@ fn missing_replication_intent_is_rejected_before_standby_wal() {
             Ok(())
         }
     }
-    struct Probe(/** 记录持久化探针调用次数的共享计数器。 */ Arc<AtomicUsize>);
+    /// 记录持久化探针调用次数的共享计数器。
+    struct Probe(Arc<AtomicUsize>);
     impl DurableAppender for Probe {
         fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
             Ok(false)
@@ -645,7 +648,8 @@ fn replication_frame_accepts_the_full_wal_payload_limit() {
 #[test]
 fn lost_ack_does_not_erase_a_synced_standby_prefix() {
     use std::io::{Read, Write};
-    struct Capture(/** 记录发送端输出的帧字节。 */ Vec<u8>);
+    /// 记录发送端输出的帧字节。
+    struct Capture(Vec<u8>);
     impl Read for Capture {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             Ok(0)
@@ -660,7 +664,8 @@ fn lost_ack_does_not_erase_a_synced_standby_prefix() {
             Ok(())
         }
     }
-    struct LostAck(/** 保存模拟确认帧的输入游标。 */ std::io::Cursor<Vec<u8>>);
+    /// 保存模拟确认帧的输入游标。
+    struct LostAck(std::io::Cursor<Vec<u8>>);
     impl Read for LostAck {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             self.0.read(bytes)
@@ -1039,7 +1044,8 @@ fn failed_authority_fence_blocks_commit_after_standby_ack() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    struct Probe(/** 记录持久化探针调用次数的共享计数器。 */ Arc<AtomicUsize>);
+    /// 记录持久化探针调用次数的共享计数器。
+    struct Probe(Arc<AtomicUsize>);
     impl DurableAppender for Probe {
         fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
             Ok(false)
@@ -1482,7 +1488,8 @@ fn standby_rejects_wal_that_differs_from_real_authority_intent() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    struct Probe(/** 记录持久化探针调用次数的共享计数器。 */ Arc<AtomicUsize>);
+    /// 记录持久化探针调用次数的共享计数器。
+    struct Probe(Arc<AtomicUsize>);
     impl DurableAppender for Probe {
         fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
             Ok(false)
@@ -1594,7 +1601,8 @@ fn failed_idle_renewal_blocks_later_wal_append_and_marks_unready() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    struct Probe(/** 记录持久化探针调用次数的共享计数器。 */ Arc<AtomicUsize>);
+    /// 记录持久化探针调用次数的共享计数器。
+    struct Probe(Arc<AtomicUsize>);
     impl DurableAppender for Probe {
         fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
             Ok(false)
@@ -1626,7 +1634,8 @@ fn failed_idle_renewal_blocks_later_wal_append_and_marks_unready() {
             Ok(())
         }
     }
-    struct Expiring(/** 控制模拟租约失效的续约次数。 */ usize);
+    /// 控制模拟租约失效的续约次数。
+    struct Expiring(usize);
     impl ReplicaCommitFence for Expiring {
         fn prepare(&mut self, _: &[WalRecord], _: std::time::Instant) -> std::io::Result<()> {
             panic!("不应登记意图")
@@ -1701,7 +1710,8 @@ fn slow_ack_cannot_commit_after_the_batch_deadline() {
             Ok(())
         }
     }
-    struct SlowAck(/** 缓慢返回模拟确认帧的输入游标。 */ std::io::Cursor<Vec<u8>>);
+    /// 缓慢返回模拟确认帧的输入游标。
+    struct SlowAck(std::io::Cursor<Vec<u8>>);
     impl Read for SlowAck {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             std::thread::sleep(Duration::from_millis(10));
@@ -1786,7 +1796,8 @@ fn timed_out_inflight_fence_does_not_start_the_next_commit() {
             Ok(())
         }
     }
-    struct Wire(/** 保存测试传输数据的内存游标。 */ std::io::Cursor<Vec<u8>>);
+    /// 保存测试传输数据的内存游标。
+    struct Wire(std::io::Cursor<Vec<u8>>);
     impl Read for Wire {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             self.0.read(bytes)

@@ -1,6 +1,8 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-11-04 当前范围：T19、T20、T21 已提交并推送各自开发分支，T21 提交为 `025c29d`；用户已授权 T22 验收通过后提交并推送当前分支 `feature-t22-manifest-group-commit`，未经进一步授权不合并。用户允许在 WAL 格式中增加独立头 CRC 并同步规格。PendingR2 用户裁定仍然有效；真实 R2、完整 MarketState/PreOpen 和 T23+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
+> 2026-11-26 当前任务为 T35 停市市场迁移。用户授权通过验收后提交并推送开发分支 `feature-t35-market-migration`。交付事实以唯一交接为准。
+
+> 2026-11-04 T22 历史范围：T19、T20、T21 已提交并推送各自开发分支，T21 提交为 `025c29d`；用户已授权 T22 验收通过后提交并推送当前分支 `feature-t22-manifest-group-commit`，未经进一步授权不合并。用户允许在 WAL 格式中增加独立头 CRC 并同步规格。PendingR2 用户裁定仍然有效；真实 R2、完整 MarketState/PreOpen 和 T23+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
 
 > 2026-10-26 当前事实：T12 Amend 已由 `d694974` 与 P2 收尾提交 `b763984` 合入并推送至 `origin/main`；本地完整验证已经通过。远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染尚未在本轮核验。`codex/t12-amend` 已删除。
 
@@ -12,7 +14,7 @@
 
 ## 角色与授权边界
 
-当前采用直接实现和 Code Review 模式。T08、订单簿模块整理及 T09–T12 均已交付；T13–T18 已完成本地提交，T19–T21 已提交并推送各自开发分支。T22 获授权验收通过后提交并推送当前分支，未获合并授权；远端 CI/GitHub Actions 与 GitHub 页面实际公式渲染未在本轮核验，不扩展 T23+。
+当前采用直接实现和 Code Review 模式。T35 以 T34 提交 `d7f98c4` 为基线。本次授权限于 T35 的验收及开发分支交付，合并与后续任务须另获授权。
 
 - 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
 - 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
@@ -33,8 +35,8 @@ T08 覆盖 visible/hidden/total 守恒、仅 visible depth、maker 补量时新 
 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
-3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §8、§14–§17、§54（重点不变量 12、13、18）、§64；按当前小步核对 §9、§13、§45–§46.1、§58，保留 §6.5.1–§6.5.2、§26.3–§26.5、§55.2–§55.4、§63 的数值/保护和回归要求。保留当前适用不变量 1–13/16–18/26/28–30/49–52/54–56；§54.53 及 §18/§27 reservation 仅作后续资金接口契约。始终遵守 §77 和 Appendix E；读取未来契约不扩大实现范围。
-4. 当前 [T22](assignment/tasks/T22_P7_manifest_group_commit.md) 原始任务书及唯一交接中的冻结裁定；用户新授权优先于原始导师模式。保留已验收的 T05–T21 契约和验证门，T13 的 PendingR2 裁定仍然有效。
+3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §29.3、§54、§55.6、§73 和 §77。订单语义、数值、保护及确定性回归仍遵循 §6.5、§8–§17、§26、§45–§46、§55.2–§55.4、§58、§63–§64 和 Appendix E。保留 §54 不变量 1–13、16–18、26、28–30、49–52、54–56 的适用验证。迁移的预留状态、账户资金边界及 §54.53 按 §18、§27 和已接入的资金路径核对。
+4. [T35 任务书](assignment/tasks/T35_P12_market_migration.md)、[执行计划](assignment/T35_EXECUTION_PLAN.md)及唯一交接中的裁定。已实现的持久模式和恢复前提见[停市迁移](docs/market_migration.md)。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
@@ -45,7 +47,7 @@ T03 已建立 OrderIndex、OrderArena slot/free-list、PriceLevel head/tail/coun
 
 T05 已以独立流程适配对比 T02 Reference API（其 incoming 余量不会自动 rest）和 T04 完整 GTC API，验收可复现 100k command tape 与当前适用不变量。T06 已验收的 Market incoming 不 rest、不分配 QueuePriority；当前冰山 maker 补量会取得新 priority；quote budget 严格正且不含手续费，spent<=budget，unused_quote 不是成交。所有 notional/quote→qty 换算走统一 checked MarketMath；向下取整到合法 lot，本档不能成交一个 lot 时立即终止，不构造 Qty(0) 或零量 Trade。保护参考在命令开始捕获并固定；bps 只允许 0..=9_999，Buy 对 reference×(10_000+bps)/10_000 双重向下取整，Sell 对 reference×(10_000-bps)/10_000 双重向上取整，最终边界按方向与显式 worst price/market band 取更严格者。边界比较包含等号；首个越界 maker 不成交并终结命令。reservation/fee release 只保留后续接口契约，不伪造已实现的资金闭环。
 
-T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Iceberg、StopBook/确定性触发级联、DAY/GTD/EndSession、Amend、CancelReplace、MassCancel 和当前支持的 STP 模式均已在各自范围内验收；CancelReplace 支持矩阵见 docs/cancel_replace.md。进程内 runtime 已实现单写者、有限队列、查询和屏障；HA、持久化、完整命令协议及 runtime 后续扩展仍在后续任务；不创建 gateway/HA/marketdata 组件，不引入 raw pointer/unsafe。
+T07 的 IOC 尽可能成交、余量取消且永不入簿；FOK 在任何 mutation 前完成可执行流动性/价格约束及当前适用算术预检，不足时零成交、簿与 priority 不变，禁止先成交再回滚；PostOnly 在改簿前检查是否会作为 taker，交叉包含等价价格，交叉时拒绝，成功实际 rest 时才分配 priority。PostOnly 禁止与 Market/IOC/FOK 组合。Iceberg、StopBook/确定性触发级联、DAY/GTD/EndSession、Amend、CancelReplace、MassCancel 和当前支持的 STP 模式均已在各自范围内验收；CancelReplace 支持矩阵见 docs/cancel_replace.md。运行时持续保留单写者、有限队列、查询和屏障约束。WAL、快照、网关、行情与控制权威的实际支持范围见 [运行时说明](docs/runtime.md)及唯一交接。
 
 ## 固定工作循环
 
@@ -62,6 +64,7 @@ v6 §77 的全部工程规则是审查依据。以下为常用约束摘要，不
 ### 文档与流程图
 
 - 所有手写代码注释必须使用中文说明，包括模块文档、公开/私有接口文档、普通注释、行尾注释与测试注释。不得保留英文说明句或用英文业务词替代中文叙述；类型、函数、字段、协议枚举、路径、公式变量及可执行示例保留准确标识符。自动生成文件不手工翻译。
+- 中文说明沿用项目术语的原文，如 `WAL`、`FIFO`、`maker`、`taker` 和 etcd 的 `mod_revision`。单参数元组变体和新类型的参数含义可写在声明上方的 `///` 中，多参数载荷按声明顺序说明各项职责。
 - 注释验收须覆盖全部当前源码与测试，单独检查语言和实际语义；Rustdoc 编译成功不等于中文规范通过。纯注释修改须验证非注释代码与可执行文档示例未变，再运行格式、Rustdoc 与文档测试检查。
 - 流程图的标题、说明和图内节点只描述实际职责、输入、状态转换和验证边界；不得使用 `T00`、`T05` 等任务/阶段编号作为流程图标识。任务编号仍可用于任务书、交接、提交记录和范围管理文档。
 - 涉及计算公式时，必须维护 [docs/numerical_formulas.md](docs/numerical_formulas.md)：公式单独记录，使用 TeX，按通用业务职责组织；该文档不得出现任务或阶段编号。Codex 负责维护此文档，并在公式契约改变时同步规格、实现说明和测试边界。
@@ -110,7 +113,7 @@ v6 §77 的全部工程规则是审查依据。以下为常用约束摘要，不
 
 ## 自动检查范围与依赖审查
 
-根 [Cargo.toml](Cargo.toml) 统一声明 lint，六个成员通过 `[lints] workspace = true` 显式继承。以后添加成员时也必须检查继承，不能假定自动生效。
+根 [Cargo.toml](Cargo.toml) 统一声明 lint，七个成员通过 `[lints] workspace = true` 显式继承。以后添加成员时也必须检查继承，不能假定自动生效。
 
 | 规则 | 等级 | 自动检查范围与局限 |
 |---|---|---|

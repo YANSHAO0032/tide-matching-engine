@@ -138,8 +138,8 @@ impl LimitReservePolicy {
         self.fee_tier_id
     }
 
-    /// 按锁定版本和两种成交角色的费用上界计算限价预留。
-    /// 按最小 lot 分别向上取整，以覆盖任意合法成交拆分。
+    /// 按锁定费率版本中 maker 与 taker 的较高费率计算限价单的费用预留。
+    /// 单个 lot 的费用上界向上取整，再乘以 lot 数，以覆盖任意合法成交拆分。
     pub fn required_versioned_reserves(
         &self,
         fees: &matching_domain::FeeScheduleBook,

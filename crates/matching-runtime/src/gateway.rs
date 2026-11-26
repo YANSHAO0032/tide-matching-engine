@@ -86,7 +86,7 @@ pub enum GatewayError {
     Ingress(crate::ShardError),
     /// 排空超时或回复丢失；会话仍保持关闭准入。
     Drain,
-    /// 会话持久日志失败。
+    /// 会话日志或意图日志操作失败。
     Journal(std::io::Error),
     /// 外部请求帧或载荷无效。
     Protocol(matching_protocol::PlaceCodecError),

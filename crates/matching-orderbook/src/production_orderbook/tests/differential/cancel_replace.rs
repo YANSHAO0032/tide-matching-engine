@@ -193,7 +193,7 @@ enum Command {
     Stop(StopOrder),
     /// 提交普通限价单。
     Place(LimitOrder),
-    /// 更新市场价格带配置。
+    /// 安装给定的市场价格带配置，传入 None 则移除价格带。
     Band(Option<matching_domain::PriceBandConfig>),
     /// 执行基础数量市价单。
     Market(matching_domain::MarketByBase),

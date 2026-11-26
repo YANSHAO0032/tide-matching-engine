@@ -103,34 +103,50 @@ fn involves_shard(route: &crate::MarketRoute, shard: ShardId) -> bool {
         || matches!(route.state, RouteState::Migrating { source, target } if source == shard || target == shard)
 }
 
-/// 恢复时允许同一所有者的活动路由版本前进，不允许变更市场归属。
+/// 核对本分片涉及的历史路由与权威路由。活动所有者可推进纪元；冻结期间兼容相同冻结路由、
+/// 冻结前指向源分片的活动路由，以及已持久安装的切换后目标路由。
 fn compatible_routes(old: &RouteTable, current: &RouteTable, shard: ShardId) -> bool {
+    fn compatible(prior: &crate::MarketRoute, next: &crate::MarketRoute) -> bool {
+        if prior == next {
+            return true;
+        }
+        if prior.state != RouteState::Active {
+            return false;
+        }
+        match next.state {
+            RouteState::Active => {
+                prior.shard_id == next.shard_id && prior.route_epoch <= next.route_epoch
+            }
+            RouteState::Migrating { source, target } => {
+                next.shard_id == source
+                    && source != target
+                    && ((prior.shard_id == source && prior.route_epoch < next.route_epoch)
+                        || (prior.shard_id == target && prior.route_epoch == next.route_epoch))
+            }
+        }
+    }
+
     old.routes()
         .filter(|route| involves_shard(route, shard))
         .all(|route| {
-            current.get(route.market_id).is_some_and(|new| {
-                route == new
-                    || (route.shard_id == shard
-                        && new.shard_id == shard
-                        && route.state == RouteState::Active
-                        && new.state == RouteState::Active
-                        && route.route_epoch <= new.route_epoch)
-            })
+            current
+                .get(route.market_id)
+                .is_some_and(|next| compatible(route, next))
         })
         && current
             .routes()
             .filter(|route| involves_shard(route, shard))
             .all(|route| {
-                old.get(route.market_id).is_some_and(|old| {
-                    old == route || (old.shard_id == shard && route.shard_id == shard)
-                })
+                old.get(route.market_id)
+                    .is_some_and(|prior| compatible(prior, route))
             })
 }
-
-/// 将完整可信下单配置编码，以便恢复时逐字节核验。
-fn place_bytes(config: &PlaceSupportConfig, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
-    let mut w = SnapshotEncoder::new(limit);
-    config.keys.write_snapshot(&mut w)?;
+/// 写入分片本地信任的公钥和容量，迁移不会改变这些配置。
+fn write_place_header(
+    config: &PlaceSupportConfig,
+    w: &mut SnapshotEncoder,
+) -> Result<(), SnapshotWireError> {
+    config.keys.write_snapshot(w)?;
     for value in [
         config.limits.active_orders,
         config.limits.terminal_history,
@@ -138,6 +154,53 @@ fn place_bytes(config: &PlaceSupportConfig, limit: usize) -> Result<Vec<u8>, Sna
     ] {
         w.u64(u64::try_from(value).map_err(|_| SnapshotWireError)?)?;
     }
+    Ok(())
+}
+
+/// 从受保护的迁移交接或其已登记快照恢复新加入市场的预留策略。
+/// 其余策略、容量和密钥继续通过完整配置的规范字节逐项核对。
+fn restore_migrating_policy(
+    config: &mut PlaceSupportConfig,
+    bytes: &[u8],
+    market: MarketId,
+    owned: bool,
+    limit: usize,
+) -> Result<(), SnapshotWireError> {
+    if !owned {
+        config.policies.remove(&market);
+        return Ok(());
+    }
+    if config.policies.contains_key(&market) {
+        return Ok(());
+    }
+    let mut header = SnapshotEncoder::new(limit);
+    write_place_header(config, &mut header)?;
+    let header = header.finish();
+    let mut r = SnapshotDecoder::new(
+        bytes
+            .strip_prefix(header.as_slice())
+            .ok_or(SnapshotWireError)?,
+        limit,
+    )?;
+    let count = usize::try_from(r.u32()?).map_err(|_| SnapshotWireError)?;
+    if config.policies.len().checked_add(1) != Some(count) || count > r.remaining() / 8 {
+        return Err(SnapshotWireError);
+    }
+    for _ in 0..count {
+        let id = MarketId(r.u32()?);
+        let policy = matching_risk::LimitReservePolicy::read_snapshot(&mut r)?;
+        if id == market {
+            config.policies.insert(market, policy);
+            return Ok(());
+        }
+    }
+    Err(SnapshotWireError)
+}
+
+/// 将完整可信下单配置编码，以便恢复时逐字节核验。
+fn place_bytes(config: &PlaceSupportConfig, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
+    let mut w = SnapshotEncoder::new(limit);
+    write_place_header(config, &mut w)?;
     w.u32(u32::try_from(config.policies.len()).map_err(|_| SnapshotWireError)?)?;
     for (market, policy) in &config.policies {
         w.u32(market.get())?;
@@ -234,7 +297,7 @@ impl SnapshotImage {
         use sha2::{Digest, Sha256};
         Ok(Sha256::digest(self.canonical_state(limit)?).into())
     }
-    /// 按业务状态顺序编码快照，供后续状态摘要计算；不包含请求身份和物理槽位。
+    /// 按业务顺序编码分片状态以计算摘要。幂等窗口保留命令和会话身份，快照请求号与物理槽位不参与摘要。
     pub fn canonical_state(&self, limit: usize) -> Result<Vec<u8>, SnapshotWireError> {
         self.validate_managed_markets()?;
         let mut w = SnapshotEncoder::new(limit);
@@ -544,6 +607,32 @@ impl SnapshotImage {
         config: &SnapshotRestoreConfig,
         replicated: bool,
     ) -> Result<Self, SnapshotWireError> {
+        let migrating = config.routes.routes().find_map(|r| match r.state {
+            RouteState::Migrating { source, target }
+                if source == config.shard || target == config.shard =>
+            {
+                Some(r.market_id)
+            }
+            _ => None,
+        });
+        Self::decode_with_migration(bytes, config, replicated, migrating)
+    }
+
+    /// 在已冻结的分片上验证交接档案中的切换后镜像。
+    pub(super) fn decode_migration_snapshot(
+        bytes: &[u8],
+        config: &SnapshotRestoreConfig,
+        market: MarketId,
+    ) -> Result<Self, SnapshotWireError> {
+        Self::decode_with_migration(bytes, config, false, Some(market))
+    }
+
+    fn decode_with_migration(
+        bytes: &[u8],
+        config: &SnapshotRestoreConfig,
+        replicated: bool,
+        migrating: Option<MarketId>,
+    ) -> Result<Self, SnapshotWireError> {
         let mut r = SnapshotDecoder::new(bytes, config.max_bytes)?;
         let version = r.u16()?;
         if !(2..=10).contains(&version) {
@@ -591,8 +680,7 @@ impl SnapshotImage {
             previous = Some(market);
             let book = ProductionOrderBook::read_snapshot(&mut r)?;
             if book.market_id().is_some_and(|id| id != market)
-                || config
-                    .routes
+                || historical_routes
                     .get(market)
                     .is_none_or(|route| route.shard_id != shard)
             {
@@ -606,7 +694,7 @@ impl SnapshotImage {
             }
             markets.insert(market, book);
         }
-        if config.routes.routes().any(|route| {
+        if historical_routes.routes().any(|route| {
             route.shard_id == shard
                 && route.state == RouteState::Active
                 && !markets.contains_key(&route.market_id)
@@ -772,6 +860,15 @@ impl SnapshotImage {
             place.as_mut().ok_or(SnapshotWireError)?.market_data = Some(data);
         }
         if let Some(place) = &mut place {
+            if let Some(market) = migrating {
+                restore_migrating_policy(
+                    &mut place.config,
+                    encoded_place.as_deref().ok_or(SnapshotWireError)?,
+                    market,
+                    markets.contains_key(&market),
+                    config.max_bytes,
+                )?;
+            }
             for (market, state) in &managed_markets {
                 let policy = place
                     .config
@@ -827,6 +924,38 @@ impl SnapshotImage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn migration_recovery_requires_either_the_original_owner_or_the_exact_staged_epoch() {
+        let market = MarketId(87);
+        let source = ShardId(3);
+        let target = ShardId(4);
+        let table = |shard, route_epoch, state| {
+            RouteTable::new([crate::MarketRoute {
+                market_id: market,
+                shard_id: shard,
+                route_epoch,
+                state,
+            }])
+            .unwrap()
+        };
+        let frozen = table(source, 4, RouteState::Migrating { source, target });
+        let before = table(source, 3, RouteState::Active);
+        let bootstrapped = table(source, 2, RouteState::Active);
+        let staged = table(target, 4, RouteState::Active);
+        for shard in [source, target] {
+            for valid in [&before, &bootstrapped, &staged] {
+                assert!(compatible_routes(valid, &frozen, shard));
+            }
+            for invalid in [
+                table(source, 4, RouteState::Active),
+                table(target, 2, RouteState::Active),
+                table(ShardId(8), 3, RouteState::Active),
+            ] {
+                assert!(!compatible_routes(&invalid, &frozen, shard));
+            }
+            assert!(!compatible_routes(&before, &staged, shard));
+        }
+    }
     #[test]
     fn replay_respects_snapshot_route_floor_and_current_ceiling() {
         use matching_domain::{

@@ -1,4 +1,4 @@
-//! 正式限价下单使用的可信静态市场与有界容量配置。
+//! 正式限价下单使用的分市场预留策略、风控密钥和分片容量配置。
 
 use matching_domain::MarketId;
 use matching_risk::{LimitReservePolicy, RiskKeySet};
@@ -40,6 +40,25 @@ pub struct PlaceSupportConfig {
 pub struct PlaceConfigError;
 
 impl PlaceSupportConfig {
+    /// 为当前没有市场、需要参与迁移的正式分片提供可信密钥和容量。
+    pub fn empty_for_migration(
+        keys: RiskKeySet,
+        limits: PlaceLimits,
+    ) -> Result<Self, PlaceConfigError> {
+        if limits.active_orders == 0 || limits.terminal_history == 0 || limits.client_id_bytes == 0
+        {
+            return Err(PlaceConfigError);
+        }
+        Ok(Self {
+            keys,
+            policies: BTreeMap::new(),
+            limits,
+            managed_only: false,
+            primary_lease: None,
+            require_route_authority: false,
+        })
+    }
+
     /// 建立可信市场配置；拒绝重复市场与无效容量。
     pub fn new(
         keys: RiskKeySet,

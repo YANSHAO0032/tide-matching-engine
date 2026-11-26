@@ -176,6 +176,17 @@ pub trait DurableAppender {
             "写入器不支持摘要检查点",
         ))
     }
+    /// 当前清单是否只以该迁移快照为恢复锚点。
+    fn is_migration_snapshot(&self, _id: u64, _seq: u64) -> bool {
+        false
+    }
+    /// 在当前完整前缀登记迁移基线；复制写入器须另行实现相应的持久保证。
+    fn commit_migration_snapshot(&mut self, _id: u64, _seq: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "写入器不支持迁移快照",
+        ))
+    }
     /// 通过同一个清单写者登记已同步的快照文件。
     fn commit_snapshot(&mut self, _snapshot_id: u64, _snapshot_seq: u64) -> io::Result<()> {
         Err(io::Error::new(
@@ -211,6 +222,12 @@ impl DurableAppender for BoxedDurableAppender {
     }
     fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
         self.0.commit_snapshot(snapshot_id, snapshot_seq)
+    }
+    fn is_migration_snapshot(&self, id: u64, seq: u64) -> bool {
+        self.0.is_migration_snapshot(id, seq)
+    }
+    fn commit_migration_snapshot(&mut self, id: u64, seq: u64) -> io::Result<()> {
+        self.0.commit_migration_snapshot(id, seq)
     }
 }
 
@@ -363,6 +380,29 @@ impl<A: DurableAppender> DurableBatcher<A> {
         if result
             .as_ref()
             .is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput)
+        {
+            self.halted = true;
+        }
+        result
+    }
+    /// 检查批次是否处于本地持久模式、没有待同步记录且写入器未停用。
+    pub fn supports_local_migration(&self) -> bool {
+        self.watermark.mode == ReplicationMode::LocalDurable
+            && self.pending_count == 0
+            && !self.halted
+    }
+    /// 通过分片唯一清单写者提交迁移快照；未知结果要求重启恢复。
+    pub fn commit_migration_snapshot(&mut self, id: u64, seq: u64) -> io::Result<()> {
+        if !self.supports_local_migration() || seq != self.committed() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "迁移要求静止的本地持久前缀",
+            ));
+        }
+        let result = self.appender.commit_migration_snapshot(id, seq);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() != io::ErrorKind::InvalidInput)
         {
             self.halted = true;
         }
@@ -904,6 +944,17 @@ impl<S: ManifestStorage> RegisteredAppender<S> {
     }
 }
 impl<S: ManifestStorage> DurableAppender for RegisteredAppender<S> {
+    fn is_migration_snapshot(&self, id: u64, seq: u64) -> bool {
+        let state = self.manifest.state();
+        state.latest_snapshot == Some((id, seq)) && state.previous_snapshot.is_none()
+    }
+    fn commit_migration_snapshot(&mut self, id: u64, seq: u64) -> io::Result<()> {
+        self.manifest
+            .submit(ManifestIntent::MigrationSnapshotCommitted {
+                snapshot_id: id,
+                snapshot_seq: seq,
+            })
+    }
     fn commit_snapshot(&mut self, snapshot_id: u64, snapshot_seq: u64) -> io::Result<()> {
         if self.manifest.state().generation < 2
             || snapshot_seq > self.manifest.state().local_durable_seq
