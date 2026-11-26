@@ -63,7 +63,7 @@ pub struct Acceptance {
     pub command_id: u128,
     /// 网关分配的订单身份。
     pub order_id: u128,
-    /// 命令首次执行的分片序号。
+    /// 命令首次执行时的分片序号，迁移后命中去重记录仍返回此值。
     pub shard_seq: u64,
 }
 /// 编码包含订单身份的版本一成功回复。

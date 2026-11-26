@@ -30,7 +30,7 @@ pub use scan::{ScanError, ScanResult, scan_segment};
 pub use segment::{SegmentMeta, SegmentScan, SegmentWriter, scan_segments, truncate_torn_tail};
 pub use snapshot::{
     commit_snapshot, read_committed_snapshot, read_previous_snapshot, read_snapshot,
-    write_snapshot_file,
+    write_migration_snapshot_file, write_snapshot_file,
 };
 pub use wal_gc::{WalGcPolicy, run_wal_gc};
 

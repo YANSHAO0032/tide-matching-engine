@@ -12,12 +12,12 @@ const MAX_KEY: usize = 1024;
 const MAX_VALUE: usize = 256 * 1024;
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
-/// 比较键不存在，或比较已观察到的键修改版本。
+/// etcd 事务对目标键的前置条件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvVersion {
     /// 键尚不存在。
     Absent,
-    /// 键的修改版本必须相等。
+    /// 键的 `mod_revision` 必须等于给定值。
     Revision(u64),
 }
 

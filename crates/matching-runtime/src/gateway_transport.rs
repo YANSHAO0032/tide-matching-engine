@@ -16,7 +16,7 @@ pub enum GatewayTransportError {
     Frame(matching_protocol::FrameError),
     /// 网关认证后准入或风险授权错误。
     Gateway(crate::GatewayError),
-    /// 分片业务拒绝或身份冲突。
+    /// 分片正式命令发生错误，连接处理无法继续。
     Formal(crate::FormalError),
     /// 返回的业务状态不符合限价请求。
     Outcome,
@@ -93,7 +93,7 @@ pub struct GatewayTransport<'a, A, R> {
     /// 入队前失败或结果未知的预留由风险服务按同一身份协调，网关不伪造释放。
     pub authorize: R,
 }
-impl<A, R> GatewayTransport<'_, A, R>
+impl<'a, A, R> GatewayTransport<'a, A, R>
 where
     A: FnMut() -> Result<(CommandId, OrderId), crate::GatewayError>,
     R: FnMut(&crate::PreparedPlace) -> Result<ReservationToken, crate::GatewayError>,
@@ -231,35 +231,8 @@ where
                 }
             };
             let market = prepared.intent().market;
-            let mut selected = None;
-            for shard in self.shards {
-                let routes = shard
-                    .routes()
-                    .map_err(|e| GatewayTransportError::Gateway(crate::GatewayError::Ingress(e)))?;
-                if routes
-                    .get(market)
-                    .is_some_and(|route| route.shard_id == shard.shard_id())
-                {
-                    selected = Some(shard);
-                    break;
-                }
-            }
-            let shard = match selected {
-                Some(shard) => shard,
-                None => {
-                    let bytes = matching_protocol::encode_rejection(
-                        request_id,
-                        matching_protocol::ReasonCode::new(
-                            matching_domain::RejectReason::StaleRouteEpoch as u16,
-                        ),
-                        self.max_frame,
-                    )
-                    .map_err(|_| GatewayTransportError::Outcome)?;
-                    stream
-                        .write_all(&bytes)
-                        .map_err(GatewayTransportError::Io)?;
-                    continue;
-                }
+            let Some(mut shard) = self.select_owner(market, request_id, stream)? else {
+                continue;
             };
             let existing = {
                 let state = self
@@ -327,11 +300,16 @@ where
                     })
                 };
                 let reply = match submitted {
-                    Some(Ok(receiver)) => receiver,
+                    Some(Ok(receiver)) => receiver
+                        .recv_timeout(self.timeout)
+                        .map_err(|_| GatewayTransportError::ResponseUnknown)?,
                     None => {
                         self.reject_not_ready(stream, request_id)?;
                         continue 'requests;
                     }
+                    Some(Err(crate::GatewayError::Route)) => Err(crate::FormalError::Rejected(
+                        matching_domain::RejectReason::StaleRouteEpoch,
+                    )),
                     Some(Err(error)) => {
                         if let Some(reason) = error.ingress_reason() {
                             let bytes = matching_protocol::encode_rejection(
@@ -348,15 +326,16 @@ where
                         return Err(GatewayTransportError::Gateway(error));
                     }
                 };
-                match reply
-                    .recv_timeout(self.timeout)
-                    .map_err(|_| GatewayTransportError::ResponseUnknown)?
-                {
+                match reply {
                     Ok(value) => break value,
                     Err(crate::FormalError::Rejected(
                         matching_domain::RejectReason::StaleRouteEpoch,
                     )) if stale_retries < 2 => {
                         stale_retries = stale_retries.checked_add(1).expect("有界路由重试计数");
+                        let Some(current) = self.select_owner(market, request_id, stream)? else {
+                            continue 'requests;
+                        };
+                        shard = current;
                         continue;
                     }
                     Err(crate::FormalError::Rejected(reason)) => {
@@ -412,6 +391,42 @@ where
                 _ => return Err(GatewayTransportError::Outcome),
             }
         }
+    }
+
+    /// 从分片公布的路由选择活动所有者。首次授权前及旧纪元重试时，若市场正在迁移就向客户端回复拒绝。
+    fn select_owner(
+        &self,
+        market: matching_domain::MarketId,
+        request_id: u64,
+        stream: &mut impl Write,
+    ) -> Result<Option<&'a crate::ShardHandle>, GatewayTransportError> {
+        let mut reason = matching_domain::RejectReason::StaleRouteEpoch;
+        for shard in self.shards {
+            let routes = shard.routes().map_err(|error| {
+                GatewayTransportError::Gateway(crate::GatewayError::Ingress(error))
+            })?;
+            if let Some(route) = routes.get(market)
+                && route.shard_id == shard.shard_id()
+            {
+                match routes.validate(market, shard.shard_id(), route.route_epoch) {
+                    Ok(()) => return Ok(Some(shard)),
+                    Err(rejected) => {
+                        reason = rejected;
+                        break;
+                    }
+                }
+            }
+        }
+        let bytes = matching_protocol::encode_rejection(
+            request_id,
+            matching_protocol::ReasonCode::new(reason as u16),
+            self.max_frame,
+        )
+        .map_err(|_| GatewayTransportError::Outcome)?;
+        stream
+            .write_all(&bytes)
+            .map_err(GatewayTransportError::Io)?;
+        Ok(None)
     }
 
     /// 对尚未进入分片的未就绪请求返回稳定过载原因。

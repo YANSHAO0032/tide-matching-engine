@@ -180,6 +180,63 @@ fn stale_primary_epoch_cannot_advance_standby_prefix() {
 }
 
 #[test]
+fn confirmed_standby_prefix_rejects_migration_without_changing_manifest() {
+    use matching_persistence::{
+        FileManifestStorage, ManifestManager, RegisteredAppender, SegmentWriter,
+    };
+    for (case, mode) in [
+        DurabilityMode::FsyncEach,
+        DurabilityMode::GroupCommit {
+            max_batch: 2,
+            max_delay_micros: 100,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = std::env::temp_dir().join(format!(
+            "t35-standby-manifest-{}-{case}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let wal = root.join("wal");
+        let manifest = root.join("manifest");
+        std::fs::create_dir(&wal).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        let writer = SegmentWriter::new(&wal, 1024).unwrap();
+        let manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
+        let appender = RegisteredAppender::new(writer, manager).unwrap();
+        let mut batch = DurableBatcher::new_with_config(
+            appender,
+            config(mode, ReplicationMode::StandbyDurable),
+            1,
+        )
+        .unwrap();
+        batch.set_standby_available(true);
+        batch.append_at(&record(1), Instant::now()).unwrap();
+        batch.flush().unwrap();
+        batch.ack_standby_epoch(1, 1, 1).unwrap();
+        assert_eq!(batch.committed(), 1);
+
+        // 备端已确认完整前缀，拒绝应来自复制模式，且不能向唯一清单写者登记快照。
+        let before = batch.appender().manifest_state().clone();
+        assert_eq!(before.local_durable_seq, 1);
+        assert_eq!(before.latest_snapshot, None);
+        assert_eq!(
+            batch.commit_migration_snapshot(42, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(batch.committed(), 1);
+        assert_eq!(batch.appender().manifest_state(), &before);
+        drop(batch);
+        let reopened = ManifestManager::<FileManifestStorage>::open_recovery(&manifest).unwrap();
+        assert_eq!(reopened.state(), &before);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn expired_batch_is_synced_before_accepting_later_record() {
     let mut batch = DurableBatcher::new_with_config(
         Appender::default(),

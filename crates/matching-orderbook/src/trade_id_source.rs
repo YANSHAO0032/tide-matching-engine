@@ -5,9 +5,13 @@ use matching_domain::{RejectReason, TradeId, TradeIdCursor};
 /// 兼容调用方预置序列或根命令内的延迟分配游标。
 #[derive(Clone)]
 pub(crate) enum TradeIdSource<'a> {
-    /// 既有接口保持调用者保证长度的契约。
-    /// `ids` 是调用方预先提供的成交 ID 序列，`position` 是下一次读取的位置。
-    Legacy { ids: &'a [TradeId], position: usize },
+    /// 调用方须预先提供足够的成交 ID。
+    Legacy {
+        /// 按成交顺序使用的 TradeId 序列。
+        ids: &'a [TradeId],
+        /// 下一个待读取的成交 ID 在序列中的下标。
+        position: usize,
+    },
     /// 仅对实际成交分配 ID，并记录游标是否耗尽。
     Cursor {
         /// 候选根命令独占的成交 ID 游标。

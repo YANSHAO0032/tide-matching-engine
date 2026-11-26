@@ -49,9 +49,32 @@ pub fn write_snapshot_file(
     snapshot_seq: u64,
     image: &[u8],
 ) -> io::Result<()> {
-    write_snapshot_file_inner(directory.as_ref(), snapshot_id, snapshot_seq, image, |_| {
-        Ok(())
-    })
+    write_snapshot_file_inner(
+        directory.as_ref(),
+        snapshot_id,
+        snapshot_seq,
+        image,
+        false,
+        |_| Ok(()),
+    )
+}
+
+/// 在独占的快照目录中安装可重试的迁移载荷。已有文件必须逐字节相同。
+pub fn write_migration_snapshot_file(
+    directory: &Path,
+    id: u64,
+    seq: u64,
+    image: &[u8],
+) -> io::Result<()> {
+    let target = directory.join(format!("snapshot-{id}.bin"));
+    if target.try_exists()? {
+        let (stored_id, stored_seq, stored) = read_snapshot(&target)?;
+        if (stored_id, stored_seq, stored.as_slice()) != (id, seq, image) {
+            return Err(invalid("快照身份已绑定其他迁移内容"));
+        }
+        return crate::sync_directory(directory);
+    }
+    write_snapshot_file_inner(directory, id, seq, image, true, |_| Ok(()))
 }
 
 /// 允许测试在真实文件操作边界注入中断。
@@ -60,13 +83,18 @@ fn write_snapshot_file_inner(
     snapshot_id: u64,
     snapshot_seq: u64,
     image: &[u8],
+    migration: bool,
     mut after: impl FnMut(u8) -> io::Result<()>,
 ) -> io::Result<()> {
     let size = u64::try_from(image.len()).map_err(|_| invalid("镜像长度溢出"))?;
     if size > MAX_IMAGE {
         return Err(invalid("镜像超过长度上限"));
     }
-    let tmp = directory.join(format!("snapshot-{snapshot_id}.tmp"));
+    let tmp = if migration {
+        directory.join(format!("snapshot-{snapshot_id}.migration.tmp"))
+    } else {
+        directory.join(format!("snapshot-{snapshot_id}.tmp"))
+    };
     let target = directory.join(format!("snapshot-{snapshot_id}.bin"));
     if target.try_exists()? {
         return Err(io::Error::new(
@@ -82,7 +110,15 @@ fn write_snapshot_file_inner(
     bytes.extend_from_slice(&size.to_be_bytes());
     bytes.extend_from_slice(image);
     bytes.extend_from_slice(&crc32c(&bytes).to_be_bytes());
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if migration {
+        // 调用者已取得目录锁，可以从头重写上次中断的迁移临时文件。
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = options.open(&tmp)?;
     file.write_all(&bytes)?;
     after(1)?;
     file.sync_all()?;
@@ -184,6 +220,32 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     #[test]
+    fn interrupted_migration_file_is_retried_without_overwriting_a_published_cut() {
+        for stop in 1..=4 {
+            let dir = std::env::temp_dir().join(format!(
+                "migration-cut-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            let bytes = b"frozen";
+            let inject = |stage| {
+                if stage == stop {
+                    Err(io::Error::other("模拟迁移切面写入中断"))
+                } else {
+                    Ok(())
+                }
+            };
+            assert!(write_snapshot_file_inner(&dir, 42, 3, bytes, true, inject).is_err());
+            write_migration_snapshot_file(&dir, 42, 3, bytes).unwrap();
+            assert!(write_migration_snapshot_file(&dir, 42, 4, bytes).is_err());
+            assert!(write_migration_snapshot_file(&dir, 42, 3, b"changed").is_err());
+            let image = read_snapshot(dir.join("snapshot-42.bin")).unwrap();
+            assert_eq!(image, (42, 3, bytes.to_vec()));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
     fn interruption_after_each_file_step_never_publishes_manifest() {
         for stop in 1..=4 {
             let root = std::env::temp_dir().join(format!(
@@ -199,7 +261,7 @@ mod tests {
             let mut manager = ManifestManager::<FileManifestStorage>::open(&manifest).unwrap();
             manager.submit(ManifestIntent::Initialize).unwrap();
             manager.submit(ManifestIntent::RecoveryAnchor).unwrap();
-            let result = write_snapshot_file_inner(&snapshots, 7, 0, b"image", |stage| {
+            let result = write_snapshot_file_inner(&snapshots, 7, 0, b"image", false, |stage| {
                 if stage == stop {
                     Err(io::Error::other("注入边界中断"))
                 } else {

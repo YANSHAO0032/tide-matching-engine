@@ -60,8 +60,8 @@ A = \frac{a}{10^{s_a}}.
 
 ```math
 A'=\begin{cases}
-A\cdot 10^{t-s}, & t\geq s,\\
-A/10^{s-t}, & t\lt s.
+A\cdot 10^{t-s}, & t\geq s,
+\\ A/10^{s-t}, & t\lt s.
 \end{cases}
 ```
 
@@ -352,8 +352,8 @@ P_{\mathrm{band,upper}}(b_{\mathrm{new}})\geq P_{\mathrm{band,upper}}(b_{\mathrm
 ```math
 \left\lceil\frac{a}{d}\right\rceil=
 \begin{cases}
-q, & u=0,\\
-q+1, & u\ne0,
+q, & u=0,
+\\ q+1, & u\ne0,
 \end{cases}
 \qquad a=qd+u, \quad 0\leq u\lt d.
 ```
@@ -383,9 +383,9 @@ P_{\mathrm{effective,sell}}
 ```math
 S_{\mathrm{buy}}=
 \begin{cases}
-\mathrm{User}, & P_u\lt P_b,\\
-\mathrm{MarketBand}, & P_b\lt P_u,\\
-\mathrm{Both}, & P_u=P_b.
+\mathrm{User}, & P_u\lt P_b,
+\\ \mathrm{MarketBand}, & P_b\lt P_u,
+\\ \mathrm{Both}, & P_u=P_b.
 \end{cases}
 ```
 
@@ -394,9 +394,9 @@ S_{\mathrm{buy}}=
 ```math
 S_{\mathrm{sell}}=
 \begin{cases}
-\mathrm{User}, & P_u\gt P_b,\\
-\mathrm{MarketBand}, & P_b\gt P_u,\\
-\mathrm{Both}, & P_u=P_b.
+\mathrm{User}, & P_u\gt P_b,
+\\ \mathrm{MarketBand}, & P_b\gt P_u,
+\\ \mathrm{Both}, & P_u=P_b.
 \end{cases}
 ```
 
@@ -479,3 +479,20 @@ N=\left\lfloor\frac{t-t_0}{I}\right\rfloor,\qquad B_a=\min(C,B+N).
 ```
 
 当 $`B_a\gt 0`$ 且全局、密钥、用户三个桶都通过时，每个桶各扣除一个令牌。未全部通过时不提交任何扣减。时间倒退或身份表容量不足时拒绝；达到容量时舍弃此前未使用的多余补充时间。
+
+
+## 停市切换的顺序边界
+
+设原活动路由纪元为 $`e`$，最后市场源序号为 $`E`$。冻结与目标接管使用同一新纪元。第一条新的市场源事件从原水位续接。
+
+```math
+e_{\mathrm{freeze}}=e_{\mathrm{target}}=e+1,\qquad E_{\mathrm{next}}=E+1
+```
+
+设 $`Q`$、$`S`$ 为屏障处下一次可分配的普通挂单和止损优先级，$`F_j`$ 为各条公开行情流最后已输出的序号。恢复本身保持这些值。每条流仅在输出新消息时递增，源、目标分片的业务序号不参与这组计算。
+
+```math
+(Q',S')=(Q,S),\qquad F'_j=F_j,\qquad F_{j,\mathrm{next}}=F_j+1
+```
+
+各项加一只在结果可表示时成立，普通挂单与止损优先级分配仍受市场高水位约束。

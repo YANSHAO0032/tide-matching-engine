@@ -14,7 +14,7 @@ pub use settlement::{FeeDelta, SettlementDelta};
 pub mod amend_order;
 /// 撤单替换的独立新订单、资金过渡及拒绝结果。
 pub mod cancel_replace;
-/// 正式命令及事件的进程内身份封装。
+/// 正式命令及事件的身份、路由和审计信息。
 pub mod command_event;
 /// 正式命令的持久化编码。
 pub mod command_wal_codec;
@@ -116,7 +116,7 @@ pub use cancel_replace::{
     ReservationTransition, UnadoptedReservation, validate_cancel_replace_old_type,
     validate_replacement_combination,
 };
-/// 正式命令及事件的进程内身份封装。
+/// 正式命令及事件的身份、路由和审计信息。
 pub use command_event::{
     ApplyUserControlFenceShard, CloseMarket, Command, CommandEnvelope, CommandResultSummary,
     CommandStatus, CreateMarket, EndSession, EventEnvelope, KillScope, MarketKillSwitch,

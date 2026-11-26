@@ -26,7 +26,7 @@ fn validate_route_key(key: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// etcd 路由快照适配器；调用方还须保证控制权的独占和失效处理。
+/// 通过 etcd 租约独占路由写权，按快照版本比较并提交更新。
 pub struct EtcdRouteAuthority {
     /// 线性一致客户端。
     client: EtcdClient,
@@ -38,7 +38,7 @@ pub struct EtcdRouteAuthority {
     lease: Option<i64>,
     /// 申请租约时使用的保守时长。
     lease_ttl: Option<std::time::Duration>,
-    /// 一旦续持失败，本实例不得恢复权威。
+    /// 续租失败或显式撤销租约后置位，本实例不再获得写权。
     invalidated: bool,
 }
 
@@ -170,7 +170,7 @@ impl EtcdRouteAuthority {
         result
     }
 
-    /// 返回本实例是否已发现续持失败；未失效不保证远端租约仍有效。
+    /// 返回本实例是否因续租失败或撤销租约而失效。远端租约状态仍须由存储事务核验。
     pub fn is_locally_invalidated(&self) -> bool {
         self.invalidated
     }
@@ -221,6 +221,31 @@ impl RouteAuthority for EtcdRouteAuthority {
         Ok((revision, decode(self.cluster, &bytes)?))
     }
     fn compare_and_swap(&mut self, expected: u64, routes: RouteTable) -> io::Result<u64> {
+        let (current_version, current) = self.load()?;
+        if current_version != expected {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "路由版本冲突"));
+        }
+        if !current.allows_epoch_update(&routes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "所有权变更须由迁移流程提交",
+            ));
+        }
+        self.commit_table(expected, &routes)
+    }
+
+    fn commit_migration(
+        &mut self,
+        change: matching_runtime::MigrationRouteChange<'_>,
+    ) -> io::Result<u64> {
+        let (expected, routes) = change.for_cluster(self.cluster_id())?;
+        self.commit_table(expected, routes)
+    }
+}
+
+impl EtcdRouteAuthority {
+    /// 在同一事务中比较版本与租约，再写入绑定集群的完整快照。
+    fn commit_table(&mut self, expected: u64, routes: &RouteTable) -> io::Result<u64> {
         if self.invalidated {
             return Err(io::Error::other("路由权威已失效"));
         }
@@ -235,7 +260,7 @@ impl RouteAuthority for EtcdRouteAuthority {
         self.client
             .transaction(
                 vec![json!({"key":key,"target":"MOD","mod_revision":expected.to_string(),"result":"EQUAL"}), json!({"key":owner,"target":"VALUE","value":STANDARD.encode(lease.to_be_bytes()),"result":"EQUAL"})],
-                vec![json!({"request_put":{"key":key,"value":STANDARD.encode(encode(self.cluster, &routes)?)}})],
+                vec![json!({"request_put":{"key":key,"value":STANDARD.encode(encode(self.cluster, routes)?)}})],
             )?
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "路由版本冲突"))
     }

@@ -7,7 +7,8 @@ struct State {
     /// 下一个可分配计数器；耗尽时为空。
     next: Option<u64>,
 }
-struct Authority(/** 模拟权威共享的编号分配状态。 */ Rc<RefCell<State>>);
+/// 模拟权威共享的编号分配状态。
+struct Authority(Rc<RefCell<State>>);
 impl LeaseAuthority for Authority {
     fn is_ready(&self, _: LeaseIdentity) -> bool {
         let state = self.0.borrow();

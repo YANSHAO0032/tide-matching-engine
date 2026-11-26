@@ -824,7 +824,7 @@ impl ReferenceOrderBook {
                 return Err(RejectReason::InvalidOrderCombination);
             }
         };
-        // 当前阶段不能静默忽略已签名的预留调整授权。
+        // 携带调整令牌的改单须经资金上下文验签。低层入口收到令牌时拒绝。
         if amend.reservation_adjustment.is_some() {
             return Err(RejectReason::InvalidReservation);
         }

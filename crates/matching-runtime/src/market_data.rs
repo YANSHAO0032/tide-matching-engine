@@ -195,6 +195,23 @@ pub struct MarketDataState {
     markets: BTreeMap<MarketId, MarketProjector>,
 }
 impl MarketDataState {
+    /// 转移市场行情候选的源计数器和逐订单视图，保留两侧各自的分片进度。
+    pub(crate) fn transfer_market_to(
+        &mut self,
+        target: &mut Self,
+        market: MarketId,
+    ) -> Result<(), MboError> {
+        if target.markets.contains_key(&market) {
+            return Err(MboError::InvalidCheckpoint);
+        }
+        let projector = self
+            .markets
+            .remove(&market)
+            .ok_or(MboError::InvalidCheckpoint)?;
+        target.markets.insert(market, projector);
+        Ok(())
+    }
+
     /// 从没有行情历史的旧快照构造显式边界与当前可见簿；结果仍须随下一命令提交。
     pub(crate) fn bootstrap_legacy(
         books: &BTreeMap<MarketId, matching_orderbook::ProductionOrderBook>,
@@ -451,7 +468,7 @@ impl MarketProjector {
             visible: MboBuilder::new(market),
         }
     }
-    /// 投影单市场正式执行结果；调用方须先证明结果属于已提交前缀。
+    /// 将正式执行结果投影为单市场行情源。持久写入路径可在提交前预演，发布方只能发布已提交的结果。
     /// 分片控制事件按市场过滤；其他结果必须只包含当前市场。
     pub fn apply_formal_execution<F>(
         &mut self,

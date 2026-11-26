@@ -22,10 +22,8 @@ pub enum RouterError {
     ),
 }
 
-/// 唯一不可变路由快照和显式分片句柄集合。
+/// 根据工作线程公布的完整路由快照定位目标分片。
 pub struct Router {
-    /// 各分片共享一致的进程内路由快照。
-    routes: RouteTable,
     /// 显式分片身份与其生产者入口的映射。
     shards: BTreeMap<ShardId, ShardHandle>,
 }
@@ -55,10 +53,10 @@ impl Router {
                 return Err(RouterError::InvalidConfig);
             }
         }
-        Ok(Self { routes, shards })
+        Ok(Self { shards })
     }
 
-    /// 使用固定所有权定位分片，再按当前快照检查版本；目标分片继续复核。
+    /// 读取一份当前完整快照，再按市场所有权投递；目标分片在序号分配前复核。
     pub fn submit(
         &self,
         command_id: CommandId,
@@ -66,15 +64,18 @@ impl Router {
         epoch: u64,
         mutation: Mutation,
     ) -> Result<Receiver<Result<Execution, RejectReason>>, RouterError> {
-        let route = self
-            .routes
+        let (_, observer) = self
+            .shards
+            .first_key_value()
+            .ok_or(RouterError::Rejected(RejectReason::StaleRouteEpoch))?;
+        let current = observer.routes().map_err(RouterError::Shard)?;
+        let route = current
             .get(market)
             .ok_or(RouterError::Rejected(RejectReason::StaleRouteEpoch))?;
         let shard = self
             .shards
             .get(&route.shard_id)
             .ok_or(RouterError::InvalidConfig)?;
-        let current = shard.routes().map_err(RouterError::Shard)?;
         current
             .validate(market, route.shard_id, epoch)
             .map_err(RouterError::Rejected)?;

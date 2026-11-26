@@ -399,3 +399,29 @@ fn version_two_slot_migrates_without_losing_durable_watermark() {
     drop(manager);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn migration_checkpoint_at_head_replaces_incompatible_fallback_and_retries() {
+    let mut manager = ManifestManager::new(
+        Store::default(),
+        ManifestState {
+            generation: 5,
+            local_durable_seq: 12,
+            active_segment: Some(1),
+            latest_snapshot: Some((10, 12)),
+            previous_snapshot: Some((9, 8)),
+            ..ManifestState::default()
+        },
+    );
+    let commit = |seq| ManifestIntent::MigrationSnapshotCommitted {
+        snapshot_id: 11,
+        snapshot_seq: seq,
+    };
+    assert!(manager.submit(commit(11)).is_err());
+    manager.submit(commit(12)).unwrap();
+    assert_eq!(manager.state().previous_snapshot, None);
+    assert_eq!(manager.state().latest_snapshot, Some((11, 12)));
+    let generation = manager.state().generation;
+    manager.submit(commit(12)).unwrap();
+    assert_eq!(manager.state().generation, generation);
+}

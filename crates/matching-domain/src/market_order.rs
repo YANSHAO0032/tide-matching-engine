@@ -109,14 +109,14 @@ pub struct MarketByQuote {
 }
 
 impl MarketByBase {
-    /// 在扫描或修改可执行流动性前验证自成交模式可以在当前阶段执行。
+    /// 在扫描可成交流动性前拒绝不支持的自成交防护模式。
     pub fn validate_stp_mode(&self) -> Result<(), RejectReason> {
         self.stp_mode.submission_rejection().map_or(Ok(()), Err)
     }
 }
 
 impl MarketByQuote {
-    /// 在扫描或修改可执行流动性前验证自成交模式可以在当前阶段执行。
+    /// 在扫描可成交流动性前拒绝不支持的自成交防护模式。
     pub fn validate_stp_mode(&self) -> Result<(), RejectReason> {
         self.stp_mode.submission_rejection().map_or(Ok(()), Err)
     }

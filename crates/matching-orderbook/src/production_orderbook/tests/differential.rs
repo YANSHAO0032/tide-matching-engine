@@ -129,7 +129,7 @@ struct ObservedBook {
 /// 将两套实现的不同返回类型收敛到同一个命令执行记录。
 #[derive(Debug, PartialEq, Eq)]
 enum CommandOutcome {
-    /// 提交普通限价单。
+    /// 记录限价单的有序成交事件或拒绝原因。
     Place(Result<Vec<TradeEvent>, RejectReason>),
     /// 记录取消结果或拒绝。
     Cancel(Result<ObservedOrder, RejectReason>),

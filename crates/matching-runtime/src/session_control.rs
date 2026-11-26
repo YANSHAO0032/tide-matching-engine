@@ -14,12 +14,12 @@ const HEADER: usize = 33;
 const TARGET_BYTES: usize = 28;
 const RECORD: usize = 9;
 
-/// 单市场撤单的固定路由及稳定命令身份。
+/// 会话日志中持久登记的撤单市场、初始路由纪元和命令身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionTarget {
     /// 目标市场。
     pub market: MarketId,
-    /// 预先固定的市场路由版本。
+    /// 会话登记时的路由纪元。派发撤单时以此为下限，使用当前活动所有者的纪元。
     pub route_epoch: u64,
     /// 在所有重试中复用的分片命令身份。
     pub command_id: CommandId,

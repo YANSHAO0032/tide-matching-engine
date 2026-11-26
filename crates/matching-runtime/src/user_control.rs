@@ -14,6 +14,14 @@ pub(crate) struct UserControlEpochs {
 }
 
 impl UserControlEpochs {
+    /// 接管市场时合并已观察到的用户下限，保留目标已有的更高纪元。
+    pub(crate) fn inherit_floors(&mut self, source: &Self) -> Result<(), RejectReason> {
+        for &(user, floor) in &source.entries {
+            self.advance(user, floor)?;
+        }
+        Ok(())
+    }
+
     /// 按用户身份排序编码下限，消除登记先后对状态比较的影响。
     pub(crate) fn write_canonical_state(
         &self,

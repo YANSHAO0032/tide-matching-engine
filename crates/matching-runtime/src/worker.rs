@@ -1,6 +1,9 @@
 //! 分片工作线程及进程内消息。
+mod market_transfer;
+mod migration_worker;
 mod snapshot;
 mod snapshot_writer;
+use migration_worker::{MigrationInstall, SnapshotReply};
 
 use crate::client_order_id::ClientOrderIds;
 use crate::idempotency::{DedupWindow, IdempotencyConfig};
@@ -222,7 +225,7 @@ pub enum SnapshotError {
 ///
 /// 镜像可编码并由后台写入器提交；仅内存捕获不代表快照已持久提交。
 pub struct SnapshotImage {
-    /// 快照时各市场路由版本，仅用于约束快照后的 WAL 回放。
+    /// 镜像记录的历史路由，供恢复时核对迁移切面并约束后续 WAL 的路由纪元。
     replay_route_floor: Option<Arc<RouteTable>>,
     /// 无快照恢复时构造的空基线；不参与编码和业务摘要。
     genesis_baseline: bool,
@@ -254,7 +257,7 @@ pub struct SnapshotImage {
     user_epochs: UserControlEpochs,
     /// 分片命令去重窗口副本。
     dedup: Option<DedupWindow>,
-    /// 可信下单配置和客户端身份索引副本。
+    /// 下单配置、客户端身份索引、费率簿、分片熔断状态及分市场行情候选的副本。
     place: Option<PlaceRuntimeState>,
 }
 impl SnapshotImage {
@@ -379,12 +382,12 @@ impl<T> CommandReply<T> {
 
 /// 只在本进程队列内传递的变更、查询与控制消息。
 enum Message {
-    /// 测试中在顺序点阻塞分片，建立确定的排空边界。
+    /// 到达顺序点时用第一个通道通知测试线程，再等待第二个通道放行。
     #[cfg(test)]
     TestBlock(SyncSender<()>, Receiver<()>),
-    /// 在队列顺序点暂停或恢复市场变更。
+    /// 在队列顺序点暂停或恢复本分片的业务变更，包括分片控制命令。
     RouteAdmission(
-        /// 是否暂停市场变更。
+        /// 是否暂停本分片的业务变更。
         bool,
         /// 返回控制操作结果。
         SyncSender<Result<(), ShardError>>,
@@ -409,7 +412,7 @@ enum Message {
         /// 只在本进程使用的一次性执行回复端。
         CommandReply<Result<Execution, RejectReason>>,
     ),
-    /// 通过完整预留归属路径执行正式命令。
+    /// 按正式协议派发下单、撤单、市场管理或分片控制等命令。
     Formal(
         /// 含路由及业务身份的命令。
         CommandEnvelope,
@@ -456,8 +459,10 @@ enum Message {
         /// 调用方提供的屏障请求身份。
         u128,
         /// 返回独立镜像或容量错误的一次性回复端。
-        SyncSender<Result<SnapshotImage, SnapshotError>>,
+        SnapshotReply,
     ),
+    /// 安装指定迁移的分片镜像，并通过请求中的回复通道报告结果。
+    InstallMigration(Box<MigrationInstall>),
     /// 对已同步快照文件向唯一清单写者提交意图。
     SnapshotCommitted(
         /// 已同步文件的快照身份。
@@ -515,6 +520,8 @@ pub struct Shard {
     route_ready: Arc<AtomicBool>,
     /// 正式业务入口是否在回复前完成本地持久提交。
     durable_formal: bool,
+    /// 具备受清单保护的本地市场迁移顺序点。
+    local_migration: bool,
     /// 持久写入器的独立时延观测。
     wal_metrics: Option<Arc<matching_persistence::DurabilityMetrics>>,
     /// 工作线程配置中的主节点租约弱引用，不延长租约生命周期。
@@ -555,7 +562,7 @@ impl Shard {
     /// 在可信外围协调下重放分片并恢复备节点持久续写。
     ///
     /// 恢复期间独占 WAL 和清单；协调器须验证快照、权威前缀、写权与备节点，
-    /// 并在重放完成后确认复制。启动时路由保持暂停，不能仅凭本入口证明 HA。
+    /// 并在重放完成后确认复制。分片启动时保持暂停，由路由协调器核验权威后开放准入；完整 HA 接任还需要有效写权与已认证的持久前缀。
     pub fn recover_replicated_group_with_genesis<C: crate::ReplicatedRecoveryCoordinator>(
         wal: impl AsRef<std::path::Path>,
         manifest: impl AsRef<std::path::Path>,
@@ -870,7 +877,12 @@ impl Shard {
         let ownership = crate::ownership::MarketOwnership::acquire(
             image.cluster,
             image.shard,
-            image.markets.keys().copied(),
+            image.markets.keys().copied().filter(|market| {
+                trusted
+                    .routes
+                    .get(*market)
+                    .is_some_and(|r| r.shard_id == image.shard)
+            }),
         )
         .ok_or(ShardError::InvalidConfig)?;
         let appender = RegisteredAppender::recover_local(
@@ -1005,6 +1017,7 @@ impl Shard {
             route_gated_at_start: self.route_gated_at_start,
             route_ready: Arc::clone(&self.route_ready),
             durable_formal: self.durable_formal,
+            local_migration: self.local_migration,
             wal_metrics: self.wal_metrics.clone(),
             primary_lease: self.primary_lease.clone(),
             snapshot_origin: Arc::clone(&self.snapshot_origin),
@@ -1138,7 +1151,7 @@ fn acquire_wal_directory(wal: &std::path::Path) -> Result<std::fs::File, ShardEr
 
 /// 由分片独占的持久写入原语。
 type OwnedAppender = matching_persistence::BoxedDurableAppender;
-/// 支持本地逐条或批量同步提交的 WAL 写入器。
+/// 分片独占的 WAL 提交状态，按持久配置逐条或分组提交，并在需要时等待备机确认。
 struct LocalDurableCommit {
     /// 从创世以来的可续写事件摘要；仅认证复制需要。
     event_hasher: Option<crate::EventHasher>,
@@ -1470,7 +1483,7 @@ impl Shard {
     /// 使用真实预留登记表启动仅允许正式命令的分片。
     ///
     /// 调用方必须保证初始逻辑时间与订单前态来自同一可信执行点，
-    /// 并保证 DAY 订单的交易时段仍有效；当前没有完整市场会话状态。
+    /// 并保证 DAY 订单的交易时段仍有效；此入口启动时不提供受管理市场的会话前态。
     /// 市场范围批量撤单的授权由可信调用方负责，本接口不执行管理身份认证。
     pub fn start_with_registry(
         shard: ShardId,
@@ -1694,7 +1707,7 @@ impl Shard {
             }
             if routes
                 .get(market)
-                .is_none_or(|route| route.shard_id != shard)
+                .is_none_or(|route| route.shard_id != shard && !(restored.is_some() && matches!(route.state, RouteState::Migrating { target,.. } if target == shard)))
                 || markets.insert(market, book).is_some()
             {
                 return Err(ShardError::InvalidConfig);
@@ -1810,6 +1823,10 @@ impl Shard {
         let drop_requested = Arc::new(AtomicBool::new(false));
         let worker_drop = Arc::clone(&drop_requested);
         let durable_formal = durable.is_some() && place_state.is_some();
+        let local_migration = durable_formal
+            && durable.as_ref().is_some_and(|gate| {
+                gate._wal_lease.is_some() && gate.batcher.supports_local_migration()
+            });
         let start_route_paused = config.require_route_authority
             || place_state
                 .as_ref()
@@ -1823,13 +1840,14 @@ impl Shard {
             .map(Arc::downgrade);
         let join = thread::spawn(move || {
             // 所有权与工作线程同寿命，排空后才释放。
-            let _ownership = ownership;
+            let mut ownership = ownership;
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut seq = initial_sequence;
                 let clock = LogicalClock::new(now);
                 let mut waiter = Waiter::new(config.wait_strategy);
                 let mut deferred = None;
                 let mut route_paused = start_route_paused;
+                let mut migrating = worker_routes.migration_participant(shard);
                 loop {
                     let Some(msg) = deferred.take().or_else(|| consumer.pop()) else {
                         if worker_drop.load(Ordering::Acquire) && consumer.is_closed_and_empty() {
@@ -1850,6 +1868,28 @@ impl Shard {
                             worker_route_ready.store(!paused, Ordering::Release);
                             let _ = reply.send(Ok(()));
                         }
+                        Message::Mutation(_, market, epoch, _, reply)
+                            if migrating && !consumer.routes_fenced() =>
+                        {
+                            let reason = migration_worker::frozen_reason(
+                                &worker_routes,
+                                shard,
+                                Some(market),
+                                Some(epoch),
+                            );
+                            let _ = reply.send(Err(reason));
+                        }
+                        Message::Formal(command, reply)
+                            if migrating && !consumer.routes_fenced() =>
+                        {
+                            let reason = migration_worker::frozen_reason(
+                                &worker_routes,
+                                shard,
+                                command.market_id,
+                                command.route_epoch,
+                            );
+                            let _ = reply.send(Err(FormalError::Rejected(reason)));
+                        }
                         Message::Mutation(_, _, _, _, reply)
                             if route_paused || consumer.routes_fenced() =>
                         {
@@ -1860,17 +1900,24 @@ impl Shard {
                                 reply.send(Err(FormalError::Rejected(RejectReason::EngineBusy)));
                         }
                         Message::InstallRoutes(next, reply) => {
-                            let valid = !next.routes().any(|route| matches!(route.state, RouteState::Migrating { source, target } if source == shard || target == shard))
-                                && worker_routes.routes().filter(|r| r.shard_id == shard)
-                                .all(|old| next.get(old.market_id).is_some_and(|new| {
-                                    new.shard_id == shard && old.state == RouteState::Active
-                                        && new.state == RouteState::Active && new.route_epoch >= old.route_epoch
-                                }))
-                                && next.routes().filter(|r| r.shard_id == shard)
-                                    .all(|new| worker_routes.get(new.market_id).is_some_and(|old| old.shard_id == shard));
+                            let valid = !consumer.routes_fenced()
+                                && migration_worker::routes_installable(
+                                    shard,
+                                    route_paused,
+                                    &worker_routes,
+                                    &next,
+                                    &markets,
+                                );
                             let result = if !valid {
                                 Err(ShardError::InvalidConfig)
                             } else if let Ok(mut visible) = shared_routes.write() {
+                                if !ownership.replace(markets.keys().copied().filter(|market| {
+                                    next.get(*market).is_some_and(|r| r.shard_id == shard)
+                                })) {
+                                    let _ = reply.send(Err(ShardError::InvalidConfig));
+                                    continue;
+                                }
+                                migrating = next.migration_participant(shard);
                                 worker_routes = Arc::new(next);
                                 *visible = Arc::clone(&worker_routes);
                                 Ok(())
@@ -2127,6 +2174,23 @@ impl Shard {
                             let _ = reply.send((id, seq.last_applied()));
                         }
                         Message::Snapshot(request_id, reply) => {
+                            if let SnapshotReply::Migration(id, _) = &reply
+                                && (!local_migration
+                                    || consumer.routes_fenced()
+                                    || !migration_worker::matches_freeze(
+                                        *id,
+                                        cluster,
+                                        shard,
+                                        &worker_routes,
+                                    )
+                                    || !durable.as_ref().is_some_and(|gate| {
+                                        gate.batcher.supports_local_migration()
+                                            && gate.batcher.committed() == seq.last_applied()
+                                    }))
+                            {
+                                reply.reject_migration();
+                                continue;
+                            }
                             let image = (|| {
                                 let user_epochs = user_epochs
                                     .try_clone_preallocated()
@@ -2171,7 +2235,62 @@ impl Shard {
                                     place,
                                 })
                             })();
-                            let _ = reply.send(image);
+                            reply.send(image);
+                        }
+                        Message::InstallMigration(request) => {
+                            let result = (|| {
+                                let id = request.migration;
+                                if !local_migration
+                                    || consumer.routes_fenced()
+                                    || !migration_worker::matches_freeze(
+                                        id,
+                                        cluster,
+                                        shard,
+                                        &worker_routes,
+                                    )
+                                {
+                                    return Err(std::io::Error::other("没有对应的迁移停写屏障"));
+                                }
+                                let gate = durable
+                                    .as_mut()
+                                    .ok_or_else(|| std::io::Error::other("缺少迁移持久化写者"))?;
+                                let config = SnapshotRestoreConfig {
+                                    cluster,
+                                    shard,
+                                    primary_epoch,
+                                    routes: migration_worker::final_routes(id, &worker_routes)?,
+                                    user_capacity,
+                                    idempotency,
+                                    expect_registry: registry.is_some(),
+                                    place: place_state.as_ref().map(|s| s.config.clone()),
+                                    max_markets: worker_routes.routes().count(),
+                                    max_bytes: request.limit,
+                                };
+                                let installed = request.install(
+                                    &config,
+                                    seq.last_applied(),
+                                    clock.now(),
+                                    gate,
+                                    markets.contains_key(&id.market) == (id.target == shard),
+                                )?;
+                                if !ownership.replace(installed.markets.keys().copied().filter(
+                                    |market| {
+                                        worker_routes
+                                            .get(*market)
+                                            .is_some_and(|r| r.shard_id == shard)
+                                    },
+                                )) {
+                                    return Err(std::io::Error::other("迁移后市场认领冲突"));
+                                }
+                                markets = installed.markets;
+                                managed_markets = installed.managed_markets;
+                                place_state = installed.place;
+                                registry = installed.registry;
+                                user_epochs = installed.user_epochs;
+                                dedup = installed.dedup;
+                                Ok(())
+                            })();
+                            let _ = request.reply.send(result);
                         }
                         Message::SnapshotCommitted(
                             id,
@@ -2180,7 +2299,8 @@ impl Shard {
                             image_shard,
                             reply,
                         ) => {
-                            let result = if image_cluster != cluster
+                            let result = if migrating
+                                || image_cluster != cluster
                                 || image_shard != shard
                                 || snapshot_seq > seq.last_applied()
                             {
@@ -2250,6 +2370,7 @@ impl Shard {
             route_gated_at_start: start_route_paused,
             route_ready,
             durable_formal,
+            local_migration,
             wal_metrics,
             primary_lease,
             snapshot_origin,
@@ -2292,9 +2413,9 @@ struct FormalIdentity {
     event_capacity: u64,
 }
 
-/// 仅允许单写者访问的限价配置及客户端身份状态。
+/// 分片单写者持有的下单配置、客户端身份索引、费率簿、熔断开关和行情候选。
 struct PlaceRuntimeState {
-    /// 启动时固定的可信市场策略和容量。
+    /// 分片的可信下单配置。市场预留策略随市场迁移，验签密钥和容量留在本分片。
     config: PlaceSupportConfig,
     /// 与活动订单及终结历史同步的客户端身份。
     ids: ClientOrderIds,
@@ -2366,7 +2487,7 @@ impl FenceBatchCandidate {
             clock: LogicalClock::new(now),
         })
     }
-    /// 在候选状态执行 fence 前置校验、去重及有序业务计划。
+    /// 在候选状态中校验用户 fence 命令的主节点纪元，再按顺序去重和执行。
     fn stage(&mut self, command: CommandEnvelope) -> Result<FormalExecution, FormalError> {
         match &command.payload {
             Command::ApplyUserControlFenceShard(fence)
@@ -5259,6 +5380,8 @@ pub struct ShardHandle {
     route_ready: Arc<AtomicBool>,
     /// 该入口是否提供正式命令的本地持久回复。
     durable_formal: bool,
+    /// 具备受清单保护的本地市场迁移顺序点。
+    local_migration: bool,
     /// 持久写入器的独立时延观测。
     wal_metrics: Option<Arc<matching_persistence::DurabilityMetrics>>,
     /// 经过启动校验的租约弱引用。
@@ -5283,7 +5406,7 @@ pub struct ShardHandle {
     shard_id: ShardId,
     /// 句柄对应的集群身份。
     cluster_id: ClusterId,
-    /// 句柄对应的不可变路由快照。
+    /// 工作线程可替换的路由快照，读取者持有各自取得的版本。
     routes: Arc<RwLock<Arc<RouteTable>>>,
 }
 
@@ -5453,7 +5576,7 @@ impl ShardHandle {
             }
         }
     }
-    /// 读取本句柄绑定的不可变路由快照。
+    /// 取得工作线程最近公布的路由快照，已取得的快照保持原版本。
     pub(crate) fn routes(&self) -> Result<Arc<RouteTable>, ShardError> {
         self.routes
             .read()
@@ -5461,7 +5584,7 @@ impl ShardHandle {
             .map_err(|_| ShardError::Failed)
     }
 
-    /// 在队列顺序点安装可信路由；本接口不执行市场迁移。
+    /// 在队列顺序点核验并安装可信路由；迁移时由协调器另行派发镜像安装请求。
     pub(crate) fn install_routes(
         &self,
         routes: RouteTable,
@@ -5471,7 +5594,7 @@ impl ShardHandle {
         Ok(rx)
     }
 
-    /// 暂停此分片的市场变更，队列中更早的操作先完成。
+    /// 暂停此分片的业务变更，队列中更早的操作先完成。
     pub(crate) fn pause_route_mutations(
         &self,
     ) -> Result<Receiver<Result<(), ShardError>>, ShardError> {
@@ -5480,7 +5603,7 @@ impl ShardHandle {
         Ok(rx)
     }
 
-    /// 在可信路由安装后恢复市场变更。
+    /// 解除队列暂停。路由表仍将迁移中的源、目标分片保持在停写状态。
     pub(crate) fn resume_route_mutations(
         &self,
     ) -> Result<Receiver<Result<(), ShardError>>, ShardError> {
@@ -5505,7 +5628,10 @@ impl ShardHandle {
         id: u128,
     ) -> Result<Receiver<Result<SnapshotImage, SnapshotError>>, ShardError> {
         let (tx, rx) = sync_channel(1);
-        self.push(Message::Snapshot(id, tx), IngressClass::Control)?;
+        self.push(
+            Message::Snapshot(id, SnapshotReply::Ordinary(tx)),
+            IngressClass::Control,
+        )?;
         Ok(rx)
     }
     /// 请求线性化屏障。
@@ -8117,9 +8243,8 @@ mod group_sync_tests {
             }
         }
     }
-    struct FenceAfterAppend(
-        /** 用于在追加后触发栅栏的队列入口。 */ crate::queue::Producer<Message>,
-    );
+    /// 用于在追加后触发栅栏的队列入口。
+    struct FenceAfterAppend(crate::queue::Producer<Message>);
     impl DurableAppender for FenceAfterAppend {
         fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
             Ok(false)
@@ -8472,7 +8597,7 @@ mod group_sync_tests {
     }
 }
 
-/// 从可信配置构造空市场基线；市场策略尚不可从恢复配置单独推导。
+/// 按可信恢复配置和逐市场提供的优先级策略建立空簿，作为从创世 WAL 回放的起点。
 pub(crate) fn empty_recovery_candidate(
     trusted: &SnapshotRestoreConfig,
     policies: &[(MarketId, matching_orderbook::QueuePriorityPolicy)],
@@ -8502,11 +8627,11 @@ pub(crate) fn empty_recovery_candidate(
             return Err(std::io::Error::other("初始市场路由无效或重复"));
         }
     }
-    if trusted.routes.routes().any(|route| {
-        route.shard_id == trusted.shard
-            && route.state == RouteState::Active
-            && !markets.contains_key(&route.market_id)
-    }) {
+    if trusted
+        .routes
+        .routes()
+        .any(|route| route.shard_id == trusted.shard && !markets.contains_key(&route.market_id))
+    {
         return Err(std::io::Error::other("初始市场策略缺失"));
     }
     let place = if let Some(config) = &trusted.place {
@@ -8603,6 +8728,23 @@ fn replay_snapshot_records_inner(
 ) -> std::io::Result<crate::SnapshotReplayResult> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut image = candidate.image;
+        // 冻结期间一旦安装切换后镜像，双方不得再存在任何已提交后缀。
+        if candidate.committed_through != image.snapshot_seq
+            && image.routes.routes().any(|route| {
+                matches!(route.state, RouteState::Migrating { source, target }
+                    if (source == image.shard || target == image.shard)
+                        && image.replay_route_floor.as_ref()
+                            .and_then(|past| past.get(route.market_id))
+                            .is_some_and(|past| past.shard_id == target
+                                && past.state == RouteState::Active
+                                && past.route_epoch == route.route_epoch))
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "已冻结并安装的分片包含额外业务记录",
+            ));
+        }
         let mut seq = Sequencer::from_last_applied(image.snapshot_seq)
             .map_err(|_| std::io::Error::other("重放序号耗尽"))?;
         let clock = LogicalClock::new(image.now);
@@ -8709,9 +8851,14 @@ fn replay_snapshot_records_inner(
                         "已提交命令重放时被前置拒绝：市场路由不存在",
                     )
                 })?;
+                let epoch_allowed = match current.state {
+                    RouteState::Active => epoch <= current.route_epoch,
+                    RouteState::Migrating { source, .. } => {
+                        source == image.shard && epoch < current.route_epoch
+                    }
+                };
                 if current.shard_id != image.shard
-                    || current.state != RouteState::Active
-                    || epoch > current.route_epoch
+                    || !epoch_allowed
                     || previous_routes
                         .get(&market)
                         .is_some_and(|previous| epoch < *previous)
@@ -8725,6 +8872,7 @@ fn replay_snapshot_records_inner(
                 RouteTable::new(image.routes.routes().copied().map(|mut route| {
                     if route.market_id == market {
                         route.route_epoch = epoch;
+                        route.state = RouteState::Active;
                     }
                     route
                 }))
