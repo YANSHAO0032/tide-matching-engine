@@ -60,8 +60,8 @@ A = \frac{a}{10^{s_a}}.
 
 ```math
 A'=\begin{cases}
-A\cdot 10^{t-s}, & t\geq s,\\
-A/10^{s-t}, & t\lt s.
+A\cdot 10^{t-s}, & t\geq s,
+\\ A/10^{s-t}, & t\lt s.
 \end{cases}
 ```
 
@@ -352,8 +352,8 @@ P_{\mathrm{band,upper}}(b_{\mathrm{new}})\geq P_{\mathrm{band,upper}}(b_{\mathrm
 ```math
 \left\lceil\frac{a}{d}\right\rceil=
 \begin{cases}
-q, & u=0,\\
-q+1, & u\ne0,
+q, & u=0,
+\\ q+1, & u\ne0,
 \end{cases}
 \qquad a=qd+u, \quad 0\leq u\lt d.
 ```
@@ -383,9 +383,9 @@ P_{\mathrm{effective,sell}}
 ```math
 S_{\mathrm{buy}}=
 \begin{cases}
-\mathrm{User}, & P_u\lt P_b,\\
-\mathrm{MarketBand}, & P_b\lt P_u,\\
-\mathrm{Both}, & P_u=P_b.
+\mathrm{User}, & P_u\lt P_b,
+\\ \mathrm{MarketBand}, & P_b\lt P_u,
+\\ \mathrm{Both}, & P_u=P_b.
 \end{cases}
 ```
 
@@ -394,9 +394,9 @@ S_{\mathrm{buy}}=
 ```math
 S_{\mathrm{sell}}=
 \begin{cases}
-\mathrm{User}, & P_u\gt P_b,\\
-\mathrm{MarketBand}, & P_b\gt P_u,\\
-\mathrm{Both}, & P_u=P_b.
+\mathrm{User}, & P_u\gt P_b,
+\\ \mathrm{MarketBand}, & P_b\gt P_u,
+\\ \mathrm{Both}, & P_u=P_b.
 \end{cases}
 ```
 
