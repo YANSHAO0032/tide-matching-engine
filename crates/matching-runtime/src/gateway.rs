@@ -41,6 +41,8 @@ pub struct PlaceIntent {
 /// 无法由外部伪造字段的已绑定意图。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedPlace {
+    /// 首次持久登记意图时的全局准入纪元。
+    global_epoch: u64,
     /// 用户域内幂等键。
     key: u128,
     /// 风险授权和分片去重共用的稳定命令身份。
@@ -142,7 +144,12 @@ pub struct GatewaySession {
     pub(crate) route_snapshot_hook: Option<Box<dyn FnOnce(u64) + Send>>,
 }
 impl GatewaySession {
-    /// 在授权前同步登记意图身份；跨会话重试复用已持久化的身份。
+    /// 获取会话认证确认的用户，供网关在意图及资金分配前检查权威栅栏。
+    pub(crate) fn authenticated_user(&self) -> UserId {
+        self.user
+    }
+    /// 在独立部署的初始全局纪元登记意图。启用跨分片控制的调用方使用
+    /// [`Self::prepare_wire_for_shard`] 在授权前读取用户与全局控制状态。
     pub fn prepare_wire_durable(
         &mut self,
         bytes: &[u8],
@@ -152,12 +159,55 @@ impl GatewaySession {
         now: u64,
         allocate: impl FnOnce() -> Result<(CommandId, matching_domain::OrderId), GatewayError>,
     ) -> Result<(u64, PreparedPlace), GatewayError> {
+        self.prepare_wire_at_epoch(
+            bytes,
+            max_frame,
+            store,
+            limiter,
+            (now, Default::default()),
+            allocate,
+        )
+    }
+
+    /// 通过目标分片的可信准入权威核对认证用户，将当前纪元与新意图一同持久保存。
+    /// `frame` 依次提供完整请求字节与最大帧长度；权威不可用时不调用身份分配器。
+    pub fn prepare_wire_for_shard(
+        &mut self,
+        frame: (&[u8], usize),
+        shard: &crate::ShardHandle,
+        store: &mut crate::GatewayIntentStore,
+        limiter: &mut GatewayRateLimiters,
+        now: u64,
+        allocate: impl FnOnce() -> Result<(CommandId, matching_domain::OrderId), GatewayError>,
+    ) -> Result<(u64, PreparedPlace), GatewayError> {
+        let status = shard
+            .admission_status(self.user)
+            .map_err(GatewayError::Ingress)?;
+        self.prepare_wire_at_epoch(frame.0, frame.1, store, limiter, (now, status), allocate)
+    }
+
+    /// 使用同一次权威读取检查用户纪元，并将全局纪元与订单身份绑定到同一条持久记录。
+    /// `admission` 依次为限流器的当前时刻与本次准入读取结果。
+    pub(crate) fn prepare_wire_at_epoch(
+        &mut self,
+        bytes: &[u8],
+        max_frame: usize,
+        store: &mut crate::GatewayIntentStore,
+        limiter: &mut GatewayRateLimiters,
+        admission: (u64, crate::place_config::AdmissionStatus),
+        allocate: impl FnOnce() -> Result<(CommandId, matching_domain::OrderId), GatewayError>,
+    ) -> Result<(u64, PreparedPlace), GatewayError> {
+        let (now, status) = admission;
+        let global_epoch = status.global_epoch().unwrap_or(0);
         if self.closing || !self.journal.is_open() {
             return Err(GatewayError::Closed);
         }
         let (request_id, request) =
             matching_protocol::decode_place_request(bytes, max_frame, self.max_client_id)
                 .map_err(GatewayError::Protocol)?;
+        if let Some(reason) = status.rejection(request.user_control_epoch) {
+            return Err(GatewayError::Rejected(reason));
+        }
         if matching_domain::StpKey::new(request.stp_key) != self.stp_key {
             return Err(GatewayError::Unauthorized);
         }
@@ -180,18 +230,21 @@ impl GatewaySession {
         limiter
             .check_prepare(self.key, self.user.0, now)
             .map_err(GatewayError::Rate)?;
-        let (command, order) = store.bind(self.user, request.key, &canonical, allocate)?;
+        let (command, order) =
+            store.bind(self.user, request.key, &canonical, global_epoch, allocate)?;
         let (_, mut prepared) = self.prepare_wire(bytes, max_frame, command, order)?;
         if prepared.command_id != command || prepared.intent.order.order_id != order {
             return Err(GatewayError::Conflict);
         }
         prepared.durable = true;
+        prepared.global_epoch = global_epoch;
         let entry = self
             .entries
             .iter_mut()
             .find(|e| e.key == request.key)
             .ok_or(GatewayError::Conflict)?;
         entry.durable = true;
+        entry.global_epoch = global_epoch;
         Ok((request_id, prepared))
     }
     /// 仅在新的有效意图首次出现时调用身份分配器；重试不分配任何身份。
@@ -388,6 +441,7 @@ impl GatewaySession {
             .try_reserve(1)
             .map_err(|_| GatewayError::Capacity)?;
         let prepared = PreparedPlace {
+            global_epoch: 0,
             key,
             command_id: candidate,
             intent,
@@ -406,6 +460,33 @@ impl GatewaySession {
         now: u64,
         shard: &crate::ShardHandle,
     ) -> Result<Receiver<Result<crate::FormalExecution, crate::FormalError>>, GatewayError> {
+        let status = shard
+            .admission_status(self.user)
+            .map_err(GatewayError::Ingress)?;
+        if let Some(reason) = status.rejection(prepared.intent.user_control_epoch) {
+            return Err(GatewayError::Rejected(reason));
+        }
+        let epoch = status.global_epoch();
+        if epoch.unwrap_or(0) != prepared.global_epoch {
+            return Err(GatewayError::Rejected(
+                matching_domain::RejectReason::ControlFenceActive,
+            ));
+        }
+        self.submit_admitted_place(prepared, token, (client_seq, epoch), limiter, now, shard)
+    }
+
+    /// `admission` 依次为持久意图的会话别名序号与入队前已复核的全局纪元。
+    /// 单写者按队列顺序将该纪元及命令中的用户纪元与本地状态比较。
+    pub(crate) fn submit_admitted_place(
+        &mut self,
+        prepared: &PreparedPlace,
+        token: ReservationToken,
+        admission: (u64, Option<u64>),
+        limiter: &mut GatewayRateLimiters,
+        now: u64,
+        shard: &crate::ShardHandle,
+    ) -> Result<Receiver<Result<crate::FormalExecution, crate::FormalError>>, GatewayError> {
+        let (client_seq, global_epoch) = admission;
         if self.closing || !self.journal.is_open() {
             return Err(GatewayError::Closed);
         }
@@ -448,23 +529,26 @@ impl GatewaySession {
             .check_submit(self.key, self.user.0, now)
             .map_err(GatewayError::Rate)?;
         let response = shard
-            .submit_command(CommandEnvelope {
-                command_id: prepared.command_id,
-                session_id: self.journal.session().0,
-                client_seq,
-                market_id: Some(intent.market),
-                user_id: Some(self.user),
-                route_epoch: Some(target.route_epoch),
-                client_timestamp: None,
-                received_at_unix_ns: None,
-                payload: Command::PlaceLimit(Box::new(PlaceLimitOrder {
-                    order: intent.order.clone(),
-                    client_order_id: intent.client_order_id.clone(),
-                    user_control_epoch: intent.user_control_epoch,
-                    post_only: intent.post_only,
-                    reservation: token,
-                })),
-            })
+            .enqueue_command(
+                CommandEnvelope {
+                    command_id: prepared.command_id,
+                    session_id: self.journal.session().0,
+                    client_seq,
+                    market_id: Some(intent.market),
+                    user_id: Some(self.user),
+                    route_epoch: Some(target.route_epoch),
+                    client_timestamp: None,
+                    received_at_unix_ns: None,
+                    payload: Command::PlaceLimit(Box::new(PlaceLimitOrder {
+                        order: intent.order.clone(),
+                        client_order_id: intent.client_order_id.clone(),
+                        user_control_epoch: intent.user_control_epoch,
+                        post_only: intent.post_only,
+                        reservation: token,
+                    })),
+                },
+                global_epoch,
+            )
             .map_err(GatewayError::Ingress)?;
         Ok(response)
     }

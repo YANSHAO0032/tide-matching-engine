@@ -203,6 +203,7 @@ impl AuditLog {
     ///
     /// 本调用在管理线程执行文件同步和等待，不能在撮合线程调用。调用方负责
     /// 验证操作者权限；超时或结果审计失败时须按原命令身份查询或重试。
+    /// 跨分片控制子命令只能由协调器派发；在此直接提交会记录一次拒绝。
     pub fn dispatch(
         &mut self,
         actor_id: u64,
@@ -226,9 +227,11 @@ impl AuditLog {
             | Command::TriggerCircuitBreaker(_) => AuditAction::KillSwitch,
             Command::UpdateFeeSchedule(_) => AuditAction::FeeUpdate,
             Command::UpdateReferencePrice(_) => AuditAction::ReferenceUpdate,
-            Command::ApplyUserControlFenceShard(_) => AuditAction::Control,
+            Command::ApplyGlobalControlFenceShard(_) | Command::ApplyUserControlFenceShard(_) => {
+                AuditAction::Control
+            }
             Command::MassCancelShard(_) => AuditAction::MassCancel,
-            Command::PlaceLimit(_) => {
+            Command::Cancel(_) | Command::PlaceLimit(_) => {
                 return Err(AuditDispatchError::NotAdmin);
             }
         };
@@ -250,6 +253,7 @@ impl AuditLog {
             route_epoch: command.route_epoch,
             primary_epoch: match &command.payload {
                 Command::ShardKillSwitch(input) => Some(input.expected_primary_epoch),
+                Command::ApplyGlobalControlFenceShard(input) => Some(input.expected_primary_epoch),
                 Command::ApplyUserControlFenceShard(input) => Some(input.expected_primary_epoch),
                 _ => None,
             },

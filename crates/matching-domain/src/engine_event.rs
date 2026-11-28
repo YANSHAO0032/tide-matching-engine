@@ -21,6 +21,11 @@ pub enum OrderRemaining {
 /// 它不是完整持久化事件封装：不携带市场事件序列、WAL 位置或发布元数据。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EngineEvent {
+    /// 当前分片的全局控制纪元已生效，排在本次开关及逐单撤单、释放事件之后。
+    GlobalControlEpochAdvanced {
+        /// 已提交的全局控制纪元。
+        epoch: u64,
+    },
     /// 确定性的市场熔断已触发。
     CircuitBreakerTriggered {
         /// 触发熔断的市场。

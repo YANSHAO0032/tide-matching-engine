@@ -20,6 +20,13 @@ pub trait ReplicationStream: Read + Write + Send + 'static {
 ///
 /// 实现者须保证比较写权与推进前缀属于同一原子操作；错误或结果未知不得视为成功。
 pub trait ReplicaCommitFence: Send + 'static {
+    /// 在分配分片序号前核验已认证主写者的写权。提交复制前缀时仍须重新比较写权。
+    fn verify_control_owner(&mut self, _epoch: u64, _deadline: Instant) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "复制权威未提供控制命令凭据",
+        ))
+    }
     /// 在发送备节点之前持久登记完整复制意图；它不是提交确认。
     fn prepare(&mut self, records: &[WalRecord], deadline: Instant) -> io::Result<()>;
     /// 比较写权并提交一条连续记录，返回其已确认序号。
@@ -67,6 +74,15 @@ where
 }
 
 impl ReplicaCommitFence for crate::FencedLogWriter {
+    fn verify_control_owner(&mut self, epoch: u64, deadline: Instant) -> io::Result<()> {
+        if self.epoch() != epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "主写者纪元不一致",
+            ));
+        }
+        self.verify_bound_lease(deadline)
+    }
     fn prepare(&mut self, records: &[WalRecord], deadline: Instant) -> io::Result<()> {
         for record in records {
             self.prepare_until(record, deadline)?;
@@ -103,8 +119,17 @@ impl ReplicationStream for std::net::TcpStream {
     }
 }
 
-/// 交给外围线程处理的复制批次或摘要登记请求。
+/// 交给外围线程的写权查验、复制批次或摘要登记请求。
 enum Request {
+    /// 在序号分配前查验主写者的实时凭据。
+    Verify {
+        /// 子命令要求的主节点纪元。
+        epoch: u64,
+        /// 读取控制存储的截止时间。
+        deadline: Instant,
+        /// 单次核验的有界回复。
+        reply: SyncSender<io::Result<()>>,
+    },
     /// 顺序复制完整有界 WAL 批次。
     Batch {
         /// 已在主节点同步的连续 WAL 记录。
@@ -280,6 +305,19 @@ impl<A: DurableAppender> ReplicatedAppender<A> {
                         }
                     };
                     let failed = match request {
+                        Request::Verify {
+                            epoch,
+                            deadline,
+                            reply,
+                        } => {
+                            // 连续核验会一直占用收件循环，须在同一期限内续持写权。
+                            let result = remaining(deadline)
+                                .and_then(|_| fence.verify_control_owner(epoch, deadline))
+                                .and_then(|()| fence.renew_until(deadline));
+                            let failed = result.is_err();
+                            let _ = reply.send(result);
+                            failed
+                        }
                         Request::Batch {
                             records,
                             deadline,
@@ -361,6 +399,36 @@ impl<A: DurableAppender> ReplicatedAppender<A> {
 }
 
 impl<A: DurableAppender> DurableAppender for ReplicatedAppender<A> {
+    fn verify_control_owner(&mut self, epoch: u64) -> io::Result<()> {
+        if self.halted || !self.health.ready() {
+            return Err(io::Error::other("复制写入器已停止"));
+        }
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "写权核验期限越界"))?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .ok_or_else(|| io::Error::other("复制线程不可用"))?
+            .try_send(Request::Verify {
+                epoch,
+                deadline,
+                reply,
+            })
+            .map_err(|e| match e {
+                TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "复制队列已满"),
+                TrySendError::Disconnected(_) => io::Error::other("复制线程已停止"),
+            })?;
+        receiver
+            .recv_timeout(remaining(deadline)?)
+            .map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => {
+                    io::Error::new(io::ErrorKind::TimedOut, "写权核验超时")
+                }
+                mpsc::RecvTimeoutError::Disconnected => io::Error::other("写权核验线程停止"),
+            })??;
+        remaining(deadline).map(|_| ())
+    }
     fn would_rotate(&self, record: &WalRecord) -> io::Result<bool> {
         if self.halted || !self.health.ready() {
             return Err(io::Error::other("复制写入器已停止"));

@@ -89,7 +89,7 @@
 
 业务说明见 [限价订单执行约束](limit_execution.md)、[冰山订单](iceberg.md)、[挂单修改与本地预留授权](amend.md)、[原子撤单替换与预留归属](cancel_replace.md)、[数值计算公式](numerical_formulas.md) 与 [关键逻辑流程](logic_flows.md)。
 
-批量撤单使用领域层的 `ShardCancelScope`，只按活动订单关联预留快照中的 `user_id`、`market_id` 与持久化的 `origin_session_id` 过滤；后者不是 DAY 的交易时段。两个订单簿各自扫描其真实活动容器，统一按 `OrderId` 升序冻结目标，在不可变计划中预演活动预留归属到 `PendingR2` 的迁移，并仅在订单簿和登记表前态未漂移时一次安装后态。Regular、冰山和未触发 Stop 均走该路径；取消会复用各自已有的容器及到期引用清理，既不触发 Stop child，也不补量冰山或分配/回退任何优先级。每个目标只产生 `OrderCanceled { reason: MassCancel }`；基础数量订单携带 `OrderRemaining::Base`，未触发的报价预算 StopMarket 携带当前 `OrderRemaining::Quote`。这只是当前执行单元的本地语义，不包含跨分片协调、围栏或真实 R2 资金释放。
+批量撤单使用领域层的 `ShardCancelScope`，只按活动订单关联预留快照中的 `user_id`、`market_id` 与持久化的 `origin_session_id` 过滤；后者不是 DAY 的交易时段。两个订单簿各自扫描其真实活动容器，统一按 `OrderId` 升序冻结目标，在不可变计划中预演活动预留归属到 `PendingR2` 的迁移，并仅在订单簿和登记表前态未漂移时一次安装后态。Regular、冰山和未触发 Stop 均走该路径；取消会复用各自已有的容器及到期引用清理，既不触发 Stop child，也不补量冰山或分配/回退任何优先级。每个目标只产生 `OrderCanceled { reason: MassCancel }`；基础数量订单携带 `OrderRemaining::Base`，未触发的报价预算 StopMarket 携带当前 `OrderRemaining::Quote`。分片工作线程把这份计划与控制纪元及相应的 R2 释放一起提交。用户主动撤销单笔订单时，`plan_user_cancel` 先按订单 ID 定位普通单或未触发的 Stop，再核对市场、用户和活动预留。运行时检查可选的客户端别名，使用 `UserRequested` 终结这一笔订单。跨分片操作的派发与恢复见[跨分片撤单与开关](cross_shard_control.md)。
 
 撤单替换领域输入位于 `matching-domain/src/cancel_replace.rs`，新预留的规范签名字节位于 `reservation_token.rs`。`matching-risk/src/reservation_transition.rs` 持有真实登记表及不可伪造的金融/归属计划，区分 ActiveOrder 与 PendingR2；订单终结不伪装成金融释放。两套簿各自规划、核对完整前态后提交，不共享过滤、撮合或提交算法。`tests/cancel_replace/` 固定约束和原子性；`tests/differential/cancel_replace/` 保存持续历史的完整混合磁带和独立性质断言。
 

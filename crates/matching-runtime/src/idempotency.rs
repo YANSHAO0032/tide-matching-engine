@@ -81,14 +81,28 @@ struct Entry {
     /// 首次事件的索引范围。
     event_range: Option<(u32, u32)>,
 }
-/// 核验缓存结果与首个业务命令的类型和订单身份。
-fn outcome_matches(command: &Command, outcome: &FormalOutcome) -> bool {
+/// 核对首次命令的结果类型、订单身份，以及控制动作允许的撤单数和事件范围。
+fn outcome_matches(command: &Command, outcome: &FormalOutcome, range: Option<(u32, u32)>) -> bool {
+    let action = match command {
+        Command::ApplyUserControlFenceShard(f)
+            if f.action == matching_domain::UserFenceAction::FenceOnly =>
+        {
+            return matches!(outcome, FormalOutcome::UserFence(epoch) if *epoch >= f.new_epoch)
+                && range == Some((0, 0));
+        }
+        Command::ApplyUserControlFenceShard(f) => Some(f.action),
+        Command::ApplyGlobalControlFenceShard(f) => Some(f.action),
+        _ => None,
+    };
+    if let Some(action) = action {
+        return matches!((outcome, range),
+            (FormalOutcome::MassCancel(result), Some((0, last)))
+            if crate::user_control::control_events_match(action, result.canceled_orders, last));
+    }
     match (command, outcome) {
         (_, FormalOutcome::Rejected(_)) => true,
         (Command::PlaceLimit(place), FormalOutcome::Placed(id)) => place.order.order_id == *id,
-        (Command::ApplyUserControlFenceShard(fence), FormalOutcome::UserFence(epoch)) => {
-            *epoch >= fence.new_epoch
-        }
+        (Command::Cancel(input), FormalOutcome::Canceled(id)) => input.order_id == *id,
         (Command::MassCancelShard(_), FormalOutcome::MassCancel(_)) => true,
         (Command::ShardKillSwitch(_), FormalOutcome::ShardControl) => true,
         (Command::UpdateFeeSchedule(input), FormalOutcome::FeeScheduleUpdated(version)) => {
@@ -302,7 +316,7 @@ impl DedupWindow {
         }
         w.u32(u32::try_from(self.entries.len()).map_err(|_| SnapshotWireError)?)?;
         for entry in &self.entries {
-            if !outcome_matches(&entry.intent.payload, &entry.outcome) {
+            if !outcome_matches(&entry.intent.payload, &entry.outcome, entry.event_range) {
                 return Err(SnapshotWireError);
             }
             let envelope = CommandEnvelope {
@@ -336,6 +350,10 @@ impl DedupWindow {
                 }
                 FormalOutcome::MarketManaged => w.u8(4)?,
                 FormalOutcome::ShardControl => w.u8(6)?,
+                FormalOutcome::Canceled(id) => {
+                    w.u8(7)?;
+                    w.u128(id.get())?;
+                }
                 FormalOutcome::Placed(id) => {
                     w.u8(0)?;
                     w.u128(id.get())?
@@ -473,11 +491,9 @@ impl DedupWindow {
                 4 => FormalOutcome::MarketManaged,
                 5 => FormalOutcome::FeeScheduleUpdated(r.u64()?),
                 6 => FormalOutcome::ShardControl,
+                7 => FormalOutcome::Canceled(matching_domain::OrderId(r.u128()?)),
                 _ => return Err(SnapshotWireError),
             };
-            if !outcome_matches(&command.payload, &outcome) {
-                return Err(SnapshotWireError);
-            }
             let event_range = match r.u8()? {
                 0 => None,
                 1 => {
@@ -490,6 +506,9 @@ impl DedupWindow {
                 }
                 _ => return Err(SnapshotWireError),
             };
+            if !outcome_matches(&command.payload, &outcome, event_range) {
+                return Err(SnapshotWireError);
+            }
             let (status, reject_reason) = match outcome {
                 FormalOutcome::Rejected(reason) => (CommandStatus::Rejected, Some(reason)),
                 _ => (CommandStatus::Succeeded, None),
@@ -830,6 +849,84 @@ mod tests {
             deduplicated: false,
         }
     }
+    /// 以持久窗口原格式逐项构造控制命令、返回类型和事件范围，保留有效旧下限结果。
+    #[test]
+    fn control_snapshot_binds_action_outcome_and_event_range() {
+        use matching_domain::{
+            ApplyGlobalControlFenceShard, ApplyUserControlFenceShard, UserFenceAction,
+            snapshot_wire::{SnapshotDecoder, SnapshotEncoder},
+        };
+        let cfg = IdempotencyConfig {
+            command_capacity: 1,
+            session_capacity: 1,
+            aliases_per_session: 1,
+        };
+        let fence = UserFenceAction::FenceOnly;
+        let cancel = UserFenceAction::FenceAndCancelAll;
+        let keep = UserFenceAction::Kill {
+            active: true,
+            cancel_all: false,
+        };
+        for (user, action, tag, value, last, valid) in [
+            (true, cancel, 1, 1, 0, false),
+            (false, fence, 2, 0, 0, false),
+            (true, fence, 2, 0, 0, false),
+            (true, fence, 1, 1, 0, true),
+            (true, fence, 1, 3, 0, true),
+            (true, fence, 1, 0, 0, false),
+            (true, fence, 1, 1, 1, false),
+            (false, keep, 2, 1, 1, false),
+            (false, keep, 2, 0, 1, true),
+            (true, cancel, 2, 1, 2, true),
+            (false, cancel, 2, 1, 3, false),
+        ] {
+            let mut c = cmd(1, 0, 0, 0);
+            c.route_epoch = None;
+            c.market_id = None;
+            c.user_id = user.then_some(UserId(10));
+            c.payload = if user {
+                Command::ApplyUserControlFenceShard(ApplyUserControlFenceShard {
+                    parent_command_id: CommandId(2),
+                    user_id: UserId(10),
+                    new_epoch: 1,
+                    action,
+                    expected_primary_epoch: 1,
+                })
+            } else {
+                Command::ApplyGlobalControlFenceShard(ApplyGlobalControlFenceShard {
+                    parent_command_id: CommandId(2),
+                    new_epoch: 1,
+                    action,
+                    expected_primary_epoch: 1,
+                })
+            };
+            let mut body = SnapshotEncoder::new(512);
+            for _ in 0..3 {
+                body.u64(1).unwrap();
+            }
+            body.u32(1).unwrap();
+            body.bytes(&matching_domain::encode_wal_command(&c).unwrap())
+                .unwrap();
+            body.u64(1).unwrap();
+            body.u8(tag).unwrap();
+            body.u64(value).unwrap();
+            body.u8(1).unwrap();
+            body.u32(0).unwrap();
+            body.u32(last).unwrap();
+            body.u8(0).unwrap();
+            body.u32(0).unwrap();
+            let mut bytes = SnapshotEncoder::new(512);
+            bytes.bytes(&body.finish()).unwrap();
+            let raw = bytes.finish();
+            let mut reader = SnapshotDecoder::new(&raw, 512).unwrap();
+            assert_eq!(
+                DedupWindow::read_snapshot(&mut reader, cfg, 1).is_ok(),
+                valid,
+                "{user}, {action:?}, {tag}, {value}, {last}"
+            );
+        }
+    }
+
     #[test]
     fn snapshot_restores_successful_market_management_dedup() {
         use matching_domain::{

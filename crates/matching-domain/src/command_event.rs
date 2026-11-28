@@ -11,7 +11,7 @@ pub struct PlaceLimitOrder {
     pub order: LimitOrder,
     /// 用户提供的可选客户端订单身份。
     pub client_order_id: Option<String>,
-    /// 用户控制状态版本，由分片在分配序号前校验。
+    /// 用户控制纪元。采用协调权威时，入口先核对已发布值，分片单写者再核对本地下限。
     pub user_control_epoch: u64,
     /// 只挂单标志；交叉价格在改簿前拒绝。
     pub post_only: bool,
@@ -43,16 +43,36 @@ pub struct CommandResultSummary {
     pub reject_reason: Option<RejectReason>,
 }
 
-/// 用户控制操作的分片内动作。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UserFenceAction {
-    /// 仅推进用户下限。
-    FenceOnly,
-    /// 推进下限并取消该用户订单。
-    FenceAndCancelAll,
+/// 用户对指定市场内一笔活动订单的精确撤单请求。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelOrder {
+    /// 订单所属市场，必须与信封路由一致。
+    pub market_id: MarketId,
+    /// 发起撤单的用户，必须与活动订单归属及信封身份一致。
+    pub user_id: UserId,
+    /// 需要终结的活动订单。
+    pub order_id: crate::OrderId,
+    /// 可选客户端订单身份；提供时须与活动绑定一致。
+    pub client_order_id: Option<String>,
 }
 
-/// 协调者向分片发送的用户控制栅栏。
+/// 用户或全局控制操作在目标分片执行的动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserFenceAction {
+    /// 仅推进用户下限，用于未绑定跨分片权威的分片入口。
+    FenceOnly,
+    /// 推进控制纪元并撤销本分片作用域内的全部活动订单。
+    FenceAndCancelAll,
+    /// 激活或清除当前作用域的熔断开关；激活时可同时撤单。
+    Kill {
+        /// 开关的目标状态。
+        active: bool,
+        /// 激活时是否撤销作用域内所有活动订单。清除开关时必须为假。
+        cancel_all: bool,
+    },
+}
+
+/// 目标分片上的用户控制命令。协调器使用它原子推进用户纪元并执行作用域动作。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyUserControlFenceShard {
     /// 父命令身份。
@@ -64,6 +84,19 @@ pub struct ApplyUserControlFenceShard {
     /// 待执行动作。
     pub action: UserFenceAction,
     /// 预期的本地主节点纪元。
+    pub expected_primary_epoch: u64,
+}
+
+/// 协调器向每个目标分片发送的全局控制栅栏。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyGlobalControlFenceShard {
+    /// 父控制操作身份。
+    pub parent_command_id: CommandId,
+    /// 本次全局控制纪元。
+    pub new_epoch: u64,
+    /// 本地撤单或熔断动作。
+    pub action: UserFenceAction,
+    /// 投递时验证的主节点纪元。
     pub expected_primary_epoch: u64,
 }
 
@@ -195,6 +228,10 @@ pub enum KillScope {
 /// 当前具有实际载荷的正式业务命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// 按订单身份和用户归属撤销一笔活动订单。
+    Cancel(CancelOrder),
+    /// 在一个分片序号内应用全局栅栏、熔断与可选撤单。
+    ApplyGlobalControlFenceShard(ApplyGlobalControlFenceShard),
     /// 修改经租约授权的分片范围熔断开关。
     ShardKillSwitch(ShardKillSwitch),
     /// 触发市场熔断。

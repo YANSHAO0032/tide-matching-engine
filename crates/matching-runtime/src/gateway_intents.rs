@@ -12,9 +12,14 @@ use std::{
 const MAX_ENTRIES: usize = 4096;
 const MAX_WIRE: usize = 65_536;
 const FIXED: usize = 60;
+/// 记录长度的最高位标识后续载荷是已有意图的风险授权。
 const AUTH_FLAG: u32 = 1 << 31;
+/// 身份记录的此位表示规范请求长度之后还保存了八字节的全局纪元。
+const EPOCH_FLAG: u32 = 1 << 30;
 
 struct Entry {
+    /// 首次准入时已发布的全局纪元；旧格式记录属于纪元零。
+    global_epoch: u64,
     /// 认证用户身份。
     user: UserId,
     /// 用户域内幂等键。
@@ -279,7 +284,7 @@ impl GatewayIntentStore {
             return Err(invalid());
         }
         let max_size = capacity
-            .checked_mul(FIXED + max_wire + 8 + MAX_WIRE + 8)
+            .checked_mul(FIXED + 8 + max_wire + 8 + MAX_WIRE + 8)
             .and_then(|n| n.checked_add(4))
             .ok_or_else(invalid)?;
         let size = usize::try_from(file.metadata()?.len()).map_err(|_| invalid())?;
@@ -304,9 +309,11 @@ impl GatewayIntentStore {
             let prefix_end = pos.checked_add(4).ok_or_else(invalid)?;
             let tagged = read_u32(bytes.get(pos..prefix_end).ok_or_else(invalid)?)?;
             let is_auth = tagged & AUTH_FLAG != 0;
-            let len = usize::try_from(tagged & !AUTH_FLAG).map_err(|_| invalid())?;
-            if (is_auth && (len == 0 || len > MAX_WIRE))
-                || (!is_auth && (len < FIXED || len > FIXED + max_wire))
+            let has_epoch = tagged & EPOCH_FLAG != 0;
+            let header = if has_epoch { FIXED + 8 } else { FIXED };
+            let len = usize::try_from(tagged & !(AUTH_FLAG | EPOCH_FLAG)).map_err(|_| invalid())?;
+            if (is_auth && (has_epoch || len == 0 || len > MAX_WIRE))
+                || (!is_auth && (len < header || len > header + max_wire))
             {
                 return Err(invalid());
             }
@@ -361,7 +368,12 @@ impl GatewayIntentStore {
             let command = CommandId(read_u128(&body[24..40])?);
             let order = OrderId(read_u128(&body[40..56])?);
             let wire_len = usize::try_from(read_u32(&body[56..60])?).map_err(|_| invalid())?;
-            if FIXED.checked_add(wire_len) != Some(len)
+            let global_epoch = if has_epoch {
+                read_u64(&body[FIXED..header])?
+            } else {
+                0
+            };
+            if header.checked_add(wire_len) != Some(len)
                 || entries.iter().any(|e| {
                     (e.user == user && e.key == key) || e.command == command || e.order == order
                 })
@@ -372,6 +384,7 @@ impl GatewayIntentStore {
                 .try_reserve(1)
                 .map_err(|_| io::Error::other("意图表内存不足"))?;
             entries.push(Entry {
+                global_epoch,
                 user,
                 key,
                 command,
@@ -380,7 +393,7 @@ impl GatewayIntentStore {
                     .map_err(|_| invalid())?
                     .checked_add(1)
                     .ok_or_else(invalid)?,
-                wire: body[FIXED..].to_vec(),
+                wire: body[header..].to_vec(),
                 authorization: None,
             });
             record_count = record_count.checked_add(1).ok_or_else(invalid)?;
@@ -405,6 +418,7 @@ impl GatewayIntentStore {
         user: UserId,
         key: u128,
         wire: &[u8],
+        global_epoch: u64,
         allocate: impl FnOnce() -> Result<(CommandId, OrderId), crate::GatewayError>,
     ) -> Result<(CommandId, OrderId), crate::GatewayError> {
         use crate::GatewayError;
@@ -415,11 +429,15 @@ impl GatewayIntentStore {
             return Err(GatewayError::Capacity);
         }
         if let Some(entry) = self.entries.iter().find(|e| e.user == user && e.key == key) {
-            return if entry.wire == wire {
-                Ok((entry.command, entry.order))
-            } else {
-                Err(GatewayError::Conflict)
-            };
+            if entry.wire != wire {
+                return Err(GatewayError::Conflict);
+            }
+            if entry.global_epoch != global_epoch {
+                return Err(GatewayError::Rejected(
+                    matching_domain::RejectReason::ControlFenceActive,
+                ));
+            }
+            return Ok((entry.command, entry.order));
         }
         if self.entries.len() == self.capacity {
             return Err(GatewayError::Capacity);
@@ -440,18 +458,21 @@ impl GatewayIntentStore {
         {
             return Err(GatewayError::Conflict);
         }
-        let len = FIXED
+        let header = if global_epoch == 0 { FIXED } else { FIXED + 8 };
+        let len = header
             .checked_add(wire.len())
             .ok_or(GatewayError::Capacity)?;
         let mut record = Vec::new();
         record
             .try_reserve_exact(len + 8)
             .map_err(|_| GatewayError::Capacity)?;
-        record.extend_from_slice(
-            &u32::try_from(len)
-                .map_err(|_| GatewayError::Capacity)?
-                .to_be_bytes(),
-        );
+        let length = u32::try_from(len).map_err(|_| GatewayError::Capacity)?;
+        let tag = if global_epoch == 0 {
+            length
+        } else {
+            length | EPOCH_FLAG
+        };
+        record.extend_from_slice(&tag.to_be_bytes());
         record.extend_from_slice(&user.0.to_be_bytes());
         record.extend_from_slice(&key.to_be_bytes());
         record.extend_from_slice(&command.0.to_be_bytes());
@@ -461,6 +482,9 @@ impl GatewayIntentStore {
                 .map_err(|_| GatewayError::Capacity)?
                 .to_be_bytes(),
         );
+        if global_epoch != 0 {
+            record.extend_from_slice(&global_epoch.to_be_bytes());
+        }
         record.extend_from_slice(wire);
         record.extend_from_slice(&matching_persistence::crc32c(&record).to_be_bytes());
         let result = self
@@ -486,6 +510,7 @@ impl GatewayIntentStore {
             return Err(GatewayError::Journal(error));
         }
         self.entries.push(Entry {
+            global_epoch,
             user,
             key,
             command,
@@ -495,5 +520,39 @@ impl GatewayIntentStore {
             authorization: None,
         });
         Ok((command, order))
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    #[test]
+    fn reopened_intent_keeps_original_global_admission_epoch() {
+        let dir = crate::test_directory::TestDirectory::new();
+        let path = dir.0.join("gateway");
+        let mut store = GatewayIntentStore::create(&path, 8, 128).unwrap();
+        for epoch in [0, 9] {
+            store
+                .bind(UserId(1), u128::from(epoch), b"intent", epoch, || {
+                    Ok((CommandId(u128::from(epoch)), OrderId(u128::from(epoch))))
+                })
+                .unwrap();
+        }
+        drop(store);
+        let mut store = GatewayIntentStore::open(&path, 8, 128).unwrap();
+        for epoch in [0, 9] {
+            let old = store.bind(UserId(1), u128::from(epoch), b"intent", epoch, || {
+                panic!("重试重新分配身份")
+            });
+            assert_eq!(old.unwrap().0, CommandId(u128::from(epoch)));
+            assert!(matches!(
+                store.bind(UserId(1), u128::from(epoch), b"intent", 10, || panic!(
+                    "过期意图重新分配身份"
+                )),
+                Err(crate::GatewayError::Rejected(
+                    matching_domain::RejectReason::ControlFenceActive
+                ))
+            ));
+        }
     }
 }

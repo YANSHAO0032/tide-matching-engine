@@ -118,10 +118,11 @@ pub use cancel_replace::{
 };
 /// 正式命令及事件的身份、路由和审计信息。
 pub use command_event::{
-    ApplyUserControlFenceShard, CloseMarket, Command, CommandEnvelope, CommandResultSummary,
-    CommandStatus, CreateMarket, EndSession, EventEnvelope, KillScope, MarketKillSwitch,
-    OpenMarket, PlaceLimitOrder, ResumeMarket, ShardKillSwitch, StartSession, SuspendMarket,
-    TriggerCircuitBreaker, UpdateFeeSchedule, UpdateMarket, UpdateReferencePrice, UserFenceAction,
+    ApplyGlobalControlFenceShard, ApplyUserControlFenceShard, CancelOrder, CloseMarket, Command,
+    CommandEnvelope, CommandResultSummary, CommandStatus, CreateMarket, EndSession, EventEnvelope,
+    KillScope, MarketKillSwitch, OpenMarket, PlaceLimitOrder, ResumeMarket, ShardKillSwitch,
+    StartSession, SuspendMarket, TriggerCircuitBreaker, UpdateFeeSchedule, UpdateMarket,
+    UpdateReferencePrice, UserFenceAction,
 };
 /// 正式命令的版本化持久编码与解码。
 pub use command_wal_codec::{CommandCodecError, decode_wal_command, encode_wal_command};

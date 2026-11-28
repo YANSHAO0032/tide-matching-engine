@@ -1,4 +1,5 @@
 //! 分片工作线程及进程内消息。
+mod cross_fence;
 mod market_transfer;
 mod migration_worker;
 mod snapshot;
@@ -141,6 +142,8 @@ pub struct FormalExecution {
 /// 正式命令的有类型结果，不作为业务事件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormalOutcome {
+    /// 用户成功撤销的单笔活动订单身份。
+    Canceled(OrderId),
     /// 分片范围控制操作已执行。
     ShardControl,
     /// 费率版本已更新。
@@ -160,7 +163,7 @@ pub enum FormalOutcome {
         /// 执行后生效的用户控制下限。
         u64,
     ),
-    /// 分片本地批量撤单的汇总结果。
+    /// 分片批量撤单或协调控制实际撤销的订单数。
     MassCancel(
         /// 成功终结的订单数量。
         ShardMassCancelResult,
@@ -196,6 +199,8 @@ pub enum ShardError {
     Busy,
     /// 入口已关闭。
     Closed,
+    /// 未能读取权威控制状态。
+    ControlUnavailable,
     /// 截止时间已到。
     Timeout,
     /// 线程异常退出。
@@ -209,7 +214,11 @@ impl ShardError {
     pub fn ingress_reason(&self) -> Option<RejectReason> {
         match self {
             Self::Busy => Some(RejectReason::EngineBusy),
-            Self::Closed | Self::Timeout | Self::Failed | Self::InvalidConfig => None,
+            Self::Closed
+            | Self::Timeout
+            | Self::Failed
+            | Self::InvalidConfig
+            | Self::ControlUnavailable => None,
         }
     }
 }
@@ -253,7 +262,7 @@ pub struct SnapshotImage {
     managed_markets: BTreeMap<MarketId, matching_domain::ManagedMarket>,
     /// 完整的预留登记表副本。
     registry: Option<ReservationRegistry>,
-    /// 分片用户控制下限副本。
+    /// 分片用户纪元下限及用户、全局最近控制回执的副本。
     user_epochs: UserControlEpochs,
     /// 分片命令去重窗口副本。
     dedup: Option<DedupWindow>,
@@ -323,6 +332,10 @@ impl SnapshotImage {
     /// 查询镜像中保留的预留金融状态。
     pub fn reservation(&self, id: ReservationId) -> Option<&ReservationState> {
         self.registry.as_ref().and_then(|registry| registry.get(id))
+    }
+    /// 在已捕获的镜像中枚举所有非零用户下限，供停写升级时按用户取各分片最大值。
+    pub fn user_control_floors(&self) -> impl Iterator<Item = (matching_domain::UserId, u64)> + '_ {
+        self.user_epochs.floors()
     }
     /// 检查用户纪元是否满足镜像中的下限。
     pub fn check_user_epoch(
@@ -416,6 +429,8 @@ enum Message {
     Formal(
         /// 含路由及业务身份的命令。
         CommandEnvelope,
+        /// 受保护命令在权威准入时观察到的全局纪元。
+        Option<u64>,
         /// 返回执行结果或前置拒绝的一次性回复端。
         CommandReply<Result<FormalExecution, FormalError>>,
     ),
@@ -516,10 +531,14 @@ impl Default for ShardConfig {
 pub struct Shard {
     /// 工作线程是否从路由暂停状态启动。
     route_gated_at_start: bool,
+    /// 启动配置中的分片主节点纪元，协调控制在执行前另行核对实际写权。
+    primary_epoch: u64,
     /// 工作线程最近确认的路由准入状态。
     route_ready: Arc<AtomicBool>,
     /// 正式业务入口是否在回复前完成本地持久提交。
     durable_formal: bool,
+    /// 已绑定到本分片的控制权威，不随市场迁移。
+    control_admission: Option<crate::place_config::AdmissionBinding>,
     /// 具备受清单保护的本地市场迁移顺序点。
     local_migration: bool,
     /// 持久写入器的独立时延观测。
@@ -1014,10 +1033,12 @@ impl Shard {
     /// 创建可并发克隆的外部生产者句柄。
     pub fn handle(&self) -> ShardHandle {
         ShardHandle {
+            primary_epoch: self.primary_epoch,
             route_gated_at_start: self.route_gated_at_start,
             route_ready: Arc::clone(&self.route_ready),
             durable_formal: self.durable_formal,
             local_migration: self.local_migration,
+            control_admission: self.control_admission.clone(),
             wal_metrics: self.wal_metrics.clone(),
             primary_lease: self.primary_lease.clone(),
             snapshot_origin: Arc::clone(&self.snapshot_origin),
@@ -1823,6 +1844,18 @@ impl Shard {
         let drop_requested = Arc::new(AtomicBool::new(false));
         let worker_drop = Arc::clone(&drop_requested);
         let durable_formal = durable.is_some() && place_state.is_some();
+        let control_admission = place_state
+            .as_ref()
+            .and_then(|state| state.config.control_admission.clone());
+        if user_epochs.requires_control_admission() && control_admission.is_none() {
+            return Err(ShardError::InvalidConfig);
+        }
+        if control_admission
+            .as_ref()
+            .is_some_and(|binding| !durable_formal || binding.0.cluster_id() != cluster)
+        {
+            return Err(ShardError::InvalidConfig);
+        }
         let local_migration = durable_formal
             && durable.as_ref().is_some_and(|gate| {
                 gate._wal_lease.is_some() && gate.batcher.supports_local_migration()
@@ -1879,7 +1912,7 @@ impl Shard {
                             );
                             let _ = reply.send(Err(reason));
                         }
-                        Message::Formal(command, reply)
+                        Message::Formal(command, _, reply)
                             if migrating && !consumer.routes_fenced() =>
                         {
                             let reason = migration_worker::frozen_reason(
@@ -1895,7 +1928,9 @@ impl Shard {
                         {
                             let _ = reply.send(Err(RejectReason::EngineBusy));
                         }
-                        Message::Formal(_, reply) if route_paused || consumer.routes_fenced() => {
+                        Message::Formal(_, _, reply)
+                            if route_paused || consumer.routes_fenced() =>
+                        {
                             let _ =
                                 reply.send(Err(FormalError::Rejected(RejectReason::EngineBusy)));
                         }
@@ -1926,14 +1961,14 @@ impl Shard {
                             };
                             let _ = reply.send(result);
                         }
-                        Message::Formal(command, reply)
+                        Message::Formal(command, admitted, reply)
                             if durable.as_ref().is_some_and(|gate| gate.group.is_some())
                                 || (durable.is_some() && place_state.is_some()) =>
                         {
                             let gate = durable.as_mut().expect("已检查批处理模式");
                             if place_state.is_some() {
                                 deferred = execute_formal_group(
-                                    (command, reply),
+                                    (command, admitted, reply),
                                     &mut consumer,
                                     gate,
                                     FormalGroupContext {
@@ -2009,7 +2044,7 @@ impl Shard {
                             worker_metrics.observe_mutation(&result);
                             let _ = reply.send(result);
                         }
-                        Message::Formal(command, reply) => {
+                        Message::Formal(command, _, reply) => {
                             let match_started = matches!(&command.payload, Command::PlaceLimit(_))
                                 .then(Instant::now);
                             let result = if let Command::ApplyUserControlFenceShard(ref fence) =
@@ -2057,6 +2092,7 @@ impl Shard {
                                     (Err(reason), _, _) => Err(FormalError::Rejected(reason)),
                                     (Ok(()), Some(window), Some(state)) => execute_place(
                                         PlaceExecutionContext {
+                                            control_killed: user_epochs.killed(place.order.user_id),
                                             managed: command
                                                 .market_id
                                                 .and_then(|id| managed_markets.get(&id)),
@@ -2105,7 +2141,7 @@ impl Shard {
                                         &clock,
                                         &mut markets,
                                         &mut registry,
-                                        (command, &mut durable, false),
+                                        (command, &mut durable, false, false),
                                     )
                                     .map_err(FormalError::Rejected),
                                 }
@@ -2367,10 +2403,12 @@ impl Shard {
         });
         let thread = join.thread().clone();
         Ok(Self {
+            primary_epoch,
             route_gated_at_start: start_route_paused,
             route_ready,
             durable_formal,
             local_migration,
+            control_admission,
             wal_metrics,
             primary_lease,
             snapshot_origin,
@@ -2429,6 +2467,8 @@ struct PlaceRuntimeState {
 
 /// 正式限价命令所需的单写者状态。
 struct PlaceExecutionContext<'a> {
+    /// 当前用户或全局控制开关是否已激活。
+    control_killed: bool,
     /// 市场管理状态；未启用市场管理的既有入口为空。
     managed: Option<&'a matching_domain::ManagedMarket>,
     /// 根事件身份与事件容量。
@@ -2451,7 +2491,7 @@ struct PlaceExecutionContext<'a> {
 
 /// 在批量持久提交前隔离用户控制、幂等和序号的候选状态。
 struct FenceBatchCandidate {
-    /// 候选用户控制下限。
+    /// 候选用户控制下限及用户、全局回执。
     epochs: UserControlEpochs,
     /// 候选幂等窗口。
     dedup: DedupWindow,
@@ -2591,7 +2631,7 @@ fn execute_fence_group(
             break;
         }
         match consumer.pop() {
-            Some(Message::Formal(command, reply)) => {
+            Some(Message::Formal(command, _, reply)) => {
                 pending = Some((command, reply));
             }
             Some(other) => {
@@ -2743,6 +2783,31 @@ impl FormalBatchCandidate {
             place,
         })
     }
+    /// 入队的下单按单写者顺序复核全局纪元和用户下限，再检查去重并分配序号。重放沿用已提交记录。
+    fn check_live_admission(
+        &self,
+        command: &CommandEnvelope,
+        admitted: Option<u64>,
+    ) -> Result<(), FormalError> {
+        let Command::PlaceLimit(place) = &command.payload else {
+            return Ok(());
+        };
+        if self
+            .place
+            .as_ref()
+            .is_none_or(|s| s.config.control_admission.is_none())
+        {
+            return Ok(());
+        }
+        if admitted != Some(self.fence.epochs.global_floor()) {
+            return Err(FormalError::Rejected(RejectReason::ControlFenceActive));
+        }
+        self.fence
+            .epochs
+            .check(place.order.user_id, place.user_control_epoch)
+            .map_err(FormalError::Rejected)
+    }
+
     /// 仅重现无法编码的下单输入在分配序号前的检查与去重顺序。
     fn reject_uncodable(
         &mut self,
@@ -2862,25 +2927,29 @@ impl FormalBatchCandidate {
         command: CommandEnvelope,
         routes: &RouteTable,
     ) -> Result<FormalExecution, FormalError> {
-        if matches!(command.payload, Command::ShardKillSwitch(_)) {
-            return execute_shard_kill(
-                ShardKillContext {
-                    identity: FormalIdentity {
-                        shard: self.fence.shard,
-                        cluster: self.fence.cluster,
-                        event_capacity: u64::from(u32::MAX) + 1,
-                    },
-                    epoch: self.fence.expected_epoch,
-                    seq: &mut self.fence.seq,
-                    clock: &self.fence.clock,
-                    markets: &mut self.markets,
-                    registry: &mut self.registry,
-                    place: &mut self.place,
-                    dedup: &mut self.fence.dedup,
-                    require_lease: true,
+        if matches!(command.payload, Command::ShardKillSwitch(_))
+            || cross_fence::coordinated(&command.payload)
+        {
+            let context = ShardKillContext {
+                identity: FormalIdentity {
+                    shard: self.fence.shard,
+                    cluster: self.fence.cluster,
+                    event_capacity: u64::from(u32::MAX) + 1,
                 },
-                command,
-            );
+                epoch: self.fence.expected_epoch,
+                seq: &mut self.fence.seq,
+                clock: &self.fence.clock,
+                markets: &mut self.markets,
+                registry: &mut self.registry,
+                place: &mut self.place,
+                dedup: &mut self.fence.dedup,
+                require_lease: true,
+            };
+            return if cross_fence::coordinated(&command.payload) {
+                cross_fence::execute(context, &mut self.fence.epochs, command)
+            } else {
+                execute_shard_kill(context, command)
+            };
         }
         if matches!(command.payload, Command::ApplyUserControlFenceShard(_)) {
             return self.fence.stage(command);
@@ -2921,6 +2990,7 @@ impl FormalBatchCandidate {
         ) {
             return execute_market_management(
                 MarketManagementContext {
+                    controls: Some(&self.fence.epochs),
                     identity: FormalIdentity {
                         shard: self.fence.shard,
                         cluster: self.fence.cluster,
@@ -2961,6 +3031,7 @@ impl FormalBatchCandidate {
                 .ok_or(FormalError::Rejected(RejectReason::InvalidOrderCombination))?;
             let result = execute_place(
                 PlaceExecutionContext {
+                    control_killed: self.fence.epochs.killed(place.order.user_id),
                     managed: self.managed_markets.get(&market),
                     identity: FormalIdentity {
                         shard: self.fence.shard,
@@ -3003,6 +3074,7 @@ impl FormalBatchCandidate {
 fn execute_formal_group(
     first: (
         CommandEnvelope,
+        Option<u64>,
         CommandReply<Result<FormalExecution, FormalError>>,
     ),
     consumer: &mut crate::queue::Consumer<Message>,
@@ -3022,52 +3094,61 @@ fn execute_formal_group(
     let mut pending = Some(first);
     let mut deferred = None;
     loop {
-        if let Some((command, reply)) = pending.take() {
+        if let Some((command, admitted, reply)) = pending.take() {
             if consumer.routes_fenced() {
                 replies.push((reply, Err(FormalError::Rejected(RejectReason::EngineBusy))));
                 break;
             }
-            let payload = matching_domain::encode_wal_command(&command);
-            let result = match payload {
-                Err(_) => candidate.reject_uncodable(&command, context.routes),
-                Ok(payload) => {
-                    let command_id = command.command_id;
-                    let match_started =
-                        matches!(&command.payload, Command::PlaceLimit(_)).then(Instant::now);
-                    let planned = candidate.stage(command, context.routes);
-                    if let (Some(metrics), Some(started)) = (context.metrics, match_started) {
-                        metrics.observe_match(started.elapsed());
+            let result = candidate
+                .check_live_admission(&command, admitted)
+                .and_then(|()| match matching_domain::encode_wal_command(&command) {
+                    Err(_) => candidate.reject_uncodable(&command, context.routes),
+                    Ok(payload) => {
+                        let command_id = command.command_id;
+                        let match_started =
+                            matches!(&command.payload, Command::PlaceLimit(_)).then(Instant::now);
+                        let planned = cross_fence::verify_owner(
+                            &command.payload,
+                            gate,
+                            candidate.place.as_ref(),
+                            (context.cluster, context.shard),
+                        )
+                        .and_then(|()| candidate.stage(command, context.routes));
+                        if let (Some(metrics), Some(started)) = (context.metrics, match_started) {
+                            metrics.observe_match(started.elapsed());
+                        }
+                        if let Ok(result) = &planned
+                            && !result.deduplicated
+                        {
+                            let record = matching_persistence::WalRecord {
+                                cluster_id: context.cluster.0,
+                                shard_id: context.shard.0,
+                                flags: 0,
+                                epoch: gate.epoch,
+                                shard_seq: result.seq,
+                                engine_time: context.now.get(),
+                                command_id: command_id.0,
+                                payload,
+                            };
+                            wal_or_halt(
+                                gate.batcher.append_at(&record, Instant::now()),
+                                DiagnosticKind::WalAppend,
+                                Some(command_id),
+                                Some(result.seq),
+                            );
+                        }
+                        planned
                     }
-                    if let Ok(result) = &planned
-                        && !result.deduplicated
-                    {
-                        let record = matching_persistence::WalRecord {
-                            cluster_id: context.cluster.0,
-                            shard_id: context.shard.0,
-                            flags: 0,
-                            epoch: gate.epoch,
-                            shard_seq: result.seq,
-                            engine_time: context.now.get(),
-                            command_id: command_id.0,
-                            payload,
-                        };
-                        wal_or_halt(
-                            gate.batcher.append_at(&record, Instant::now()),
-                            DiagnosticKind::WalAppend,
-                            Some(command_id),
-                            Some(result.seq),
-                        );
-                    }
-                    planned
-                }
-            };
+                });
             replies.push((reply, result));
         }
         if group_should_flush(replies.len(), limit, Instant::now(), deadline, false) {
             break;
         }
         match consumer.pop() {
-            Some(Message::Formal(command, reply)) => pending = Some((command, reply)),
+            Some(Message::Formal(command, admitted, reply)) => {
+                pending = Some((command, admitted, reply))
+            }
             Some(other) => {
                 deferred = Some(other);
                 break;
@@ -3326,6 +3407,7 @@ fn execute_place(
     command: CommandEnvelope,
 ) -> Result<FormalExecution, FormalError> {
     let PlaceExecutionContext {
+        control_killed,
         managed,
         identity,
         seq,
@@ -3403,7 +3485,7 @@ fn execute_place(
     }
     let cursor = TradeIdCursor::new(identity.cluster, identity.shard, n);
     let book = markets.get_mut(&market).expect("已验证市场存在");
-    let planned = (if state.shard_kill_active {
+    let planned = (if state.shard_kill_active || control_killed {
         Err(RejectReason::KillSwitchActive)
     } else {
         Ok(())
@@ -3866,6 +3948,8 @@ fn execute_shard_kill(
 
 /// 市场管理命令在当前独占候选内需要的上下文。
 struct MarketManagementContext<'a> {
+    /// 分片持久用户及全局开关的当前视图，供 Stop 子单重校验。
+    controls: Option<&'a UserControlEpochs>,
     /// 根事件的分片和容量约束。
     identity: FormalIdentity,
     /// 不可变的路由视图。
@@ -3892,6 +3976,7 @@ fn execute_market_management(
     command: CommandEnvelope,
 ) -> Result<FormalExecution, FormalError> {
     let MarketManagementContext {
+        controls,
         identity,
         routes,
         seq,
@@ -4101,7 +4186,8 @@ fn execute_market_management(
                     matching_risk::TradeSettlementContext { market_id: market, math, base: matching_risk::SettlementAsset { asset: base, scale: math.qty_scale() }, quote: matching_risk::SettlementAsset { asset: quote, scale: math.quote_scale() }, fees },
                     &candidate_registry, (&cursor, (limits.max_internal_actions_per_command, limits.max_trades_per_command)),
                     |stop, current| {
-                        if state.kill_switch_active() || state_place.shard_kill_active { return Err(RejectReason::KillSwitchActive); }
+                        let user = match stop { matching_domain::StopOrder::Limit(order) => order.user_id, matching_domain::StopOrder::Market(order) => order.user_id };
+                        if state.kill_switch_active() || state_place.shard_kill_active || controls.is_some_and(|c| c.killed(user)) { return Err(RejectReason::KillSwitchActive); }
                         match stop {
                         matching_domain::StopOrder::Limit(child) => {
                             let crosses = match child.side {
@@ -4709,7 +4795,7 @@ fn execute_fence(
     Ok(result)
 }
 
-/// 在候选订单簿及登记表上执行正式命令，完成事件封装后安装后态。
+/// 先核对市场路由、撤单身份和市场生命周期，再将单笔或批量撤单交给候选执行。
 fn execute_formal_guarded(
     routes: &RouteTable,
     identity: FormalIdentity,
@@ -4746,10 +4832,7 @@ fn execute_formal_guarded(
         dedup.remember_alias(&command);
         return Ok(result);
     }
-    let Command::MassCancelShard(ref input) = command.payload else {
-        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
-    };
-    if !valid_market_cancel_scope(input.scope, market, command.user_id) {
+    if !valid_cancel_envelope(&command, market, place.as_ref()) {
         return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
     }
     let reason = match managed.get(&market) {
@@ -4808,7 +4891,7 @@ fn execute_formal_guarded(
     Ok(result)
 }
 
-/// 在候选订单簿及登记表上执行正式命令，完成事件封装后安装后态。
+/// 在去重窗口命中时返回原摘要；首次执行校验可选客户端别名，并按终结事件更新身份索引。
 fn execute_formal_idempotent(
     routes: &RouteTable,
     identity: FormalIdentity,
@@ -4842,12 +4925,23 @@ fn execute_formal_idempotent(
         dedup.remember_alias(&command);
         return Ok(result);
     }
+    if !valid_cancel_envelope(&command, market, place_state.as_ref()) {
+        return Err(FormalError::Rejected(RejectReason::InvalidOrderCombination));
+    }
     let mut candidate_ids = place_state
         .as_ref()
         .map(|state| state.ids.try_clone_preallocated())
         .transpose()
         .map_err(|()| FormalError::Rejected(RejectReason::EngineBusy))?;
     let prepared = dedup.prepare(&command);
+    let valid_alias = match &command.payload {
+        Command::Cancel(input) => input.client_order_id.as_ref().is_none_or(|alias| {
+            candidate_ids
+                .as_ref()
+                .is_some_and(|ids| ids.matches_active(input.user_id, alias, market, input.order_id))
+        }),
+        _ => true,
+    };
     let result = execute_formal(
         routes,
         identity,
@@ -4861,6 +4955,7 @@ fn execute_formal_idempotent(
             place_state
                 .as_ref()
                 .is_some_and(|state| state.fee_book.is_some()),
+            valid_alias,
         ),
     )
     .map_err(FormalError::Rejected)?;
@@ -4874,6 +4969,28 @@ fn execute_formal_idempotent(
     }
     dedup.insert_prepared(&command, prepared, &result);
     Ok(result)
+}
+
+/// 正式单笔撤单绑定信封身份，批量撤单沿用已有管理员范围约束。
+fn valid_cancel_envelope(
+    command: &CommandEnvelope,
+    market: MarketId,
+    place: Option<&PlaceRuntimeState>,
+) -> bool {
+    match &command.payload {
+        Command::Cancel(input) => {
+            input.market_id == market
+                && command.user_id == Some(input.user_id)
+                && input.client_order_id.as_ref().is_none_or(|id| {
+                    !id.is_empty()
+                        && place.is_none_or(|state| id.len() <= state.config.limits.client_id_bytes)
+                })
+        }
+        Command::MassCancelShard(input) => {
+            valid_market_cancel_scope(input.scope, market, command.user_id)
+        }
+        _ => false,
+    }
 }
 
 /// 仅允许可信控制入口按市场执行本市场撤单或指定用户来源会话撤单。
@@ -4898,17 +5015,19 @@ fn execute_formal(
     clock: &LogicalClock,
     markets: &mut BTreeMap<MarketId, ProductionOrderBook>,
     registry: &mut Option<ReservationRegistry>,
-    (command, durable, settle_r2): (CommandEnvelope, &mut Option<LocalDurableCommit>, bool),
+    (command, durable, settle_r2, valid_alias): (
+        CommandEnvelope,
+        &mut Option<LocalDurableCommit>,
+        bool,
+        bool,
+    ),
 ) -> Result<FormalExecution, RejectReason> {
     let market = command
         .market_id
         .ok_or(RejectReason::InvalidOrderCombination)?;
     let epoch = command.route_epoch.ok_or(RejectReason::StaleRouteEpoch)?;
     routes.validate(market, identity.shard, epoch)?;
-    let Command::MassCancelShard(input) = command.payload else {
-        return Err(RejectReason::InvalidOrderCombination);
-    };
-    if !valid_market_cancel_scope(input.scope, market, command.user_id) {
+    if !valid_cancel_envelope(&command, market, None) {
         return Err(RejectReason::InvalidOrderCombination);
     }
     let book = markets
@@ -4943,24 +5062,38 @@ fn execute_formal(
     }
     let mut candidate = book.clone();
     let mut candidate_registry = registry.clone();
-    let (mut outcome, events) = match candidate.plan_mass_cancel(input.scope, &candidate_registry) {
+    let plan = match &command.payload {
+        Command::Cancel(input) if valid_alias || input.client_order_id.is_none() => {
+            candidate.plan_user_cancel(input, &candidate_registry)
+        }
+        Command::Cancel(_) => Err(RejectReason::OrderNotFound),
+        Command::MassCancelShard(input) => {
+            candidate.plan_mass_cancel(input.scope, &candidate_registry)
+        }
+        _ => unreachable!("已核验撤单载荷"),
+    };
+    let (mut outcome, events) = match plan {
         Ok(plan) => {
             let (result, mut events) = candidate
                 .apply_mass_cancel(&mut candidate_registry, plan)
-                .expect("新生成的批量撤单计划发生状态漂移");
-            if settle_r2 {
+                .expect("新生成的撤单计划发生状态漂移");
+            if settle_r2 || matches!(command.payload, Command::Cancel(_)) {
                 events = crate::place_candidate::release_terminal_reservations(
                     book,
                     &candidate,
                     &mut candidate_registry,
                     events,
                 )
-                .expect("批量撤单真实预留释放失败，分片停止");
+                .expect("撤单真实预留释放失败，分片停止");
             }
-            (FormalOutcome::MassCancel(result), events)
+            let outcome = match command.payload {
+                Command::Cancel(ref input) => FormalOutcome::Canceled(input.order_id),
+                _ => FormalOutcome::MassCancel(result),
+            };
+            (outcome, events)
         }
         Err(RejectReason::InvalidReservation | RejectReason::InvalidQty) => {
-            panic!("正式批量撤单发现预留或订单状态不变量损坏")
+            panic!("正式撤单发现预留或订单状态不变量损坏")
         }
         Err(reason) => (
             FormalOutcome::Rejected(reason),
@@ -4996,7 +5129,8 @@ fn execute_formal(
         *registry = candidate_registry;
     }
     let (status, reject_reason) = match &outcome {
-        FormalOutcome::MassCancel(_)
+        FormalOutcome::Canceled(_)
+        | FormalOutcome::MassCancel(_)
         | FormalOutcome::UserFence(_)
         | FormalOutcome::Placed(_)
         | FormalOutcome::FeeScheduleUpdated(_)
@@ -5376,10 +5510,14 @@ pub struct ShardObservation {
 pub struct ShardHandle {
     /// 工作线程是否从路由暂停状态启动。
     route_gated_at_start: bool,
+    /// 启动配置中的分片主节点纪元，协调控制在执行前另行核对实际写权。
+    primary_epoch: u64,
     /// 工作线程最近确认的路由准入状态。
     route_ready: Arc<AtomicBool>,
     /// 该入口是否提供正式命令的本地持久回复。
     durable_formal: bool,
+    /// 已绑定到本分片的控制权威，不随市场迁移。
+    control_admission: Option<crate::place_config::AdmissionBinding>,
     /// 具备受清单保护的本地市场迁移顺序点。
     local_migration: bool,
     /// 持久写入器的独立时延观测。
@@ -5522,6 +5660,10 @@ impl ShardHandle {
         }
     }
 
+    /// 返回投递控制子命令时使用的目标主节点纪元。
+    pub(crate) fn control_primary_epoch(&self) -> u64 {
+        self.primary_epoch
+    }
     /// 会话协调仅能使用带持久正式业务入口的句柄。
     pub(crate) fn has_durable_formal(&self) -> bool {
         self.durable_formal
@@ -5698,15 +5840,90 @@ impl ShardHandle {
         self.thread.unpark();
         Ok(rx)
     }
-    /// 在分片顺序队列提交正式业务命令。
+    /// 提交正式业务命令。下单先经过控制准入，单笔撤单仍可入队；跨分片控制子命令须由协调器派发。
     pub fn submit_command(
         &self,
         command: CommandEnvelope,
+    ) -> Result<Receiver<Result<FormalExecution, FormalError>>, ShardError> {
+        let coordinator_only = match &command.payload {
+            Command::ApplyGlobalControlFenceShard(_) => true,
+            Command::ApplyUserControlFenceShard(fence) => {
+                self.control_admission.is_some()
+                    || (self.durable_formal
+                        && fence.action != matching_domain::UserFenceAction::FenceOnly)
+            }
+            _ => false,
+        };
+        if coordinator_only {
+            return Err(ShardError::InvalidConfig);
+        }
+        if let Command::PlaceLimit(place) = &command.payload {
+            let status = self.admission_status(place.order.user_id)?;
+            if let Some(reason) = status.rejection(place.user_control_epoch) {
+                let (tx, rx) = sync_channel(1);
+                tx.send(Err(FormalError::Rejected(reason)))
+                    .map_err(|_| ShardError::Failed)?;
+                return Ok(rx);
+            }
+            return self.enqueue_command(command, status.global_epoch());
+        }
+        self.enqueue_command(command, None)
+    }
+
+    /// 读取已发布的全局纪元、指定用户纪元和当前拒绝原因。
+    pub(crate) fn admission_status(
+        &self,
+        user: matching_domain::UserId,
+    ) -> Result<crate::place_config::AdmissionStatus, ShardError> {
+        let Some(binding) = &self.control_admission else {
+            return Ok(Default::default());
+        };
+        let (global, user, reason) = binding
+            .0
+            .check(user)
+            .map_err(|_| ShardError::ControlUnavailable)?;
+        Ok(crate::place_config::AdmissionStatus {
+            epochs: Some((global, user)),
+            reason,
+        })
+    }
+
+    /// 取得已绑定的控制命名空间，供协调器和网关核对目标。
+    pub(crate) fn control_namespace(&self) -> Option<String> {
+        self.control_admission
+            .as_ref()
+            .map(|binding| binding.0.namespace())
+    }
+
+    /// 只有绑定同一权威的协调器才可派发用户或全局控制。
+    pub(crate) fn submit_control_command(
+        &self,
+        namespace: &str,
+        command: CommandEnvelope,
+    ) -> Result<Receiver<Result<FormalExecution, FormalError>>, ShardError> {
+        if !self.durable_formal
+            || self.control_namespace().as_deref() != Some(namespace)
+            || !matches!(
+                command.payload,
+                Command::ApplyUserControlFenceShard(_) | Command::ApplyGlobalControlFenceShard(_)
+            )
+        {
+            return Err(ShardError::InvalidConfig);
+        }
+        self.enqueue_command(command, None)
+    }
+
+    /// 将已完成入口核准的命令及原始全局纪元一并放入单写者队列。
+    pub(crate) fn enqueue_command(
+        &self,
+        command: CommandEnvelope,
+        admitted: Option<u64>,
     ) -> Result<Receiver<Result<FormalExecution, FormalError>>, ShardError> {
         let (tx, rx) = sync_channel(1);
         self.push(
             Message::Formal(
                 command,
+                admitted,
                 CommandReply::new(tx, Some(Arc::clone(&self.metrics))),
             ),
             IngressClass::Mutation,
@@ -5859,6 +6076,7 @@ mod tests {
         ] {
             let result = execute_market_management(
                 MarketManagementContext {
+                    controls: None,
                     identity: FormalIdentity {
                         shard: ShardId(1),
                         cluster: ClusterId(1),
@@ -5961,6 +6179,7 @@ mod tests {
             };
             let outcome = execute_market_management(
                 MarketManagementContext {
+                    controls: None,
                     identity: FormalIdentity {
                         shard: ShardId(1),
                         cluster: ClusterId(1),
@@ -6617,6 +6836,7 @@ mod tests {
             let run = || {
                 execute_market_management(
                     MarketManagementContext {
+                        controls: None,
                         identity: FormalIdentity {
                             shard: ShardId(1),
                             cluster: ClusterId(1),
@@ -6830,6 +7050,7 @@ mod tests {
         let decoded_command = matching_domain::decode_wal_command(&wal_payload).unwrap();
         let result = execute_market_management(
             MarketManagementContext {
+                controls: None,
                 identity: FormalIdentity {
                     shard: ShardId(1),
                     cluster: ClusterId(1),
@@ -6876,6 +7097,7 @@ mod tests {
             };
             let rejected = execute_market_management(
                 MarketManagementContext {
+                    controls: None,
                     identity: FormalIdentity {
                         shard: ShardId(1),
                         cluster: ClusterId(1),
@@ -6968,6 +7190,7 @@ mod tests {
             executions.push(
                 execute_market_management(
                     MarketManagementContext {
+                        controls: None,
                         identity: FormalIdentity {
                             shard: ShardId(1),
                             cluster: ClusterId(1),
@@ -7602,7 +7825,7 @@ mod tests {
                 &LogicalClock::new(LogicalTime::new(0)),
                 &mut books,
                 &mut registry,
-                (command, &mut None, false),
+                (command, &mut None, false, false),
             )
         }));
         assert!(result.is_err());
@@ -7871,6 +8094,7 @@ mod place_event_capacity_tests {
         let clock = LogicalClock::new(LogicalTime::new(0));
         let first = execute_place(
             PlaceExecutionContext {
+                control_killed: false,
                 managed: None,
                 identity: FormalIdentity {
                     cluster: ClusterId(1),
@@ -7908,6 +8132,7 @@ mod place_event_capacity_tests {
         assert_eq!(state.ids, ids_before);
         let second = execute_place(
             PlaceExecutionContext {
+                control_killed: false,
                 managed: None,
                 identity: FormalIdentity {
                     cluster: ClusterId(1),
@@ -8175,7 +8400,7 @@ mod group_sync_tests {
             assert!(
                 producer
                     .try_push_classified(
-                        Message::Formal(command(2), CommandReply::new(second_tx, None)),
+                        Message::Formal(command(2), None, CommandReply::new(second_tx, None)),
                         IngressClass::Mutation
                     )
                     .is_ok()
@@ -8292,7 +8517,7 @@ mod group_sync_tests {
         assert!(
             producer
                 .try_push_classified(
-                    Message::Formal(command(2), CommandReply::new(tx2, None)),
+                    Message::Formal(command(2), None, CommandReply::new(tx2, None)),
                     IngressClass::Mutation
                 )
                 .is_ok()
@@ -8407,7 +8632,7 @@ mod group_sync_tests {
         let routes = RouteTable::new([]).unwrap();
         let start = Instant::now();
         execute_formal_group(
-            (command(1), CommandReply::new(tx, None)),
+            (command(1), None, CommandReply::new(tx, None)),
             &mut consumer,
             &mut gate,
             FormalGroupContext {
@@ -8482,7 +8707,7 @@ mod group_sync_tests {
         let routes = RouteTable::new([]).unwrap();
         producer.fence_routes();
         let deferred = execute_formal_group(
-            (command(1), CommandReply::new(tx, None)),
+            (command(1), None, CommandReply::new(tx, None)),
             &mut consumer,
             &mut gate,
             FormalGroupContext {
@@ -8548,7 +8773,7 @@ mod group_sync_tests {
         assert!(
             producer
                 .try_push_classified(
-                    Message::Formal(command(2), CommandReply::new(second_tx, None)),
+                    Message::Formal(command(2), None, CommandReply::new(second_tx, None)),
                     IngressClass::Mutation
                 )
                 .is_ok()
@@ -8565,7 +8790,7 @@ mod group_sync_tests {
         let routes = RouteTable::new([]).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             execute_formal_group(
-                (command(1), CommandReply::new(first_tx, None)),
+                (command(1), None, CommandReply::new(first_tx, None)),
                 &mut consumer,
                 &mut gate,
                 FormalGroupContext {
@@ -8881,6 +9106,11 @@ fn replay_snapshot_records_inner(
                 (*image.routes).clone()
             };
             let mut result = match &command.payload {
+                payload if cross_fence::coordinated(payload) => {
+                    let window = image.dedup.as_mut().ok_or_else(|| std::io::Error::other("缺少控制命令去重窗口"))?;
+                    cross_fence::execute(ShardKillContext { identity, epoch: image.primary_epoch, seq: &mut seq, clock: &clock, markets: &mut image.markets, registry: &mut image.registry, place: &mut image.place, dedup: window, require_lease: false }, &mut image.user_epochs, command)
+                }
+                Command::ApplyGlobalControlFenceShard(_) => return Err(std::io::Error::other("无效的全局控制载荷")),
                 Command::ShardKillSwitch(_) => {
                     let window = image.dedup.as_mut().ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
                     execute_shard_kill(ShardKillContext { identity, epoch: image.primary_epoch, seq: &mut seq, clock: &clock, markets: &mut image.markets, registry: &mut image.registry, place: &mut image.place, dedup: window, require_lease: false }, command)
@@ -8908,7 +9138,8 @@ fn replay_snapshot_records_inner(
                         .ok_or_else(|| std::io::Error::other("缺少重放去重窗口"))?;
                     execute_market_management(
                         MarketManagementContext {
-                            identity,
+                            controls: Some(&image.user_epochs),
+                identity,
                             routes: &replay_routes,
                             seq: &mut seq,
                             clock: &clock,
@@ -8973,7 +9204,8 @@ fn replay_snapshot_records_inner(
                     }
                     let execution = execute_place(
                         PlaceExecutionContext {
-                            managed: image.managed_markets.get(&market),
+                            control_killed: image.user_epochs.killed(place.order.user_id),
+                managed: image.managed_markets.get(&market),
                             identity,
                             seq: &mut seq,
                             clock: &clock,
@@ -8992,7 +9224,7 @@ fn replay_snapshot_records_inner(
                     }
                     execution
                 }
-                Command::MassCancelShard(_) => {
+                Command::Cancel(_) | Command::MassCancelShard(_) => {
                     let window = image
                         .dedup
                         .as_mut()

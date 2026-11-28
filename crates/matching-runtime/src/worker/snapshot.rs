@@ -737,6 +737,9 @@ impl SnapshotImage {
             return Err(SnapshotWireError);
         }
         let user_epochs = UserControlEpochs::read_snapshot(&mut r, config.user_capacity)?;
+        if !user_epochs.receipts_fit_prefix(snapshot_seq) {
+            return Err(SnapshotWireError);
+        }
         let dedup = match r.u8()? {
             0 => None,
             1 => Some(DedupWindow::read_snapshot(

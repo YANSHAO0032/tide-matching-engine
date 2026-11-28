@@ -241,6 +241,19 @@ impl ClientOrderIds {
         candidate.terminal.extend(self.terminal.iter().cloned());
         Ok(candidate)
     }
+    /// 仅核对活动身份，防止已终结的旧别名指向后来复用的订单 ID。
+    pub(crate) fn matches_active(
+        &self,
+        user: UserId,
+        client_id: &str,
+        market: MarketId,
+        order: OrderId,
+    ) -> bool {
+        self.active.iter().any(|k| {
+            k.user == user && k.client_id == client_id && k.market == market && k.order_id == order
+        })
+    }
+
     /// 按用户隔离检查活动和保留的终结身份。
     pub(crate) fn lookup(&self, user: UserId, client_id: &str) -> Option<(MarketId, OrderId)> {
         self.active

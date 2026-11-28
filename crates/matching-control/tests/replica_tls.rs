@@ -430,3 +430,80 @@ fn client_rejects_wrong_server_pin() {
         worker.join().unwrap();
     });
 }
+
+/// 连续核验超过最初申请的租约时长，期间应持续续租。显式撤销后，同一主节点应被拒绝。
+#[test]
+#[ignore = "需要独立本地 etcd 测试集群"]
+fn control_owner_verification_renews_authenticated_writer_and_fails_after_revoke() {
+    use matching_control::{EtcdClient, FencedLog, ReplicatedAppender};
+    use matching_domain::{ClusterId, ShardId};
+    use matching_persistence::{DurableAppender, WalRecord};
+
+    // 该入口仅查验写权。若误触 WAL 或同步，测试立即失败。
+    struct NoWrite;
+    impl DurableAppender for NoWrite {
+        fn would_rotate(&self, _: &WalRecord) -> std::io::Result<bool> {
+            panic!("写权查验不应访问 WAL")
+        }
+        fn append(&mut self, _: &WalRecord) -> std::io::Result<()> {
+            panic!("写权查验不应追加 WAL")
+        }
+        fn sync(&mut self) -> std::io::Result<()> {
+            panic!("写权查验不应同步 WAL")
+        }
+    }
+    let endpoints = std::env::var("TIDE_ETCD_TEST_ENDPOINTS").unwrap();
+    let client = EtcdClient::new(
+        endpoints.split(',').map(str::to_owned).collect(),
+        Duration::from_secs(3),
+        true,
+    )
+    .unwrap();
+    let prefix = format!("/tide-test/control-writer/{}", std::process::id());
+    let log = FencedLog::new(client, &prefix, ClusterId(194), ShardId(195)).unwrap();
+    let writer = log.acquire_bound(2, CLIENT).unwrap();
+    let identity = writer.replica_identity();
+    let (client, server) = configs();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let deadline = || Instant::now() + Duration::from_secs(5);
+    std::thread::scope(|scope| {
+        let (done, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = scope.spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let _tls = TlsReplicaStream::accept(socket, server, CLIENT, deadline()).unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(20));
+        });
+        let socket = std::net::TcpStream::connect(address).unwrap();
+        let name = ServerName::try_from("server.test".to_string()).unwrap();
+        let tls = TlsReplicaStream::connect(socket, client, name, SERVER, deadline()).unwrap();
+        let mut appender = ReplicatedAppender::new_authenticated(
+            NoWrite,
+            tls,
+            writer,
+            32 * 1024 * 1024,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let until = Instant::now() + Duration::from_secs(7);
+        while Instant::now() < until {
+            appender.verify_control_owner(identity.epoch).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        ureq::post(&format!(
+            "{}/v3/lease/revoke",
+            endpoints.split(',').next().unwrap()
+        ))
+        .set("Content-Type", "application/json")
+        .send_string(&serde_json::json!({"ID":identity.lease_id.to_string()}).to_string())
+        .unwrap();
+        let mut next = log.acquire_bound(30, OTHER).unwrap();
+        assert!(next.epoch() > identity.epoch);
+        assert!(appender.verify_control_owner(identity.epoch).is_err());
+        assert_eq!(log.committed().unwrap(), 0);
+        next.revoke().unwrap();
+        drop(appender);
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    });
+}

@@ -59,7 +59,12 @@ pub enum PlaceCodecError {
     /// 数量不是严格正值。
     InvalidQty,
 }
-const TYPE_PLACE: u16 = 1;
+/// 普通限价请求的帧类型。
+pub const TYPE_PLACE: u16 = 1;
+/// 改单请求的帧类型，目前开放认证后的控制栅栏检查。
+pub const TYPE_AMEND: u16 = 4;
+/// 撤单替换请求的帧类型，目前仅用于认证后的控制准入检查。
+pub const TYPE_CANCEL_REPLACE: u16 = 5;
 const FIXED: usize = 58;
 
 /// 将请求编码为版本一大端帧；请求身份只用于响应关联。

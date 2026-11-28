@@ -112,7 +112,16 @@ where
         stream: &mut (impl Read + Write),
         mut on_committed: impl FnMut(&crate::FormalExecution) -> io::Result<()>,
     ) -> Result<(), GatewayTransportError> {
-        let result = if self.health.covers(self.shards) {
+        let namespace = self
+            .shards
+            .first()
+            .and_then(crate::ShardHandle::control_namespace);
+        let result = if self.health.covers(self.shards)
+            && self
+                .shards
+                .iter()
+                .all(|s| s.control_namespace() == namespace)
+        {
             self.receive_loop(stream, &mut on_committed)
         } else {
             Err(GatewayTransportError::HealthConfiguration)
@@ -194,6 +203,32 @@ where
                 self.reject_not_ready(stream, frame.request_id)?;
                 continue;
             }
+            // 完整帧通过长度与 CRC 检查后，以会话认证身份读取栅栏。检查在风险授权和全局身份分配之前。
+            let admission = if matches!(
+                frame.message_type,
+                matching_protocol::TYPE_PLACE
+                    | matching_protocol::TYPE_AMEND
+                    | matching_protocol::TYPE_CANCEL_REPLACE
+            ) {
+                let handle = self
+                    .shards
+                    .first()
+                    .ok_or(GatewayTransportError::HealthConfiguration)?;
+                let status = handle
+                    .admission_status(self.session.authenticated_user())
+                    .map_err(|e| GatewayTransportError::Gateway(crate::GatewayError::Ingress(e)))?;
+                let rejection = status.reason.or_else(|| {
+                    (frame.message_type != matching_protocol::TYPE_PLACE)
+                        .then_some(matching_domain::RejectReason::InvalidOrderCombination)
+                });
+                if let Some(rejected) = rejection {
+                    self.reject_request(stream, frame.request_id, rejected)?;
+                    continue;
+                }
+                status
+            } else {
+                Default::default()
+            };
             let allocation = &mut self.allocate;
             let prepared = {
                 let mut state = self
@@ -203,12 +238,12 @@ where
                     .map_err(|_| GatewayTransportError::SharedState)?;
                 let now = (state.now)();
                 let GatewaySharedState { store, limits, .. } = &mut *state;
-                self.session.prepare_wire_durable(
+                self.session.prepare_wire_at_epoch(
                     &bytes,
                     self.max_frame,
                     store,
                     limits,
-                    now,
+                    (now, admission),
                     allocation,
                 )
             };
@@ -277,6 +312,20 @@ where
             };
             let mut stale_retries = 0_u8;
             let result = loop {
+                // 每次投递尝试在连接线程检查权威，不持共享锁。已准入的旧请求由分片本地纪元隔开。
+                let current = shard
+                    .admission_status(self.session.authenticated_user())
+                    .map_err(|e| GatewayTransportError::Gateway(crate::GatewayError::Ingress(e)))?;
+                let rejection = current
+                    .rejection(prepared.intent().user_control_epoch)
+                    .or_else(|| {
+                        (current.global_epoch() != admission.global_epoch())
+                            .then_some(matching_domain::RejectReason::ControlFenceActive)
+                    });
+                if let Some(reason) = rejection {
+                    self.reject_request(stream, request_id, reason)?;
+                    continue 'requests;
+                }
                 let submitted = {
                     let mut state = self
                         .shared
@@ -289,10 +338,10 @@ where
                         .ok_or(GatewayTransportError::Outcome)?;
                     let now = (state.now)();
                     self.health.admit(|| {
-                        self.session.submit_place(
+                        self.session.submit_admitted_place(
                             &prepared,
                             token.clone(),
-                            client_seq,
+                            (client_seq, admission.global_epoch()),
                             &mut state.limits,
                             now,
                             shard,
@@ -437,9 +486,23 @@ where
         stream: &mut impl Write,
         request_id: u64,
     ) -> Result<(), GatewayTransportError> {
+        self.reject_request(
+            stream,
+            request_id,
+            matching_domain::RejectReason::EngineBusy,
+        )
+    }
+
+    /// 将前置拒绝作为关联到原请求身份的稳定线协议响应返回。
+    fn reject_request(
+        &self,
+        stream: &mut impl Write,
+        request_id: u64,
+        reason: matching_domain::RejectReason,
+    ) -> Result<(), GatewayTransportError> {
         let reply = matching_protocol::encode_rejection(
             request_id,
-            matching_protocol::ReasonCode::new(matching_domain::RejectReason::EngineBusy as u16),
+            matching_protocol::ReasonCode::new(reason as u16),
             self.max_frame,
         )
         .map_err(|_| GatewayTransportError::Outcome)?;

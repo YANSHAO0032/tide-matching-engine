@@ -1,6 +1,8 @@
 # Matching Engine Engineering Rules v6
 
-> 2026-11-26 当前任务为 T35 停市市场迁移。用户授权通过验收后提交并推送开发分支 `feature-t35-market-migration`。交付事实以唯一交接为准。
+> 2026-11-28 用户授权在注释、文档和质量检查通过后，提交 T36 并推送开发分支 `feature-t36-cross-shard-control`。交付提交和远端核验结果见唯一交接。
+
+> 2026-11-26 T35 停市市场迁移。用户授权通过验收后提交并推送开发分支 `feature-t35-market-migration`。交付事实以唯一交接为准。
 
 > 2026-11-04 T22 历史范围：T19、T20、T21 已提交并推送各自开发分支，T21 提交为 `025c29d`；用户已授权 T22 验收通过后提交并推送当前分支 `feature-t22-manifest-group-commit`，未经进一步授权不合并。用户允许在 WAL 格式中增加独立头 CRC 并同步规格。PendingR2 用户裁定仍然有效；真实 R2、完整 MarketState/PreOpen 和 T23+ 不在当前授权范围内。实际验证与交付事实以唯一交接为准。
 
@@ -14,7 +16,7 @@
 
 ## 角色与授权边界
 
-当前采用直接实现和 Code Review 模式。T35 以 T34 提交 `d7f98c4` 为基线。本次授权限于 T35 的验收及开发分支交付，合并与后续任务须另获授权。
+当前采用直接实现和 Code Review 模式。T36 以 T35 交付提交 `2f90264` 为基线。本次授权包括 T36 的本地实现、验收以及验收后的开发分支提交和推送。合并与后续任务须另获授权。
 
 - 可按当前任务规格新增、修改 Rust 行为、接口、注释和测试；保留用户已有改动。
 - 仍须完成失败原子性、数值约束、独立参考模型与 gate，不以弱化测试或 lint 换取通过。
@@ -36,7 +38,7 @@ T08 覆盖 visible/hidden/total 守恒、仅 visible depth、maker 补量时新 
 1. 本文件及 [CODEX_GUIDANCE_RULES.md](assignment/CODEX_GUIDANCE_RULES.md)。
 2. [SESSION_HANDOFF.md](assignment/SESSION_HANDOFF.md)，它是唯一交接摘要。
 3. [v6 规格](assignment/rust_cex_matching_engine_development_spec_v6.md) 的 §29.3、§54、§55.6、§73 和 §77。订单语义、数值、保护及确定性回归仍遵循 §6.5、§8–§17、§26、§45–§46、§55.2–§55.4、§58、§63–§64 和 Appendix E。保留 §54 不变量 1–13、16–18、26、28–30、49–52、54–56 的适用验证。迁移的预留状态、账户资金边界及 §54.53 按 §18、§27 和已接入的资金路径核对。
-4. [T35 任务书](assignment/tasks/T35_P12_market_migration.md)、[执行计划](assignment/T35_EXECUTION_PLAN.md)及唯一交接中的裁定。已实现的持久模式和恢复前提见[停市迁移](docs/market_migration.md)。
+4. [T36 任务书](assignment/tasks/T36_P12_cross_shard_control.md)、[执行计划](assignment/T36_EXECUTION_PLAN.md)、v6 §22、§31.4、§31.6、§41.2、§55.8及唯一交接中的裁定。已实现的持久模式和恢复前提见[停市迁移](docs/market_migration.md)。
 5. 当前相关源码、配置、测试、git status 和 git diff；新增未跟踪文件也必须读取。
 
 任务索引在 [assignment/README.md](assignment/README.md)，不是 `assignment/tasks/README.md`。当前 assignment 被 Git 忽略；不能假定它已提交或在新 clone 中存在。资料缺失时明确记录，不凭记忆重建仓库完成状态，不另建第二份权威 handoff。
