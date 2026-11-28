@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 impl SnapshotImage {
     /// 计算随市场迁移的撮合、资金、身份及行情源状态摘要。
-    /// 用户控制纪元下限在目标分片另行逐用户取最大值；逐订单行情视图另由行情检查点核验。
+    /// 分片控制权威及回执在迁移预检和冻结后另行核对，用户下限在目标逐用户取最大值。逐订单行情视图由行情检查点核验。
     pub fn market_state_digest(
         &self,
         market: MarketId,
@@ -213,7 +213,14 @@ impl SnapshotImage {
                     sum.checked_add(b.reservation_snapshots().len())
                 })
                 .ok_or(SnapshotWireError)?;
-            if source_keys.finish() != target_keys.finish()
+            let authority = |config: &PlaceSupportConfig| {
+                config
+                    .control_admission
+                    .as_ref()
+                    .map(|binding| (binding.0.cluster_id(), binding.0.namespace()))
+            };
+            if authority(&s.config) != authority(&t.config)
+                || source_keys.finish() != target_keys.finish()
                 || s.fee_book != t.fee_book
                 || s.config.managed_only != t.config.managed_only
                 || active_count > t.config.limits.active_orders

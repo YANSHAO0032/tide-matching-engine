@@ -130,6 +130,10 @@ pub fn encode_event_for_hash(
             w.u8(tag(*new))?;
             w.u16(*reason as u16)?;
         }
+        EngineEvent::GlobalControlEpochAdvanced { epoch } => {
+            w.u8(25)?;
+            w.u64(*epoch)?;
+        }
         EngineEvent::UserControlEpochAdvanced { user_id, epoch } => {
             w.u8(0)?;
             w.u64(user_id.get())?;

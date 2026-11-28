@@ -1,5 +1,6 @@
 //! 控制平面的线性一致存储适配，不进入撮合线程。
 mod authenticated_recovery;
+mod cross_control;
 mod cursor;
 mod etcd;
 mod fenced_log;
@@ -10,6 +11,8 @@ mod route;
 
 /// 使用认证复制链协调创世 WAL 重放和接任。
 pub use authenticated_recovery::AuthenticatedRecovery;
+/// 使用 etcd 租约及原子事务管理跨分片控制操作。
+pub use cross_control::EtcdControlStore;
 /// 发布者租约及分片消费者的持久游标。
 pub use cursor::{
     CursorCheckpoint, CursorPosition, CursorStore, PublisherLease, PublisherToken, RequiredSinks,

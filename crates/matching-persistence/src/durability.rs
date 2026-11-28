@@ -146,6 +146,13 @@ impl CommitWatermark {
 
 /// 有序追加与同步接口；`sync` 返回成功前必须完成实际同步。
 pub trait DurableAppender {
+    /// 在控制子命令分配序号前核对当前复制写权。未实现该校验的写入器返回 Unsupported。
+    fn verify_control_owner(&mut self, _epoch: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "写入器未提供复制写权凭据",
+        ))
+    }
     /// 判断下一条记录是否需要关闭当前 segment。
     fn would_rotate(&self, record: &WalRecord) -> io::Result<bool>;
     /// 按顺序追加记录。
@@ -199,6 +206,9 @@ pub trait DurableAppender {
 /// 类型擦除后的持久写入器，保留原写入器及其持久状态。
 pub struct BoxedDurableAppender(Box<dyn DurableAppender + Send>);
 impl DurableAppender for BoxedDurableAppender {
+    fn verify_control_owner(&mut self, epoch: u64) -> io::Result<()> {
+        self.0.verify_control_owner(epoch)
+    }
     fn would_rotate(&self, record: &WalRecord) -> io::Result<bool> {
         self.0.would_rotate(record)
     }
@@ -261,6 +271,16 @@ pub struct DurableBatcher<A> {
     halted: bool,
 }
 impl<A: DurableAppender> DurableBatcher<A> {
+    /// 拒绝已停止的批次或过期纪元，再由复制写入器向其权威核验当前写权。
+    pub fn verify_control_owner(&mut self, epoch: u64) -> io::Result<()> {
+        if self.halted || self.expected_epoch != epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "控制命令的主节点纪元已失效",
+            ));
+        }
+        self.appender.verify_control_owner(epoch)
+    }
     /// 在不更换写入器和水位的前提下擦除其具体类型。
     pub fn into_boxed(self) -> DurableBatcher<BoxedDurableAppender>
     where

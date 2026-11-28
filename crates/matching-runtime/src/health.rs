@@ -25,6 +25,8 @@ impl HealthDependency {
 
 /// 面向单节点的健康状态；依赖报告由实际资源所有者负责维护。
 pub struct Health {
+    /// 控制面派发停滞的可选观测，监控句柄不持有协调者租约。
+    control: Option<std::sync::Arc<crate::cross_control::ControlTelemetry>>,
     /// 需要同时运行的分片，不允许空集合。
     shards: Vec<crate::ShardHandle>,
     /// 尚未报告成功的依赖默认不健康。
@@ -53,6 +55,7 @@ impl Health {
             return Err("必须提供不重复的分片");
         }
         Ok(Self {
+            control: None,
             shards,
             healthy: AtomicU8::new(0),
             admission: std::sync::Mutex::new(()),
@@ -61,6 +64,15 @@ impl Health {
             feed_cursors: Vec::new(),
             priority_markets: Vec::new(),
         })
+    }
+
+    /// 将控制操作停滞次数接入节点指标。独立用户的降级不影响节点就绪状态。
+    pub fn with_control_telemetry(
+        mut self,
+        control: std::sync::Arc<crate::cross_control::ControlTelemetry>,
+    ) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// 显式登记游标缺口指标，拒绝重复句柄并限制总数量。
@@ -332,6 +344,8 @@ impl Health {
                 overflow |= size.overflow || wait.overflow;
             }
         }
+        let control = self.control.as_ref().map(|metric| metric.snapshot());
+        overflow |= control.is_some_and(|(_, exceeded)| exceeded);
         let mut output = format!(
             "# TYPE engine_queue_depth gauge\nengine_queue_depth {depth}\n# TYPE engine_queue_capacity gauge\nengine_queue_capacity {capacity}\n# TYPE engine_commands_total counter\nengine_commands_total {commands}\n# TYPE engine_reject_total counter\nengine_reject_total {rejects}\n# TYPE engine_trades_total counter\nengine_trades_total {trades}\n# TYPE engine_metrics_overflow gauge\nengine_metrics_overflow {}\n# TYPE engine_live gauge\nengine_live {}\n# TYPE engine_ready gauge\nengine_ready {}\n",
             u8::from(overflow),
@@ -339,6 +353,13 @@ impl Health {
             u8::from(self.ready())
         );
         use std::fmt::Write as _;
+        if let Some((stalls, _)) = control {
+            writeln!(
+                &mut output,
+                "# TYPE control_fanout_stalled_total counter\ncontrol_fanout_stalled_total {stalls}"
+            )
+            .map_err(|_| "指标格式化失败")?;
+        }
         writeln!(&mut output, "# TYPE priority_space_exhaustion_total counter\npriority_space_exhaustion_total {priority_exhaustions}").map_err(|_| "指标格式化失败")?;
         writeln!(&mut output, "# TYPE engine_diagnostics_dropped_total counter\nengine_diagnostics_dropped_total {diagnostics_dropped}").map_err(|_| "指标格式化失败")?;
         if feed_present.iter().any(|value| *value) {

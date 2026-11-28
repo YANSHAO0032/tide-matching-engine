@@ -1,4 +1,4 @@
-//! 生产簿独立构造批量撤单计划，并在单一提交点安装后态。
+//! 生产簿在独立候选上预演单笔、批量和市场管理撤单，核对前态后安装订单簿及预留绑定。
 
 use super::ProductionOrderBook;
 use matching_domain::{
@@ -8,7 +8,7 @@ use matching_domain::{
 use matching_risk::{ReservationApplyError, ReservationRegistry, ReservationState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// 生产簿只读预检得到的不可变批量撤单提交快照。
+/// 生产簿撤单或市场清理计划，包含提交前后的订单簿、预留绑定和有序事件。
 pub struct ProductionMassCancelPlan {
     /// 计划建立时的完整生产簿快照，用于提交前检测状态漂移。
     before_book: ProductionOrderBook,
@@ -23,6 +23,76 @@ pub struct ProductionMassCancelPlan {
 }
 
 impl ProductionOrderBook {
+    /// 按订单 ID 核对普通挂单或未触发止损单的用户及预留绑定。普通挂单按总余量、止损单按原计价模式报告取消。
+    /// 候选先将绑定移入 PendingR2，正式分片在同一命令中结清实际剩余。
+    pub fn plan_user_cancel(
+        &self,
+        input: &matching_domain::CancelOrder,
+        registry: &ReservationRegistry,
+    ) -> Result<ProductionMassCancelPlan, matching_domain::RejectReason> {
+        use matching_domain::RejectReason;
+        if self.market_id() != Some(input.market_id) {
+            return Err(RejectReason::OrderNotFound);
+        }
+        let id = input.order_id;
+        let (owner, remaining, is_stop) = if let Some(order) = self.order(id) {
+            (
+                order.original_order().user_id,
+                OrderRemaining::Base(Qty::try_new(order.total_remaining())?),
+                false,
+            )
+        } else if let Some((stop, _)) = self.stop_order(id) {
+            let (user, remaining) = match stop {
+                StopOrder::Limit(s) => (s.user_id, OrderRemaining::Base(s.qty)),
+                StopOrder::Market(s) => (
+                    s.user_id,
+                    match s.quantity {
+                        StopMarketQuantity::Base(q) => OrderRemaining::Base(q),
+                        StopMarketQuantity::Quote(q) => {
+                            OrderRemaining::Quote(QuoteAmount::new(q.get()))
+                        }
+                    },
+                ),
+            };
+            (user, remaining, true)
+        } else {
+            return Err(RejectReason::OrderNotFound);
+        };
+        if owner != input.user_id {
+            return Err(RejectReason::OrderNotFound);
+        }
+        let shadow = self
+            .reservation_state(id)
+            .ok_or(RejectReason::InvalidReservation)?;
+        if shadow.user_id != owner || shadow.order_id != id || shadow.market_id != input.market_id {
+            return Err(RejectReason::InvalidReservation);
+        }
+        let transition = registry.plan_binding_transitions([shadow], [])?;
+        let mut after_book = self.clone();
+        if is_stop {
+            after_book
+                .cancel_stop(id)
+                .expect("已定位的止损订单必须存在");
+        } else {
+            after_book.cancel(id).expect("已定位的普通订单必须存在");
+        }
+        let mut after_registry = registry.clone();
+        after_registry
+            .apply_binding_transition(transition)
+            .expect("已预检的单笔撤单归属不能漂移");
+        Ok(ProductionMassCancelPlan {
+            before_book: self.clone(),
+            before_registry: registry.clone(),
+            after_book,
+            after_registry,
+            events: vec![EngineEvent::OrderCanceled {
+                order_id: id,
+                remaining,
+                reason: CancelReason::UserRequested,
+            }],
+        })
+    }
+
     /// 预演熔断开关按策略终结市场内所有活动订单。
     pub fn plan_kill_switch_cancel(
         &self,

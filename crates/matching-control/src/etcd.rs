@@ -56,7 +56,66 @@ fn transaction_succeeded(response: &Value) -> io::Result<bool> {
     }
 }
 
+/// 事务内比较键值。
+pub(crate) fn value_compare(key: &str, value: &[u8]) -> Value {
+    json!({"key":STANDARD.encode(key),"target":"VALUE","value":STANDARD.encode(value),"result":"EQUAL"})
+}
+/// 比较修改版本或要求键不存在。
+pub(crate) fn version_compare(key: &str, revision: Option<u64>) -> Value {
+    match revision {
+        None => {
+            json!({"key":STANDARD.encode(key),"target":"VERSION","version":"0","result":"EQUAL"})
+        }
+        Some(revision) => {
+            json!({"key":STANDARD.encode(key),"target":"MOD","mod_revision":revision.to_string(),"result":"EQUAL"})
+        }
+    }
+}
+/// 构造持久或租约绑定的键写入。
+pub(crate) fn put(key: &str, value: &[u8], lease: Option<i64>) -> Value {
+    let mut request = json!({"key":STANDARD.encode(key),"value":STANDARD.encode(value)});
+    if let Some(lease) = lease {
+        request["lease"] = Value::String(lease.to_string());
+    }
+    json!({"request_put":request})
+}
+/// 单键读取的修改版本与原始字节。
+pub(crate) type VersionedValue = Option<(u64, Vec<u8>)>;
+
 impl EtcdClient {
+    /// 返回构造客户端时经服务端响应核对的集群身份。
+    pub(crate) fn cluster_id(&self) -> io::Result<u64> {
+        self.cluster
+            .lock()
+            .map_err(|_| io::Error::other("控制存储身份锁不可用"))?
+            .ok_or_else(|| invalid("控制存储缺少集群身份"))
+    }
+
+    /// 在一个线性一致事务中按输入顺序读取固定数量的键，各键保留自己的修改版本。
+    pub(crate) fn get_keys<const N: usize>(
+        &self,
+        keys: [&str; N],
+    ) -> io::Result<[VersionedValue; N]> {
+        let mut ranges = Vec::with_capacity(N);
+        for key in keys {
+            validate(key.as_bytes(), None)?;
+            ranges.push(json!({"request_range":{"key":STANDARD.encode(key)}}));
+        }
+        let response = self.read_rpc("v3/kv/txn", &json!({"success":ranges}))?;
+        if !transaction_succeeded(&response)? {
+            return Err(invalid("控制状态读取失败"));
+        }
+        let responses = response["responses"]
+            .as_array()
+            .filter(|a| a.len() == N)
+            .ok_or_else(|| invalid("控制状态读取数量错误"))?;
+        let mut values = std::array::from_fn(|_| None);
+        for ((key, response), value) in keys.into_iter().zip(responses).zip(&mut values) {
+            *value = Self::parse_range(key.as_bytes(), &response["response_range"])?;
+        }
+        Ok(values)
+    }
+
     /// 保留同一集群身份与连接池，将单次操作限制在剩余期限内。
     pub(crate) fn constrained_by(&self, deadline: Instant) -> io::Result<Self> {
         let left = deadline

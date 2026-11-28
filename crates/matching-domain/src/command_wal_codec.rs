@@ -19,6 +19,23 @@ pub fn encode_wal_command(c: &CommandEnvelope) -> Result<Vec<u8>, CommandCodecEr
     w.opt(c.client_timestamp, |w, v| w.u64(v));
     w.opt(c.received_at_unix_ns, |w, v| w.u64(v));
     match &c.payload {
+        Command::Cancel(input) => {
+            w.u8(17);
+            w.u32(input.market_id.get());
+            w.u64(input.user_id.get());
+            w.u128(input.order_id.get());
+            w.u8(u8::from(input.client_order_id.is_some()));
+            if let Some(id) = &input.client_order_id {
+                w.bytes(id.as_bytes())?;
+            }
+        }
+        Command::ApplyGlobalControlFenceShard(f) => {
+            w.u8(16);
+            w.u128(f.parent_command_id.get());
+            w.u64(f.new_epoch);
+            w.u8(f.action.wire_code().ok_or(CommandCodecError)?);
+            w.u64(f.expected_primary_epoch);
+        }
         Command::ShardKillSwitch(input) => {
             w.u8(15);
             w.u16(input.target_shard_id.get());
@@ -94,10 +111,7 @@ pub fn encode_wal_command(c: &CommandEnvelope) -> Result<Vec<u8>, CommandCodecEr
             w.u128(f.parent_command_id.0);
             w.u64(f.user_id.0);
             w.u64(f.new_epoch);
-            w.u8(match f.action {
-                UserFenceAction::FenceOnly => 0,
-                UserFenceAction::FenceAndCancelAll => 1,
-            });
+            w.u8(f.action.wire_code().ok_or(CommandCodecError)?);
             w.u64(f.expected_primary_epoch);
         }
         Command::MassCancelShard(m) => {
@@ -228,6 +242,19 @@ pub fn decode_wal_command(bytes: &[u8]) -> Result<CommandEnvelope, CommandCodecE
     let client_timestamp = r.opt(|r| r.u64())?;
     let received_at_unix_ns = r.opt(|r| r.u64())?;
     let payload = match r.u8()? {
+        17 => Command::Cancel(CancelOrder {
+            market_id: MarketId(r.u32()?),
+            user_id: UserId(r.u64()?),
+            order_id: OrderId(r.u128()?),
+            client_order_id: r
+                .opt(|r| String::from_utf8(r.bytes()?.to_vec()).map_err(|_| CommandCodecError))?,
+        }),
+        16 => Command::ApplyGlobalControlFenceShard(ApplyGlobalControlFenceShard {
+            parent_command_id: CommandId(r.u128()?),
+            new_epoch: r.u64()?,
+            action: UserFenceAction::from_wire(r.u8()?).ok_or(CommandCodecError)?,
+            expected_primary_epoch: r.u64()?,
+        }),
         15 => Command::ShardKillSwitch(ShardKillSwitch {
             target_shard_id: ShardId(r.u16()?),
             parent_command_id: CommandId(r.u128()?),
@@ -320,11 +347,7 @@ pub fn decode_wal_command(bytes: &[u8]) -> Result<CommandEnvelope, CommandCodecE
             parent_command_id: CommandId(r.u128()?),
             user_id: UserId(r.u64()?),
             new_epoch: r.u64()?,
-            action: match r.u8()? {
-                0 => UserFenceAction::FenceOnly,
-                1 => UserFenceAction::FenceAndCancelAll,
-                _ => return Err(CommandCodecError),
-            },
+            action: UserFenceAction::from_wire(r.u8()?).ok_or(CommandCodecError)?,
             expected_primary_epoch: r.u64()?,
         }),
         1 => Command::MassCancelShard(MassCancelShard {
@@ -486,6 +509,51 @@ struct Reader<'a> {
     bytes: &'a [u8],
     /// 下一个待读取的偏移。
     pos: usize,
+}
+impl UserFenceAction {
+    /// 控制命令和回执共用的稳定动作标记；清除时撤单不是合法组合。
+    pub fn wire_code(self) -> Option<u8> {
+        Some(match self {
+            Self::FenceOnly => 0,
+            Self::FenceAndCancelAll => 1,
+            Self::Kill {
+                active: false,
+                cancel_all: false,
+            } => 2,
+            Self::Kill {
+                active: true,
+                cancel_all: false,
+            } => 3,
+            Self::Kill {
+                active: true,
+                cancel_all: true,
+            } => 4,
+            Self::Kill {
+                active: false,
+                cancel_all: true,
+            } => return None,
+        })
+    }
+    /// 从持久标记恢复动作，未知值交由调用方拒绝。
+    pub fn from_wire(tag: u8) -> Option<Self> {
+        Some(match tag {
+            0 => Self::FenceOnly,
+            1 => Self::FenceAndCancelAll,
+            2 => Self::Kill {
+                active: false,
+                cancel_all: false,
+            },
+            3 => Self::Kill {
+                active: true,
+                cancel_all: false,
+            },
+            4 => Self::Kill {
+                active: true,
+                cancel_all: true,
+            },
+            _ => return None,
+        })
+    }
 }
 impl Reader<'_> {
     fn take<const N: usize>(&mut self) -> Result<[u8; N], CommandCodecError> {

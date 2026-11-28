@@ -1,8 +1,8 @@
 //! 按集群、分片和消费者隔离的持久游标与发布者围栏。
 use crate::EtcdClient;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use crate::etcd::{put, value_compare, version_compare};
 use matching_domain::{ClusterId, ShardId};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     io,
     sync::{
@@ -115,26 +115,6 @@ fn epoch_key(ns: &str) -> String {
 }
 fn cursor_key(ns: &str, sink: u64) -> String {
     format!("{ns}/cursor/{sink:016x}")
-}
-fn value_compare(key: &str, value: &[u8]) -> Value {
-    json!({"key":STANDARD.encode(key),"target":"VALUE","value":STANDARD.encode(value),"result":"EQUAL"})
-}
-fn version_compare(key: &str, revision: Option<u64>) -> Value {
-    match revision {
-        None => {
-            json!({"key":STANDARD.encode(key),"target":"VERSION","version":"0","result":"EQUAL"})
-        }
-        Some(revision) => {
-            json!({"key":STANDARD.encode(key),"target":"MOD","mod_revision":revision.to_string(),"result":"EQUAL"})
-        }
-    }
-}
-fn put(key: &str, value: &[u8], lease: Option<i64>) -> Value {
-    let mut request = json!({"key":STANDARD.encode(key),"value":STANDARD.encode(value)});
-    if let Some(lease) = lease {
-        request["lease"] = Value::String(lease.to_string());
-    }
-    json!({"request_put":request})
 }
 fn epoch_value(bytes: &[u8]) -> io::Result<u64> {
     let epoch = u64::from_be_bytes(

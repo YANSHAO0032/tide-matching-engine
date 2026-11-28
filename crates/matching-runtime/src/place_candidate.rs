@@ -242,6 +242,11 @@ pub(crate) fn release_terminal_reservations(
             match event {
                 EngineEvent::OrderCanceled {
                     order_id,
+                    reason: CancelReason::UserRequested,
+                    ..
+                } => Ok(Some((*order_id, ReservationReleaseReason::UserCancel))),
+                EngineEvent::OrderCanceled {
+                    order_id,
                     reason: CancelReason::MassCancel,
                     ..
                 } => Ok(Some((*order_id, ReservationReleaseReason::MassCancel))),

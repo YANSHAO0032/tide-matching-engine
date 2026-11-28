@@ -206,9 +206,10 @@ mod rate;
 pub use rate::{BucketConfig, GatewayRateLimiters, RateError, RateLimiter};
 
 mod place;
-/// 网关外部限价请求的稳定二进制模式。
+/// 网关限价载荷的编解码接口，以及限价、改单、撤单替换的请求帧类型。
 pub use place::{
-    PlaceCodecError, PlaceRequest, PlaceSide, StpPolicy, decode_place_request, encode_place_request,
+    PlaceCodecError, PlaceRequest, PlaceSide, StpPolicy, TYPE_AMEND, TYPE_CANCEL_REPLACE,
+    TYPE_PLACE, decode_place_request, encode_place_request,
 };
 
 mod reason;

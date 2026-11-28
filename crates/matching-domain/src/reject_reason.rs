@@ -88,6 +88,8 @@ pub enum RejectReason {
     FeeScheduleMismatch = 4004,
     /// 用户控制版本低于分片当前接收下限。
     StaleUserControlEpoch = 4005,
+    /// 跨分片控制栅栏生效，受保护的请求在分配业务序号前被拒绝。
+    ControlFenceActive = 4006,
     /// 所需带溢出检查的算术无法以目标整数类型精确表示。
     ArithmeticOverflow = 5001,
     /// 入口繁忙（容量、配额或准入锁竞争），请求未进入业务执行。
@@ -115,6 +117,13 @@ mod tests {
         assert_eq!(RejectReason::DuplicateOrderId as u16, 2008);
         assert_eq!(RejectReason::DuplicateClientOrderId as u16, 2009);
         assert_eq!(RejectReason::StaleUserControlEpoch as u16, 4005);
+        assert_eq!(RejectReason::ControlFenceActive as u16, 4006);
+        let bytes = 4006_u16.to_be_bytes();
+        let mut reader = crate::snapshot_wire::SnapshotDecoder::new(&bytes, 2).unwrap();
+        assert_eq!(
+            crate::snapshot_wire::decode_reject_reason(&mut reader).unwrap(),
+            RejectReason::ControlFenceActive
+        );
         assert_eq!(RejectReason::ArithmeticOverflow as u16, 5001);
         assert_eq!(RejectReason::StalePrimaryEpoch as u16, 5005);
         assert_eq!(RejectReason::InvalidExpireTime as u16, 2013);

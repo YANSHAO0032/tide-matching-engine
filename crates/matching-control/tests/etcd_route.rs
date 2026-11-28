@@ -113,7 +113,7 @@ fn monitored_route_lease_remains_exclusive_past_initial_ttl() {
     )
     .unwrap();
     let coordinator = RouteCoordinator::with_authority(authority, vec![shard.handle()]).unwrap();
-    let before_monitor = matching_domain::LimitOrder {
+    let order = matching_domain::LimitOrder {
         order_id: matching_domain::OrderId(1),
         user_id: matching_domain::UserId(1),
         stp_key: matching_domain::StpKey::new(0),
@@ -122,25 +122,36 @@ fn monitored_route_lease_remains_exclusive_past_initial_ttl() {
         price: matching_domain::Price::try_new(1).unwrap(),
         qty: matching_domain::Qty::try_new(1).unwrap(),
     };
-    assert!(matches!(
-        shard
-            .handle()
-            .submit(
+    let handle = shard.handle();
+    // 队列在等待租约与恢复写入后都可能暂时繁忙，只重试尚未入队的请求。
+    fn enqueue<T>(mut send: impl FnMut() -> Result<T, matching_runtime::ShardError>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match send() {
+                Ok(reply) => return reply,
+                Err(matching_runtime::ShardError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("分片入口失败 {error:?}"),
+            }
+        }
+    }
+    let submit = |epoch| {
+        enqueue(|| {
+            handle.submit(
                 matching_domain::CommandId(1),
                 market,
-                1,
-                matching_runtime::Mutation::Place(before_monitor)
+                epoch,
+                matching_runtime::Mutation::Place(order.clone()),
             )
-            .unwrap()
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap(),
+        })
+    };
+    assert!(matches!(
+        submit(1).recv_timeout(Duration::from_secs(2)).unwrap(),
         Err(matching_domain::RejectReason::EngineBusy)
     ));
     assert_eq!(
-        shard
-            .handle()
-            .barrier(1)
-            .unwrap()
+        enqueue(|| handle.barrier(1))
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .1,
@@ -161,31 +172,6 @@ fn monitored_route_lease_remains_exclusive_past_initial_ttl() {
         .unwrap();
     assert!(updated > revision);
     assert_eq!(competitor.read_snapshot().unwrap(), (updated, next));
-    let order = matching_domain::LimitOrder {
-        order_id: matching_domain::OrderId(1),
-        user_id: matching_domain::UserId(1),
-        stp_key: matching_domain::StpKey::new(0),
-        stp_mode: matching_domain::StpMode::None,
-        side: matching_domain::Side::Buy,
-        price: matching_domain::Price::try_new(1).unwrap(),
-        qty: matching_domain::Qty::try_new(1).unwrap(),
-    };
-    let handle = shard.handle();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let submit = |epoch| loop {
-        match handle.submit(
-            matching_domain::CommandId(1),
-            market,
-            epoch,
-            matching_runtime::Mutation::Place(order.clone()),
-        ) {
-            Ok(reply) => break reply,
-            Err(matching_runtime::ShardError::Busy) if std::time::Instant::now() < deadline => {
-                std::thread::yield_now()
-            }
-            Err(error) => panic!("分片入口失败: {error:?}"),
-        }
-    };
     assert!(matches!(
         submit(1).recv_timeout(Duration::from_secs(2)).unwrap(),
         Err(matching_domain::RejectReason::StaleRouteEpoch)

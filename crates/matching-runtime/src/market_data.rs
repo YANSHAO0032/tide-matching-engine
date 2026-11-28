@@ -469,7 +469,8 @@ impl MarketProjector {
         }
     }
     /// 将正式执行结果投影为单市场行情源。持久写入路径可在提交前预演，发布方只能发布已提交的结果。
-    /// 分片控制事件按市场过滤；其他结果必须只包含当前市场。
+    /// 分片控制按市场提取撤单事件，跳过无市场归属的开关和纪元事件。
+    /// 末尾的纪元事件用于区分跨市场控制撤单与单市场批量撤单。
     pub fn apply_formal_execution<F>(
         &mut self,
         execution: &crate::FormalExecution,
@@ -495,7 +496,16 @@ impl MarketProjector {
         original_indices
             .try_reserve_exact(execution.events.len())
             .map_err(|_| MboError::Capacity)?;
-        let shard_control = matches!(execution.outcome, crate::FormalOutcome::ShardControl);
+        let shard_control = matches!(execution.outcome, crate::FormalOutcome::ShardControl)
+            || (matches!(execution.outcome, crate::FormalOutcome::MassCancel(_))
+                && execution.events.last().is_some_and(|last| {
+                    last.market_id.is_none()
+                        && matches!(
+                            last.payload,
+                            matching_domain::EngineEvent::UserControlEpochAdvanced { .. }
+                                | matching_domain::EngineEvent::GlobalControlEpochAdvanced { .. }
+                        )
+                }));
         if shard_control && !execution.market_data_child_opens.is_empty() {
             return Err(MboError::InvalidOrder);
         }

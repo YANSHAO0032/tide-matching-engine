@@ -5,6 +5,7 @@ mod audit;
 pub use audit::{AuditAction, AuditDispatchError, AuditLog, AuditOutcome, AuditRecord};
 mod client_order_id;
 mod control_store;
+pub mod cross_control;
 /// 可信文件目录中的单机排他主节点租约。
 pub use control_store::{ControlCoordinator, ControlStore, LeaseError, PrimaryLease};
 mod event_hash;
@@ -25,6 +26,9 @@ mod recovery;
 mod route_store;
 mod route_table;
 mod sequencer;
+#[cfg(test)]
+#[path = "../tests/t22_support/mod.rs"]
+mod test_directory;
 mod user_control;
 mod wait_strategy;
 mod worker;

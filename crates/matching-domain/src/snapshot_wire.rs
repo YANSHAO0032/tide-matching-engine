@@ -647,6 +647,7 @@ pub fn decode_reject_reason(
         4003 => FeeScheduleNotFound,
         4004 => FeeScheduleMismatch,
         4005 => StaleUserControlEpoch,
+        4006 => ControlFenceActive,
         5001 => ArithmeticOverflow,
         5002 => EngineBusy,
         5005 => StalePrimaryEpoch,

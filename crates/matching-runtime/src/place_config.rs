@@ -3,6 +3,42 @@
 use matching_domain::MarketId;
 use matching_risk::{LimitReservePolicy, RiskKeySet};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// 可信控制权威的进程内绑定；快照与 WAL 均不序列化连接信息。
+#[derive(Clone)]
+pub(crate) struct AdmissionBinding(pub(crate) Arc<dyn crate::cross_control::ControlAdmission>);
+
+impl std::fmt::Debug for AdmissionBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdmissionBinding")
+    }
+}
+
+/// 一次权威读取同时取得的发布纪元与栅栏状态。独立部署没有跨分片纪元绑定。
+#[derive(Default, Clone, Copy)]
+pub(crate) struct AdmissionStatus {
+    /// 全局、当前用户的已发布纪元。
+    pub(crate) epochs: Option<(u64, u64)>,
+    /// 用户或全局范围正在建立栅栏或已启用 Kill 开关时的稳定拒绝原因。
+    pub(crate) reason: Option<matching_domain::RejectReason>,
+}
+
+impl AdmissionStatus {
+    /// 先检查权威栅栏，再检查用户提供的纪元，包括伪造的未来纪元。
+    pub(crate) fn rejection(&self, user_epoch: u64) -> Option<matching_domain::RejectReason> {
+        self.reason.or_else(|| {
+            self.epochs
+                .is_some_and(|(_, current)| current != user_epoch)
+                .then_some(matching_domain::RejectReason::StaleUserControlEpoch)
+        })
+    }
+
+    /// 返回可信的全局纪元，供请求绑定和分片顺序点复核。
+    pub(crate) fn global_epoch(&self) -> Option<u64> {
+        self.epochs.map(|(global, _)| global)
+    }
+}
 
 /// 正式下单活动订单及客户端身份的显式容量限制。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +69,8 @@ pub struct PlaceSupportConfig {
     pub(crate) primary_lease: Option<std::sync::Arc<crate::PrimaryLease>>,
     /// 工作线程启动时暂停变更，直到路由协调器确认权威。
     pub(crate) require_route_authority: bool,
+    /// 提供跨分片控制的权威准入视图。
+    pub(crate) control_admission: Option<AdmissionBinding>,
 }
 
 /// 正式下单配置不满足市场唯一性或容量约束。
@@ -56,6 +94,7 @@ impl PlaceSupportConfig {
             managed_only: false,
             primary_lease: None,
             require_route_authority: false,
+            control_admission: None,
         })
     }
 
@@ -85,11 +124,20 @@ impl PlaceSupportConfig {
             managed_only: false,
             primary_lease: None,
             require_route_authority: false,
+            control_admission: None,
         })
     }
     /// 要求正式业务变更仅作用于已创建的受管理市场。
     pub fn require_managed_markets(mut self) -> Self {
         self.managed_only = true;
+        self
+    }
+    /// 绑定同时验证用户与全局控制状态的线性一致权威。
+    pub fn with_control_admission(
+        mut self,
+        admission: Arc<dyn crate::cross_control::ControlAdmission>,
+    ) -> Self {
+        self.control_admission = Some(AdmissionBinding(admission));
         self
     }
     /// 将可信主节点租约绑定到分片生命周期；租约身份在启动时校验。

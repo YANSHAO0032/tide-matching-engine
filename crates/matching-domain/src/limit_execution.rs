@@ -7,6 +7,8 @@ use crate::{
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelReason {
+    /// 用户主动撤销指定活动订单。
+    UserRequested = 1101,
     /// 分片本地批量撤单命中活动订单时终结。
     MassCancel = 1102,
     /// 市场关闭时终结非 DAY 活动订单。
